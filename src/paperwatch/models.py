@@ -213,13 +213,24 @@ class PaperRecord:
         return f"title:{self.normalized_title}:{year}"
 
 
-def _narrative_limit(value: str) -> str:
-    if len(value.split()) > 200:
-        raise ValueError("narrative strings must contain at most 200 words")
+def _word_limit(value: str, *, maximum: int, label: str) -> str:
+    if len(value.split()) > maximum:
+        raise ValueError(f"{label} must contain at most {maximum} words")
     return value
 
 
+def _narrative_limit(value: str) -> str:
+    return _word_limit(value, maximum=200, label="narrative strings")
+
+
+def _chunk_narrative_limit(value: str) -> str:
+    # Chunk notes are intermediate evidence, not final user-facing narrative fields.
+    # They need enough room to preserve details before the reduction and final merge.
+    return _word_limit(value, maximum=1200, label="chunk-note strings")
+
+
 Narrative = Annotated[str, AfterValidator(_narrative_limit)]
+ChunkNarrative = Annotated[str, AfterValidator(_chunk_narrative_limit)]
 OneSentence = Annotated[Narrative, Field(max_length=500)]
 PaperKind = Literal[
     "mathematics",
@@ -344,13 +355,13 @@ ANALYSIS_JSON_SCHEMA: dict[str, Any] = AnalysisResult.model_json_schema()
 
 class ChunkNotes(StrictModel):
     section: str = Field(min_length=1)
-    substantive_content: Narrative
-    definitions: list[Narrative]
-    methods: list[Narrative]
-    results: list[Narrative]
-    assumptions: list[Narrative]
-    evidence: list[Narrative]
-    limitations: list[Narrative]
+    substantive_content: ChunkNarrative
+    definitions: list[ChunkNarrative]
+    methods: list[ChunkNarrative]
+    results: list[ChunkNarrative]
+    assumptions: list[ChunkNarrative]
+    evidence: list[ChunkNarrative]
+    limitations: list[ChunkNarrative]
     bibliography_titles: list[str]
 
 

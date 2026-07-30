@@ -1,38 +1,49 @@
-# Release audit — paperwatch 0.5.5
+# Release audit — paperwatch 0.6.2
 
 ## Result
 
-Version 0.5.5 is release-ready. It keeps the recent-paper-first interface and adds a one-year initial discovery window, default open-PDF downloads, larger complete-PDF extraction limits, one-shot local-model readiness checks, actionable missing-model errors, OpenAI-compatible local-server fallback, and resilient skipping of sparse OpenAlex work records.
+Version 0.6.2 adds in-place paper jobs to the 0.6.1 interface. Summary and saved-prompt runs preserve scroll position, stream live Ollama output, support cancellation, refresh only the result section, and hide abandoned or failed attempts after restart. Existing fetch, analysis, PDF, topic, tag, export, Codex, and author behavior is retained.
+
+
+### In-place paper jobs
+
+- Summary and saved-prompt forms submit asynchronously from the paper page.
+- The paper page is not reloaded when a job starts or finishes.
+- Only the results fragment is refreshed, and the previous vertical scroll position is restored.
+- Ollama JSON fragments and chunk/reduction progress are shown live.
+- Active jobs can be stopped; queued and active rows are finalized as cancelled.
+- Startup marks abandoned jobs inconclusive, while paper pages show only active or successful attempts.
 
 ## Usability review
 
-The primary route is intentionally shallow:
+The primary routes require no nested search workflow:
 
 ```text
-Recent papers -> Paper detail -> source, author, model, and export actions
+Recent table -> paper detail
+Recent filters + saved prompt + model -> query result
+Authors table -> filter, tag, pause/resume, archive
 ```
 
-- The home page is the newest-paper feed rather than an analytics dashboard.
-- Each feed card exposes immediate paper/source links.
-- The paper page holds the complete summary, source links, author picker, author tracking, external author links, model selection, context size, and rerun controls.
-- Authors and saved queries are one top-level navigation step away.
-- Diagnostics remain available under Runs and Dashboard but do not interrupt normal reading.
-- No essential operation requires a multi-level drill-down.
-
-The UI remains server-rendered Jinja with one CSS file and one small JavaScript file. It has no CDN, bundler, client router, or JavaScript data framework.
+- Recent opens directly to a wrapping, horizontally resilient paper table.
+- Tracked author links immediately re-filter Recent.
+- PDF availability and missing state are visible without opening a paper.
+- Author management uses one table and compact icon actions.
+- Query definitions are separate from paper selection; selection happens once on Recent.
+- Light and high-contrast dark themes remain available from the corner button.
+- Diagnostics remain separate from the normal reading workflow.
 
 ## Added behavior
 
 ### Recent-paper interface
 
-- Newest-first scrolling feed is the default route.
-- Search and optional filters reuse the same feed.
-- Paper cards link directly to detail, arXiv, Google Scholar, and OpenAlex where identifiers allow.
+- Newest-first table is the default route.
+- Columns combine date/journal, wrapping title, tracked-author links, the leading OpenAlex topic, PDF state, and latest summary.
+- Current filters can be passed directly to a saved query and selected model.
 
 ### Centralized author controls
 
-- A picker exposes every coauthor on the paper page.
-- Selected authors can be searched locally, opened on OpenAlex/Scholar/arXiv, or added/restored to tracking.
+- A picker exposes every coauthor on the paper page and defaults to the first tracked author in paper order, falling back to the first author.
+- Tracked coauthors are highlighted in orange; selected authors can be searched locally, opened on OpenAlex/Scholar/arXiv, or added/restored to tracking.
 - Authors without an OpenAlex ID still receive useful name-based local and external searches.
 - Removing from the author list only changes tracking flags; no historical data is deleted.
 
@@ -152,3 +163,18 @@ The UI remains server-rendered Jinja with one CSS file and one small JavaScript 
 - Direct, chunked, multi-model, rerun, and saved-query paths all use the common LLM protocol.
 - Reasoning effort is included in direct and chunked cache identities, preventing stale cross-effort reuse.
 - Provider-specific authentication, model-access, and HTTP errors are actionable.
+
+
+## 0.5.6 corrective audit
+
+- The patch is based directly on the uploaded 0.5.5 source tree and preserves its Codex changes.
+- `paperwatch backfill --days 365` ignores existing `last_checked_at` cursors and defaults to a 5000-work-per-author safety cap.
+- Backfill runs download open PDFs without invoking any LLM.
+- Historical imports use `papers.auto_analyze = 0`; routine runs do not summarize the initial backlog.
+- A PDF first downloaded during a later normal run is analyzed once.
+- Recent-paper cards and paper details expose both downloaded and source PDF links.
+- Local PDFs are served inline and remain confined to the configured PDF directory.
+- PDF filters and dashboard totals include downloaded files even if the remote URL is absent.
+- The missing packaged `defaults/config.toml` is restored, so `paperwatch init` works again.
+
+Verification: 190 tests passed with 95.08% branch-aware coverage.

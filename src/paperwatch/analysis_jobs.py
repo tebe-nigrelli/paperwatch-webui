@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import inspect
 import secrets
 import threading
 from dataclasses import asdict, dataclass
@@ -13,7 +14,14 @@ from .analysis import analyze_pdf_file, analyze_text
 from .chunking import analyze_chunked_text, direct_prompt_fit
 from .config import AppConfig, load_config
 from .db import Database
-from .llm import LLMError, configure_context_window, create_llm
+from .job_runtime import JobCancelled, ProgressCallback, check_cancelled, publish
+from .llm import (
+    LLMClient,
+    LLMError,
+    configure_context_window,
+    configure_job_runtime,
+    create_llm,
+)
 from .locking import analysis_lock
 from .pdfs import download_pdf, extract_pdf_text, safe_pdf_name
 
@@ -29,6 +37,11 @@ class AnalysisBatchSnapshot:
     context_window_tokens: int | None = None
     completed: int = 0
     failed: int = 0
+    cancelled: bool = False
+    cancel_requested: bool = False
+    stage: str = ""
+    message: str = ""
+    live_output: str = ""
     error: str | None = None
 
 
@@ -82,6 +95,17 @@ def _paper_text(
     return paper, extract_pdf_text(path, max_chars=config.fetch.max_pdf_chars)
 
 
+def _cancel_pending_tasks(
+    db: Database, tasks: dict[str, Any], *, current_task_id: int | None = None
+) -> int:
+    cancelled = 0
+    for task in tasks.values():
+        task_id = int(task["id"])
+        if task_id == current_task_id or task["status"] in {"queued", "running"}:
+            db.finish_analysis_task(task_id, error="Cancelled by user")
+            cancelled += 1
+    return cancelled
+
 
 def run_analysis_batch(
     config_path: Path,
@@ -91,12 +115,16 @@ def run_analysis_batch(
     profile_names: tuple[str, ...],
     analysis_strategy: str = "direct",
     context_window_tokens: int | None = None,
-) -> dict[str, int]:
+    progress: ProgressCallback | None = None,
+    cancel_event: threading.Event | None = None,
+    active_client: Callable[[LLMClient | None], None] | None = None,
+) -> dict[str, int | bool]:
     config = load_config(config_path)
     profiles = {item.profile: item for item in config.available_llms}
     selected = [profiles[name] for name in profile_names if name in profiles]
     completed = 0
     failed = 0
+    publish(progress, "stage", "Preparing paper")
     with analysis_lock(config.paths.database):
         with Database(config.paths.database) as db, httpx.Client(
             timeout=60,
@@ -108,10 +136,12 @@ def run_analysis_batch(
             for name, task in tasks.items():
                 if name not in selected_names:
                     db.finish_analysis_task(
-                        int(task["id"]), error=f"Configured LLM profile {name!r} is no longer available"
+                        int(task["id"]),
+                        error=f"Configured LLM profile {name!r} is no longer available",
                     )
                     failed += 1
             try:
+                check_cancelled(cancel_event)
                 pdf_path: Path | None = None
                 text: str | None = None
                 needs_codex_file = (
@@ -120,9 +150,19 @@ def run_analysis_batch(
                     and any(item.provider == "codex" for item in selected)
                 )
                 if needs_codex_file:
+                    publish(progress, "message", "Loading the source PDF")
                     paper, pdf_path = _paper_pdf_path(config, db, paper_id, pdf_client)
                 else:
+                    publish(
+                        progress,
+                        "message",
+                        "Extracting PDF text" if scope == "fulltext" else "Loading abstract",
+                    )
                     paper, text = _paper_text(config, db, paper_id, scope, pdf_client)
+                check_cancelled(cancel_event)
+            except JobCancelled:
+                _cancel_pending_tasks(db, tasks)
+                return {"completed": completed, "failed": failed, "cancelled": True}
             except Exception as exc:
                 for task in tasks.values():
                     db.finish_analysis_task(int(task["id"]), error=str(exc))
@@ -134,10 +174,21 @@ def run_analysis_batch(
                 if task is None:
                     continue
                 task_id = int(task["id"])
-                db.start_analysis_task(task_id)
-                llm = None
                 try:
+                    check_cancelled(cancel_event)
+                except JobCancelled:
+                    _cancel_pending_tasks(db, tasks)
+                    return {"completed": completed, "failed": failed, "cancelled": True}
+                db.start_analysis_task(task_id)
+                llm: LLMClient | None = None
+                try:
+                    publish(progress, "reset_output", "")
+                    publish(progress, "stage", f"Summarizing with {profile.model}")
+                    publish(progress, "message", f"Using profile {profile.profile}")
                     llm = create_llm(profile)
+                    configure_job_runtime(llm, progress, cancel_event)
+                    if active_client is not None:
+                        active_client(llm)
                     effective_context = context_window_tokens or profile.context_window_tokens
                     configure_context_window(llm, effective_context)
                     effective_strategy = analysis_strategy
@@ -150,6 +201,7 @@ def run_analysis_batch(
                     )
                     if codex_pdf_upload:
                         assert pdf_path is not None
+                        publish(progress, "message", "Uploading and reading the complete PDF")
                         outcome = analyze_pdf_file(
                             db=db,
                             prompt_path=config.paths.prompt,
@@ -196,10 +248,13 @@ def run_analysis_batch(
                                 paper=paper,
                                 text=text,
                                 context_window_tokens=effective_context,
+                                progress=progress,
+                                cancel_event=cancel_event,
                             )
                             outcome = chunked.outcome
                             chunk_count = chunked.chunk_count
                         else:
+                            publish(progress, "message", "Generating the structured summary")
                             outcome = analyze_text(
                                 db=db,
                                 prompt_path=config.paths.prompt,
@@ -211,16 +266,25 @@ def run_analysis_batch(
                                 scope=scope,
                             )
                             chunk_count = 0
+                    check_cancelled(cancel_event)
                     db.finish_analysis_task(
                         task_id, analysis_id=outcome.analysis_id, chunk_count=chunk_count
                     )
                     completed += 1
+                    publish(progress, "message", f"Completed {profile.model}")
+                except JobCancelled:
+                    _cancel_pending_tasks(db, tasks, current_task_id=task_id)
+                    return {"completed": completed, "failed": failed, "cancelled": True}
                 except Exception as exc:
                     db.finish_analysis_task(task_id, error=str(exc))
                     failed += 1
+                    publish(progress, "message", f"{profile.model} failed: {exc}")
                 finally:
+                    if active_client is not None:
+                        active_client(None)
                     if llm is not None:
                         llm.close()
+    publish(progress, "stage", "Complete")
     return {"completed": completed, "failed": failed}
 
 
@@ -230,13 +294,15 @@ class AnalysisController:
     def __init__(
         self,
         config_path: str | Path,
-        runner: Callable[[Path, str, int, str, tuple[str, ...], str, int | None], dict[str, int]] | None = None,
+        runner: Callable[..., dict[str, int | bool]] | None = None,
     ) -> None:
         self.config_path = Path(config_path).resolve()
         self._runner = runner or run_analysis_batch
         self._lock = threading.Lock()
         self._snapshot = AnalysisBatchSnapshot()
         self._thread: threading.Thread | None = None
+        self._cancel_event = threading.Event()
+        self._active_llm: LLMClient | None = None
 
     def start(
         self,
@@ -263,10 +329,9 @@ class AnalysisController:
             unknown = [name for name in requested if name not in available]
             if unknown:
                 raise ValueError(f"Unknown configured model profile(s): {', '.join(unknown)}")
-            selected = requested
-            if not selected:
+            if not requested:
                 raise ValueError("Select at least one configured model")
-            if len(selected) > 12:
+            if len(requested) > 12:
                 raise ValueError("Select at most 12 models per batch")
             batch_id = secrets.token_hex(10)
             with Database(config.paths.database) as db:
@@ -278,47 +343,117 @@ class AnalysisController:
                     scope=scope,
                     profiles=[
                         (name, available[name].provider, available[name].model)
-                        for name in selected
+                        for name in requested
                     ],
                     analysis_strategy=analysis_strategy,
                     context_window_tokens=context_window_tokens,
                 )
+            self._cancel_event = threading.Event()
+            self._active_llm = None
             self._snapshot = AnalysisBatchSnapshot(
                 running=True,
                 batch_id=batch_id,
                 paper_id=paper_id,
                 scope=scope,
-                profiles=selected,
+                profiles=requested,
                 analysis_strategy=analysis_strategy,
                 context_window_tokens=context_window_tokens,
+                stage="Queued",
+                message="Preparing analysis",
             )
             self._thread = threading.Thread(
                 target=self._work,
-                args=(batch_id, paper_id, scope, selected, analysis_strategy, context_window_tokens),
+                args=(
+                    batch_id,
+                    paper_id,
+                    scope,
+                    requested,
+                    analysis_strategy,
+                    context_window_tokens,
+                ),
                 name="paperwatch-model-batch",
                 daemon=True,
             )
             self._thread.start()
             return batch_id
 
+    def _progress(self, kind: str, value: str) -> None:
+        with self._lock:
+            if kind == "stage":
+                self._snapshot.stage = value[:200]
+            elif kind == "message":
+                self._snapshot.message = value[:1000]
+            elif kind == "reset_output":
+                self._snapshot.live_output = ""
+            elif kind == "output":
+                self._snapshot.live_output = (self._snapshot.live_output + value)[-100_000:]
+
+    def _set_active_llm(self, llm: LLMClient | None) -> None:
+        with self._lock:
+            self._active_llm = llm
+
+    def cancel(self) -> bool:
+        with self._lock:
+            if not self._snapshot.running:
+                return False
+            self._snapshot.cancel_requested = True
+            self._snapshot.message = "Stopping after the current response boundary"
+            self._cancel_event.set()
+            llm = self._active_llm
+        if llm is not None:
+            try:
+                llm.close()
+            except Exception:
+                pass
+        return True
+
     def _work(
-        self, batch_id: str, paper_id: int, scope: str, profiles: tuple[str, ...],
-        analysis_strategy: str, context_window_tokens: int | None
+        self,
+        batch_id: str,
+        paper_id: int,
+        scope: str,
+        profiles: tuple[str, ...],
+        analysis_strategy: str,
+        context_window_tokens: int | None,
     ) -> None:
         try:
-            import inspect
             parameter_count = len(inspect.signature(self._runner).parameters)
             if parameter_count <= 5:
                 result = self._runner(self.config_path, batch_id, paper_id, scope, profiles)
+            elif parameter_count <= 7:
+                result = self._runner(
+                    self.config_path,
+                    batch_id,
+                    paper_id,
+                    scope,
+                    profiles,
+                    analysis_strategy,
+                    context_window_tokens,
+                )
             else:
                 result = self._runner(
-                    self.config_path, batch_id, paper_id, scope, profiles,
-                    analysis_strategy, context_window_tokens
+                    self.config_path,
+                    batch_id,
+                    paper_id,
+                    scope,
+                    profiles,
+                    analysis_strategy,
+                    context_window_tokens,
+                    self._progress,
+                    self._cancel_event,
+                    self._set_active_llm,
                 )
             with self._lock:
                 self._snapshot.running = False
                 self._snapshot.completed = int(result.get("completed", 0))
                 self._snapshot.failed = int(result.get("failed", 0))
+                self._snapshot.cancelled = bool(result.get("cancelled", False))
+                self._snapshot.cancel_requested = False
+                self._snapshot.stage = "Cancelled" if self._snapshot.cancelled else "Complete"
+                if self._snapshot.cancelled:
+                    self._snapshot.message = "Analysis cancelled"
+                elif not self._snapshot.message:
+                    self._snapshot.message = "Analysis complete"
         except Exception as exc:
             try:
                 config = load_config(self.config_path)
@@ -332,6 +467,11 @@ class AnalysisController:
                 with self._lock:
                     self._snapshot.running = False
                     self._snapshot.error = str(exc)
+                    self._snapshot.stage = "Failed"
+                    self._snapshot.message = str(exc)
+        finally:
+            with self._lock:
+                self._active_llm = None
 
     def snapshot(self) -> AnalysisBatchSnapshot:
         with self._lock:

@@ -3,6 +3,7 @@ from __future__ import annotations
 from copy import deepcopy
 from dataclasses import replace
 from datetime import date
+from pathlib import Path
 
 import httpx
 
@@ -650,3 +651,81 @@ def test_daily_codex_fulltext_uploads_original_pdf_without_text_extraction(
         assert llm.uploads[0][1] == PDF_BYTES
         analyses = db.paper_analyses(db.list_papers()[0]["id"])
         assert {row["analysis_strategy"] for row in analyses} == {"direct", "pdf_upload"}
+
+
+def test_cursor_independent_download_only_backfill_and_late_pdf_analysis(
+    app_config,
+    author_candidate,
+    paper_record,
+    analysis_result,
+    monkeypatch,
+):
+    openalex = FakeOpenAlex([paper_record])
+    llm = FakeLLM(analysis_result)
+    pdf_client = httpx.Client(
+        transport=httpx.MockTransport(lambda request: httpx.Response(200, content=PDF_BYTES))
+    )
+    monkeypatch.setattr(
+        "paperwatch.pipeline.extract_pdf_text", lambda path, max_chars: "complete paper text"
+    )
+
+    with Database(app_config.paths.database) as db:
+        db.add_author(author_candidate)
+        db.mark_author_checked("A123", "2026-07-29T00:00:00+00:00")
+        app = PaperWatch(
+            app_config,
+            db=db,
+            openalex=openalex,
+            arxiv=None,
+            llm=llm,
+            pdf_client=pdf_client,
+        )
+        backfill = app.run(
+            today=date(2026, 7, 30),
+            since_override=date(2025, 7, 30),
+            download_only=True,
+            historical=True,
+            max_papers_per_author_override=5000,
+        )
+        assert backfill.status == "success"
+        assert backfill.pdfs_downloaded == 1
+        assert backfill.papers_analyzed == 0
+        assert openalex.calls[0] == ("A123", "2025-07-30", 5000)
+        stored = db.list_papers()[0]
+        assert stored["auto_analyze"] == 0
+        assert stored["local_pdf_path"]
+        assert llm.prompts == []
+        assert db.get_author("A123")["last_checked_at"].startswith("2026-07-30")
+
+        # Rediscovery does not summarize an already downloaded historical paper.
+        normal = app.run(today=date(2026, 7, 31))
+        assert normal.papers_analyzed == 0
+        assert llm.prompts == []
+
+        # If the PDF first becomes downloadable later, analyze that new download once.
+        Path(stored["local_pdf_path"]).unlink()
+        late = app.run(today=date(2026, 8, 1))
+        assert late.pdfs_downloaded == 1
+        assert late.papers_analyzed == 1
+        assert len(llm.prompts) == 1
+        assert db.paper_analyses(stored["id"])[0]["scope"] == "fulltext"
+
+
+def test_backfill_override_validation_happens_before_run_creation(
+    app_config, author_candidate, analysis_result
+):
+    import pytest
+
+    with Database(app_config.paths.database) as db:
+        db.add_author(author_candidate)
+        app = PaperWatch(
+            app_config,
+            db=db,
+            openalex=FakeOpenAlex([]),
+            arxiv=None,
+            llm=FakeLLM(analysis_result),
+            pdf_client=httpx.Client(),
+        )
+        with pytest.raises(ValueError, match="at least 1"):
+            app.run(max_papers_per_author_override=0)
+        assert db.list_runs() == []

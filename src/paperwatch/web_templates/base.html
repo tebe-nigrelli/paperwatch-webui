@@ -27,7 +27,7 @@
   </div>
 </header>
 <main class="shell">
-  {% if run_state.running %}<div class="notice notice-warning">Fetch in progress{% if run_state.started_at %} · started {{ run_state.started_at }}{% endif %}</div>{% endif %}
+  {% if run_state.running %}<div class="notice notice-warning">{{ 'One-year PDF backfill' if run_state.mode == 'backfill' else 'Fetch' }} in progress{% if run_state.started_at %} · started {{ run_state.started_at }}{% endif %}</div>{% endif %}
   {% if notice %}<div class="notice notice-{{ notice_level }}" role="status">{{ notice }}</div>{% endif %}
   {% if run_state.error %}<div class="notice notice-error">Fetch failed: {{ run_state.error }}</div>{% endif %}
   {% if analysis_state.error %}<div class="notice notice-error">Analysis failed: {{ analysis_state.error }}</div>{% endif %}

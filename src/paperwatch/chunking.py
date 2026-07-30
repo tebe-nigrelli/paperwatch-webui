@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import threading
 from dataclasses import dataclass
 from typing import Any
 
@@ -9,6 +10,7 @@ from pydantic import ValidationError
 from .analysis import AnalysisOutcome
 from .config import LLMConfig
 from .db import Database
+from .job_runtime import ProgressCallback, check_cancelled, publish
 from .llm import LLMClient, LLMError, PromptBuilder
 from .models import (
     CHUNK_NOTES_JSON_SCHEMA,
@@ -97,7 +99,7 @@ def split_text(text: str, chunk_chars: int, *, overlap_chars: int = 300) -> list
 
 def _chunk_prompt(paper: PaperRecord, text: str, index: int, total: int) -> str:
     return f"""You are extracting rigorous notes from chunk {index + 1} of {total} of a research paper.
-Return exactly one JSON object matching the supplied schema. Record only material actually present in this chunk. Do not infer missing sections or fabricate citations. Keep each narrative concise but substantive. Preserve mathematical notation with escaped LaTeX.
+Return exactly one JSON object matching the supplied schema. Record only material actually present in this chunk. Do not infer missing sections or fabricate citations. Intermediate chunk notes are not subject to the final summary's 200-word field cap. Keep substantive_content below 800 words and each list item below 200 words while preserving all material needed for the final merge. Preserve mathematical notation with escaped LaTeX.
 
 Paper: {paper.title}
 Authors: {', '.join(author.name for author in paper.authors)}
@@ -147,9 +149,13 @@ def _reduce_to_budget(
     notes: list[ChunkNotes],
     budget: int,
     usage: dict[str, Any],
+    *,
+    progress: ProgressCallback | None = None,
+    cancel_event: threading.Event | None = None,
 ) -> str:
     current = [item.model_dump() for item in notes]
     for round_index in range(1, 7):
+        check_cancelled(cancel_event)
         encoded = json.dumps(current, ensure_ascii=False)
         if len(encoded) <= budget:
             return encoded
@@ -172,7 +178,9 @@ def _reduce_to_budget(
                 "Chunk notes exceed the selected context window; choose a larger context window"
             )
         reduced: list[dict[str, Any]] = []
-        for group_items in groups:
+        for group_index, group_items in enumerate(groups):
+            check_cancelled(cancel_event)
+            publish(progress, "message", f"Reducing notes {group_index + 1}/{len(groups)} · round {round_index}")
             result, call_usage = _generate_notes(
                 llm, _reduction_prompt(group_items, round_index)
             )
@@ -192,7 +200,10 @@ def analyze_chunked_text(
     paper: PaperRecord,
     text: str,
     context_window_tokens: int,
+    progress: ProgressCallback | None = None,
+    cancel_event: threading.Event | None = None,
 ) -> ChunkedAnalysisOutcome:
+    check_cancelled(cancel_event)
     prompt_budget = context_prompt_budget(context_window_tokens)
     try:
         prompt_template_hash = stable_hash(prompt_path.read_text(encoding="utf-8"))
@@ -248,6 +259,8 @@ def analyze_chunked_text(
     notes: list[ChunkNotes] = []
     usage: dict[str, Any] = {}
     for index, chunk in enumerate(chunks):
+        check_cancelled(cancel_event)
+        publish(progress, "message", f"Processing chunk {index + 1}/{len(chunks)}")
         digest = stable_hash(f"{cache_variant}:{chunk}")
         cached = db.get_analysis_chunk(
             paper_id=paper_id,
@@ -278,7 +291,10 @@ def analyze_chunked_text(
         )
         notes.append(result)
 
-    consolidated = _reduce_to_budget(llm, notes, final_notes_budget, usage)
+    publish(progress, "message", "Combining chunk summaries")
+    consolidated = _reduce_to_budget(
+        llm, notes, final_notes_budget, usage, progress=progress, cancel_event=cancel_event
+    )
     source_text = final_prefix + consolidated
     prompt = builder.build(
         paper, source_text, "fulltext_chunked", model_attribution(llm.model)
@@ -288,6 +304,8 @@ def analyze_chunked_text(
             "The reduced chunk notes still exceed the selected context window; "
             "choose a larger context window"
         )
+    check_cancelled(cancel_event)
+    publish(progress, "message", "Generating final merged summary")
     response = llm.analyze(prompt)
     _sum_usage(usage, response.usage)
     source = paper.doi or paper.arxiv_id or paper.openalex_id or response.result.source

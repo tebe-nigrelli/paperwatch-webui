@@ -45,6 +45,7 @@ def test_paper_upsert_deduplicates_and_links_authors(tmp_path, author_candidate,
         assert len(rows) == 2
         tracked = [row for row in rows if row["openalex_author_id"] == "A123"][0]
         assert tracked["tracked_author_id"] is not None
+        assert db.list_authors_with_tags()[0]["paper_count"] == 1
 
 
 def test_analysis_cache_and_run_accounting(tmp_path, paper_record, analysis_result):
@@ -358,7 +359,14 @@ def test_author_tags_filter_suggestions_and_cleanup(tmp_path, author_candidate):
 
     with Database(tmp_path / "tags.sqlite") as db:
         db.add_author(author_candidate)
-        db.add_author(replace(author_candidate, openalex_id="A456", name="Grace Hopper"))
+        db.add_author(
+            replace(
+                author_candidate,
+                openalex_id="A456",
+                name="Grace Hopper",
+                institution="United States Navy",
+            )
+        )
         assert db.add_author_tag("A123", " theory ")
         assert db.add_author_tag("A123", "ML")
         assert db.add_author_tag("A456", "ml")
@@ -367,6 +375,13 @@ def test_author_tags_filter_suggestions_and_cleanup(tmp_path, author_candidate):
         assert [row["name"] for row in rows] == ["Ada Lovelace", "Grace Hopper"]
         ada = db.list_authors_with_tags(tag="theory")[0]
         assert ada["tags"] == "ML, theory"
+        assert [row["name"] for row in db.list_authors_with_tags(query="Engine")] == [
+            "Ada Lovelace"
+        ]
+        assert [row["name"] for row in db.list_authors_with_tags(query="theory")] == [
+            "Ada Lovelace"
+        ]
+        assert db.list_authors_with_tags(query="100%_missing") == []
         tags = {row["name"]: row["author_count"] for row in db.list_tags()}
         assert tags == {"ML": 2, "theory": 1}
         assert db.remove_author_tag("A123", "theory")
@@ -431,6 +446,7 @@ def test_chunk_cache_and_saved_query_lifecycle(tmp_path, paper_record):
             query_id=query_id,
             profiles=[("default", "ollama", "m")],
             context_window_tokens=2048,
+            selection={"query": "Minimal", "has_pdf": True},
         )
         db.start_query_run(run_ids[0])
         db.finish_query_run(
@@ -442,6 +458,7 @@ def test_chunk_cache_and_saved_query_lifecycle(tmp_path, paper_record):
         row = db.list_query_runs(query_id)[0]
         assert row["status"] == "success"
         assert row["query_name"] == "Updated"
+        assert __import__("json").loads(row["selection_json"])["has_pdf"] is True
         assert db.list_query_runs()[0]["id"] == run_ids[0]
         assert db.query_runs_for_batch("qbatch")[0]["output_json"]
 
@@ -464,3 +481,75 @@ def test_chunk_cache_and_saved_query_lifecycle(tmp_path, paper_record):
         assert not db.update_saved_query(
             999, name="x", source_type="papers", search_query="", prompt="x"
         )
+
+
+def test_historical_paper_flag_is_persistent_and_local_pdf_counts(tmp_path, paper_record):
+    path = tmp_path / "historical.sqlite"
+    with Database(path) as db:
+        paper_id, _ = db.upsert_paper(paper_record, auto_analyze=False)
+        assert db.get_paper(paper_id)["auto_analyze"] == 0
+
+        # A normal metadata refresh must not silently re-enable the historical backlog.
+        db.upsert_paper(paper_record)
+        assert db.get_paper(paper_id)["auto_analyze"] == 0
+
+        db._conn.execute("UPDATE papers SET pdf_url=NULL WHERE id=?", (paper_id,))
+        local = tmp_path / "paper.pdf"
+        local.write_bytes(b"%PDF-1.4\n%%EOF")
+        db.set_local_pdf(paper_id, str(local))
+        assert db.dashboard_stats()["with_pdf"] == 1
+        rows, total = db.search_papers(has_pdf=True)
+        assert total == 1 and rows[0]["id"] == paper_id
+        _, missing = db.search_papers(has_pdf=False)
+        assert missing == 0
+
+
+def test_version_six_database_gains_auto_analyze_column(tmp_path, paper_record):
+    import sqlite3
+    from paperwatch.db import SCHEMA_VERSION
+
+    path = tmp_path / "v6.sqlite"
+    with Database(path) as db:
+        paper_id, _ = db.upsert_paper(paper_record)
+        assert db.get_paper(paper_id)["auto_analyze"] == 1
+
+    conn = sqlite3.connect(path)
+    conn.execute("ALTER TABLE papers DROP COLUMN auto_analyze")
+    conn.execute("PRAGMA user_version = 6")
+    conn.commit()
+    conn.close()
+
+    with Database(path) as db:
+        row = db.get_paper(paper_id)
+        assert row["auto_analyze"] == 1
+        assert db._conn.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION
+        assert db._conn.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
+
+
+def test_version_seven_database_gains_query_selection_column(tmp_path):
+    import sqlite3
+    from paperwatch.db import SCHEMA_VERSION
+
+    path = tmp_path / "v7.sqlite"
+    with Database(path) as db:
+        query_id = db.create_saved_query(
+            name="Legacy query", source_type="papers", search_query="", prompt="Compare"
+        )
+        run_id = db.create_query_runs(
+            batch_id="legacy",
+            query_id=query_id,
+            profiles=[("default", "ollama", "m")],
+            context_window_tokens=2048,
+        )[0]
+
+    conn = sqlite3.connect(path)
+    conn.execute("ALTER TABLE query_runs DROP COLUMN selection_json")
+    conn.execute("PRAGMA user_version = 7")
+    conn.commit()
+    conn.close()
+
+    with Database(path) as db:
+        row = db._conn.execute("SELECT * FROM query_runs WHERE id=?", (run_id,)).fetchone()
+        assert row["selection_json"] == "{}"
+        assert db._conn.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION
+        assert db._conn.execute("PRAGMA integrity_check").fetchone()[0] == "ok"

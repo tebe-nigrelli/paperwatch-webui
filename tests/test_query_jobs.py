@@ -12,6 +12,7 @@ from paperwatch.models import BatchQueryResult
 from paperwatch.query_jobs import (
     QueryController,
     _pack_documents,
+    _selection_search_args,
     collect_query_documents,
     run_query_batch,
     run_query_for_model,
@@ -94,6 +95,65 @@ def test_collect_documents_for_papers_and_summaries(
         assert collect_query_documents(db, "summaries", "missing") == []
         with pytest.raises(ValueError, match="papers or summaries"):
             collect_query_documents(db, "bad", "")
+
+
+def test_collect_documents_uses_recent_page_selection(
+    config_path, author_candidate, paper_record, analysis_result
+):
+    config = load_config(config_path)
+    with Database(config.paths.database) as db:
+        db.add_author(author_candidate)
+        paper_id, _ = db.upsert_paper(paper_record)
+        db.save_analysis(
+            paper_id=paper_id,
+            scope="fulltext",
+            provider="ollama",
+            model="m",
+            prompt_version="v1",
+            content_sha256="selection",
+            input_chars=10,
+            result=analysis_result,
+            usage={},
+        )
+        db.save_analysis(
+            paper_id=paper_id,
+            scope="abstract",
+            provider="ollama",
+            model="m",
+            prompt_version="v1",
+            content_sha256="selection-abstract",
+            input_chars=10,
+            result=analysis_result,
+            usage={},
+        )
+        selection = {
+            "query": "Minimal",
+            "author_id": "A123",
+            "topic_id": "T100",
+            "paper_kind": "machine_learning",
+            "scope": "fulltext",
+            "has_pdf": True,
+            "analyzed": True,
+            "date_from": "2026-01-01",
+            "date_to": "2026-12-31",
+            "sort": "title",
+        }
+        papers = collect_query_documents(
+            db, "papers", "ignored legacy term", selection=selection
+        )
+        summaries = collect_query_documents(
+            db, "summaries", "ignored legacy term", selection=selection
+        )
+        assert [item["paper_id"] for item in papers] == [paper_id]
+        assert summaries[0]["paper_id"] == paper_id
+        assert summaries[0]["summary"]["paper_kind"] == "machine_learning"
+        assert len(summaries) == 1
+        assert summaries[0]["scope"] == "fulltext"
+
+    args = _selection_search_args({"has_pdf": "yes", "analyzed": 1})
+    assert args["has_pdf"] is None
+    assert args["analyzed"] is None
+    assert _selection_search_args(None)["sort"] == "newest"
 
 
 def test_collection_query_map_reduce_and_empty_result():
@@ -185,6 +245,72 @@ def test_query_batch_persists_success_and_failure(
         assert db.get_saved_query(query_id)["last_run_at"]
 
 
+def test_query_batch_persisted_selection_and_edge_cases(
+    config_path, paper_record, monkeypatch
+):
+    config = load_config(config_path)
+    with Database(config.paths.database) as db:
+        db.upsert_paper(paper_record)
+        query_id = db.create_saved_query(
+            name="Filtered", source_type="papers", search_query="Minimal", prompt="Compare"
+        )
+        run_id = db.create_query_runs(
+            batch_id="filtered",
+            query_id=query_id,
+            profiles=[("default", "ollama", "test-model")],
+            context_window_tokens=2048,
+            selection={"query": "does-not-match", "labels": ["No matches"]},
+        )[0]
+
+    client = FakeQueryLLM()
+    monkeypatch.setattr("paperwatch.query_jobs.create_llm", lambda profile: client)
+    assert run_query_batch(
+        config_path, "filtered", query_id, ("default",), 2048
+    ) == {"completed": 1, "failed": 0}
+    assert client.calls == []
+    with Database(config.paths.database) as db:
+        row = db._conn.execute("SELECT * FROM query_runs WHERE id=?", (run_id,)).fetchone()
+        assert row["matched_count"] == 0
+        assert "No matching papers" in row["output_json"]
+
+        malformed_id = db.create_query_runs(
+            batch_id="malformed",
+            query_id=query_id,
+            profiles=[("default", "ollama", "test-model")],
+            context_window_tokens=2048,
+        )[0]
+        db._conn.execute(
+            "UPDATE query_runs SET selection_json='{bad' WHERE id=?", (malformed_id,)
+        )
+        db._conn.commit()
+    client.calls.clear()
+    assert run_query_batch(
+        config_path, "malformed", query_id, ("default",), 2048
+    )["completed"] == 1
+    assert client.calls
+
+    assert run_query_batch(
+        config_path, "no-rows", query_id, ("default",), 2048
+    ) == {"completed": 0, "failed": 0}
+    with pytest.raises(ValueError, match="Saved query"):
+        run_query_batch(config_path, "none", 999999, ("default",), 2048)
+
+    with Database(config.paths.database) as db:
+        removed_id = db.create_query_runs(
+            batch_id="removed-profile",
+            query_id=query_id,
+            profiles=[("removed", "ollama", "gone")],
+            context_window_tokens=2048,
+        )[0]
+    assert run_query_batch(
+        config_path, "removed-profile", query_id, ("removed", "missing-row"), 2048
+    ) == {"completed": 0, "failed": 1}
+    with Database(config.paths.database) as db:
+        assert "no longer available" in db._conn.execute(
+            "SELECT error_text FROM query_runs WHERE id=?", (removed_id,)
+        ).fetchone()[0]
+
+
 def test_query_controller_validation_busy_and_failure(config_path, paper_record):
     config = load_config(config_path)
     with Database(config.paths.database) as db:
@@ -205,8 +331,14 @@ def test_query_controller_validation_busy_and_failure(config_path, paper_record)
         controller.start(query_id, (), 1024)
     with pytest.raises(ValueError, match="Unknown"):
         controller.start(query_id, ("missing",), 1024)
-    batch = controller.start(query_id, ("default", "default"), 1024)
+    selection = {"query": "Minimal", "has_pdf": True}
+    batch = controller.start(
+        query_id, ("default", "default"), 1024, selection=selection
+    )
     assert batch
+    with Database(config.paths.database) as db:
+        stored = db.query_runs_for_batch(batch)[0]
+        assert __import__("json").loads(stored["selection_json"]) == selection
     assert controller.start(query_id, ("default",), 1024) is None
     gate.set()
     controller.wait()
@@ -219,3 +351,7 @@ def test_query_controller_validation_busy_and_failure(config_path, paper_record)
     assert broken.start(query_id, ("default",), 1024)
     broken.wait()
     assert broken.snapshot().error == "query boom"
+
+    missing = QueryController(config_path, runner=runner)
+    with pytest.raises(ValueError, match="Saved query"):
+        missing.start(999999, ("default",), 1024)

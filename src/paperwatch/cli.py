@@ -4,7 +4,7 @@ import argparse
 import shutil
 import sys
 from dataclasses import dataclass
-from datetime import date
+from datetime import date, datetime, timedelta, timezone
 from importlib.resources import as_file, files
 from pathlib import Path
 from typing import Sequence
@@ -95,6 +95,26 @@ def _parser() -> argparse.ArgumentParser:
 
     run = sub.add_parser("run", help="Fetch and analyze recent papers")
     run.add_argument("--today", type=_iso_date, help="Testing override in YYYY-MM-DD format")
+
+    backfill = sub.add_parser(
+        "backfill",
+        help="Fetch a historical window, download open PDFs, and skip automatic analysis",
+    )
+    backfill.add_argument(
+        "--days",
+        type=_positive_int,
+        default=365,
+        help="Number of calendar days to fetch (default: 365)",
+    )
+    backfill.add_argument(
+        "--max-papers-per-author",
+        type=_positive_int,
+        default=5000,
+        help="Safety cap per author for the backfill (default: 5000)",
+    )
+    backfill.add_argument(
+        "--today", type=_iso_date, help="Testing override in YYYY-MM-DD format"
+    )
 
     papers = sub.add_parser("papers", help="List stored papers")
     papers.add_argument("--limit", type=_positive_int, default=20)
@@ -191,6 +211,35 @@ def _run(args: argparse.Namespace, services: Services) -> int:
     return 0 if stats.status == "success" else 1
 
 
+def _backfill(args: argparse.Namespace, services: Services) -> int:
+    current_day = args.today or datetime.now(timezone.utc).date()
+    since = current_day - timedelta(days=args.days)
+    app = PaperWatch(
+        services.config,
+        db=services.db,
+        openalex=services.openalex,
+        arxiv=services.arxiv,
+        llm=services.llm,
+    )
+    try:
+        stats = app.run(
+            today=current_day,
+            since_override=since,
+            download_only=True,
+            historical=True,
+            max_papers_per_author_override=args.max_papers_per_author,
+        )
+    finally:
+        app.close()
+    print(
+        f"backfill={stats.run_id} status={stats.status} since={since.isoformat()} "
+        f"authors={stats.authors_checked} papers={stats.papers_found} "
+        f"pdfs={stats.pdfs_downloaded} analyses={stats.papers_analyzed} "
+        f"errors={stats.errors_count}"
+    )
+    return 0 if stats.status == "success" else 1
+
+
 def _list_papers(args: argparse.Namespace, services: Services) -> int:
     for paper in services.db.list_papers(args.limit):
         published = paper["publication_date"] or "unknown date"
@@ -242,6 +291,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             return _author_command(args, services)
         if args.command == "run":
             return _run(args, services)
+        if args.command == "backfill":
+            return _backfill(args, services)
         if args.command == "papers":
             return _list_papers(args, services)
         if args.command == "runs":

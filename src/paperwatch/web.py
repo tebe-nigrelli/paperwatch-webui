@@ -50,6 +50,35 @@ class PaperFilters:
     page: int = 1
     page_size: int = 25
 
+    def selection(self) -> dict[str, Any]:
+        return {
+            "query": self.query,
+            "author_id": self.author_id,
+            "topic_id": self.topic_id,
+            "paper_kind": self.paper_kind,
+            "scope": self.scope,
+            "has_pdf": self.has_pdf,
+            "analyzed": self.analyzed,
+            "date_from": self.date_from,
+            "date_to": self.date_to,
+            "sort": self.sort,
+        }
+
+    def selection_items(self) -> list[tuple[str, str]]:
+        values = {
+            "q": self.query,
+            "author": self.author_id,
+            "topic": self.topic_id,
+            "kind": self.paper_kind,
+            "scope": self.scope,
+            "has_pdf": _bool_query(self.has_pdf),
+            "analyzed": _bool_query(self.analyzed),
+            "date_from": self.date_from,
+            "date_to": self.date_to,
+            "sort": self.sort if self.sort != "newest" else "",
+        }
+        return [(key, value) for key, value in values.items() if value]
+
     def query_items(self, *, page: int | None = None) -> list[tuple[str, str]]:
         values = {
             "q": self.query,
@@ -75,6 +104,7 @@ class PaperFilters:
 @dataclass(slots=True)
 class RunSnapshot:
     running: bool = False
+    mode: str | None = None
     started_at: str | None = None
     finished_at: str | None = None
     run_id: int | None = None
@@ -89,7 +119,7 @@ class RunController:
     def __init__(
         self,
         config_path: str | Path,
-        runner: Callable[[Path], dict[str, Any]] | None = None,
+        runner: Callable[[Path, str], dict[str, Any]] | None = None,
     ) -> None:
         self.config_path = Path(config_path).resolve()
         self._runner = runner or _run_pipeline
@@ -97,26 +127,30 @@ class RunController:
         self._snapshot = RunSnapshot()
         self._thread: threading.Thread | None = None
 
-    def start(self) -> bool:
+    def start(self, mode: str = "run") -> bool:
+        if mode not in {"run", "backfill"}:
+            raise ValueError("Unknown run mode")
         with self._lock:
             if self._snapshot.running:
                 return False
             self._snapshot = RunSnapshot(
                 running=True,
+                mode=mode,
                 started_at=_utcnow(),
                 status="running",
             )
             self._thread = threading.Thread(
                 target=self._work,
+                args=(mode,),
                 name="paperwatch-web-run",
                 daemon=True,
             )
             self._thread.start()
             return True
 
-    def _work(self) -> None:
+    def _work(self, mode: str) -> None:
         try:
-            result = self._runner(self.config_path)
+            result = self._runner(self.config_path, mode)
             with self._lock:
                 self._snapshot.running = False
                 self._snapshot.finished_at = _utcnow()
@@ -140,7 +174,7 @@ class RunController:
             thread.join(timeout)
 
 
-def _run_pipeline(config_path: Path) -> dict[str, Any]:
+def _run_pipeline(config_path: Path, mode: str = "run") -> dict[str, Any]:
     from .cli import build_services
     from .pipeline import PaperWatch
 
@@ -155,7 +189,19 @@ def _run_pipeline(config_path: Path) -> dict[str, Any]:
             arxiv=services.arxiv,
             llm=services.llm,
         )
-        stats = app.run()
+        if mode == "backfill":
+            current_day = datetime.now(timezone.utc).date()
+            stats = app.run(
+                today=current_day,
+                since_override=current_day - timedelta(days=365),
+                download_only=True,
+                historical=True,
+                max_papers_per_author_override=5000,
+            )
+        elif mode == "run":
+            stats = app.run()
+        else:
+            raise ValueError("Unknown run mode")
         return {"run_id": stats.run_id, "status": stats.status, **stats.as_dict()}
     finally:
         if app is not None:
@@ -199,8 +245,7 @@ def _valid_date(value: str | None) -> str:
         return ""
 
 
-def _parse_filters(request: Request) -> PaperFilters:
-    params = request.query_params
+def _parse_filter_values(params: Any) -> PaperFilters:
     page = max(1, _int_or_none(params.get("page")) or 1)
     page_size = _int_or_none(params.get("page_size")) or 25
     if page_size not in PAGE_SIZES:
@@ -231,6 +276,10 @@ def _parse_filters(request: Request) -> PaperFilters:
         page=page,
         page_size=page_size,
     )
+
+
+def _parse_filters(request: Request) -> PaperFilters:
+    return _parse_filter_values(request.query_params)
 
 
 def _json_value(value: Any, fallback: Any) -> Any:
@@ -346,9 +395,9 @@ def _author_view(row: Any) -> dict[str, Any]:
         {
             "author_id": author_id,
             "papers_url": (
-                f"/papers?author={quote_plus(author_id)}"
+                f"/?author={quote_plus(author_id)}"
                 if author_id
-                else f"/papers?q={encoded_name}"
+                else f"/?q={encoded_name}"
             ),
             "google_scholar_url": f"https://scholar.google.com/scholar?q={scholar_query}",
             "openalex_url": (f"https://openalex.org/authors/{author_id.lower()}" if author_id else None),
@@ -376,9 +425,95 @@ def _paper_view(row: Any) -> dict[str, Any]:
     return data
 
 
+def _paper_table_view(db: Database, row: Any) -> dict[str, Any]:
+    data = _paper_view(row)
+    paper_authors = [_author_view(item) for item in db.paper_authors(int(data["id"]))]
+    tracked_authors = [item for item in paper_authors if bool(item.get("is_tracked"))]
+    data["tracked_authors"] = tracked_authors
+    data["other_author_count"] = max(0, len(paper_authors) - len(tracked_authors))
+    data["all_authors"] = paper_authors
+    return data
+
+
+def _selection_with_labels(
+    filters: PaperFilters,
+    *,
+    authors: Iterable[Any],
+    topics: Iterable[Any],
+) -> dict[str, Any]:
+    selection = filters.selection()
+    labels: list[str] = []
+    if filters.query:
+        labels.append(f'Search “{filters.query}”')
+    if filters.author_id:
+        name = next(
+            (str(row["name"]) for row in authors if row["openalex_id"] == filters.author_id),
+            filters.author_id,
+        )
+        labels.append(f"Author: {name}")
+    if filters.topic_id:
+        name = next(
+            (
+                str(row["display_name"])
+                for row in topics
+                if row["openalex_id"] == filters.topic_id
+            ),
+            filters.topic_id,
+        )
+        labels.append(f"Topic: {name}")
+    if filters.paper_kind:
+        labels.append(f"Kind: {filters.paper_kind.replace('_', ' ')}")
+    if filters.scope:
+        labels.append(f"Scope: {filters.scope}")
+    if filters.has_pdf is not None:
+        labels.append("PDF available" if filters.has_pdf else "PDF missing")
+    if filters.analyzed is not None:
+        labels.append("Analyzed" if filters.analyzed else "Not analyzed")
+    if filters.date_from:
+        labels.append(f"From {filters.date_from}")
+    if filters.date_to:
+        labels.append(f"To {filters.date_to}")
+    selection["labels"] = labels
+    return selection
+
+
 def _query_output(row: Any) -> dict[str, Any]:
     data = _row_dict(row)
     data["output"] = _json_value(data.get("output_json"), None)
+    selection = _json_value(data.get("selection_json"), {})
+    data["selection"] = selection if isinstance(selection, dict) else {}
+    selection_items = []
+    labels = data["selection"].get("labels")
+    if isinstance(labels, list):
+        selection_items.extend(str(item) for item in labels if item)
+    if not selection_items:
+        query = str(data["selection"].get("query") or "")
+        if query:
+            selection_items.append(f'Search “{query}”')
+        if data["selection"].get("date_from"):
+            selection_items.append(f'From {data["selection"]["date_from"]}')
+        if data["selection"].get("date_to"):
+            selection_items.append(f'To {data["selection"]["date_to"]}')
+    data["selection_label"] = " · ".join(selection_items) or "All matching records"
+    selection_query = urlencode([
+        (key, value)
+        for key, value in {
+            "q": data["selection"].get("query"),
+            "author": data["selection"].get("author_id"),
+            "topic": data["selection"].get("topic_id"),
+            "kind": data["selection"].get("paper_kind"),
+            "scope": data["selection"].get("scope"),
+            "has_pdf": _bool_query(data["selection"].get("has_pdf")),
+            "analyzed": _bool_query(data["selection"].get("analyzed")),
+            "date_from": data["selection"].get("date_from"),
+            "date_to": data["selection"].get("date_to"),
+            "sort": data["selection"].get("sort")
+            if data["selection"].get("sort") != "newest"
+            else "",
+        }.items()
+        if value
+    ])
+    data["selection_url"] = f"/?{selection_query}" if selection_query else "/"
     return data
 
 
@@ -461,10 +596,7 @@ def create_app(
                     "Interrupted because the web application restarted"
                 )
                 recovery_db.fail_incomplete_analysis_tasks(
-                    "Interrupted because the web application restarted",
-                    created_before=(
-                        datetime.now(timezone.utc) - timedelta(minutes=10)
-                    ).replace(microsecond=0).isoformat(),
+                    "Interrupted because the web application restarted"
                 )
     except AnalysisAlreadyInProgress:
         pass
@@ -532,15 +664,19 @@ def create_app(
             )
             author_rows = db.list_authors_with_tags(tracked_only=True)
             topic_rows = db.list_topics()
+            saved_queries = [dict(row) for row in db.list_saved_queries()]
             recent_errors = db.recent_errors(3)
+            paper_views = [_paper_table_view(db, row) for row in rows]
         pages = max(1, (total + filters.page_size - 1) // filters.page_size)
         return render(
             request,
             "papers.html",
-            papers=[_paper_view(row) for row in rows],
+            papers=paper_views,
             filters=filters,
             authors=author_rows,
             topics=topic_rows,
+            saved_queries=saved_queries,
+            model_profiles=config.available_llms,
             total=total,
             pages=pages,
             is_home=True,
@@ -567,8 +703,11 @@ def create_app(
     def authors(request: Request) -> HTMLResponse:
         tag = request.query_params.get("tag", "").strip()[:40]
         name = request.query_params.get("name", "").strip()[:200]
+        query = request.query_params.get("q", "").strip()[:200]
         with Database(config.paths.database) as db:
-            rows = db.list_authors_with_tags(tracked_only=True, tag=tag)
+            rows = db.list_authors_with_tags(
+                tracked_only=True, tag=tag, query=query
+            )
             tags = db.list_tags()
         return render(
             request,
@@ -576,6 +715,7 @@ def create_app(
             authors=rows,
             tags=tags,
             active_tag=tag,
+            author_query=query,
             search_results=[],
             search_name=name,
         )
@@ -605,6 +745,7 @@ def create_app(
             authors=rows,
             tags=tags,
             active_tag="",
+            author_query="",
             search_results=results,
             search_name=name,
             search_error=error,
@@ -681,6 +822,19 @@ def create_app(
             level = "warning"
         return RedirectResponse(_notice_url("/", message, level=level), status_code=303)
 
+    @app.post("/actions/backfill")
+    def start_backfill() -> RedirectResponse:
+        if controller.start("backfill"):
+            message = (
+                "One-year PDF backfill started. Historical papers will not be "
+                "auto-summarized."
+            )
+            level = "success"
+        else:
+            message = "A fetch is already running."
+            level = "warning"
+        return RedirectResponse(_notice_url("/", message, level=level), status_code=303)
+
     @app.get("/api/run-status")
     def run_status() -> JSONResponse:
         return JSONResponse(asdict(controller.snapshot()))
@@ -706,6 +860,8 @@ def create_app(
             )
             author_rows = db.list_authors(tracked_only=True)
             topic_rows = db.list_topics()
+            saved_queries = [dict(row) for row in db.list_saved_queries()]
+            paper_views = [_paper_table_view(db, row) for row in rows]
         pages = max(1, (total + filters.page_size - 1) // filters.page_size)
         if filters.page > pages and total:
             target = urlencode(filters.query_items(page=pages))
@@ -713,10 +869,12 @@ def create_app(
         return render(
             request,
             "papers.html",
-            papers=[_paper_view(row) for row in rows],
+            papers=paper_views,
             filters=filters,
             authors=author_rows,
             topics=topic_rows,
+            saved_queries=saved_queries,
+            model_profiles=config.available_llms,
             total=total,
             pages=pages,
         )
@@ -729,17 +887,30 @@ def create_app(
                 raise HTTPException(404, "Paper not found")
             paper = _paper_view(paper_row)
             author_rows = [_author_view(row) for row in db.paper_authors(paper_id)]
+            default_author_index = next(
+                (index for index, author in enumerate(author_rows) if bool(author.get("is_tracked"))),
+                0,
+            )
             topic_rows = [dict(row) for row in db.paper_topics(paper_id)]
             analyses = [_analysis_view(row) for row in db.paper_analyses(paper_id)]
-            analysis_tasks = [dict(row) for row in db.analysis_tasks_for_paper(paper_id)]
+            analysis_tasks = [
+                dict(row) for row in db.visible_analysis_tasks_for_paper(paper_id)
+            ]
+            saved_queries = [dict(row) for row in db.list_saved_queries()]
+            prompt_runs = [
+                _query_output(row) for row in db.query_runs_for_paper(paper_id)
+            ]
         return render(
             request,
             "paper_detail.html",
             paper=paper,
             authors=author_rows,
+            default_author_index=default_author_index,
             topics=topic_rows,
             analyses=analyses,
             analysis_tasks=analysis_tasks,
+            saved_queries=saved_queries,
+            prompt_runs=prompt_runs,
             model_profiles=config.available_llms,
             metadata=_json_value(paper["metadata_json"], {}),
         )
@@ -777,7 +948,8 @@ def create_app(
         )
 
     @app.post("/papers/{paper_id}/analyze")
-    async def analyze_paper(request: Request, paper_id: int) -> RedirectResponse:
+    async def analyze_paper(request: Request, paper_id: int) -> Response:
+        async_request = request.headers.get("x-paperwatch-async") == "1"
         form = await request.form()
         scope = str(form.get("scope", "fulltext"))
         if scope not in SCOPES:
@@ -789,54 +961,104 @@ def create_app(
             paper = db.get_paper(paper_id)
         if paper is None:
             raise HTTPException(404, "Paper not found")
+
+        def failure(message: str, status_code: int = 400) -> Response:
+            if async_request:
+                return JSONResponse({"ok": False, "message": message}, status_code=status_code)
+            return RedirectResponse(
+                _notice_url(f"/papers/{paper_id}", message, level="error"), status_code=303
+            )
+
         if scope == "abstract" and not paper["abstract"]:
-            return RedirectResponse(
-                _notice_url(
-                    f"/papers/{paper_id}",
-                    "This paper has no abstract to analyze.",
-                    level="error",
-                ),
-                status_code=303,
-            )
+            return failure("This paper has no abstract to analyze.")
         if scope == "fulltext" and not (paper["pdf_url"] or paper["local_pdf_path"]):
-            return RedirectResponse(
-                _notice_url(
-                    f"/papers/{paper_id}",
-                    "This paper has no PDF available for full-text analysis.",
-                    level="error",
-                ),
-                status_code=303,
-            )
+            return failure("This paper has no PDF available for full-text analysis.")
         try:
-            import inspect
-            if len(inspect.signature(model_controller.start).parameters) <= 3:
+            if len(__import__("inspect").signature(model_controller.start).parameters) <= 3:
                 batch_id = model_controller.start(paper_id, scope, profile_names)
             else:
                 batch_id = model_controller.start(
-                    paper_id,
-                    scope,
-                    profile_names,
-                    analysis_strategy=strategy,
+                    paper_id, scope, profile_names, analysis_strategy=strategy,
                     context_window_tokens=context_tokens,
                 )
         except ValueError as exc:
-            return RedirectResponse(
-                _notice_url(f"/papers/{paper_id}", str(exc), level="error"),
-                status_code=303,
-            )
+            return failure(str(exc))
         if batch_id is None:
             message = "Another model-analysis batch is already running."
-            level = "warning"
-        else:
-            message = f"Started {len(set(profile_names))} model analysis task(s)."
-            level = "success"
+            if async_request:
+                return JSONResponse({"ok": False, "message": message}, status_code=409)
+            return RedirectResponse(
+                _notice_url(f"/papers/{paper_id}", message, level="warning"), status_code=303
+            )
+        message = f"Started {len(set(profile_names))} model analysis task(s)."
+        if async_request:
+            return JSONResponse({"ok": True, "batch_id": batch_id, "message": message})
         return RedirectResponse(
-            _notice_url(f"/papers/{paper_id}", message, level=level), status_code=303
+            _notice_url(f"/papers/{paper_id}#paper-jobs", message), status_code=303
+        )
+
+    @app.post("/papers/{paper_id}/prompt")
+    async def prompt_paper(request: Request, paper_id: int) -> Response:
+        async_request = request.headers.get("x-paperwatch-async") == "1"
+        form = await request.form()
+        query_id = _int_or_none(form.get("query_id"))
+        profile_name = str(form.get("model", ""))
+        context = _int_or_none(form.get("context_window_tokens")) or 8192
+        with Database(config.paths.database) as db:
+            paper = db.get_paper(paper_id)
+            query = db.get_saved_query(query_id) if query_id is not None else None
+        if paper is None:
+            raise HTTPException(404, "Paper not found")
+
+        def failure(message: str, status_code: int = 400) -> Response:
+            if async_request:
+                return JSONResponse({"ok": False, "message": message}, status_code=status_code)
+            return RedirectResponse(
+                _notice_url(f"/papers/{paper_id}", message, level="error"), status_code=303
+            )
+
+        if query is None:
+            return failure("Select a saved prompt.")
+        profile = next(
+            (item for item in config.available_llms if item.profile == profile_name), None
+        )
+        if profile is None:
+            return failure("Select a configured model.")
+        selection = {
+            "paper_ids": [paper_id],
+            "labels": [f"Paper: {paper['title']}"],
+        }
+        try:
+            batch_id = collection_controller.start(
+                int(query["id"]), (profile_name,), context, selection=selection
+            )
+        except ValueError as exc:
+            return failure(str(exc))
+        if batch_id is None:
+            message = "Another saved prompt is already running."
+            if async_request:
+                return JSONResponse({"ok": False, "message": message}, status_code=409)
+            return RedirectResponse(
+                _notice_url(f"/papers/{paper_id}", message, level="warning"), status_code=303
+            )
+        message = f"Started {query['name']} with {profile.model}."
+        if async_request:
+            return JSONResponse({"ok": True, "batch_id": batch_id, "message": message})
+        return RedirectResponse(
+            _notice_url(f"/papers/{paper_id}#paper-jobs", message), status_code=303
         )
 
     @app.get("/api/analysis-status")
     def analysis_status() -> JSONResponse:
         return JSONResponse(asdict(model_controller.snapshot()))
+
+    @app.post("/api/analysis-cancel")
+    def cancel_analysis() -> JSONResponse:
+        cancelled = model_controller.cancel()
+        return JSONResponse(
+            {"ok": cancelled, "message": "Cancellation requested" if cancelled else "No analysis is running"},
+            status_code=200 if cancelled else 409,
+        )
 
     @app.get("/papers/{paper_id}/pdf")
     def local_pdf(paper_id: int) -> FileResponse:
@@ -848,7 +1070,12 @@ def create_app(
         root = config.paths.pdf_dir.resolve()
         if not path.is_file() or (path != root and root not in path.parents):
             raise HTTPException(404, "Local PDF not found")
-        return FileResponse(path, media_type="application/pdf", filename=f"paper-{paper_id}.pdf")
+        return FileResponse(
+            path,
+            media_type="application/pdf",
+            filename=f"paper-{paper_id}.pdf",
+            content_disposition_type="inline",
+        )
 
     @app.get("/papers/{paper_id}/export.json")
     def export_paper(paper_id: int) -> JSONResponse:
@@ -923,7 +1150,7 @@ def create_app(
                 db.create_saved_query(
                     name=str(form.get("name", "")),
                     source_type=str(form.get("source_type", "papers")),
-                    search_query=str(form.get("search_query", "")),
+                    search_query="",
                     prompt=str(form.get("prompt", "")),
                 )
         except ValueError as exc:
@@ -941,7 +1168,7 @@ def create_app(
                     query_id,
                     name=str(form.get("name", "")),
                     source_type=str(form.get("source_type", "papers")),
-                    search_query=str(form.get("search_query", "")),
+                    search_query="",
                     prompt=str(form.get("prompt", "")),
                 )
             if not changed:
@@ -980,9 +1207,69 @@ def create_app(
             status_code=303,
         )
 
+    @app.post("/queries/run-filtered")
+    async def run_filtered_query(request: Request) -> RedirectResponse:
+        form = await request.form()
+        query_id = _int_or_none(form.get("query_id"))
+        profile_name = str(form.get("model", ""))
+        if query_id is None:
+            return RedirectResponse(
+                _notice_url("/", "Select a saved query.", level="error"),
+                status_code=303,
+            )
+        profile = next(
+            (item for item in config.available_llms if item.profile == profile_name),
+            None,
+        )
+        if profile is None:
+            return RedirectResponse(
+                _notice_url("/", "Select a configured model.", level="error"),
+                status_code=303,
+            )
+        filters = _parse_filter_values(form)
+        with Database(config.paths.database) as db:
+            authors_for_labels = db.list_authors_with_tags(tracked_only=True)
+            topics_for_labels = db.list_topics()
+        selection = _selection_with_labels(
+            filters,
+            authors=authors_for_labels,
+            topics=topics_for_labels,
+        )
+        try:
+            batch_id = collection_controller.start(
+                query_id,
+                (profile_name,),
+                profile.context_window_tokens,
+                selection=selection,
+            )
+        except ValueError as exc:
+            return RedirectResponse(
+                _notice_url("/", str(exc), level="error"), status_code=303
+            )
+        if batch_id is None:
+            return RedirectResponse(
+                _notice_url(
+                    "/", "Another collection query is already running.", level="warning"
+                ),
+                status_code=303,
+            )
+        target = _notice_url(
+            f"/queries?focus={query_id}",
+            f"Started saved query for {profile.model}.",
+        )
+        return RedirectResponse(f"{target}#query-{query_id}", status_code=303)
+
     @app.get("/api/query-status")
     def query_status() -> JSONResponse:
         return JSONResponse(asdict(collection_controller.snapshot()))
+
+    @app.post("/api/query-cancel")
+    def cancel_query() -> JSONResponse:
+        cancelled = collection_controller.cancel()
+        return JSONResponse(
+            {"ok": cancelled, "message": "Cancellation requested" if cancelled else "No saved prompt is running"},
+            status_code=200 if cancelled else 409,
+        )
 
     @app.get("/runs", response_class=HTMLResponse)
     def runs(request: Request) -> HTMLResponse:

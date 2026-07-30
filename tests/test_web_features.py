@@ -49,8 +49,8 @@ class QueryStub:
     def snapshot(self):
         return QueryBatchSnapshot(**asdict(self.state))
 
-    def start(self, query_id, profiles, context):
-        self.calls.append((query_id, profiles, context))
+    def start(self, query_id, profiles, context, *, selection=None):
+        self.calls.append((query_id, profiles, context, selection))
         return "query-batch"
 
 
@@ -106,6 +106,10 @@ def test_recent_feed_theme_and_direct_links(
     response = client.get("/")
     assert response.status_code == 200
     assert "Recent papers" in response.text
+    assert "Research feed" not in response.text
+    assert "Tracked author(s)" in response.text
+    assert "OpenAlex topics" in response.text
+    assert "PDF file" in response.text
     assert 'id="theme-toggle"' in response.text
     assert "Queries" in response.text
     assert f'/papers/{paper_id}' in response.text
@@ -135,6 +139,9 @@ def test_author_tags_filter_and_non_destructive_removal(
     assert "Ada Lovelace" in page.text
     assert "theory" in page.text
     assert 'list="tag-suggestions"' in page.text
+    assert "last checked" not in page.text
+    assert "Add tag</button>" not in page.text
+    assert "Pause / resume" in page.text
     client.post("/authors/A123/remove", follow_redirects=False)
     with Database(config.paths.database) as db:
         row = db.get_author("A123")
@@ -197,6 +204,11 @@ def test_saved_query_create_edit_run_output_and_delete(
             query_id=query_id,
             profiles=[("default", "ollama", "test-model")],
             context_window_tokens=2048,
+            selection={
+                "query": "Minimal",
+                "date_from": "2026-01-01",
+                "date_to": "2026-12-31",
+            },
         )[0]
         db.finish_query_run(
             run_id,
@@ -217,20 +229,51 @@ def test_saved_query_create_edit_run_output_and_delete(
     page = client.get("/queries")
     assert "Compare evidence" in page.text
     assert "One paper matched" in page.text
-    assert "Run / rerun" in page.text
+    assert "Search “Minimal”" in page.text
+    assert "From 2026-01-01" in page.text
+    assert "Filter papers and run" in page.text
+    assert "Paper search" not in page.text
+    recent = client.get("/")
+    assert "Run on these" in recent.text
+    assert "Saved query" in recent.text
     response = client.post(
-        f"/queries/{query_id}/run",
-        data={"model": ["default", "second"], "context_window_tokens": "4096"},
+        "/queries/run-filtered",
+        data={
+            "query_id": str(query_id),
+            "model": "default",
+            "q": "Minimal",
+            "author": "A123",
+            "topic": "T100",
+            "kind": "machine_learning",
+            "scope": "fulltext",
+            "has_pdf": "yes",
+            "analyzed": "no",
+            "date_from": "2026-01-01",
+            "date_to": "2026-12-31",
+        },
         follow_redirects=False,
     )
     assert response.status_code == 303
-    assert query.calls == [(query_id, ("default", "second"), 4096)]
+    assert response.headers["location"].startswith("/queries?focus=")
+    assert f"#query-{query_id}" in response.headers["location"]
+    assert "notice=Started+saved+query" in response.headers["location"]
+    assert query.calls[0][:3] == (query_id, ("default",), 8192)
+    selection = query.calls[0][3]
+    assert selection["query"] == "Minimal"
+    assert selection["author_id"] == "A123"
+    assert selection["topic_id"] == "T100"
+    assert selection["has_pdf"] is True
+    assert "Author: Ada Lovelace" in selection["labels"]
+    assert "Kind: machine learning" in selection["labels"]
+    assert "Scope: fulltext" in selection["labels"]
+    assert "Not analyzed" in selection["labels"]
+    assert "From 2026-01-01" in selection["labels"]
+    assert "To 2026-12-31" in selection["labels"]
     client.post(
         f"/queries/{query_id}/edit",
         data={
             "name": "Updated query",
             "source_type": "papers",
-            "search_query": "Agents",
             "prompt": "Rank methods.",
         },
         follow_redirects=False,
@@ -280,12 +323,12 @@ def test_saved_query_validation_missing_routes_busy_and_status(
             self.busy = busy
             self.state = QueryBatchSnapshot(running=busy, batch_id='busy' if busy else None)
 
-        def start(self, query_id, profiles, context):
+        def start(self, query_id, profiles, context, *, selection=None):
             if self.error:
                 raise self.error
             if self.busy:
                 return None
-            return super().start(query_id, profiles, context)
+            return super().start(query_id, profiles, context, selection=selection)
 
     client = make_app(config_path)
     response = client.post(
@@ -331,3 +374,80 @@ def test_saved_query_validation_missing_routes_busy_and_status(
     status = busy_client.get('/api/query-status').json()
     assert status['running'] is True
     assert status['batch_id'] == 'busy'
+
+    response = client.post('/queries/run-filtered', data={}, follow_redirects=False)
+    assert 'Select+a+saved+query' in response.headers['location']
+    response = client.post(
+        '/queries/run-filtered',
+        data={'query_id': str(query_id), 'model': 'missing'},
+        follow_redirects=False,
+    )
+    assert 'Select+a+configured+model' in response.headers['location']
+
+    response = error_client.post(
+        '/queries/run-filtered',
+        data={'query_id': str(query_id), 'model': 'default'},
+        follow_redirects=False,
+    )
+    assert 'Select+at+least+one+configured+model' in response.headers['location']
+
+    response = busy_client.post(
+        '/queries/run-filtered',
+        data={
+            'query_id': str(query_id),
+            'model': 'default',
+            'has_pdf': 'no',
+            'analyzed': 'yes',
+        },
+        follow_redirects=False,
+    )
+    assert 'already+running' in response.headers['location']
+
+
+def test_recent_feed_shows_only_first_openalex_topic(
+    config_path, author_candidate, paper_record, analysis_result
+):
+    seed(config_path, author_candidate, paper_record, analysis_result)
+    page = make_app(config_path).get("/")
+    assert page.status_code == 200
+    topics_cell = page.text.split('<td class="paper-topics-cell">', 1)[1].split('</td>', 1)[0]
+    assert "Machine Learning" in topics_cell
+    assert "Autonomous Agents" not in topics_cell
+
+
+def test_paper_author_picker_defaults_to_first_tracked_author_and_marks_it(
+    config_path, author_candidate, paper_record, analysis_result
+):
+    from paperwatch.models import AuthorCandidate
+
+    config, paper_id = seed(config_path, author_candidate, paper_record, analysis_result)
+    with Database(config.paths.database) as db:
+        assert db.remove_author("A123")
+        db.add_author(
+            AuthorCandidate(
+                openalex_id="A999",
+                name="Alan Turing",
+                institution="Bletchley Park",
+            )
+        )
+
+    page = make_app(config_path).get(f"/papers/{paper_id}")
+    assert page.status_code == 200
+    assert '<option value="1" selected class="tracked-author-option"' in page.text
+    assert 'href="/?author=A999"' in page.text
+    assert 'class="tag author-chip author-chip-tracked"' in page.text
+    assert 'data-author-index="1" aria-pressed="true">Alan Turing</button>' in page.text
+    assert 'data-author-index="0" aria-pressed="false">Ada Lovelace</button>' in page.text
+
+
+def test_paper_author_picker_falls_back_to_first_paper_author(
+    config_path, author_candidate, paper_record, analysis_result
+):
+    config, paper_id = seed(config_path, author_candidate, paper_record, analysis_result)
+    with Database(config.paths.database) as db:
+        assert db.remove_author("A123")
+
+    page = make_app(config_path).get(f"/papers/{paper_id}")
+    assert page.status_code == 200
+    assert '<option value="0" selected' in page.text
+    assert 'data-author-index="0" aria-pressed="true">Ada Lovelace</button>' in page.text

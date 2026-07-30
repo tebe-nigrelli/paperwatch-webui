@@ -3,11 +3,13 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Protocol, TypeVar
+import threading
 
 import httpx
 from pydantic import BaseModel, ValidationError
 
 from .config import LLMConfig
+from .job_runtime import JobCancelled, ProgressCallback, check_cancelled
 from .models import ANALYSIS_JSON_SCHEMA, AnalysisResult, LLMResponse, PaperRecord, model_attribution
 
 
@@ -47,6 +49,11 @@ class LLMClient(Protocol):
     ) -> StructuredJSONResponse:
         ...
 
+    def set_runtime(
+        self, progress: ProgressCallback | None, cancel_event: threading.Event | None
+    ) -> None:
+        ...
+
     def close(self) -> None:
         ...
 
@@ -65,6 +72,11 @@ class NoLLMClient:
         self, prompt: str, *, schema: dict[str, Any], schema_name: str
     ) -> StructuredJSONResponse:
         raise LLMError("LLM provider is disabled")
+
+    def set_runtime(
+        self, progress: ProgressCallback | None, cancel_event: threading.Event | None
+    ) -> None:
+        return None
 
     def close(self) -> None:
         return None
@@ -92,6 +104,14 @@ class OllamaClient:
         self.context_window_tokens = context_window_tokens
         self._owns_client = client is None
         self.client = client or httpx.Client(timeout=timeout_seconds)
+        self._progress: ProgressCallback | None = None
+        self._cancel_event: threading.Event | None = None
+
+    def set_runtime(
+        self, progress: ProgressCallback | None, cancel_event: threading.Event | None
+    ) -> None:
+        self._progress = progress
+        self._cancel_event = cancel_event
 
     def close(self) -> None:
         if self._owns_client:
@@ -200,46 +220,104 @@ class OllamaClient:
         schema: dict[str, Any],
     ) -> StructuredJSONResponse | None:
         endpoint = f"{self.base_url}/api/chat"
-        response = self.client.post(
-            endpoint,
-            json={
-                "model": self.model,
-                "messages": [{"role": "user", "content": prompt}],
-                "stream": False,
-                "format": schema,
-                "options": {
-                    "temperature": 0,
-                    **(
-                        {"num_ctx": self.context_window_tokens}
-                        if self.context_window_tokens is not None
-                        else {}
-                    ),
-                },
+        request_json = {
+            "model": self.model,
+            "messages": [{"role": "user", "content": prompt}],
+            "stream": self._progress is not None or self._cancel_event is not None,
+            "format": schema,
+            "options": {
+                "temperature": 0,
+                **(
+                    {"num_ctx": self.context_window_tokens}
+                    if self.context_window_tokens is not None
+                    else {}
+                ),
             },
-        )
-        if response.status_code == 404:
-            detail = self._error_detail(response).casefold()
-            if "model" in detail and any(
-                phrase in detail for phrase in ("not found", "does not exist", "pull")
-            ):
+        }
+        check_cancelled(self._cancel_event)
+        if not request_json["stream"]:
+            response = self.client.post(endpoint, json=request_json)
+            if response.status_code == 404:
+                detail = self._error_detail(response).casefold()
+                if "model" in detail and any(
+                    phrase in detail for phrase in ("not found", "does not exist", "pull")
+                ):
+                    raise self._http_error(response, endpoint=endpoint)
+                return None
+            if response.is_error:
                 raise self._http_error(response, endpoint=endpoint)
-            return None
-        if response.is_error:
-            raise self._http_error(response, endpoint=endpoint)
-        payload = response.json()
-        if not isinstance(payload, dict):
-            raise LLMError("Ollama returned an unexpected payload")
-        message = payload.get("message") or {}
-        content = message.get("content") if isinstance(message, dict) else None
-        if not isinstance(content, str):
+            payload = response.json()
+            if not isinstance(payload, dict):
+                raise LLMError("Ollama returned an unexpected payload")
+            message = payload.get("message") or {}
+            content = message.get("content") if isinstance(message, dict) else None
+            if not isinstance(content, str):
+                raise LLMError("Ollama response has no message content")
+            usage = {
+                key: payload[key]
+                for key in ("prompt_eval_count", "eval_count", "total_duration")
+                if key in payload
+            }
+            return StructuredJSONResponse(
+                data=self._decode_json_content(content), usage=usage, raw=payload
+            )
+
+        import json
+
+        content_parts: list[str] = []
+        final_payload: dict[str, Any] = {}
+        try:
+            with self.client.stream("POST", endpoint, json=request_json) as response:
+                if response.status_code == 404:
+                    body = response.read()
+                    fallback = httpx.Response(
+                        404, headers=response.headers, content=body, request=response.request
+                    )
+                    detail = self._error_detail(fallback).casefold()
+                    if "model" in detail and any(
+                        phrase in detail for phrase in ("not found", "does not exist", "pull")
+                    ):
+                        raise self._http_error(fallback, endpoint=endpoint)
+                    return None
+                if response.is_error:
+                    body = response.read()
+                    failed = httpx.Response(
+                        response.status_code,
+                        headers=response.headers,
+                        content=body,
+                        request=response.request,
+                    )
+                    raise self._http_error(failed, endpoint=endpoint)
+                for line in response.iter_lines():
+                    check_cancelled(self._cancel_event)
+                    if not line.strip():
+                        continue
+                    payload = json.loads(line)
+                    if not isinstance(payload, dict):
+                        continue
+                    final_payload = payload
+                    message = payload.get("message") or {}
+                    fragment = message.get("content") if isinstance(message, dict) else None
+                    if isinstance(fragment, str) and fragment:
+                        content_parts.append(fragment)
+                        if self._progress is not None:
+                            self._progress("output", fragment)
+        except JobCancelled:
+            raise
+        except (httpx.HTTPError, ValueError) as exc:
+            check_cancelled(self._cancel_event)
+            raise LLMError(f"Ollama streaming response failed: {exc}") from exc
+
+        content = "".join(content_parts)
+        if not content:
             raise LLMError("Ollama response has no message content")
         usage = {
-            key: payload[key]
+            key: final_payload[key]
             for key in ("prompt_eval_count", "eval_count", "total_duration")
-            if key in payload
+            if key in final_payload
         }
         return StructuredJSONResponse(
-            data=self._decode_json_content(content), usage=usage, raw=payload
+            data=self._decode_json_content(content), usage=usage, raw=final_payload
         )
 
     def _openai_compatible_generate(
@@ -250,6 +328,7 @@ class OllamaClient:
         schema_name: str,
     ) -> StructuredJSONResponse:
         endpoint = f"{self.base_url}/v1/chat/completions"
+        check_cancelled(self._cancel_event)
         response = self.client.post(
             endpoint,
             json={
@@ -282,6 +361,9 @@ class OllamaClient:
         usage = payload.get("usage") or {}
         if not isinstance(usage, dict):
             usage = {}
+        check_cancelled(self._cancel_event)
+        if self._progress is not None:
+            self._progress("output", content)
         return StructuredJSONResponse(
             data=self._decode_json_content(content), usage=usage, raw=payload
         )
@@ -308,6 +390,7 @@ class OllamaClient:
                 "or enable its systemd service, then retry."
             ) from exc
         except (httpx.HTTPError, ValueError) as exc:
+            check_cancelled(self._cancel_event)
             raise LLMError(f"Ollama analysis failed: {exc}") from exc
 
     def analyze(self, prompt: str) -> LLMResponse:
@@ -343,12 +426,20 @@ class OpenAIClient:
         self.base_url = normalized if normalized.endswith("/v1") else f"{normalized}/v1"
         self._owns_client = client is None
         self.client = client or httpx.Client(timeout=timeout_seconds)
+        self._progress: ProgressCallback | None = None
+        self._cancel_event: threading.Event | None = None
         self.api_key = api_key
         self.reasoning_effort = reasoning_effort
 
     @property
     def provider_name(self) -> str:
         return "OpenAI"
+
+    def set_runtime(
+        self, progress: ProgressCallback | None, cancel_event: threading.Event | None
+    ) -> None:
+        self._progress = progress
+        self._cancel_event = cancel_event
 
     def close(self) -> None:
         if self._owns_client:
@@ -460,6 +551,7 @@ class OpenAIClient:
     ) -> StructuredJSONResponse:
         if not self.api_key:
             raise LLMError(f"{self.provider_name} API key is missing")
+        check_cancelled(self._cancel_event)
         try:
             response = self.client.post(
                 f"{self.base_url}/responses",
@@ -468,10 +560,16 @@ class OpenAIClient:
             )
             if response.is_error:
                 raise self._http_error(response)
-            return self._structured_response(response.json())
+            check_cancelled(self._cancel_event)
+            structured = self._structured_response(response.json())
+            if self._progress is not None:
+                import json
+                self._progress("output", json.dumps(structured.data, ensure_ascii=False))
+            return structured
         except LLMError:
             raise
         except (httpx.HTTPError, ValueError) as exc:
+            check_cancelled(self._cancel_event)
             raise LLMError(f"{self.provider_name} analysis failed: {exc}") from exc
 
     def analyze(self, prompt: str) -> LLMResponse:
@@ -561,6 +659,16 @@ class CodexClient(OpenAIClient):
                     self.client.delete(f"{self.base_url}/files/{file_id}", headers=headers)
                 except httpx.HTTPError:
                     pass
+
+
+def configure_job_runtime(
+    llm: LLMClient,
+    progress: ProgressCallback | None,
+    cancel_event: threading.Event | None,
+) -> None:
+    setter = getattr(llm, "set_runtime", None)
+    if callable(setter):
+        setter(progress, cancel_event)
 
 
 def configure_context_window(llm: LLMClient, context_window_tokens: int) -> None:

@@ -2,7 +2,7 @@
 
 Paperwatch is a local, daily research-paper tracker for a curated set of authors. It discovers papers through OpenAlex, fills missing abstract and open-PDF metadata from arXiv, stores everything in SQLite, and produces strict structured summaries with Ollama, OpenAI, or OpenAI Codex models.
 
-Version 0.5.4 is organized around one immediate workflow: open the Web UI, scroll the newest papers, open one, and act from that page. Paper links, author links, tracking controls, model reruns, and exports are kept next to the paper rather than hidden behind nested menus.
+Version 0.6.3 keeps the compact table-first interface and adds in-place, cancellable paper jobs. Summaries and saved prompts run without reloading the paper page, preserve vertical scroll, and show live model output while they run.
 
 ## Main flow
 
@@ -72,20 +72,23 @@ The server binds to localhost by default and has no login system. Do not expose 
 
 ### Recent papers
 
-The home page is the paper library, sorted newest first. It provides:
+The home page is a newest-first table with these columns:
 
-- a continuous, paginated recent-paper feed;
-- one-click paper detail, arXiv, Google Scholar, and OpenAlex links when available;
-- compact search plus author and OpenAlex-topic filters without a separate search workflow;
-- clickable OpenAlex topic tags on every paper with topic-preserving exports;
-- direct access to authors, saved queries, fetch history, and manual fetching.
+- publication date and journal;
+- wrapping paper title with direct source links;
+- tracked authors, plus the number of other authors;
+- the leading OpenAlex topic;
+- local/source PDF state, with missing PDFs highlighted;
+- the latest structured summary.
+
+Tracked author names link directly to the same table filtered to that author. Search, author, topic, kind, year, PDF, and summary filters stay on this page. A saved prompt and model can be selected beside the filters and run against exactly the currently matched papers or summaries.
 
 ### Paper detail
 
 A paper page centralizes all paper actions:
 
 - complete structured summaries grouped by model and source scope;
-- abstract, publication metadata, local PDF, source PDF, JSON export, arXiv, Scholar, and OpenAlex links;
+- abstract, publication metadata, downloaded PDF, source PDF, JSON export, arXiv, Scholar, and OpenAlex links;
 - an author picker for every listed coauthor;
 - local paper search for the selected author;
 - OpenAlex, Scholar, and arXiv author links adjacent to the author name;
@@ -93,41 +96,38 @@ A paper page centralizes all paper actions:
 - useful external searches even when a coauthor lacks an OpenAlex identifier;
 - rerun one or several configured models against the abstract or full PDF;
 - direct, automatic, or explicitly chunked full-text processing;
-- a user-selectable context-window size for local-model jobs.
+- a user-selectable context-window size for local-model jobs;
+- saved prompts beside the summary controls;
+- live progress and streamed Ollama output;
+- a Stop button for active summary or saved-prompt jobs;
+- in-place result refresh without page reload or scroll reset.
 
 There is no multi-page author drill-down required to perform these actions.
 
 ### Authors and tags
 
-The author page supports:
+The Authors page is a searchable table. It shows each tracked author’s name, institution, local paper count, tags, external links, and compact icon controls for pausing, resuming, or non-destructively removing tracking.
 
-- OpenAlex author search and stable-ID tracking;
-- enable, disable, or non-destructively remove from the visible tracking list;
-- multiple tags per author;
-- existing-tag suggestions while typing;
-- filtering the tracked-author list by tag;
-- direct OpenAlex, Google Scholar, arXiv, and local-paper links.
+- Search matches name, institution/employment, ORCID, OpenAlex ID, and tags.
+- The small **Add tag** field submits on Enter and clears after the redirect.
+- Multiple tags are supported and existing tags are suggested.
+- OpenAlex search results use the same table structure and can be tracked with one icon action.
 
-`Remove from list` sets `tracked = 0` and `enabled = 0`. It never deletes the author, papers, tags, analyses, or paper-author relationships. An archived author can be restored from a paper page or a new OpenAlex search.
+Removing an author sets `tracked = 0` and `enabled = 0`. It never deletes the author, papers, tags, analyses, or paper-author relationships.
 
 ### Saved collection queries
 
-A saved query combines:
+The Queries page stores reusable prompts only: a name, input source (`papers` or `summaries`), and prompt. It does not contain a second paper-search form.
 
-- a name;
-- a source set: matching stored papers or matching stored summaries;
-- a search expression;
-- a reusable prompt.
+To run a query:
 
-Each query can be edited, rerun with one or several configured models and a chosen context size, or deleted. Outputs and per-model failures are saved in `query_runs` and displayed under the query. Large collections are grouped and recursively reduced so the model receives bounded inputs.
+1. Filter the Recent table.
+2. Select a saved query.
+3. Select a configured model.
+4. Run it against the current result set.
+5. Open the saved output on Queries.
 
-Examples:
-
-- Compare the assumptions used by papers matching `diffusion`.
-- Identify common evidence gaps among summaries matching `alignment`.
-- Build a reading order for all papers matching an author, method, or title term.
-
-Deleting a saved query removes that query and its query-run outputs; it does not delete papers or paper analyses.
+Every query run records the exact filters, model, context, output, and any per-model error. Queries can be edited or deleted without deleting papers or paper analyses.
 
 ## Light and dark themes
 
@@ -247,6 +247,26 @@ max_pdf_chars = 2000000
 
 The overlap handles delayed indexing and metadata changes. It is configurable because very late indexing of an old publication can otherwise be missed.
 
+### Cursor-independent one-year PDF backfill
+
+Changing `initial_lookback_days` does not rewind authors that already have a
+`last_checked_at` cursor. Use the explicit download-only backfill instead:
+
+```bash
+uv run paperwatch --config config.toml backfill --days 365
+```
+
+The command ignores existing author cursors, requests the previous 365 calendar
+days, paginates up to 5000 works per author by default, and downloads every
+available open PDF. It does not call an LLM. Papers imported by the backfill are
+marked as historical so routine overlap runs do not summarize the backlog. If a
+historical paper's PDF becomes available for the first time during a later normal
+run, that newly downloaded PDF is summarized once.
+
+The same operation is available on the recent-papers page through **Backfill 1
+year PDFs**. Local files are linked as **Downloaded PDF** and remote origins as
+**Source PDF**.
+
 ## Abstract and PDF behavior
 
 - OpenAlex is the primary metadata/discovery source.
@@ -344,7 +364,7 @@ Exports preserve structured nested analysis data through canonical JSON fields.
 ## Database tables
 
 - `authors`: stable identity, tracking state, profile metadata, and fetch cursor
-- `papers`: identifiers, abstract, publication/PDF links, provenance, and fetch dates
+- `papers`: identifiers, abstract, publication/PDF links, provenance, fetch dates, and historical auto-analysis state
 - `paper_authors`: complete ordered authorship, including coauthors not currently tracked
 - `topics`: OpenAlex topic labels and their domain/field/subfield hierarchy
 - `paper_topics`: ranked paper-topic links, relevance scores, and primary-topic state
@@ -370,6 +390,7 @@ paperwatch --config config.toml author disable A123456789
 paperwatch --config config.toml author enable A123456789
 paperwatch --config config.toml author remove A123456789
 paperwatch --config config.toml run
+paperwatch --config config.toml backfill --days 365
 paperwatch --config config.toml papers
 paperwatch --config config.toml runs
 paperwatch --config config.toml web --host 127.0.0.1 --port 8765

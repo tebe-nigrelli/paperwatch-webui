@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import date
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -227,3 +228,63 @@ def test_web_command_reports_config_error(config_path, monkeypatch, capsys):
     monkeypatch.setattr("paperwatch.web.create_app", lambda path: (_ for _ in ()).throw(ValueError("bad web config")))
     assert cli.main(["--config", str(config_path), "web"]) == 2
     assert "bad web config" in capsys.readouterr().err
+
+
+def test_backfill_command_uses_explicit_window_and_download_only(
+    config_path, monkeypatch, capsys
+):
+    monkeypatch.setattr(cli, "build_services", service_factory)
+    calls = []
+
+    class FakePdfClient:
+        def close(self):
+            pass
+
+    class FakePaperWatch:
+        def __init__(self, *args, **kwargs):
+            self.pdf_client = FakePdfClient()
+
+        def run(self, **kwargs):
+            calls.append(kwargs)
+            return SimpleNamespace(
+                run_id=11,
+                status="success",
+                authors_checked=2,
+                papers_found=10,
+                papers_analyzed=0,
+                pdfs_downloaded=7,
+                errors_count=0,
+            )
+
+        def close(self):
+            self.pdf_client.close()
+
+    monkeypatch.setattr(cli, "PaperWatch", FakePaperWatch)
+    assert (
+        cli.main(
+            [
+                "--config",
+                str(config_path),
+                "backfill",
+                "--days",
+                "365",
+                "--max-papers-per-author",
+                "5000",
+                "--today",
+                "2026-07-30",
+            ]
+        )
+        == 0
+    )
+    assert calls == [
+        {
+            "today": date(2026, 7, 30),
+            "since_override": date(2025, 7, 30),
+            "download_only": True,
+            "historical": True,
+            "max_papers_per_author_override": 5000,
+        }
+    ]
+    output = capsys.readouterr().out
+    assert "since=2025-07-30" in output
+    assert "analyses=0" in output

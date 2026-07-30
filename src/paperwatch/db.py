@@ -18,7 +18,7 @@ from .models import (
 )
 
 
-SCHEMA_VERSION = 6
+SCHEMA_VERSION = 8
 
 
 def utcnow() -> str:
@@ -56,6 +56,7 @@ CREATE TABLE IF NOT EXISTS papers (
     publication_url TEXT,
     pdf_url TEXT,
     local_pdf_path TEXT,
+    auto_analyze INTEGER NOT NULL DEFAULT 1,
     abstract_source TEXT,
     pdf_source TEXT,
     discovered_at TEXT NOT NULL,
@@ -224,6 +225,7 @@ CREATE TABLE IF NOT EXISTS query_runs (
     model TEXT NOT NULL,
     status TEXT NOT NULL CHECK (status IN ('queued', 'running', 'success', 'failed')),
     context_window_tokens INTEGER NOT NULL,
+    selection_json TEXT NOT NULL DEFAULT '{}',
     matched_count INTEGER NOT NULL DEFAULT 0,
     input_chars INTEGER NOT NULL DEFAULT 0,
     output_json TEXT,
@@ -292,6 +294,7 @@ class Database:
 
         self._conn.executescript(COMMON_SCHEMA)
         self._ensure_author_tracking_column()
+        self._ensure_paper_columns()
         if version == 1:
             self._migrate_v1_analyses()
         elif version == 0 and self._is_legacy_analyses_table():
@@ -301,6 +304,7 @@ class Database:
         self._conn.executescript(ANALYSIS_TASKS_SCHEMA)
         self._ensure_analysis_columns()
         self._conn.executescript(EXTRA_SCHEMA)
+        self._ensure_query_columns()
         self._conn.executescript(TOPICS_SCHEMA)
         if version < 6:
             self._backfill_paper_topics()
@@ -314,6 +318,15 @@ class Database:
         if "tracked" not in columns:
             self._conn.execute(
                 "ALTER TABLE authors ADD COLUMN tracked INTEGER NOT NULL DEFAULT 1"
+            )
+
+    def _ensure_paper_columns(self) -> None:
+        columns = {
+            row["name"] for row in self._conn.execute("PRAGMA table_info(papers)").fetchall()
+        }
+        if "auto_analyze" not in columns:
+            self._conn.execute(
+                "ALTER TABLE papers ADD COLUMN auto_analyze INTEGER NOT NULL DEFAULT 1"
             )
 
     def _ensure_analysis_columns(self) -> None:
@@ -336,6 +349,16 @@ class Database:
             for name, definition in columns.items():
                 if name not in existing:
                     self._conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {definition}")
+
+    def _ensure_query_columns(self) -> None:
+        columns = {
+            row["name"]
+            for row in self._conn.execute("PRAGMA table_info(query_runs)").fetchall()
+        }
+        if "selection_json" not in columns:
+            self._conn.execute(
+                "ALTER TABLE query_runs ADD COLUMN selection_json TEXT NOT NULL DEFAULT '{}'"
+            )
 
     def _backfill_paper_topics(self) -> None:
         rows = self._conn.execute(
@@ -586,7 +609,9 @@ class Database:
             ).fetchone()
         return None
 
-    def upsert_paper(self, paper: PaperRecord) -> tuple[int, bool]:
+    def upsert_paper(
+        self, paper: PaperRecord, *, auto_analyze: bool = True
+    ) -> tuple[int, bool]:
         existing = self._find_existing_paper(paper)
         now = utcnow()
         metadata = json_dumps(paper.metadata)
@@ -598,9 +623,9 @@ class Database:
                     INSERT INTO papers (
                         identity_key, openalex_id, doi, arxiv_id, title,
                         normalized_title, abstract, publication_date, updated_date,
-                        venue, publication_url, pdf_url, abstract_source, pdf_source,
+                        venue, publication_url, pdf_url, auto_analyze, abstract_source, pdf_source,
                         discovered_at, fetched_at, metadata_json
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         paper.identity_key,
@@ -615,6 +640,7 @@ class Database:
                         paper.venue,
                         paper.publication_url,
                         paper.pdf_url,
+                        1 if auto_analyze else 0,
                         paper.abstract_source,
                         paper.pdf_source,
                         now,
@@ -638,6 +664,7 @@ class Database:
                         venue=COALESCE(?, venue),
                         publication_url=COALESCE(?, publication_url),
                         pdf_url=COALESCE(?, pdf_url),
+                        auto_analyze=CASE WHEN ? = 0 THEN 0 ELSE auto_analyze END,
                         abstract_source=COALESCE(?, abstract_source),
                         pdf_source=COALESCE(?, pdf_source),
                         fetched_at=?, metadata_json=?
@@ -655,6 +682,7 @@ class Database:
                         paper.venue,
                         paper.publication_url,
                         paper.pdf_url,
+                        1 if auto_analyze else 0,
                         paper.abstract_source,
                         paper.pdf_source,
                         now,
@@ -716,7 +744,7 @@ class Database:
                 (SELECT count(*) FROM authors WHERE tracked = 0) AS archived_authors,
                 (SELECT count(*) FROM papers) AS papers,
                 (SELECT count(*) FROM papers WHERE abstract IS NOT NULL) AS with_abstract,
-                (SELECT count(*) FROM papers WHERE pdf_url IS NOT NULL) AS with_pdf,
+                (SELECT count(*) FROM papers WHERE pdf_url IS NOT NULL OR local_pdf_path IS NOT NULL) AS with_pdf,
                 (SELECT count(*) FROM analyses) AS analyses,
                 (SELECT count(DISTINCT paper_id) FROM analyses) AS analyzed_papers
             """
@@ -796,7 +824,11 @@ class Database:
             )
             params.append(scope)
         if has_pdf is not None:
-            where.append("p.pdf_url IS NOT NULL" if has_pdf else "p.pdf_url IS NULL")
+            where.append(
+                "(p.pdf_url IS NOT NULL OR p.local_pdf_path IS NOT NULL)"
+                if has_pdf
+                else "(p.pdf_url IS NULL AND p.local_pdf_path IS NULL)"
+            )
         if analyzed is not None:
             clause = "EXISTS" if analyzed else "NOT EXISTS"
             where.append(f"{clause} (SELECT 1 FROM analyses aa WHERE aa.paper_id=p.id)")
@@ -1182,8 +1214,23 @@ class Database:
             ).fetchall()
         )
 
+    def visible_analysis_tasks_for_paper(
+        self, paper_id: int, limit: int = 30
+    ) -> list[sqlite3.Row]:
+        """Return successful or currently active tasks, excluding inconclusive history."""
+        return list(
+            self._conn.execute(
+                """
+                SELECT * FROM analysis_tasks
+                WHERE paper_id=? AND status IN ('queued', 'running', 'success')
+                ORDER BY id DESC LIMIT ?
+                """,
+                (paper_id, limit),
+            ).fetchall()
+        )
+
     def list_authors_with_tags(
-        self, *, tracked_only: bool = True, tag: str = ""
+        self, *, tracked_only: bool = True, tag: str = "", query: str = ""
     ) -> list[sqlite3.Row]:
         where = ["a.tracked=1"] if tracked_only else []
         params: list[Any] = []
@@ -1194,6 +1241,20 @@ class Database:
                 "WHERE atl2.author_id=a.id AND at2.name=? COLLATE NOCASE)"
             )
             params.append(tag.strip())
+        if query:
+            escaped = query.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+            term = f"%{escaped}%"
+            where.append(
+                "(a.name LIKE ? ESCAPE '\\' COLLATE NOCASE "
+                "OR COALESCE(a.institution, '') LIKE ? ESCAPE '\\' COLLATE NOCASE "
+                "OR COALESCE(a.orcid, '') LIKE ? ESCAPE '\\' COLLATE NOCASE "
+                "OR a.openalex_id LIKE ? ESCAPE '\\' COLLATE NOCASE "
+                "OR EXISTS (SELECT 1 FROM author_tag_links atl3 "
+                "JOIN author_tags at3 ON at3.id=atl3.tag_id "
+                "WHERE atl3.author_id=a.id "
+                "AND at3.name LIKE ? ESCAPE '\\' COLLATE NOCASE))"
+            )
+            params.extend([term, term, term, term, term])
         where_sql = " WHERE " + " AND ".join(where) if where else ""
         return list(
             self._conn.execute(
@@ -1205,7 +1266,10 @@ class Database:
                         JOIN author_tags at ON at.id=atl.tag_id
                         WHERE atl.author_id=a.id
                         ORDER BY at.name COLLATE NOCASE
-                    )), '') AS tags
+                    )), '') AS tags,
+                    (SELECT count(DISTINCT pa.paper_id)
+                     FROM paper_authors pa
+                     WHERE pa.tracked_author_id=a.id) AS paper_count
                 FROM authors a
                 {where_sql}
                 ORDER BY a.name COLLATE NOCASE
@@ -1432,8 +1496,10 @@ class Database:
         query_id: int,
         profiles: list[tuple[str, str, str]],
         context_window_tokens: int,
+        selection: dict[str, Any] | None = None,
     ) -> list[int]:
         now = utcnow()
+        selection_json = json_dumps(selection or {})
         ids: list[int] = []
         with self.transaction() as conn:
             for profile, provider, model in profiles:
@@ -1441,10 +1507,19 @@ class Database:
                     """
                     INSERT INTO query_runs(
                         batch_id, query_id, profile, provider, model, status,
-                        context_window_tokens, created_at
-                    ) VALUES (?, ?, ?, ?, ?, 'queued', ?, ?)
+                        context_window_tokens, selection_json, created_at
+                    ) VALUES (?, ?, ?, ?, ?, 'queued', ?, ?, ?)
                     """,
-                    (batch_id, query_id, profile, provider, model, context_window_tokens, now),
+                    (
+                        batch_id,
+                        query_id,
+                        profile,
+                        provider,
+                        model,
+                        context_window_tokens,
+                        selection_json,
+                        now,
+                    ),
                 )
                 ids.append(int(cur.lastrowid))
         return ids
@@ -1520,6 +1595,32 @@ class Database:
                 (query_id, limit),
             ).fetchall()
         )
+
+    def query_runs_for_paper(
+        self, paper_id: int, *, successful_only: bool = True, limit: int = 100
+    ) -> list[sqlite3.Row]:
+        """Return saved-prompt runs explicitly scoped to one paper."""
+        rows = self.list_query_runs(limit=max(limit * 5, 100))
+        matched: list[sqlite3.Row] = []
+        for row in rows:
+            if successful_only and row["status"] != "success":
+                continue
+            try:
+                selection = json.loads(row["selection_json"] or "{}")
+            except (TypeError, json.JSONDecodeError):
+                continue
+            paper_ids = selection.get("paper_ids") if isinstance(selection, dict) else None
+            if not isinstance(paper_ids, list):
+                continue
+            try:
+                ids = {int(value) for value in paper_ids}
+            except (TypeError, ValueError):
+                continue
+            if paper_id in ids:
+                matched.append(row)
+                if len(matched) >= limit:
+                    break
+        return matched
 
     def fail_incomplete_query_runs(self, message: str) -> int:
         with self.transaction() as conn:

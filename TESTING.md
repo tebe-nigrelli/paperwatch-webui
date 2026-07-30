@@ -1,4 +1,4 @@
-# Automated testing strategy — paperwatch 0.5.5
+# Automated testing strategy — paperwatch 0.6.2
 
 The default suite is deterministic and requires no live OpenAlex index, arXiv service, Ollama server, OpenAI account, PDF host, or external browser assets.
 
@@ -10,8 +10,8 @@ pytest
 
 Release result:
 
-- 183 tests passed
-- 95.13% branch-aware coverage
+- 211 tests passed
+- 95.08% branch-aware coverage
 - Python 3.13.5 release environment
 
 ## Feature coverage
@@ -21,7 +21,7 @@ Release result:
 | Configuration | TOML parsing, generated defaults, relative paths, environment keys, ranges, metadata-only mode, multiple profiles, profile names, context windows |
 | Author lifecycle | Add/update/re-enable, pause, non-destructive archive, archived-row retention, restoration, coauthor relinking |
 | Author tags | Multiple tags, normalization, suggestions, duplicate handling, removal, filtering, archived-author visibility rules |
-| Paper author controls | Author picker, local searches, tracked/untracked states, OpenAlex/Scholar/arXiv links, missing OpenAlex IDs, failed author lookup notices |
+| Paper author controls | First-tracked/default-first selection, orange tracked-author markers, picker state, local searches, OpenAlex/Scholar/arXiv links, missing IDs, failed lookup notices |
 | OpenAlex | Authentication, author search/get, work filtering/sorting, cursor pagination, retries, malformed responses, sparse title-less work skipping, metadata normalization |
 | Deduplication | DOI, arXiv, OpenAlex, title/year, and same-run coauthor cases |
 | arXiv enrichment | ID/title lookup, author verification, polite throttling, retries, malformed XML, missing fields, conditional calls |
@@ -31,12 +31,12 @@ Release result:
 | Chunked analysis | Paragraph splitting, overlap, chunk-size budgets, direct-fit checks, chunk-note cache, recursive reduction, final strict schema, context failures |
 | Multi-model analysis | Direct/auto/chunked modes, same-source runs, partial failures, cache reuse, context overrides, source validation |
 | Saved queries | Paper/summary search, summary-content matching, map/reduce grouping, oversized nested record compaction, model success/failure, CRUD, status recovery |
-| Pipeline | One-year initial/overlap windows, model preflight, metadata/PDF continuation when a model is missing, automatic PDF chunking, cache behavior, error isolation, counters |
+| Pipeline | Cursor-independent one-year download-only backfill, historical-analysis suppression, late-PDF analysis, normal initial/overlap windows, model preflight, automatic PDF chunking, cache behavior, error isolation, counters |
 | Concurrency | Separate cross-process fetch, paper-analysis, and saved-query locks; clean release behavior |
-| SQLite | Transactions, WAL, foreign keys, schema guards, migrations through schema v5, tag/query/chunk persistence, integrity |
-| Recent-paper UI | Newest-first home feed, search/filter redirect, direct paper links, pagination, high-contrast theme control |
-| Paper UI | Centralized source/author/model actions, author picker state, model reruns, context input, analysis rendering, exports |
-| Author/query UI | Tag suggestions/filtering, non-destructive removal, saved-query edit/rerun/delete, persisted outputs and errors |
+| SQLite | Transactions, WAL, foreign keys, schema guards, migrations through schema v8, historical paper flags, tag/query/chunk persistence, integrity |
+| Recent-paper UI | Newest-first table, wrapping titles, tracked-author links, one leading topic, missing-PDF state, summary column, filter-preserving query runner, pagination, high-contrast theme control |
+| Paper UI | Centralized source/author/model actions, author picker state, model reruns, saved prompts, context input, no-reload fragment refresh, scroll preservation, live output, cancellation, stale-attempt recovery, analysis rendering, exports |
+| Author/query UI | Table-based author filtering across identity/employment/tags, Enter-to-tag, icon pause/resume/archive controls, OpenAlex result table, prompt-only query CRUD, filtered query execution, persisted selections/outputs/errors |
 | Static resilience | Theme storage fallback, hidden-state CSS precedence, no CDN dependency, responsive templates |
 | Web security | CSP, frame denial, MIME-sniff prevention, same-origin referrer policy, protected local-PDF paths, localhost default |
 | CLI/systemd | CLI commands, web invocation, daily timer, web service files, archive wording |

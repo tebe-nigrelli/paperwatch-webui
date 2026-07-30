@@ -9,8 +9,8 @@
     <a class="button" href="{{ paper.google_scholar_url }}" target="_blank" rel="noreferrer">Google Scholar</a>
     {% if paper.openalex_url %}<a class="button" href="{{ paper.openalex_url }}" target="_blank" rel="noreferrer">OpenAlex</a>{% endif %}
     {% if paper.publication_url %}<a class="button" href="{{ paper.publication_url }}" target="_blank" rel="noreferrer">Publication</a>{% endif %}
-    {% if paper.pdf_url %}<a class="button" href="{{ paper.pdf_url }}" target="_blank" rel="noreferrer">PDF</a>{% endif %}
-    {% if paper.local_pdf_path %}<a class="button" href="/papers/{{ paper.id }}/pdf" target="_blank">Local PDF</a>{% endif %}
+    {% if paper.local_pdf_path %}<a class="button button-primary" href="/papers/{{ paper.id }}/pdf" target="_blank" rel="noreferrer">Downloaded PDF</a>{% endif %}
+    {% if paper.pdf_url %}<a class="button" href="{{ paper.pdf_url }}" target="_blank" rel="noreferrer">Source PDF</a>{% endif %}
     <a class="button" href="/papers/{{ paper.id }}/export.json">Export JSON</a>
   </div>
   {% if topics %}<div class="topic-tags paper-topic-tags" aria-label="OpenAlex topics">{% for topic in topics %}<a class="tag topic-tag{% if topic.is_primary %} active{% endif %}" href="/?topic={{ topic.openalex_id }}" title="{% if topic.score is not none %}OpenAlex relevance {{ '%.3f'|format(topic.score) }}{% endif %}{% if topic.subfield_name %} · {{ topic.subfield_name }}{% endif %}">{{ topic.display_name }}</a>{% endfor %}</div>{% endif %}
@@ -19,19 +19,19 @@
 <section class="panel author-picker-panel">
   <div class="panel-heading"><div><h2>Author actions</h2><p>Pick an author once, then jump directly to local papers, external profiles, or tracking.</p></div></div>
   {% if authors %}
-  {% set first_author = authors[0] %}
-  {% set first_status = 'tracked' if first_author.is_tracked and first_author.tracked_enabled else ('paused' if first_author.is_tracked else 'not tracked') %}
-  {% set first_track = first_author.author_id and not (first_author.is_tracked and first_author.tracked_enabled) %}
+  {% set default_author = authors[default_author_index] %}
+  {% set default_status = 'tracked' if default_author.is_tracked and default_author.tracked_enabled else ('paused' if default_author.is_tracked else 'not tracked') %}
+  {% set default_track = default_author.author_id and not (default_author.is_tracked and default_author.tracked_enabled) %}
   <div class="author-picker-toolbar">
-    <label class="grow"><span>Author</span><select id="author-picker">{% for author in authors %}<option value="{{ loop.index0 }}" data-papers="{{ author.papers_url }}" data-scholar="{{ author.google_scholar_url }}" data-arxiv="{{ author.arxiv_url }}" data-openalex="{{ author.openalex_url or '' }}" data-track="{% if author.author_id and not (author.is_tracked and author.tracked_enabled) %}/papers/{{ paper.id }}/authors/{{ author.author_id }}/add{% endif %}" data-status="{% if author.is_tracked and author.tracked_enabled %}tracked{% elif author.is_tracked %}paused{% else %}not tracked{% endif %}">{{ author.name }}</option>{% endfor %}</select></label>
-    <span id="author-status" class="status {{ 'status-success' if first_status == 'tracked' else 'status-disabled' }}">{{ first_status }}</span>
-    <a id="author-local" class="button button-primary" href="{{ first_author.papers_url }}">Local papers</a>
-    <a id="author-scholar" class="button" href="{{ first_author.google_scholar_url }}" target="_blank" rel="noreferrer">Scholar</a>
-    <a id="author-arxiv" class="button" href="{{ first_author.arxiv_url }}" target="_blank" rel="noreferrer">arXiv</a>
-    <a id="author-openalex" class="button" href="{{ first_author.openalex_url or '#' }}" {% if not first_author.openalex_url %}hidden{% endif %} target="_blank" rel="noreferrer">OpenAlex</a>
-    <form id="author-track-form" method="post" action="{% if first_track %}/papers/{{ paper.id }}/authors/{{ first_author.author_id }}/add{% endif %}" {% if not first_track %}hidden{% endif %}><button id="author-track" class="button" type="submit" {% if not first_track %}disabled{% endif %}>Track author</button></form>
+    <label class="grow"><span>Author</span><select id="author-picker">{% for author in authors %}<option value="{{ loop.index0 }}"{% if loop.index0 == default_author_index %} selected{% endif %}{% if author.is_tracked %} class="tracked-author-option"{% endif %} data-papers="{{ author.papers_url }}" data-scholar="{{ author.google_scholar_url }}" data-arxiv="{{ author.arxiv_url }}" data-openalex="{{ author.openalex_url or '' }}" data-track="{% if author.author_id and not (author.is_tracked and author.tracked_enabled) %}/papers/{{ paper.id }}/authors/{{ author.author_id }}/add{% endif %}" data-status="{% if author.is_tracked and author.tracked_enabled %}tracked{% elif author.is_tracked %}paused{% else %}not tracked{% endif %}">{{ author.name }}</option>{% endfor %}</select></label>
+    <span id="author-status" class="status {{ 'status-success' if default_status == 'tracked' else 'status-disabled' }}">{{ default_status }}</span>
+    <a id="author-local" class="button button-primary" href="{{ default_author.papers_url }}">Local papers</a>
+    <a id="author-scholar" class="button" href="{{ default_author.google_scholar_url }}" target="_blank" rel="noreferrer">Scholar</a>
+    <a id="author-arxiv" class="button" href="{{ default_author.arxiv_url }}" target="_blank" rel="noreferrer">arXiv</a>
+    <a id="author-openalex" class="button" href="{{ default_author.openalex_url or '#' }}" {% if not default_author.openalex_url %}hidden{% endif %} target="_blank" rel="noreferrer">OpenAlex</a>
+    <form id="author-track-form" method="post" action="{% if default_track %}/papers/{{ paper.id }}/authors/{{ default_author.author_id }}/add{% endif %}" {% if not default_track %}hidden{% endif %}><button id="author-track" class="button" type="submit" {% if not default_track %}disabled{% endif %}>Track author</button></form>
   </div>
-  <div class="author-chips">{% for author in authors %}<button class="tag author-chip" type="button" data-author-index="{{ loop.index0 }}">{{ author.name }}</button>{% endfor %}</div>
+  <div class="author-chips">{% for author in authors %}<button class="tag author-chip{% if author.is_tracked %} author-chip-tracked{% endif %}" type="button" data-author-index="{{ loop.index0 }}"{% if loop.index0 == default_author_index %} aria-pressed="true"{% else %} aria-pressed="false"{% endif %}>{{ author.name }}</button>{% endfor %}</div>
   {% else %}<p class="muted">No author metadata is stored.</p>{% endif %}
 </section>
 
@@ -43,7 +43,7 @@
 <section class="panel model-runner">
   <div class="panel-heading"><div><h2>Summarize or rerun</h2><p>Run additional models or rerun the same strict summary with multiple models. Full PDFs can be analyzed directly or chunked for smaller local contexts.</p></div>{% if analysis_state.running and analysis_state.paper_id == paper.id %}<span class="status status-running">running</span>{% endif %}</div>
   {% if model_profiles and (paper.abstract or paper.pdf_url or paper.local_pdf_path) %}
-  <form method="post" action="/papers/{{ paper.id }}/analyze">
+  <form id="analysis-form" data-paper-job="analysis" method="post" action="/papers/{{ paper.id }}/analyze">
     <fieldset class="model-options"><legend>Models</legend>{% for profile in model_profiles %}<label class="model-option"><input type="checkbox" name="model" value="{{ profile.profile }}" {% if loop.first %}checked{% endif %}><span><strong>{{ profile.profile }}</strong><small>{{ profile.provider }} · {{ profile.model }}{% if profile.reasoning_effort %} · reasoning {{ profile.reasoning_effort }}{% endif %} · default context {{ profile.context_window_tokens }} tokens</small></span></label>{% endfor %}</fieldset>
     <div class="model-run-actions">
       <label><span>Source</span><select name="scope">{% if paper.pdf_url or paper.local_pdf_path %}<option value="fulltext">Full paper PDF</option>{% endif %}{% if paper.abstract %}<option value="abstract">Abstract</option>{% endif %}</select></label>
@@ -53,9 +53,29 @@
     </div>
     <p class="form-help">Codex Direct/Auto uploads the original PDF; Chunk + merge extracts text locally. Chunk size follows this context window, and chunk notes are cached.</p>
   </form>
+  {% if saved_queries %}
+  <form id="saved-prompt-form" data-paper-job="query" method="post" action="/papers/{{ paper.id }}/prompt" class="saved-prompt-runner">
+    <div class="model-run-actions">
+      <label class="grow"><span>Run saved prompt</span><select name="query_id" required><option value="">Choose a saved prompt</option>{% for query in saved_queries %}<option value="{{ query.id }}">{{ query.name }} · {{ query.source_type }}</option>{% endfor %}</select></label>
+      <label><span>Model</span><select name="model">{% for profile in model_profiles %}<option value="{{ profile.profile }}">{{ profile.profile }} · {{ profile.model }}</option>{% endfor %}</select></label>
+      <label><span>Context tokens</span><input type="number" name="context_window_tokens" min="512" max="1000000" value="8192"></label>
+      <button class="button" type="submit">Run prompt</button>
+    </div>
+  </form>
+  {% else %}<p class="form-help">Create a reusable prompt on <a href="/queries">Queries</a> to run it on this paper.</p>{% endif %}
   {% elif not model_profiles %}<p class="muted">No active LLM profiles are configured.</p>{% else %}<p class="muted">No abstract or PDF is available.</p>{% endif %}
+  <div id="paper-jobs" class="live-job" data-paper-id="{{ paper.id }}" hidden>
+    <div class="live-job-heading"><div><strong id="job-stage">Starting</strong><small id="job-message"></small></div><button id="job-cancel" class="button button-small button-danger" type="button">Stop</button></div>
+    <pre id="job-output" aria-live="polite"></pre>
+  </div>
+</section>
+
+<div id="paper-results">
+<section class="panel model-task-history">
   {% if analysis_tasks %}<h3 class="subheading">Recent tasks</h3><div class="table-wrap"><table><thead><tr><th>Model</th><th>Source</th><th>Strategy</th><th>Status</th><th>Result</th></tr></thead><tbody>{% for task in analysis_tasks %}<tr><td><strong>{{ task.profile }}</strong><small>{{ task.model }}</small></td><td>{{ task.scope }}</td><td>{{ task.analysis_strategy }}{% if task.context_window_tokens %}<small>{{ task.context_window_tokens }} tokens · {{ task.chunk_count }} chunks</small>{% endif %}</td><td><span class="status status-{{ task.status }}">{{ task.status }}</span>{% if task.error_text %}<small class="task-error">{{ task.error_text }}</small>{% endif %}</td><td>{% if task.analysis_id %}<a href="#analysis-{{ task.analysis_id }}">Open</a>{% else %}—{% endif %}</td></tr>{% endfor %}</tbody></table></div>{% endif %}
 </section>
+
+{% if prompt_runs %}<section class="panel prompt-results"><div class="panel-heading"><div><h2>Saved prompt results</h2><p>Completed prompts run on this paper.</p></div></div>{% for run in prompt_runs %}<article class="prompt-result"><div class="panel-heading"><div><h3>{{ run.query_name }} · {{ run.model }}</h3><p>{{ run.created_at }} · {{ run.matched_count }} matched record{{ '' if run.matched_count == 1 else 's' }}</p></div><a class="button button-small" href="/queries#query-{{ run.query_id }}">Saved query</a></div>{% if run.output %}<h4>{{ run.output.title }}</h4><p class="lead">{{ run.output.summary }}</p>{% if run.output["items"] %}<div class="object-list">{% for item in run.output["items"] %}<article>{% if item.paper_id %}<a href="/papers/{{ item.paper_id }}"><strong>{{ item.title }}</strong></a>{% else %}<strong>{{ item.title }}</strong>{% endif %}<p>{{ item.output }}</p></article>{% endfor %}</div>{% endif %}{% endif %}</article>{% endfor %}</section>{% endif %}
 
 {% if analyses %}<section class="panel analysis-index"><div class="panel-heading"><div><h2>Summary comparison</h2><p>{{ analyses|length }} stored result{{ '' if analyses|length == 1 else 's' }}.</p></div></div><div class="table-wrap"><table><thead><tr><th>Model</th><th>Scope</th><th>Strategy</th><th>Kind</th><th>One-sentence result</th><th></th></tr></thead><tbody>{% for analysis in analyses %}<tr><td><strong>{{ analysis.model }}</strong><small>{{ analysis.provider }} · {{ analysis.created_at }}</small></td><td>{{ analysis.scope }}</td><td>{{ analysis.analysis_strategy }}{% if analysis.chunk_count %}<small>{{ analysis.chunk_count }} chunks</small>{% endif %}</td><td>{{ analysis.result.paper_kind|replace('_',' ') }}</td><td>{{ analysis.result.one_sentence_summary }}</td><td><a href="#analysis-{{ analysis.id }}">Details</a></td></tr>{% endfor %}</tbody></table></div></section>{% endif %}
 
@@ -75,5 +95,6 @@
   <details><summary>Raw JSON and usage</summary><pre>{{ analysis.result|prettyjson }}</pre>{% if analysis.usage %}<pre>{{ analysis.usage|prettyjson }}</pre>{% endif %}</details>
 </section>
 {% else %}<section class="empty panel">No LLM analysis is stored for this paper.</section>{% endfor %}
+</div>
 <details class="panel"><summary>Source metadata</summary><pre>{{ metadata|prettyjson }}</pre></details>
 {% endblock %}

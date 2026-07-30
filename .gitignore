@@ -78,4 +78,5 @@ tmp/
 
 # Keep examples and source fixtures tracked
 !config.example.toml
+!src/paperwatch/defaults/config.toml
 !tests/fixtures/**

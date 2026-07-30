@@ -47,13 +47,20 @@ class StubController:
     def __init__(self, starts: list[bool] | None = None, snapshot: RunSnapshot | None = None):
         self.starts = starts or [True]
         self.calls = 0
+        self.modes: list[str] = []
         self.state = snapshot or RunSnapshot()
 
-    def start(self) -> bool:
+    def start(self, mode: str = "run") -> bool:
+        self.modes.append(mode)
         value = self.starts[min(self.calls, len(self.starts) - 1)]
         self.calls += 1
         if value:
-            self.state = RunSnapshot(running=True, started_at="2026-07-25T10:00:00+00:00", status="running")
+            self.state = RunSnapshot(
+                running=True,
+                mode=mode,
+                started_at="2026-07-25T10:00:00+00:00",
+                status="running",
+            )
         return value
 
     def snapshot(self) -> RunSnapshot:
@@ -169,8 +176,13 @@ def test_dashboard_assets_and_security_headers(config_path, seeded_web):
     client, _ = make_client(config_path)
     response = client.get("/")
     assert response.status_code == 200
-    assert "Research feed" in response.text
+    assert "Research feed" not in response.text
+    assert "Tracked author(s)" in response.text
+    assert "OpenAlex topics" in response.text
+    assert "PDF file" in response.text
     assert "Minimal Agents" in response.text
+    assert "Downloaded PDF" in response.text
+    assert "Backfill 1 year PDFs" in response.text
     assert "broken PDF" in response.text
     assert response.headers["x-frame-options"] == "DENY"
     assert "default-src 'self'" in response.headers["content-security-policy"]
@@ -190,11 +202,23 @@ def test_dashboard_running_and_error_states(config_path, seeded_web):
 
 def test_author_search_add_toggle_remove(config_path, seeded_web):
     client, instances = make_client(config_path)
-    assert "Ada Lovelace" in client.get("/authors").text
+    author_page = client.get("/authors")
+    assert "Ada Lovelace" in author_page.text
+    assert "Name<br>University" in author_page.text
+    assert "Pause / resume" in author_page.text
+    assert "last checked" not in author_page.text
+    assert 'placeholder="Add tag"' in author_page.text
+    assert ">Add</button>" not in author_page.text
+    assert client.get("/authors?q=Analytical+Engine").status_code == 200
+    assert "Ada Lovelace" in client.get("/authors?q=Analytical+Engine").text
+    assert "Ada Lovelace" not in client.get("/authors?q=unrelated").text
 
     response = client.post("/authors/search", data={"name": "Grace Hopper", "limit": "25"})
     assert response.status_code == 200
     assert "Grace Hopper" in response.text
+    assert "Search OpenAlex" in response.text
+    assert "After tracking" in response.text
+    assert 'aria-label="Track Grace Hopper"' in response.text
     assert instances[-1].search_calls == [("Grace Hopper", 25)]
     assert instances[-1].closed
 
@@ -302,7 +326,7 @@ def test_paper_detail_and_exports(config_path, seeded_web):
     assert "OpenAlex" in response.text
     assert "arXiv" in response.text
     assert "Track author" in response.text
-    assert "/papers?author=A123" in response.text
+    assert "/?author=A123" in response.text
     assert "https://openalex.org/authors/a123" in response.text
     assert "https://scholar.google.com/scholar?q=author%3A%22Ada+Lovelace%22" in response.text
     assert "https://arxiv.org/search/?query=Ada+Lovelace&amp;searchtype=author" in response.text
@@ -331,6 +355,7 @@ def test_local_pdf_download_and_path_guard(config_path, seeded_web, tmp_path):
     response = client.get(f"/papers/{paper_id}/pdf")
     assert response.status_code == 200
     assert response.content.startswith(b"%PDF")
+    assert response.headers["content-disposition"].startswith("inline")
     assert client.get(f"/papers/{second_id}/pdf").status_code == 404
     assert client.get("/papers/99999/pdf").status_code == 404
 
@@ -374,8 +399,10 @@ def test_run_pages_action_and_status_api(config_path, seeded_web):
     response = client.post("/actions/run", follow_redirects=False)
     assert response.status_code == 303
     assert "Fetch+started" in response.headers["location"]
-    response = client.post("/actions/run", follow_redirects=False)
+    assert controller.modes == ["run"]
+    response = client.post("/actions/backfill", follow_redirects=False)
     assert "already+running" in response.headers["location"]
+    assert controller.modes == ["run", "backfill"]
     status = client.get("/api/run-status").json()
     assert status["running"] is True
 
@@ -434,7 +461,8 @@ def test_analysis_error_is_rendered(config_path, seeded_web):
 def test_run_controller_success_busy_and_failure(tmp_path):
     gate = threading.Event()
 
-    def runner(_path):
+    def runner(_path, mode):
+        assert mode == "run"
         gate.wait(1)
         return {"run_id": "12", "status": "partial", "papers_found": 3}
 
@@ -450,11 +478,32 @@ def test_run_controller_success_busy_and_failure(tmp_path):
     assert snapshot.status == "partial"
     assert snapshot.stats["papers_found"] == 3
 
-    broken = RunController(tmp_path / "config.toml", runner=lambda _: (_ for _ in ()).throw(RuntimeError("boom")))
+    broken = RunController(
+        tmp_path / "config.toml",
+        runner=lambda _path, _mode: (_ for _ in ()).throw(RuntimeError("boom")),
+    )
     assert broken.start()
     broken.wait()
     assert broken.snapshot().error == "boom"
     assert broken.snapshot().status == "failed"
+
+
+def test_run_controller_records_backfill_mode(tmp_path):
+    calls = []
+
+    def runner(_path, mode):
+        calls.append(mode)
+        return {"run_id": 4, "status": "success"}
+
+    controller = RunController(tmp_path / "config.toml", runner=runner)
+    assert controller.start("backfill") is True
+    controller.wait()
+    snapshot = controller.snapshot()
+    assert calls == ["backfill"]
+    assert snapshot.mode == "backfill"
+    assert snapshot.run_id == 4
+    with pytest.raises(ValueError, match="Unknown run mode"):
+        controller.start("bad")
 
 
 def test_run_pipeline_wires_and_closes(monkeypatch, config_path):
@@ -480,8 +529,8 @@ def test_run_pipeline_wires_and_closes(monkeypatch, config_path):
         def __init__(self, *args, **kwargs):
             events.append((args, kwargs))
 
-        def run(self):
-            events.append("run")
+        def run(self, **kwargs):
+            events.append(("run", kwargs))
             return Stats()
 
         def close(self):
@@ -491,7 +540,18 @@ def test_run_pipeline_wires_and_closes(monkeypatch, config_path):
     monkeypatch.setattr("paperwatch.pipeline.PaperWatch", Watch)
     result = _run_pipeline(config_path)
     assert result["run_id"] == 7
+    assert ("run", {}) in events
     assert events[-2:] == ["watch-close", "services-close"]
+
+    events.clear()
+    result = _run_pipeline(config_path, "backfill")
+    assert result["run_id"] == 7
+    run_event = next(item for item in events if isinstance(item, tuple) and item[0] == "run")
+    kwargs = run_event[1]
+    assert kwargs["download_only"] is True
+    assert kwargs["historical"] is True
+    assert kwargs["max_papers_per_author_override"] == 5000
+    assert (kwargs["today"] - kwargs["since_override"]).days == 365
 
 
 def test_run_pipeline_closes_services_when_watch_construction_fails(monkeypatch, config_path):
@@ -607,3 +667,14 @@ def test_invalid_topic_filter_is_ignored(config_path, seeded_web):
     response = client.get("/", params={"topic": "A123"})
     assert response.status_code == 200
     assert "2 matching records" in response.text
+
+
+def test_backfill_action_starts_dedicated_mode(config_path, seeded_web):
+    controller = StubController(starts=[True])
+    client, _ = make_client(config_path, controller=controller)
+    response = client.post("/actions/backfill", follow_redirects=False)
+    assert response.status_code == 303
+    assert "One-year+PDF+backfill+started" in response.headers["location"]
+    assert controller.modes == ["backfill"]
+    page = client.get("/")
+    assert "One-year PDF backfill in progress" in page.text

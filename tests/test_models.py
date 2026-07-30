@@ -5,6 +5,7 @@ from pydantic import ValidationError
 
 from paperwatch.models import (
     AnalysisResult,
+    ChunkNotes,
     extract_arxiv_id,
     normalize_title,
     reconstruct_abstract,
@@ -56,6 +57,35 @@ def test_analysis_result_enforces_exact_schema_and_invariants(analysis_result):
     empty_author = {**payload, "authors": [""]}
     with pytest.raises(ValidationError, match="empty"):
         AnalysisResult.model_validate(empty_author)
+
+
+def test_chunk_notes_allow_intermediate_detail_but_remain_bounded():
+    detailed = "detail " * 400
+    notes = ChunkNotes(
+        section="Chunk 1",
+        substantive_content=detailed,
+        definitions=[detailed],
+        methods=[],
+        results=[],
+        assumptions=[],
+        evidence=[],
+        limitations=[],
+        bibliography_titles=[],
+    )
+    assert len(notes.substantive_content.split()) == 400
+
+    with pytest.raises(ValidationError, match="1200 words"):
+        ChunkNotes(
+            section="Chunk 1",
+            substantive_content="detail " * 1201,
+            definitions=[],
+            methods=[],
+            results=[],
+            assumptions=[],
+            evidence=[],
+            limitations=[],
+            bibliography_titles=[],
+        )
 
 
 def test_text_and_identifier_edge_cases():

@@ -4,8 +4,8 @@
 <section class="page-heading split">
   <div>
     <p class="eyebrow">Overview</p>
-    <h1>Research feed</h1>
-    <p>Track selected authors, fetch recent work, and inspect structured analyses.</p>
+    <h1>Diagnostics</h1>
+    <p>Inspect database coverage, fetch history, and processing errors.</p>
   </div>
   {% if run_state.running %}
   <div class="run-live">
@@ -19,7 +19,7 @@
   <article><strong>{{ stats.enabled_authors }}</strong><span>enabled authors</span><small>{{ stats.authors }} total</small></article>
   <article><strong>{{ stats.papers }}</strong><span>papers</span><small>{{ stats.with_abstract }} with abstracts</small></article>
   <article><strong>{{ stats.analyzed_papers }}</strong><span>analyzed papers</span><small>{{ stats.analyses }} analysis rows</small></article>
-  <article><strong>{{ stats.with_pdf }}</strong><span>PDF links</span><small>open or publisher sources</small></article>
+  <article><strong>{{ stats.with_pdf }}</strong><span>PDF links</span><small>downloaded files or source links</small></article>
 </section>
 
 <div class="grid-2">

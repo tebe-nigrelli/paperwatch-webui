@@ -183,6 +183,8 @@ class PaperWatch:
         *,
         paper_id: int,
         paper: PaperRecord,
+        analyze: bool,
+        analyze_new_downloads: bool,
     ) -> None:
         if not paper.pdf_url or not self.config.fetch.download_pdfs:
             return
@@ -198,28 +200,38 @@ class PaperWatch:
             stats.pdfs_downloaded += 1
         self.db.set_local_pdf(paper_id, str(destination))
 
-        if self.config.llm.analyze_pdfs and self.llm.provider != "none":
-            if self.llm.provider == "codex":
-                outcome = analyze_pdf_file(
-                    db=self.db,
-                    prompt_path=self.config.paths.prompt,
-                    llm_config=self.config.llm,
-                    llm=self.llm,
-                    paper_id=paper_id,
-                    paper=paper,
-                    pdf_path=destination,
-                )
-                if outcome.created:
-                    stats.papers_analyzed += 1
-            else:
-                text = extract_pdf_text(
-                    destination, max_chars=self.config.fetch.max_pdf_chars
-                )
-                self._analyze(
-                    stats, paper_id=paper_id, paper=paper, text=text, scope="fulltext"
-                )
+        should_analyze = analyze or (downloaded and analyze_new_downloads)
+        if not should_analyze or not self.config.llm.analyze_pdfs or self.llm.provider == "none":
+            return
+        if self.llm.provider == "codex":
+            outcome = analyze_pdf_file(
+                db=self.db,
+                prompt_path=self.config.paths.prompt,
+                llm_config=self.config.llm,
+                llm=self.llm,
+                paper_id=paper_id,
+                paper=paper,
+                pdf_path=destination,
+            )
+            if outcome.created:
+                stats.papers_analyzed += 1
+            return
+        text = extract_pdf_text(
+            destination, max_chars=self.config.fetch.max_pdf_chars
+        )
+        self._analyze(
+            stats, paper_id=paper_id, paper=paper, text=text, scope="fulltext"
+        )
 
-    def _process_paper(self, stats: RunStats, author_id: str, paper: PaperRecord) -> None:
+    def _process_paper(
+        self,
+        stats: RunStats,
+        author_id: str,
+        paper: PaperRecord,
+        *,
+        analyze: bool,
+        auto_analyze: bool,
+    ) -> None:
         try:
             paper = self._enrich_from_arxiv(paper)
         except Exception as exc:
@@ -231,8 +243,10 @@ class PaperWatch:
                 paper=paper,
             )
 
-        paper_id, _ = self.db.upsert_paper(paper)
-        if paper.abstract:
+        paper_id, _ = self.db.upsert_paper(paper, auto_analyze=auto_analyze)
+        stored = self.db.get_paper(paper_id)
+        analysis_allowed = analyze and bool(stored and stored["auto_analyze"])
+        if analysis_allowed and paper.abstract:
             try:
                 self._analyze(
                     stats,
@@ -255,6 +269,8 @@ class PaperWatch:
                 stats,
                 paper_id=paper_id,
                 paper=paper,
+                analyze=analysis_allowed,
+                analyze_new_downloads=analyze,
             )
         except Exception as exc:
             self._record_error(
@@ -269,16 +285,40 @@ class PaperWatch:
     def _run_identity(paper: PaperRecord) -> str:
         return paper.openalex_id or paper.doi or paper.arxiv_id or paper.identity_key
 
-    def run(self, *, today: date | None = None) -> RunStats:
+    def run(
+        self,
+        *,
+        today: date | None = None,
+        since_override: date | None = None,
+        download_only: bool = False,
+        historical: bool = False,
+        max_papers_per_author_override: int | None = None,
+    ) -> RunStats:
         with run_lock(self.config.paths.database):
-            return self._run_locked(today=today)
+            return self._run_locked(
+                today=today,
+                since_override=since_override,
+                download_only=download_only,
+                historical=historical,
+                max_papers_per_author_override=max_papers_per_author_override,
+            )
 
-    def _run_locked(self, *, today: date | None = None) -> RunStats:
+    def _run_locked(
+        self,
+        *,
+        today: date | None = None,
+        since_override: date | None = None,
+        download_only: bool = False,
+        historical: bool = False,
+        max_papers_per_author_override: int | None = None,
+    ) -> RunStats:
+        if max_papers_per_author_override is not None and max_papers_per_author_override < 1:
+            raise ValueError("max_papers_per_author_override must be at least 1")
         stats = RunStats()
         stats.run_id = self.db.start_run()
         current_day = today or datetime.now(timezone.utc).date()
         seen_papers: set[str] = set()
-        self._llm_available = self.llm.provider != "none"
+        self._llm_available = self.llm.provider != "none" and not download_only
         self._llm_preflight_failed = False
 
         try:
@@ -297,8 +337,11 @@ class PaperWatch:
                 try:
                     papers = self.openalex.recent_works(
                         author_id,
-                        since=self._since(author, current_day).isoformat(),
-                        max_results=self.config.fetch.max_papers_per_author,
+                        since=(since_override or self._since(author, current_day)).isoformat(),
+                        max_results=(
+                            max_papers_per_author_override
+                            or self.config.fetch.max_papers_per_author
+                        ),
                     )
                 except Exception as exc:
                     self._record_error(
@@ -314,7 +357,13 @@ class PaperWatch:
                     seen_papers.add(run_identity)
                     stats.papers_found += 1
                     try:
-                        self._process_paper(stats, author_id, paper)
+                        self._process_paper(
+                            stats,
+                            author_id,
+                            paper,
+                            analyze=not download_only,
+                            auto_analyze=not historical,
+                        )
                     except Exception as exc:
                         self._record_error(
                             stats,
@@ -323,10 +372,10 @@ class PaperWatch:
                             author_id=author_id,
                             paper=paper,
                         )
-                # If the configured model is unavailable, leave the initial-fetch
-                # cursor untouched so a later run can analyze the entire lookback
-                # window after the model is installed.
-                if not self._llm_preflight_failed:
+                # If the configured model is unavailable, leave the normal-run cursor
+                # untouched so a later run can analyze the complete pending window.
+                # Download-only backfills never require an LLM and may advance it.
+                if download_only or not self._llm_preflight_failed:
                     self.db.mark_author_checked(author_id)
 
             stats.status = "partial" if stats.errors_count else "success"
