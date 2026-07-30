@@ -1,0 +1,61 @@
+[paths]
+database = "paperwatch.db"
+pdf_dir = "data/pdfs"
+prompt = "prompts/analyze.txt"
+
+[openalex]
+api_key = "" # Prefer OPENALEX_API_KEY in the environment
+base_url = "https://api.openalex.org"
+timeout_seconds = 30
+
+[arxiv]
+enabled = true
+base_url = "https://export.arxiv.org/api/query"
+timeout_seconds = 30
+min_interval_seconds = 3
+title_match_threshold = 0.90
+
+[fetch]
+overlap_days = 30
+initial_lookback_days = 365
+max_papers_per_author = 500
+download_pdfs = true
+max_pdf_bytes = 50000000
+max_pdf_chars = 2000000
+
+[llm]
+provider = "ollama" # ollama | openai | none
+model = "qwen3:8b"
+base_url = "http://localhost:11434"
+api_key = "" # Prefer OPENAI_API_KEY in the environment
+timeout_seconds = 180
+max_input_chars = 100000
+context_window_tokens = 8192
+analyze_pdfs = true
+prompt_version = "v2"
+# Optional models shown in the paper-page multi-model picker.
+# The primary [llm] profile remains the model used by the daily fetch.
+#
+# [[llm_profiles]]
+# name = "large-local"
+# provider = "ollama"
+# model = "qwen3:30b"
+# base_url = "http://localhost:11434"
+# timeout_seconds = 300
+# max_input_chars = 100000
+# context_window_tokens = 8192
+# analyze_pdfs = true
+# prompt_version = "v2"
+#
+# [[llm_profiles]]
+# name = "openai-review"
+# provider = "openai"
+# model = "YOUR_SUPPORTED_MODEL"
+# base_url = "https://api.openai.com/v1"
+# api_key = "" # Prefer OPENAI_API_KEY
+# timeout_seconds = 300
+# max_input_chars = 100000
+# context_window_tokens = 8192
+# analyze_pdfs = true
+# prompt_version = "v2"
+

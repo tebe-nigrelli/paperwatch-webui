@@ -1,0 +1,81 @@
+# Python bytecode and caches
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.pyright/
+.ruff_cache/
+.cache/
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# Build and packaging artifacts
+build/
+dist/
+*.egg-info/
+.eggs/
+*.egg
+pip-wheel-metadata/
+
+# Test and coverage output
+.coverage
+.coverage.*
+coverage.xml
+htmlcov/
+
+# Local Paperwatch configuration and secrets
+config.toml
+.env
+.env.*
+!.env.example
+
+# Paperwatch runtime data
+*.csv
+*.db
+*.db-shm
+*.db-wal
+*.sqlite
+*.sqlite3
+*.lock
+data/
+pdfs/
+exports/
+logs/
+*.log
+paperwatch-author-import-report.csv
+
+# Generated analysis/export files
+*.jsonl
+*.csv.tmp
+*.json.tmp
+
+# Editors and IDEs
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS and desktop metadata
+.DS_Store
+Thumbs.db
+.directory
+
+# Local tooling
+.direnv/
+.envrc.local
+
+# Temporary files
+.tmp/
+tmp/
+*.tmp
+*.bak
+
+# Keep examples and source fixtures tracked
+!config.example.toml
+!tests/fixtures/**

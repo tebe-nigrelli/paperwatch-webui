@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="utf-8"?>
+<feed xmlns="http://www.w3.org/2005/Atom" xmlns:arxiv="http://arxiv.org/schemas/atom">
+  <title>ArXiv Query</title>
+  <entry>
+    <id>http://arxiv.org/abs/2607.12345v2</id>
+    <updated>2026-07-20T00:00:00Z</updated>
+    <published>2026-07-18T00:00:00Z</published>
+    <title>Minimal Agents for Reliable Machine Learning</title>
+    <summary>We introduce a compact agent architecture and evaluate it on three benchmarks.</summary>
+    <author><name>Ada Lovelace</name></author>
+    <author><name>Alan Turing</name></author>
+    <link href="http://arxiv.org/abs/2607.12345v2" rel="alternate" type="text/html"/>
+    <link title="pdf" href="https://arxiv.org/pdf/2607.12345v2" rel="related" type="application/pdf"/>
+    <arxiv:doi>10.1000/example</arxiv:doi>
+  </entry>
+</feed>

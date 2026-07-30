@@ -1,0 +1,41 @@
+{% extends "base.html" %}
+{% block title %}Recent papers · paperwatch{% endblock %}
+{% block content %}
+<section class="page-heading feed-heading">
+  <div><p class="eyebrow">Research feed</p><h1>{{ 'Recent papers' if is_home else 'Papers' }}</h1><p>{{ total }} matching records · newest first.</p></div>
+  <div class="button-group"><a class="button" href="/exports/papers.json{% if filters.query_string %}?{{ filters.query_string }}{% endif %}">JSON</a><a class="button" href="/exports/papers.csv{% if filters.query_string %}?{{ filters.query_string }}{% endif %}">CSV</a></div>
+</section>
+<section class="panel quick-filter">
+<form method="get" action="/" class="quick-filter-row">
+  <label class="grow"><span>Search title, abstract, or author</span><input name="q" value="{{ filters.query }}" placeholder="e.g. diffusion, scaling laws, author name"></label>
+  <label><span>Author</span><select name="author"><option value="">All authors</option>{% for author in authors %}<option value="{{ author.openalex_id }}" {% if filters.author_id == author.openalex_id %}selected{% endif %}>{{ author.name }}</option>{% endfor %}</select></label>
+  <label><span>Topic</span><select name="topic"><option value="">All topics</option>{% for topic in topics %}<option value="{{ topic.openalex_id }}" {% if filters.topic_id == topic.openalex_id %}selected{% endif %}>{{ topic.display_name }} ({{ topic.paper_count }})</option>{% endfor %}</select></label>
+  <button class="button button-primary" type="submit">Search</button>
+  {% if filters.query or filters.author_id or filters.topic_id %}<a class="button" href="/">Clear</a>{% endif %}
+</form>
+<details class="advanced-filters"><summary>More filters</summary>
+<form method="get" action="/" class="filter-grid">
+  <input type="hidden" name="q" value="{{ filters.query }}"><input type="hidden" name="author" value="{{ filters.author_id }}"><input type="hidden" name="topic" value="{{ filters.topic_id }}">
+  <label><span>Kind</span><select name="kind"><option value="">Any</option>{% for kind in paper_kinds %}<option value="{{ kind }}" {% if filters.paper_kind == kind %}selected{% endif %}>{{ kind|replace('_',' ') }}</option>{% endfor %}</select></label>
+  <label><span>Analysis</span><select name="analyzed"><option value="">Any</option><option value="yes" {% if filters.analyzed is sameas true %}selected{% endif %}>Analyzed</option><option value="no" {% if filters.analyzed is sameas false %}selected{% endif %}>Not analyzed</option></select></label>
+  <label><span>PDF</span><select name="has_pdf"><option value="">Any</option><option value="yes" {% if filters.has_pdf is sameas true %}selected{% endif %}>Available</option><option value="no" {% if filters.has_pdf is sameas false %}selected{% endif %}>Missing</option></select></label>
+  <label><span>Sort</span><select name="sort"><option value="newest">Newest</option><option value="discovered" {% if filters.sort=='discovered' %}selected{% endif %}>Recently fetched</option><option value="oldest" {% if filters.sort=='oldest' %}selected{% endif %}>Oldest</option><option value="title" {% if filters.sort=='title' %}selected{% endif %}>Title</option></select></label>
+  <label><span>From</span><input type="date" name="date_from" value="{{ filters.date_from }}"></label><label><span>To</span><input type="date" name="date_to" value="{{ filters.date_to }}"></label>
+  <button class="button" type="submit">Apply</button>
+</form></details>
+</section>
+<section class="paper-feed" aria-label="Recent papers">
+{% for paper in papers %}
+<article class="paper-card">
+  <div class="paper-meta"><span>{{ paper.publication_date or 'Unknown date' }}</span><span>{{ paper.venue or 'Venue unavailable' }}</span>{% if paper.latest_kind %}<span class="badge">{{ paper.latest_kind|replace('_',' ') }}</span>{% endif %}</div>
+  <h2><a href="/papers/{{ paper.id }}">{{ paper.title }}</a></h2>
+  <p class="authors">{{ paper.author_names or 'Authors unavailable' }}</p>
+  {% if paper.topics %}<div class="topic-tags" aria-label="OpenAlex topics">{% for topic in paper.topics %}<a class="tag topic-tag{% if topic.is_primary %} active{% endif %}" href="/?topic={{ topic.id }}" title="{% if topic.score is not none %}OpenAlex relevance {{ '%.3f'|format(topic.score) }}{% else %}OpenAlex topic{% endif %}">{{ topic.name }}</a>{% endfor %}</div>{% endif %}
+  {% if paper.latest_summary %}<p class="summary">{{ paper.latest_summary }}</p>{% elif paper.abstract %}<p class="summary">{{ paper.abstract[:600] }}{% if paper.abstract|length > 600 %}…{% endif %}</p>{% endif %}
+  <div class="paper-actions"><a class="button button-primary" href="/papers/{{ paper.id }}">Open summary</a>{% if paper.arxiv_url %}<a class="button" href="{{ paper.arxiv_url }}" target="_blank" rel="noreferrer">arXiv</a>{% endif %}<a class="button" href="{{ paper.google_scholar_url }}" target="_blank" rel="noreferrer">Scholar</a>{% if paper.openalex_url %}<a class="button" href="{{ paper.openalex_url }}" target="_blank" rel="noreferrer">OpenAlex</a>{% endif %}</div>
+</article>
+{% else %}<div class="panel empty">No papers match this search.</div>{% endfor %}
+</section>
+{% if recent_errors %}<details class="panel"><summary>Recent fetch errors</summary>{% for error in recent_errors %}<p><strong>{{ error.stage }}:</strong> {{ error.message }}</p>{% endfor %}</details>{% endif %}
+{% if pages > 1 %}<nav class="pagination" aria-label="Pagination">{% if filters.page > 1 %}<a class="button" href="/?{{ filters.query_items(page=filters.page-1)|querystring }}">Previous</a>{% endif %}<span>Page {{ filters.page }} of {{ pages }}</span>{% if filters.page < pages %}<a class="button" href="/?{{ filters.query_items(page=filters.page+1)|querystring }}">Next</a>{% endif %}</nav>{% endif %}
+{% endblock %}

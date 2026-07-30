@@ -1,0 +1,109 @@
+{
+  "id": "https://openalex.org/W456",
+  "doi": "https://doi.org/10.1000/example",
+  "display_name": "Minimal Agents for Reliable Machine Learning",
+  "publication_date": "2026-07-18",
+  "updated_date": "2026-07-20",
+  "abstract_inverted_index": {
+    "We": [
+      0
+    ],
+    "introduce": [
+      1
+    ],
+    "a": [
+      2
+    ],
+    "compact": [
+      3
+    ],
+    "agent": [
+      4
+    ],
+    "architecture.": [
+      5
+    ]
+  },
+  "authorships": [
+    {
+      "author_position": "first",
+      "is_corresponding": true,
+      "author": {
+        "id": "https://openalex.org/A123",
+        "display_name": "Ada Lovelace"
+      }
+    },
+    {
+      "author_position": "last",
+      "is_corresponding": false,
+      "author": {
+        "id": "https://openalex.org/A999",
+        "display_name": "Alan Turing"
+      }
+    }
+  ],
+  "primary_location": {
+    "landing_page_url": "https://doi.org/10.1000/example",
+    "source": {
+      "display_name": "Journal of Minimal ML"
+    }
+  },
+  "best_oa_location": {
+    "landing_page_url": "https://arxiv.org/abs/2607.12345",
+    "pdf_url": "https://arxiv.org/pdf/2607.12345.pdf"
+  },
+  "locations": [],
+  "topics": [
+    {
+      "id": "https://openalex.org/T100",
+      "display_name": "Machine Learning",
+      "score": 0.98,
+      "subfield": {
+        "id": "https://openalex.org/subfields/1702",
+        "display_name": "Artificial Intelligence"
+      },
+      "field": {
+        "id": "https://openalex.org/fields/17",
+        "display_name": "Computer Science"
+      },
+      "domain": {
+        "id": "https://openalex.org/domains/3",
+        "display_name": "Physical Sciences"
+      }
+    },
+    {
+      "id": "https://openalex.org/T200",
+      "display_name": "Autonomous Agents",
+      "score": 0.77,
+      "subfield": {
+        "id": "https://openalex.org/subfields/1702",
+        "display_name": "Artificial Intelligence"
+      },
+      "field": {
+        "id": "https://openalex.org/fields/17",
+        "display_name": "Computer Science"
+      },
+      "domain": {
+        "id": "https://openalex.org/domains/3",
+        "display_name": "Physical Sciences"
+      }
+    }
+  ],
+  "primary_topic": {
+    "id": "https://openalex.org/T100",
+    "display_name": "Machine Learning",
+    "score": 0.98,
+    "subfield": {
+      "id": "https://openalex.org/subfields/1702",
+      "display_name": "Artificial Intelligence"
+    },
+    "field": {
+      "id": "https://openalex.org/fields/17",
+      "display_name": "Computer Science"
+    },
+    "domain": {
+      "id": "https://openalex.org/domains/3",
+      "display_name": "Physical Sciences"
+    }
+  }
+}

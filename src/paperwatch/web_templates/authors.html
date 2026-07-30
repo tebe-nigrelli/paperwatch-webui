@@ -1,0 +1,32 @@
+{% extends "base.html" %}
+{% block title %}Authors · paperwatch{% endblock %}
+{% block content %}
+<section class="page-heading split"><div><p class="eyebrow">Tracking</p><h1>Authors</h1><p>Search, track, tag, pause, or archive authors from one page.</p></div></section>
+<section class="panel search-panel">
+  <form method="post" action="/authors/search" class="quick-filter-row">
+    <label class="grow"><span>Find an author on OpenAlex</span><input name="name" value="{{ search_name or '' }}" placeholder="e.g. Geoffrey Hinton" required></label>
+    <input type="hidden" name="limit" value="10"><button class="button button-primary" type="submit">Search</button>
+  </form>
+  {% if search_error %}<div class="notice notice-error">{{ search_error }}</div>{% endif %}
+  {% if search_results %}<div class="results-list">{% for item in search_results %}<article><div><h3>{{ item.name }}</h3><p>{{ item.institution or 'Institution unavailable' }} · {{ item.orcid or 'No ORCID' }}</p><small>{{ item.openalex_id }} · {{ item.works_count }} works</small></div><form method="post" action="/authors/{{ item.openalex_id }}/add"><button class="button button-primary" type="submit">Track</button></form></article>{% endfor %}</div>{% endif %}
+</section>
+<section class="panel">
+  <div class="panel-heading"><div><h2>Tracked authors</h2><p>Removing an author archives tracking but preserves all database records.</p></div><span>{{ authors|length }} visible</span></div>
+  <div class="tag-filter"><a class="tag {% if not active_tag %}active{% endif %}" href="/authors">All</a>{% for tag in tags %}<a class="tag {% if active_tag == tag.name %}active{% endif %}" href="/authors?tag={{ tag.name|urlencode }}">{{ tag.name }} <small>{{ tag.author_count }}</small></a>{% endfor %}</div>
+  <div class="author-list">
+  {% for author in authors %}
+  <article class="author-row">
+    <div class="author-main"><h3>{{ author.name }}</h3><p>{{ author.institution or 'Institution unavailable' }}</p><small>{{ author.openalex_id }}{% if author.orcid %} · {{ author.orcid }}{% endif %} · last checked {{ author.last_checked_at or 'never' }}</small>
+      <div class="tag-list">{% for tag in author.tags.split(', ') if tag %}<form method="post" action="/authors/{{ author.openalex_id }}/tags/remove"><input type="hidden" name="tag" value="{{ tag }}"><button class="tag tag-removable" title="Remove tag">{{ tag }} ×</button></form>{% endfor %}</div>
+    </div>
+    <div class="author-controls">
+      <div class="button-group"><a class="button button-small" href="/?author={{ author.openalex_id }}">Papers</a><a class="button button-small" href="https://openalex.org/authors/{{ author.openalex_id|lower }}" target="_blank" rel="noreferrer">OpenAlex</a><a class="button button-small" href="https://scholar.google.com/scholar?q=author%3A%22{{ author.name|urlencode }}%22" target="_blank" rel="noreferrer">Scholar</a><a class="button button-small" href="https://arxiv.org/search/?query={{ author.name|urlencode }}&searchtype=author" target="_blank" rel="noreferrer">arXiv</a></div>
+      <form method="post" action="/authors/{{ author.openalex_id }}/tags" class="tag-form"><input name="tag" list="tag-suggestions" placeholder="Add tag" maxlength="40" required><button class="button button-small" type="submit">Add</button></form>
+      <div class="button-group">{% if author.enabled %}<form method="post" action="/authors/{{ author.openalex_id }}/disable"><button class="button button-small" type="submit">Pause</button></form>{% else %}<form method="post" action="/authors/{{ author.openalex_id }}/enable"><button class="button button-small" type="submit">Resume</button></form>{% endif %}<form method="post" action="/authors/{{ author.openalex_id }}/remove" data-confirm="Remove this author from the tracking list? Stored papers and history remain."><button class="button button-small button-danger" type="submit">Remove</button></form></div>
+    </div>
+  </article>
+  {% else %}<div class="empty">No authors match this tag.</div>{% endfor %}
+  </div>
+  <datalist id="tag-suggestions">{% for tag in tags %}<option value="{{ tag.name }}">{% endfor %}</datalist>
+</section>
+{% endblock %}

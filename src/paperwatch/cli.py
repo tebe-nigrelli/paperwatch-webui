@@ -1,0 +1,258 @@
+from __future__ import annotations
+
+import argparse
+import shutil
+import sys
+from dataclasses import dataclass
+from datetime import date
+from importlib.resources import as_file, files
+from pathlib import Path
+from typing import Sequence
+
+from .config import AppConfig, ConfigError, load_config
+from .db import Database
+from .llm import LLMClient, create_llm
+from .pipeline import PaperWatch
+from .sources.arxiv import ArxivClient
+from .sources.openalex import OpenAlexClient
+
+
+@dataclass
+class Services:
+    config: AppConfig
+    db: Database
+    openalex: OpenAlexClient
+    arxiv: ArxivClient | None
+    llm: LLMClient
+
+    def close(self) -> None:
+        self.openalex.close()
+        if self.arxiv:
+            self.arxiv.close()
+        self.llm.close()
+        self.db.close()
+
+
+def build_services(config: AppConfig) -> Services:
+    return Services(
+        config=config,
+        db=Database(config.paths.database),
+        openalex=OpenAlexClient(
+            api_key=config.openalex.api_key,
+            base_url=config.openalex.base_url,
+            timeout_seconds=config.openalex.timeout_seconds,
+        ),
+        arxiv=(
+            ArxivClient(
+                base_url=config.arxiv.base_url,
+                timeout_seconds=config.arxiv.timeout_seconds,
+                min_interval_seconds=config.arxiv.min_interval_seconds,
+                title_match_threshold=config.arxiv.title_match_threshold,
+            )
+            if config.arxiv.enabled
+            else None
+        ),
+        llm=create_llm(config.llm),
+    )
+
+
+def _positive_int(value: str) -> int:
+    parsed = int(value)
+    if parsed < 1:
+        raise argparse.ArgumentTypeError("must be at least 1")
+    return parsed
+
+
+def _iso_date(value: str) -> date:
+    try:
+        return date.fromisoformat(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("must be an ISO date in YYYY-MM-DD format") from exc
+
+
+def _parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(prog="paperwatch")
+    parser.add_argument("--config", default="config.toml", help="Path to TOML configuration")
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    init = sub.add_parser("init", help="Create a starter configuration")
+    init.add_argument("path", nargs="?", default="config.toml")
+
+    author = sub.add_parser("author", help="Manage tracked authors")
+    author_sub = author.add_subparsers(dest="author_command", required=True)
+    search = author_sub.add_parser("search")
+    search.add_argument("name")
+    search.add_argument("--limit", type=_positive_int, default=10)
+    add = author_sub.add_parser("add")
+    add.add_argument("openalex_id")
+    author_sub.add_parser("list")
+    enable = author_sub.add_parser("enable")
+    enable.add_argument("openalex_id")
+    disable = author_sub.add_parser("disable")
+    disable.add_argument("openalex_id")
+    remove = author_sub.add_parser("remove")
+    remove.add_argument("openalex_id")
+
+    run = sub.add_parser("run", help="Fetch and analyze recent papers")
+    run.add_argument("--today", type=_iso_date, help="Testing override in YYYY-MM-DD format")
+
+    papers = sub.add_parser("papers", help="List stored papers")
+    papers.add_argument("--limit", type=_positive_int, default=20)
+
+    runs = sub.add_parser("runs", help="List previous runs")
+    runs.add_argument("--limit", type=_positive_int, default=20)
+
+    web = sub.add_parser("web", help="Run the local web interface")
+    web.add_argument("--host", default="127.0.0.1")
+    web.add_argument("--port", type=_positive_int, default=8765)
+    web.add_argument(
+        "--log-level",
+        choices=("critical", "error", "warning", "info", "debug", "trace"),
+        default="info",
+    )
+    return parser
+
+
+def _init_config(path: str) -> int:
+    destination = Path(path).expanduser()
+    if destination.exists():
+        print(f"Refusing to overwrite {destination}", file=sys.stderr)
+        return 2
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    template_ref = files("paperwatch").joinpath("defaults/config.toml")
+    prompt_ref = files("paperwatch").joinpath("defaults/analyze.txt")
+    with as_file(template_ref) as template:
+        shutil.copyfile(template, destination)
+    prompt_destination = destination.parent / "prompts" / "analyze.txt"
+    prompt_destination.parent.mkdir(parents=True, exist_ok=True)
+    if not prompt_destination.exists():
+        with as_file(prompt_ref) as prompt_source:
+            shutil.copyfile(prompt_source, prompt_destination)
+    print(destination)
+    return 0
+
+
+def _author_command(args: argparse.Namespace, services: Services) -> int:
+    if args.author_command == "search":
+        results = services.openalex.search_authors(args.name, limit=args.limit)
+        for index, author in enumerate(results, 1):
+            institution = author.institution or "unknown institution"
+            orcid = author.orcid or "no ORCID"
+            print(
+                f"{index}. {author.name} | {institution} | {author.openalex_id} | "
+                f"{orcid} | works={author.works_count} citations={author.cited_by_count}"
+            )
+        return 0
+    if args.author_command == "add":
+        author = services.openalex.get_author(args.openalex_id)
+        services.db.add_author(author)
+        print(f"Added {author.name} ({author.openalex_id})")
+        return 0
+    if args.author_command == "list":
+        for author in services.db.list_authors(tracked_only=True):
+            state = "enabled" if author["enabled"] else "disabled"
+            institution = author["institution"] or "unknown institution"
+            print(f"{author['openalex_id']} | {author['name']} | {institution} | {state}")
+        return 0
+    if args.author_command in {"enable", "disable"}:
+        enabled = args.author_command == "enable"
+        changed = services.db.set_author_enabled(args.openalex_id, enabled)
+        if not changed:
+            print("Author not found", file=sys.stderr)
+            return 1
+        print(f"{args.openalex_id}: {'enabled' if enabled else 'disabled'}")
+        return 0
+    if args.author_command == "remove":
+        if not services.db.remove_author(args.openalex_id):
+            print("Author not found", file=sys.stderr)
+            return 1
+        print(f"Removed {args.openalex_id} from tracking; database record retained")
+        return 0
+    return 2
+
+
+def _run(args: argparse.Namespace, services: Services) -> int:
+    app = PaperWatch(
+        services.config,
+        db=services.db,
+        openalex=services.openalex,
+        arxiv=services.arxiv,
+        llm=services.llm,
+    )
+    try:
+        stats = app.run(today=args.today)
+    finally:
+        app.close()
+    print(
+        f"run={stats.run_id} status={stats.status} authors={stats.authors_checked} "
+        f"papers={stats.papers_found} analyses={stats.papers_analyzed} "
+        f"pdfs={stats.pdfs_downloaded} errors={stats.errors_count}"
+    )
+    return 0 if stats.status == "success" else 1
+
+
+def _list_papers(args: argparse.Namespace, services: Services) -> int:
+    for paper in services.db.list_papers(args.limit):
+        published = paper["publication_date"] or "unknown date"
+        local = paper["local_pdf_path"] or "no local PDF"
+        print(f"{paper['id']} | {published} | {paper['title']} | {local}")
+    return 0
+
+
+def _list_runs(args: argparse.Namespace, services: Services) -> int:
+    for run in services.db.list_runs(args.limit):
+        print(
+            f"{run['id']} | {run['started_at']} | {run['status']} | "
+            f"authors={run['authors_checked']} papers={run['papers_found']} "
+            f"analyses={run['papers_analyzed']} errors={run['errors_count']}"
+        )
+    return 0
+
+
+
+def _serve_web(args: argparse.Namespace) -> int:
+    import uvicorn
+
+    from .web import create_app
+
+    app = create_app(args.config)
+    uvicorn.run(app, host=args.host, port=args.port, log_level=args.log_level)
+    return 0
+
+def main(argv: Sequence[str] | None = None) -> int:
+    args = _parser().parse_args(argv)
+    if args.command == "init":
+        return _init_config(args.path)
+    if args.command == "web":
+        try:
+            return _serve_web(args)
+        except (ConfigError, OSError, ValueError) as exc:
+            print(str(exc), file=sys.stderr)
+            return 2
+
+    try:
+        config = load_config(args.config)
+        services = build_services(config)
+    except (ConfigError, OSError, ValueError) as exc:
+        print(str(exc), file=sys.stderr)
+        return 2
+
+    try:
+        if args.command == "author":
+            return _author_command(args, services)
+        if args.command == "run":
+            return _run(args, services)
+        if args.command == "papers":
+            return _list_papers(args, services)
+        if args.command == "runs":
+            return _list_runs(args, services)
+        return 2
+    except Exception as exc:
+        print(str(exc), file=sys.stderr)
+        return 1
+    finally:
+        services.close()
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

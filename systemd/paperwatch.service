@@ -1,0 +1,13 @@
+[Unit]
+Description=Fetch and analyze recent papers
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+EnvironmentFile=-%h/.config/paperwatch/env
+WorkingDirectory=%h/.local/share/paperwatch
+ExecStart=%h/.local/share/paperwatch/.venv/bin/paperwatch --config %h/.config/paperwatch/config.toml run
+
+[Install]
+WantedBy=default.target

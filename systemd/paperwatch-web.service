@@ -1,0 +1,15 @@
+[Unit]
+Description=Paperwatch local web interface
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+EnvironmentFile=-%h/.config/paperwatch/env
+WorkingDirectory=%h/.local/share/paperwatch
+ExecStart=%h/.local/share/paperwatch/.venv/bin/paperwatch --config %h/.config/paperwatch/config.toml web --host 127.0.0.1 --port 8765
+Restart=on-failure
+RestartSec=5s
+
+[Install]
+WantedBy=default.target

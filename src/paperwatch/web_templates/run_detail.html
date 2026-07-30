@@ -1,0 +1,10 @@
+{% extends "base.html" %}
+{% block title %}Run #{{ run.id }} · paperwatch{% endblock %}
+{% block content %}
+<section class="page-heading split"><div><p class="eyebrow">Run #{{ run.id }}</p><h1>{{ run.status|capitalize }}</h1><p>{{ run.started_at }} → {{ run.finished_at or 'still running' }}</p></div><span class="status status-{{ run.status }} large">{{ run.status }}</span></section>
+<section class="metrics"><article><strong>{{ run.authors_checked }}</strong><span>authors checked</span></article><article><strong>{{ run.papers_found }}</strong><span>papers found</span></article><article><strong>{{ run.papers_analyzed }}</strong><span>analyses saved</span></article><article><strong>{{ run.pdfs_downloaded }}</strong><span>PDFs downloaded</span></article></section>
+{% if run.error_text %}<div class="notice notice-error">{{ run.error_text }}</div>{% endif %}
+<section class="panel"><div class="panel-heading"><h2>Errors</h2><span>{{ errors|length }}</span></div>
+{% for error in errors %}<article class="error-item"><div><span class="badge badge-error">{{ error.stage }}</span><span>{{ error.created_at }}</span></div><p>{{ error.message }}</p>{% if error.author_openalex_id %}<small>Author: {{ error.author_openalex_id }}</small>{% endif %}{% if error.paper_identity_key %}<small> · Paper: {{ error.paper_identity_key }}</small>{% endif %}</article>{% else %}<div class="empty">No errors in this run.</div>{% endfor %}
+</section>
+{% endblock %}

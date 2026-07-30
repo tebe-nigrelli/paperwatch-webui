@@ -1,0 +1,40 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light dark">
+  <title>{% block title %}paperwatch{% endblock %}</title>
+  <link rel="stylesheet" href="{{ url_for('static', path='app.css') }}">
+  <script defer src="{{ url_for('static', path='app.js') }}"></script>
+</head>
+<body data-run-running="{{ 'true' if run_state.running else 'false' }}" data-analysis-running="{{ 'true' if analysis_state.running else 'false' }}" data-query-running="{{ 'true' if query_state.running else 'false' }}">
+<header class="site-header">
+  <div class="shell header-inner">
+    <a class="brand" href="/">paperwatch</a>
+    <nav aria-label="Primary navigation">
+      <a href="/">Recent</a>
+      <a href="/authors">Authors</a>
+      <a href="/queries">Queries</a>
+      <a href="/runs">Runs</a>
+    </nav>
+    <form class="header-search" method="get" action="/">
+      <input name="q" aria-label="Search papers" placeholder="Search papers">
+    </form>
+    <form method="post" action="/actions/run" class="run-form">
+      <button class="button button-primary" type="submit" {% if run_state.running %}disabled{% endif %}>{{ 'Fetching…' if run_state.running else 'Fetch now' }}</button>
+    </form>
+  </div>
+</header>
+<main class="shell">
+  {% if run_state.running %}<div class="notice notice-warning">Fetch in progress{% if run_state.started_at %} · started {{ run_state.started_at }}{% endif %}</div>{% endif %}
+  {% if notice %}<div class="notice notice-{{ notice_level }}" role="status">{{ notice }}</div>{% endif %}
+  {% if run_state.error %}<div class="notice notice-error">Fetch failed: {{ run_state.error }}</div>{% endif %}
+  {% if analysis_state.error %}<div class="notice notice-error">Analysis failed: {{ analysis_state.error }}</div>{% endif %}
+  {% if query_state.error %}<div class="notice notice-error">Collection query failed: {{ query_state.error }}</div>{% endif %}
+  {% block content %}{% endblock %}
+</main>
+<button id="theme-toggle" class="theme-toggle" type="button" aria-label="Toggle dark mode" title="Toggle light/dark theme">◐</button>
+<footer class="shell footer"><a href="/dashboard">Diagnostics</a><span>Local research-paper monitor</span></footer>
+</body>
+</html>

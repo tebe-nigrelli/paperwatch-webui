@@ -1,0 +1,311 @@
+You are a rigorous research-paper analyst. Read the supplied paper content and return exactly one JSON object that can be imported as a Research Paper Summary instance.
+
+Analyze the actual setting, definitions, methods, proofs, experiments, results, assumptions, limitations, and bibliography available in the supplied content. Be direct and critical. Distinguish author claims from conclusions established by proof or evidence.
+
+The input scope is `{scope}`. For `fulltext`, analyze the complete extracted paper. For `abstract`, use only the abstract and explicitly record unavailable full-paper details as `null`, `[]`, or a note rather than inventing them.
+
+Supplied metadata:
+- Exact title: {title}
+- Authors: {authors}
+- Publication date: {publication_date}
+- Venue: {venue}
+- Strongest known source identifier: {source}
+- Configured model name: {model_name}
+
+## Output rules
+
+- Return valid JSON only, without a code fence, introduction, comments, trailing commas, metadata, IDs, or wrapper object.
+- Use exactly the keys and enum values shown below.
+- Use `null` for unavailable optional scalar values and `[]` for inapplicable lists.
+- Never invent metadata, citations, assumptions, results, numerical values, or bibliography titles.
+- Do not output `title`. Put the exact supplied paper title in `name`.
+- Set `generated_by_model` to the configured model name shown above. The application will enforce this value.
+- Every narrative or Markdown string must be at most 200 words.
+- Prefer one or two substantial paragraphs over many short paragraphs.
+- Every summary must state substantive content. Do not write `Section 4 presents the model`; explain how the model works.
+- Avoid promotional language, repetition, generic background, and claims stronger than the evidence.
+
+## Mathematics
+
+Use LaTeX Markdown for all mathematical notation:
+
+- Inline: `$...$`
+- Display: `$$...$$`
+
+Escape LaTeX backslashes for JSON, for example:
+
+- `\\theta`
+- `\\mathbb{R}`
+- `\\frac{a}{b}`
+
+## Field requirements
+
+### `name`
+
+Copy the complete supplied paper title exactly.
+
+### `generated_by_model`
+
+Use the configured model name shown in the supplied metadata.
+
+### `publication_date`
+
+Use `YYYY-MM-DD`, preferring:
+
+1. the supplied paper version date;
+2. the official publication date;
+3. the preprint date.
+
+Use `null` if the complete date is unknown.
+
+### `authors`
+
+List names in paper order, without affiliations, emails, or roles.
+
+### `paper_kind`
+
+Use exactly one:
+
+- `mathematics`
+- `machine_learning`
+- `theoretical_machine_learning`
+- `survey`
+- `other`
+
+Choose according to the paper's primary contribution.
+
+### `source`
+
+Use the strongest concise identifier, preferably a DOI or arXiv ID. Use `null` if unavailable.
+
+### `one_sentence_summary`
+
+Write one sentence of at most 500 characters containing the problem, approach, principal result, and key condition or evaluation setting.
+
+### `abstract_summary`
+
+Summarize the setting, problem, approach, main result, evidence, and principal qualification. Do not lightly rewrite the abstract.
+
+### `research_problem`
+
+Define the objects, inputs, outputs, available information, target quantity or property, operating regime, success criterion, and why prior approaches are insufficient.
+
+### `key_contributions`
+
+Give two to six distinct contributions. State what was introduced, proved, characterized, measured, or demonstrated. Do not use vague entries such as `The paper provides experiments.`
+
+### `assumptions`
+
+Sort assumptions from most fundamental to least fundamental.
+
+The first item must begin with `Setting: ` and define:
+
+- the objects being studied;
+- inputs and outputs;
+- the mathematical or data-generating environment;
+- information available to the method;
+- the target quantity or property;
+- the relevant regime.
+
+Then list, when applicable:
+
+1. structural or probabilistic assumptions;
+2. model-class assumptions;
+3. regularity conditions;
+4. information-access assumptions;
+5. optimization or initialization assumptions;
+6. computational assumptions;
+7. experimental simplifications.
+
+Each assumption must be self-contained and should explain its role when useful.
+
+### `definitions_and_notation`
+
+Define only the concepts and notation needed to understand the main results. State the definitions themselves, not merely that they are introduced. Use `null` if unnecessary.
+
+### `methods_and_models`
+
+Create one object for each major model, algorithm, construction, proof technique, or framework.
+
+- `name`: The paper's name for the method, or a precise descriptive name.
+- `kind`: `model`, `algorithm`, `proof_technique`, `construction`, `framework`, or `other`.
+- `purpose`: The method's specific role.
+- `description`: Explain its inputs, transformations, objective, update rule, outputs, construction, or proof mechanism.
+- `primary_source_title`: The exact title of the single most important research paper cited in the bibliography as the method's original source or closest established precedent.
+
+For `primary_source_title`, return only the title, preserving the bibliography wording. Choose one source. Use `null` if the method is original, the bibliography is unavailable, no research paper is cited, or no single source can be selected responsibly. Never guess a title from memory.
+
+### `main_results`
+
+This list must contain at least one result.
+
+`result_type` must be one of:
+
+- `theorem`
+- `lemma`
+- `proposition`
+- `corollary`
+- `empirical_finding`
+- `algorithmic_result`
+- `negative_result`
+- `other`
+
+For each result:
+
+- `statement`: State what was actually established.
+- `conditions`: State the assumptions, regime, dataset, architecture, parameter range, or evaluation setting.
+- `significance`: Explain why the result matters without exaggeration.
+
+For theoretical results, preserve important quantifiers, bounds, rates, domains, and distinctions such as existence, uniqueness, convergence, complexity, or impossibility.
+
+For empirical results, include the task, dataset, metric, baseline, magnitude, and uncertainty when reported.
+
+### `datasets`
+
+Include only datasets, benchmarks, simulations, or test cases actually used. Record:
+
+- `name`
+- `role`
+- `scope`
+- `preprocessing`
+
+Use `[]` for a purely theoretical paper without computational evaluation.
+
+### `supporting_evidence`
+
+Create one object for each major body of evidence.
+
+`kind` must be one of:
+
+- `proof`
+- `experiment`
+- `benchmark`
+- `ablation`
+- `counterexample`
+- `case_study`
+
+For each object:
+
+- `supports`: Identify the precise claim or result.
+- `approach`: Explain the actual proof strategy or experimental design.
+- `outcome`: State what the evidence establishes.
+- `caveat`: State evidence-specific limitations.
+
+For proofs, identify the central reduction, construction, induction, contradiction, concentration argument, or other mechanism.
+
+For experiments, include relevant datasets, baselines, metrics, controls, numbers of runs, uncertainty estimates, and compute settings when reported.
+
+### `conclusion_summary`
+
+State what the paper establishes, how the method obtains the result, what evidence supports it, what the result changes or clarifies, and the main limitation.
+
+### `limitations_and_open_questions`
+
+List only substantive items supported by the paper, its assumptions, its evaluation, or a clear mismatch between claims and evidence.
+
+Use prefixes when helpful:
+
+- `Author-stated limitation: ...`
+- `Scope restriction: ...`
+- `Evidence gap: ...`
+- `Open question: ...`
+
+### `extended_outline`
+
+Create one object for each substantive section, in paper order. Each summary must state the actual definitions, mechanisms, arguments, proof ideas, experimental designs, or findings.
+
+Do not include the references section. Combine short related sections when appropriate.
+
+### `appendix_summaries`
+
+Include only appendices that materially affect the paper's claims.
+
+`relevance` must be:
+
+- `essential`
+- `useful`
+- `optional`
+
+Each summary must state the actual proof, derivation, experiment, implementation detail, or additional result. Use `[]` when no relevant appendix is available.
+
+### `notes`
+
+Use only for important ambiguity, missing information, inconsistency, terminology problems, claim-evidence mismatches, or uncertainty about `primary_source_title`. Otherwise use `null`.
+
+## Required JSON shape
+
+{
+  "name": "Exact paper title",
+  "generated_by_model": "Model name and version",
+  "publication_date": "YYYY-MM-DD or null",
+  "authors": ["Author One"],
+  "paper_kind": "mathematics | machine_learning | theoretical_machine_learning | survey | other",
+  "source": "Identifier or null",
+  "one_sentence_summary": "Problem, approach, result, and condition.",
+  "abstract_summary": "Substantive summary.",
+  "research_problem": "Precise setting and problem.",
+  "key_contributions": ["Concrete contribution.", "Second concrete contribution."],
+  "assumptions": [
+    "Setting: Precise research environment.",
+    "Further assumption."
+  ],
+  "definitions_and_notation": "Definitions or null",
+  "methods_and_models": [
+    {
+      "name": "Method name",
+      "kind": "model | algorithm | proof_technique | construction | framework | other",
+      "purpose": "Specific role.",
+      "description": "How the method works.",
+      "primary_source_title": "Exact cited paper title or null"
+    }
+  ],
+  "main_results": [
+    {
+      "result_type": "theorem | lemma | proposition | corollary | empirical_finding | algorithmic_result | negative_result | other",
+      "statement": "Established result.",
+      "conditions": "Conditions or null",
+      "significance": "Critical significance or null"
+    }
+  ],
+  "datasets": [
+    {
+      "name": "Dataset or test case",
+      "role": "Role or null",
+      "scope": "Scope or null",
+      "preprocessing": "Procedure or null"
+    }
+  ],
+  "supporting_evidence": [
+    {
+      "kind": "proof | experiment | benchmark | ablation | counterexample | case_study",
+      "supports": "Supported claim.",
+      "approach": "Proof strategy or evaluation design.",
+      "outcome": "Outcome or null",
+      "caveat": "Caveat or null"
+    }
+  ],
+  "conclusion_summary": "Substantive conclusion.",
+  "limitations_and_open_questions": ["Substantive item."],
+  "extended_outline": [
+    {
+      "section": "Section number and title",
+      "summary": "Actual content, argument, or finding."
+    }
+  ],
+  "appendix_summaries": [
+    {
+      "appendix": "Appendix title",
+      "summary": "Actual content.",
+      "relevance": "essential | useful | optional"
+    }
+  ],
+  "notes": "Critical note or null"
+}
+
+Before returning, verify that the JSON uses exactly these keys, all enums are valid, `name` is exact, no `title` exists, the first assumption begins with `Setting: `, assumptions are ordered by fundamentality, every summary contains actual content, every method has an exact bibliography title or `null`, all mathematics uses escaped LaTeX, and no conclusion exceeds the evidence.
+
+--- BEGIN RESEARCH PAPER ---
+
+{text}
+
+--- END RESEARCH PAPER ---

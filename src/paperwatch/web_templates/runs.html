@@ -1,0 +1,8 @@
+{% extends "base.html" %}
+{% block title %}Runs · paperwatch{% endblock %}
+{% block content %}
+<section class="page-heading"><p class="eyebrow">Operations</p><h1>Fetch history</h1><p>Every daily or manually triggered pipeline execution.</p></section>
+<section class="panel"><div class="table-wrap"><table><thead><tr><th>Run</th><th>Started</th><th>Finished</th><th>Status</th><th>Authors</th><th>Papers</th><th>Analyses</th><th>PDFs</th><th>Errors</th></tr></thead><tbody>
+{% for run in runs %}<tr><td><a href="/runs/{{ run.id }}">#{{ run.id }}</a></td><td>{{ run.started_at }}</td><td>{{ run.finished_at or 'Running' }}</td><td><span class="status status-{{ run.status }}">{{ run.status }}</span></td><td>{{ run.authors_checked }}</td><td>{{ run.papers_found }}</td><td>{{ run.papers_analyzed }}</td><td>{{ run.pdfs_downloaded }}</td><td>{{ run.errors_count }}</td></tr>{% else %}<tr><td colspan="9">No runs recorded.</td></tr>{% endfor %}
+</tbody></table></div></section>
+{% endblock %}

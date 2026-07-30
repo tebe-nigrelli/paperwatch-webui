@@ -1,0 +1,11 @@
+[Unit]
+Description=Run paperwatch once per day
+
+[Timer]
+OnCalendar=daily
+Persistent=true
+RandomizedDelaySec=30m
+Unit=paperwatch.service
+
+[Install]
+WantedBy=timers.target
