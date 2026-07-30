@@ -1,0 +1,28 @@
+{% extends "base.html" %}
+{% block title %}{{ analysis.scope|capitalize }} analysis · {{ analysis.model }} · paperwatch{% endblock %}
+{% block content %}
+<section class="page-heading paper-heading">
+  <div class="paper-meta"><span>{{ analysis.provider }}</span><span>{{ analysis.created_at }}</span><span>{{ analysis.analysis_strategy }}</span></div>
+  <h1>{{ analysis.scope|capitalize }} analysis · {{ analysis.model }}</h1>
+  <p><a href="/papers/{{ paper.id }}">{{ paper.title }}</a></p>
+  <div class="button-group links">
+    <a class="button button-primary" href="/papers/{{ paper.id }}">Back to paper</a>
+    <a class="button" href="/analyses/{{ analysis.id }}/export.json">Export JSON</a>
+  </div>
+</section>
+
+<section class="analysis panel">
+  <div class="panel-heading"><div><p>{{ analysis.provider }} · {{ analysis.created_at }} · {{ analysis.analysis_strategy }}{% if analysis.context_window_tokens %} · {{ analysis.context_window_tokens }} tokens{% endif %}</p></div><span class="badge">{{ analysis.result.paper_kind|replace('_',' ') }}</span></div>
+  <p class="lead">{{ analysis.result.one_sentence_summary }}</p>
+  <div class="analysis-grid"><section><h3>Abstract summary</h3><p>{{ analysis.result.abstract_summary }}</p></section><section><h3>Research problem</h3><p>{{ analysis.result.research_problem }}</p></section><section><h3>Conclusion</h3><p>{{ analysis.result.conclusion_summary }}</p></section>{% if analysis.result.definitions_and_notation %}<section><h3>Definitions and notation</h3><p>{{ analysis.result.definitions_and_notation }}</p></section>{% endif %}</div>
+  <div class="grid-2"><section><h3>Key contributions</h3><ol>{% for item in analysis.result.key_contributions %}<li>{{ item }}</li>{% endfor %}</ol></section><section><h3>Assumptions</h3><ol>{% for item in analysis.result.assumptions %}<li>{{ item }}</li>{% endfor %}</ol></section></div>
+  <h3>Methods and models</h3><div class="object-list">{% for item in analysis.result.methods_and_models %}<article><div><strong>{{ item.name }}</strong><span class="badge">{{ item.kind|replace('_',' ') }}</span></div><p><b>Purpose:</b> {{ item.purpose }}</p><p>{{ item.description }}</p>{% if item.primary_source_title %}<small>Primary source: {{ item.primary_source_title }}</small>{% endif %}</article>{% else %}<p class="muted">None listed.</p>{% endfor %}</div>
+  <h3>Main results</h3><div class="object-list">{% for item in analysis.result.main_results %}<article><span class="badge">{{ item.result_type|replace('_',' ') }}</span><p>{{ item.statement }}</p>{% if item.conditions %}<p><b>Conditions:</b> {{ item.conditions }}</p>{% endif %}{% if item.significance %}<p><b>Significance:</b> {{ item.significance }}</p>{% endif %}</article>{% endfor %}</div>
+  <div class="grid-2"><section><h3>Datasets and test cases</h3><div class="object-list">{% for item in analysis.result.datasets %}<article><strong>{{ item.name }}</strong>{% if item.role %}<p>{{ item.role }}</p>{% endif %}{% if item.scope %}<small>{{ item.scope }}</small>{% endif %}</article>{% else %}<p class="muted">No datasets or computational test cases.</p>{% endfor %}</div></section><section><h3>Supporting evidence</h3><div class="object-list">{% for item in analysis.result.supporting_evidence %}<article><span class="badge">{{ item.kind }}</span><p><b>Supports:</b> {{ item.supports }}</p><p>{{ item.approach }}</p>{% if item.outcome %}<p><b>Outcome:</b> {{ item.outcome }}</p>{% endif %}{% if item.caveat %}<p><b>Caveat:</b> {{ item.caveat }}</p>{% endif %}</article>{% else %}<p class="muted">No supporting evidence listed.</p>{% endfor %}</div></section></div>
+  <h3>Limitations and open questions</h3><ul>{% for item in analysis.result.limitations_and_open_questions %}<li>{{ item }}</li>{% else %}<li>None listed.</li>{% endfor %}</ul>
+  <h3>Extended outline</h3><div class="timeline">{% for item in analysis.result.extended_outline %}<article><strong>{{ item.section }}</strong><p>{{ item.summary }}</p></article>{% else %}<p class="muted">No section outline.</p>{% endfor %}</div>
+  {% if analysis.result.appendix_summaries %}<h3>Relevant appendices</h3><div class="object-list">{% for item in analysis.result.appendix_summaries %}<article><div><strong>{{ item.appendix }}</strong><span class="badge">{{ item.relevance }}</span></div><p>{{ item.summary }}</p></article>{% endfor %}</div>{% endif %}
+  {% if analysis.result.notes %}<div class="notice notice-warning"><strong>Analyst note:</strong> {{ analysis.result.notes }}</div>{% endif %}
+  <details><summary>Raw JSON and usage</summary><pre>{{ analysis.result|prettyjson }}</pre>{% if analysis.usage %}<pre>{{ analysis.usage|prettyjson }}</pre>{% endif %}</details>
+</section>
+{% endblock %}

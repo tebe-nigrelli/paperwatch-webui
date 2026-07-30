@@ -892,7 +892,6 @@ def create_app(
                 0,
             )
             topic_rows = [dict(row) for row in db.paper_topics(paper_id)]
-            analyses = [_analysis_view(row) for row in db.paper_analyses(paper_id)]
             analysis_tasks = [
                 dict(row) for row in db.visible_analysis_tasks_for_paper(paper_id)
             ]
@@ -907,7 +906,6 @@ def create_app(
             authors=author_rows,
             default_author_index=default_author_index,
             topics=topic_rows,
-            analyses=analyses,
             analysis_tasks=analysis_tasks,
             saved_queries=saved_queries,
             prompt_runs=prompt_runs,
@@ -1087,6 +1085,22 @@ def create_app(
         return JSONResponse(
             payload,
             headers={"Content-Disposition": f'attachment; filename="paper-{paper_id}.json"'},
+        )
+
+    @app.get("/analyses/{analysis_id}", response_class=HTMLResponse)
+    def analysis_detail(request: Request, analysis_id: int) -> HTMLResponse:
+        with Database(config.paths.database) as db:
+            analysis_row = db.get_analysis_by_id(analysis_id)
+            if analysis_row is None:
+                raise HTTPException(404, "Analysis not found")
+            paper_row = db.get_paper(int(analysis_row["paper_id"]))
+            if paper_row is None:
+                raise HTTPException(404, "Paper not found")
+        return render(
+            request,
+            "analysis_detail.html",
+            analysis=_analysis_view(analysis_row),
+            paper=_paper_view(paper_row),
         )
 
     @app.get("/analyses/{analysis_id}/export.json")

@@ -112,6 +112,13 @@ def seeded_web(config_path, author_candidate, paper_record, analysis_result):
             result=analysis_result,
             usage={"prompt_eval_count": 22},
         )
+        task_id = db.create_analysis_tasks(
+            batch_id="seeded-analysis",
+            paper_id=paper_id,
+            scope="fulltext",
+            profiles=[("default", "ollama", "test-model")],
+        )[0]
+        db.finish_analysis_task(task_id, analysis_id=analysis_id)
         second = PaperRecord(
             openalex_id="W999",
             doi=None,
@@ -318,9 +325,13 @@ def test_paper_detail_and_exports(config_path, seeded_web):
     client, _ = make_client(config_path)
     response = client.get(f"/papers/{paper_id}")
     assert response.status_code == 200
-    assert "Fulltext analysis" in response.text
-    assert "Key contributions" in response.text
-    assert "Raw JSON and usage" in response.text
+    assert "Summary comparison" not in response.text
+    assert "Fulltext analysis" not in response.text
+    assert "Key contributions" not in response.text
+    assert "Raw JSON and usage" not in response.text
+    assert "Recent tasks" in response.text
+    assert f'href="/analyses/{analysis_id}"' in response.text
+    assert response.text.index("Source metadata") < response.text.index("Recent tasks")
     assert "Run additional models" in response.text
     assert "Google Scholar" in response.text
     assert "OpenAlex" in response.text
@@ -332,8 +343,17 @@ def test_paper_detail_and_exports(config_path, seeded_web):
     assert "https://arxiv.org/search/?query=Ada+Lovelace&amp;searchtype=author" in response.text
 
     response = client.get(f"/papers/{second_id}")
-    assert "No LLM analysis" in response.text
+    assert "Recent tasks" in response.text
+    assert "No analysis tasks yet." in response.text
     assert client.get("/papers/999999").status_code == 404
+
+    analysis_page = client.get(f"/analyses/{analysis_id}")
+    assert analysis_page.status_code == 200
+    assert "Fulltext analysis · test-model" in analysis_page.text
+    assert "Key contributions" in analysis_page.text
+    assert "Raw JSON and usage" in analysis_page.text
+    assert f'href="/papers/{paper_id}"' in analysis_page.text
+    assert client.get("/analyses/999999").status_code == 404
 
     paper_export = client.get(f"/papers/{paper_id}/export.json")
     assert paper_export.status_code == 200
