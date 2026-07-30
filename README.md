@@ -1,8 +1,8 @@
 # paperwatch
 
-Paperwatch is a local, daily research-paper tracker for a curated set of authors. It discovers papers through OpenAlex, fills missing abstract and open-PDF metadata from arXiv, stores everything in SQLite, and produces strict structured summaries with Ollama or OpenAI.
+Paperwatch is a local, daily research-paper tracker for a curated set of authors. It discovers papers through OpenAlex, fills missing abstract and open-PDF metadata from arXiv, stores everything in SQLite, and produces strict structured summaries with Ollama, OpenAI, or OpenAI Codex models.
 
-Version 0.5.3 is organized around one immediate workflow: open the Web UI, scroll the newest papers, open one, and act from that page. Paper links, author links, tracking controls, model reruns, and exports are kept next to the paper rather than hidden behind nested menus.
+Version 0.5.4 is organized around one immediate workflow: open the Web UI, scroll the newest papers, open one, and act from that page. Paper links, author links, tracking controls, model reruns, and exports are kept next to the paper rather than hidden behind nested menus.
 
 ## Main flow
 
@@ -24,6 +24,7 @@ Failures are isolated per author, paper, PDF, model, or saved query. Cross-proce
 - Python 3.11+
 - An OpenAlex API key
 - Ollama, an OpenAI API key, or metadata-only mode
+- Optional OpenAI Codex API model access for Codex profiles
 
 ## Install on Arch Linux
 
@@ -46,11 +47,16 @@ ollama list
 
 Ollama is the local model runtime; `qwen3:8b`, `llama3.1:8b`, and similar names are models downloaded into it. The model named in `config.toml` must appear in `ollama list`.
 
-For OpenAI:
+For OpenAI or OpenAI Codex API profiles:
 
 ```bash
 export OPENAI_API_KEY='...'
 ```
+
+Paperwatch calls Codex models directly through the OpenAI Responses API. It does not
+shell out to the Codex coding-agent CLI and does not read Codex CLI ChatGPT-login
+credentials. This keeps paper analysis deterministic, schema-constrained, and free of
+filesystem or tool access.
 
 ## Start the Web UI
 
@@ -138,7 +144,7 @@ The primary `[llm]` profile is used by the daily pipeline and appears in Web UI 
 
 ```toml
 [llm]
-provider = "ollama" # ollama | openai | none
+provider = "ollama" # ollama | openai | codex | none
 model = "qwen3:8b"
 base_url = "http://localhost:11434"
 timeout_seconds = 180
@@ -171,9 +177,22 @@ api_key = "" # Prefer OPENAI_API_KEY
 context_window_tokens = 32768
 analyze_pdfs = true
 prompt_version = "v2"
+
+[[llm_profiles]]
+name = "codex-review"
+provider = "codex"
+model = "gpt-5.3-codex"
+base_url = "https://api.openai.com/v1"
+api_key = "" # Prefer OPENAI_API_KEY
+reasoning_effort = "high"
+timeout_seconds = 600
+max_input_chars = 1000000
+context_window_tokens = 400000
+analyze_pdfs = true
+prompt_version = "v2"
 ```
 
-Profile names must be unique and contain only letters, numbers, dots, dashes, or underscores. Selected models run sequentially to keep local GPU and API load predictable. A failed model does not discard successful outputs from the same batch.
+Profile names must be unique and contain only letters, numbers, dots, dashes, or underscores. Codex profiles accept `low`, `medium`, `high`, or `xhigh` reasoning effort; `medium` is used when omitted. Selected models run sequentially to keep local GPU and API load predictable. A failed model does not discard successful outputs from the same batch.
 
 Metadata-only mode is supported:
 
@@ -271,6 +290,43 @@ curl http://localhost:11434/api/chat \
 ```
 
 Paperwatch performs one model-readiness check at the start of a daily run. If the model is unavailable, it still discovers papers and downloads PDFs, records one actionable error, and leaves the initial author cursor unchanged so the full one-year window can be analyzed after the model is installed. Native Ollama `/api/chat` is preferred; an OpenAI-compatible `/v1/chat/completions` endpoint is used as a fallback for compatible local servers such as llama.cpp.
+
+## OpenAI Codex
+
+Codex support uses the OpenAI Responses API and strict JSON Schema output. Configure it
+as an additional model profile so the same paper can be summarized by Ollama and Codex
+side by side:
+
+```toml
+[[llm_profiles]]
+name = "codex-review"
+provider = "codex"
+model = "gpt-5.3-codex"
+base_url = "https://api.openai.com/v1"
+api_key = ""
+reasoning_effort = "high"
+timeout_seconds = 600
+max_input_chars = 1000000
+context_window_tokens = 400000
+analyze_pdfs = true
+prompt_version = "v2"
+```
+
+Then start Paperwatch with the API key available:
+
+```bash
+export OPENAI_API_KEY='...'
+uv run paperwatch --config config.toml web
+```
+
+On a paper page, select `codex-review` in **Summarize or rerun**. For a full-paper
+analysis, **Direct** and **Auto** upload the original PDF to OpenAI with file purpose
+`user_data`, attach the returned file ID to the Responses request, and delete the remote
+file after the response. The PDF is not replaced with locally extracted text in this
+path, so figures, page layout, tables, appendices, and bibliography remain available to
+the model. **Chunk + merge** remains an explicit alternative that extracts and processes
+text locally in bounded chunks. The reasoning effort and PDF content hash are part of
+the analysis cache identity.
 
 ## Exports
 

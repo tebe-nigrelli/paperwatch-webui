@@ -123,6 +123,21 @@ def test_chunked_analysis_caches_chunks_and_final_result(
         assert len(llm.analysis_calls) == analysis_calls
         assert db._conn.execute("SELECT count(*) FROM analysis_chunks").fetchone()[0] == first.chunk_count
 
+        higher_effort = replace(profile, reasoning_effort="high")
+        third = analyze_chunked_text(
+            db=db,
+            prompt_path=config.paths.prompt,
+            llm_config=higher_effort,
+            llm=llm,
+            paper_id=paper_id,
+            paper=paper_record,
+            text=text,
+            context_window_tokens=1024,
+        )
+        assert third.outcome.created
+        assert len(llm.analysis_calls) == analysis_calls + 1
+        assert db._conn.execute("SELECT count(*) FROM analyses").fetchone()[0] == 2
+
 
 def test_chunk_reduction_and_validation_errors(analysis_result):
     llm = FakeChunkLLM(analysis_result)

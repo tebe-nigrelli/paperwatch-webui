@@ -9,7 +9,7 @@ from typing import Any, Callable
 import httpx
 
 from . import USER_AGENT
-from .analysis import analyze_text
+from .analysis import analyze_pdf_file, analyze_text
 from .chunking import analyze_chunked_text, direct_prompt_fit
 from .config import AppConfig, load_config
 from .db import Database
@@ -32,24 +32,16 @@ class AnalysisBatchSnapshot:
     error: str | None = None
 
 
-def _paper_text(
+def _paper_pdf_path(
     config: AppConfig,
     db: Database,
     paper_id: int,
-    scope: str,
     pdf_client: httpx.Client,
-) -> tuple[Any, str]:
+) -> tuple[Any, Path]:
     paper = db.get_paper_record(paper_id)
     row = db.get_paper(paper_id)
     if paper is None or row is None:
         raise ValueError("Paper not found")
-    if scope == "abstract":
-        if not paper.abstract:
-            raise ValueError("This paper has no abstract to analyze")
-        return paper, paper.abstract
-    if scope != "fulltext":
-        raise ValueError("Analysis scope must be abstract or fulltext")
-
     root = config.paths.pdf_dir.resolve()
     path: Path | None = None
     if row["local_pdf_path"]:
@@ -67,6 +59,26 @@ def _paper_text(
             client=pdf_client,
         )
         db.set_local_pdf(paper_id, str(path))
+    return paper, path
+
+
+def _paper_text(
+    config: AppConfig,
+    db: Database,
+    paper_id: int,
+    scope: str,
+    pdf_client: httpx.Client,
+) -> tuple[Any, str]:
+    paper = db.get_paper_record(paper_id)
+    if paper is None:
+        raise ValueError("Paper not found")
+    if scope == "abstract":
+        if not paper.abstract:
+            raise ValueError("This paper has no abstract to analyze")
+        return paper, paper.abstract
+    if scope != "fulltext":
+        raise ValueError("Analysis scope must be abstract or fulltext")
+    paper, path = _paper_pdf_path(config, db, paper_id, pdf_client)
     return paper, extract_pdf_text(path, max_chars=config.fetch.max_pdf_chars)
 
 
@@ -100,7 +112,17 @@ def run_analysis_batch(
                     )
                     failed += 1
             try:
-                paper, text = _paper_text(config, db, paper_id, scope, pdf_client)
+                pdf_path: Path | None = None
+                text: str | None = None
+                needs_codex_file = (
+                    scope == "fulltext"
+                    and analysis_strategy != "chunked"
+                    and any(item.provider == "codex" for item in selected)
+                )
+                if needs_codex_file:
+                    paper, pdf_path = _paper_pdf_path(config, db, paper_id, pdf_client)
+                else:
+                    paper, text = _paper_text(config, db, paper_id, scope, pdf_client)
             except Exception as exc:
                 for task in tasks.values():
                     db.finish_analysis_task(int(task["id"]), error=str(exc))
@@ -118,54 +140,77 @@ def run_analysis_batch(
                     llm = create_llm(profile)
                     effective_context = context_window_tokens or profile.context_window_tokens
                     configure_context_window(llm, effective_context)
-                    direct_fits, prompt_chars, prompt_budget = direct_prompt_fit(
-                        prompt_path=config.paths.prompt,
-                        max_input_chars=profile.max_input_chars,
-                        paper=paper,
-                        text=text,
-                        scope=scope,
-                        model_name=llm.model,
-                        context_window_tokens=effective_context,
-                    )
                     effective_strategy = analysis_strategy
                     if scope == "abstract":
                         effective_strategy = "direct"
-                    elif effective_strategy == "auto":
-                        effective_strategy = "direct" if direct_fits else "chunked"
-                    if effective_strategy == "direct" and not direct_fits:
-                        detail = (
-                            f"The direct prompt needs {prompt_chars} characters but the selected "
-                            f"context safely allows about {prompt_budget}; use chunked analysis or "
-                            "choose a larger context window"
-                            if prompt_chars
-                            else "The source exceeds the configured direct-input limit; use chunked analysis"
-                        )
-                        raise LLMError(detail)
-                    if effective_strategy == "chunked":
-                        chunked = analyze_chunked_text(
+                    codex_pdf_upload = (
+                        scope == "fulltext"
+                        and profile.provider == "codex"
+                        and effective_strategy != "chunked"
+                    )
+                    if codex_pdf_upload:
+                        assert pdf_path is not None
+                        outcome = analyze_pdf_file(
                             db=db,
                             prompt_path=config.paths.prompt,
                             llm_config=profile,
                             llm=llm,
                             paper_id=paper_id,
                             paper=paper,
-                            text=text,
-                            context_window_tokens=effective_context,
+                            pdf_path=pdf_path,
                         )
-                        outcome = chunked.outcome
-                        chunk_count = chunked.chunk_count
+                        chunk_count = 0
                     else:
-                        outcome = analyze_text(
-                            db=db,
+                        if text is None:
+                            assert pdf_path is not None
+                            text = extract_pdf_text(
+                                pdf_path, max_chars=config.fetch.max_pdf_chars
+                            )
+                        direct_fits, prompt_chars, prompt_budget = direct_prompt_fit(
                             prompt_path=config.paths.prompt,
-                            llm_config=profile,
-                            llm=llm,
-                            paper_id=paper_id,
+                            max_input_chars=profile.max_input_chars,
                             paper=paper,
                             text=text,
                             scope=scope,
+                            model_name=llm.model,
+                            context_window_tokens=effective_context,
                         )
-                        chunk_count = 0
+                        if effective_strategy == "auto":
+                            effective_strategy = "direct" if direct_fits else "chunked"
+                        if effective_strategy == "direct" and not direct_fits:
+                            detail = (
+                                f"The direct prompt needs {prompt_chars} characters but the selected "
+                                f"context safely allows about {prompt_budget}; use chunked analysis or "
+                                "choose a larger context window"
+                                if prompt_chars
+                                else "The source exceeds the configured direct-input limit; use chunked analysis"
+                            )
+                            raise LLMError(detail)
+                        if effective_strategy == "chunked":
+                            chunked = analyze_chunked_text(
+                                db=db,
+                                prompt_path=config.paths.prompt,
+                                llm_config=profile,
+                                llm=llm,
+                                paper_id=paper_id,
+                                paper=paper,
+                                text=text,
+                                context_window_tokens=effective_context,
+                            )
+                            outcome = chunked.outcome
+                            chunk_count = chunked.chunk_count
+                        else:
+                            outcome = analyze_text(
+                                db=db,
+                                prompt_path=config.paths.prompt,
+                                llm_config=profile,
+                                llm=llm,
+                                paper_id=paper_id,
+                                paper=paper,
+                                text=text,
+                                scope=scope,
+                            )
+                            chunk_count = 0
                     db.finish_analysis_task(
                         task_id, analysis_id=outcome.analysis_id, chunk_count=chunk_count
                     )

@@ -593,3 +593,60 @@ def test_missing_ollama_model_is_reported_once_and_preserves_initial_cursor(
         assert author["last_checked_at"] is None
         assert db._conn.execute("SELECT count(*) FROM papers").fetchone()[0] == 1
         assert db._conn.execute("SELECT count(*) FROM analyses").fetchone()[0] == 0
+
+
+def test_daily_codex_fulltext_uploads_original_pdf_without_text_extraction(
+    app_config, author_candidate, paper_record, analysis_result, monkeypatch
+):
+    config = replace(
+        app_config,
+        llm=replace(
+            app_config.llm,
+            provider="codex",
+            model="gpt-5.3-codex",
+            api_key="secret",
+            reasoning_effort="high",
+        ),
+    )
+
+    class FakeCodex(FakeLLM):
+        provider = "codex"
+        model = "gpt-5.3-codex"
+
+        def __init__(self, result):
+            super().__init__(result)
+            self.uploads = []
+
+        def check_ready(self):
+            pass
+
+        def analyze_pdf(self, prompt, pdf_path):
+            self.uploads.append((prompt, Path(pdf_path).read_bytes()))
+            return LLMResponse(result=self.result, usage={"input_tokens": 100})
+
+    from pathlib import Path
+
+    llm = FakeCodex(analysis_result)
+    pdf_client = httpx.Client(
+        transport=httpx.MockTransport(lambda request: httpx.Response(200, content=PDF_BYTES))
+    )
+    monkeypatch.setattr(
+        "paperwatch.pipeline.extract_pdf_text",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("must not extract")),
+    )
+    with Database(config.paths.database) as db:
+        db.add_author(author_candidate)
+        app = PaperWatch(
+            config,
+            db=db,
+            openalex=FakeOpenAlex([paper_record]),
+            arxiv=None,
+            llm=llm,
+            pdf_client=pdf_client,
+        )
+        stats = app.run(today=date(2026, 7, 24))
+        assert stats.status == "success"
+        assert stats.papers_analyzed == 2
+        assert llm.uploads[0][1] == PDF_BYTES
+        analyses = db.paper_analyses(db.list_papers()[0]["id"])
+        assert {row["analysis_strategy"] for row in analyses} == {"direct", "pdf_upload"}

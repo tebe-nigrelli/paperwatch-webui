@@ -194,6 +194,59 @@ model = "gpt-test"
     assert profile.api_key == "secret"
 
 
+
+def test_codex_profile_uses_responses_defaults_and_environment_key(config_path: Path, monkeypatch):
+    monkeypatch.setenv("OPENAI_API_KEY", "codex-secret")
+    config_path.write_text(
+        config_path.read_text()
+        + """
+
+[[llm_profiles]]
+name = "codex-review"
+provider = "codex"
+model = "gpt-5.3-codex"
+context_window_tokens = 400000
+"""
+    )
+    profile = load_config(config_path).llm_profile("codex-review")
+    assert profile.provider == "codex"
+    assert profile.base_url == "https://api.openai.com/v1"
+    assert profile.api_key == "codex-secret"
+    assert profile.reasoning_effort == "medium"
+    assert profile.context_window_tokens == 400000
+
+
+def test_codex_reasoning_effort_is_validated(config_path: Path, monkeypatch):
+    monkeypatch.setenv("OPENAI_API_KEY", "codex-secret")
+    original = config_path.read_text()
+    config_path.write_text(
+        original
+        + """
+
+[[llm_profiles]]
+name = "codex-bad"
+provider = "codex"
+model = "gpt-5.3-codex"
+reasoning_effort = "max"
+"""
+    )
+    with pytest.raises(ConfigError, match="Codex profile.*low, medium, high, or xhigh"):
+        load_config(config_path)
+
+    config_path.write_text(
+        original
+        + """
+
+[[llm_profiles]]
+name = "openai-bad"
+provider = "openai"
+model = "gpt-test"
+reasoning_effort = "turbo"
+"""
+    )
+    with pytest.raises(ConfigError, match="reasoning_effort"):
+        load_config(config_path)
+
 def test_fetch_defaults_cover_one_year_and_large_complete_pdfs(tmp_path: Path):
     prompt = tmp_path / "prompt.txt"
     prompt.write_text("{text}")
@@ -220,3 +273,15 @@ model = ""
     assert loaded.fetch.download_pdfs is True
     assert loaded.fetch.max_pdf_chars == 2_000_000
     assert loaded.fetch.max_papers_per_author == 500
+
+
+def test_reasoning_effort_is_rejected_for_ollama(config_path: Path):
+    config_path.write_text(
+        config_path.read_text().replace(
+            'prompt_version = "test-v1"',
+            'prompt_version = "test-v1"\nreasoning_effort = "high"',
+            1,
+        )
+    )
+    with pytest.raises(ConfigError, match="only supported for openai or codex"):
+        load_config(config_path)

@@ -8,7 +8,7 @@ import httpx
 
 from . import USER_AGENT
 
-from .analysis import analyze_text
+from .analysis import analyze_pdf_file, analyze_text
 from .chunking import analyze_chunked_text, direct_prompt_fit
 from .config import AppConfig
 from .db import Database
@@ -199,8 +199,25 @@ class PaperWatch:
         self.db.set_local_pdf(paper_id, str(destination))
 
         if self.config.llm.analyze_pdfs and self.llm.provider != "none":
-            text = extract_pdf_text(destination, max_chars=self.config.fetch.max_pdf_chars)
-            self._analyze(stats, paper_id=paper_id, paper=paper, text=text, scope="fulltext")
+            if self.llm.provider == "codex":
+                outcome = analyze_pdf_file(
+                    db=self.db,
+                    prompt_path=self.config.paths.prompt,
+                    llm_config=self.config.llm,
+                    llm=self.llm,
+                    paper_id=paper_id,
+                    paper=paper,
+                    pdf_path=destination,
+                )
+                if outcome.created:
+                    stats.papers_analyzed += 1
+            else:
+                text = extract_pdf_text(
+                    destination, max_chars=self.config.fetch.max_pdf_chars
+                )
+                self._analyze(
+                    stats, paper_id=paper_id, paper=paper, text=text, scope="fulltext"
+                )
 
     def _process_paper(self, stats: RunStats, author_id: str, paper: PaperRecord) -> None:
         try:

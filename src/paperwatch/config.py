@@ -56,6 +56,7 @@ class LLMConfig:
     context_window_tokens: int
     analyze_pdfs: bool
     prompt_version: str
+    reasoning_effort: str | None = None
     profile: str = "default"
 
 
@@ -116,17 +117,23 @@ def _llm_config(
 ) -> LLMConfig:
     inherited = defaults or {}
     provider = str(section.get("provider", inherited.get("provider", "ollama"))).strip().lower()
-    if provider not in {"ollama", "openai", "none"}:
-        raise ConfigError(f"LLM profile {profile!r} provider must be ollama, openai, or none")
+    if provider not in {"ollama", "openai", "codex", "none"}:
+        raise ConfigError(
+            f"LLM profile {profile!r} provider must be ollama, openai, codex, or none"
+        )
     if not PROFILE_RE.fullmatch(profile):
         raise ConfigError(
             f"LLM profile name {profile!r} must use letters, numbers, dots, dashes, or underscores"
         )
-    default_url = "https://api.openai.com/v1" if provider == "openai" else "http://localhost:11434"
+    default_url = (
+        "https://api.openai.com/v1"
+        if provider in {"openai", "codex"}
+        else "http://localhost:11434"
+    )
     same_provider = provider == str(inherited.get("provider", provider)).strip().lower()
     inherited_url = inherited.get("base_url") if same_provider else None
     api_key = str(section.get("api_key", inherited.get("api_key", "") if same_provider else "")).strip()
-    if provider == "openai" and not api_key:
+    if provider in {"openai", "codex"} and not api_key:
         api_key = os.getenv("OPENAI_API_KEY", "").strip()
     return LLMConfig(
         provider=provider,
@@ -138,6 +145,15 @@ def _llm_config(
         context_window_tokens=int(section.get("context_window_tokens", inherited.get("context_window_tokens", 8192))),
         analyze_pdfs=_bool(section, "analyze_pdfs", bool(inherited.get("analyze_pdfs", True))),
         prompt_version=str(section.get("prompt_version", inherited.get("prompt_version", "v1"))).strip(),
+        reasoning_effort=(
+            str(
+                section.get(
+                    "reasoning_effort",
+                    inherited.get("reasoning_effort", "") if same_provider else "",
+                )
+            ).strip().lower()
+            or ("medium" if provider == "codex" else None)
+        ),
         profile=profile,
     )
 
@@ -236,9 +252,23 @@ def load_config(path: str | Path = "config.toml") -> AppConfig:
         _positive(item.context_window_tokens, f"llm profile {item.profile} context_window_tokens")
         if item.provider != "none" and not item.model:
             raise ConfigError(f"LLM profile {item.profile!r} model cannot be empty")
-        if item.provider == "openai" and not item.api_key:
+        if item.provider not in {"openai", "codex"} and item.reasoning_effort is not None:
             raise ConfigError(
-                f"OPENAI_API_KEY or api_key is required for OpenAI profile {item.profile!r}"
+                f"LLM profile {item.profile!r} reasoning_effort is only supported for openai or codex"
+            )
+        if item.reasoning_effort not in {None, "none", "minimal", "low", "medium", "high", "xhigh", "max"}:
+            raise ConfigError(
+                f"LLM profile {item.profile!r} reasoning_effort must be none, minimal, low, "
+                "medium, high, xhigh, or max"
+            )
+        if item.provider == "codex" and item.reasoning_effort not in {"low", "medium", "high", "xhigh"}:
+            raise ConfigError(
+                f"Codex profile {item.profile!r} reasoning_effort must be low, medium, high, or xhigh"
+            )
+        if item.provider in {"openai", "codex"} and not item.api_key:
+            provider_name = "OpenAI Codex" if item.provider == "codex" else "OpenAI"
+            raise ConfigError(
+                f"OPENAI_API_KEY or api_key is required for {provider_name} profile {item.profile!r}"
             )
 
     cfg.paths.pdf_dir.mkdir(parents=True, exist_ok=True)

@@ -5,7 +5,14 @@ import json
 import httpx
 import pytest
 
-from paperwatch.llm import LLMError, OllamaClient, OpenAIClient, PromptBuilder, create_llm
+from paperwatch.llm import (
+    CodexClient,
+    LLMError,
+    OllamaClient,
+    OpenAIClient,
+    PromptBuilder,
+    create_llm,
+)
 
 
 def test_prompt_builder_includes_metadata_and_rejects_truncation(tmp_path, paper_record):
@@ -180,6 +187,53 @@ def test_openai_responses_structured_request_and_response(analysis_result):
     assert seen["json"]["text"]["format"]["strict"] is True
 
 
+
+def test_codex_responses_structured_request_and_reasoning(analysis_result):
+    seen = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen["path"] = request.url.path
+        seen["headers"] = request.headers
+        seen["json"] = json.loads(request.content)
+        return httpx.Response(
+            200,
+            json={
+                "output_text": analysis_result.model_dump_json(),
+                "usage": {"input_tokens": 12, "output_tokens": 34},
+            },
+        )
+
+    llm = CodexClient(
+        model="gpt-5.3-codex",
+        base_url="https://api.openai.test/v1",
+        api_key="secret",
+        timeout_seconds=1,
+        reasoning_effort="high",
+        client=httpx.Client(transport=httpx.MockTransport(handler)),
+    )
+    response = llm.analyze("analyze this")
+    assert llm.provider == "codex"
+    assert response.result.generated_by_model == "gpt-5.3-codex (version not exposed)"
+    assert response.usage["output_tokens"] == 34
+    assert seen["path"] == "/v1/responses"
+    assert seen["headers"]["authorization"] == "Bearer secret"
+    assert seen["json"]["reasoning"] == {"effort": "high"}
+    assert seen["json"]["text"]["format"]["strict"] is True
+
+
+def test_codex_missing_key_has_specific_error():
+    llm = CodexClient(
+        model="gpt-5.3-codex",
+        base_url="https://api.openai.test",
+        api_key="",
+        timeout_seconds=1,
+        client=httpx.Client(),
+    )
+    with pytest.raises(LLMError, match="OpenAI Codex API key is missing"):
+        llm.check_ready()
+    with pytest.raises(LLMError, match="OpenAI Codex API key is missing"):
+        llm.analyze("x")
+
 def test_llm_rejects_invalid_model_json():
     client = httpx.Client(
         transport=httpx.MockTransport(
@@ -215,6 +269,20 @@ def test_no_llm_and_provider_factory_branches(app_config):
     )
     assert isinstance(openai, OpenAIClient)
     assert openai.base_url == "https://api.test/v1"
+    codex = create_llm(
+        replace(
+            app_config.llm,
+            provider="codex",
+            model="gpt-5.3-codex",
+            api_key="key",
+            base_url="https://api.test/v1",
+            reasoning_effort="xhigh",
+        ),
+        client=httpx.Client(),
+    )
+    assert isinstance(codex, CodexClient)
+    assert codex.provider == "codex"
+    assert codex.reasoning_effort == "xhigh"
     with pytest.raises(LLMError, match="Unsupported"):
         create_llm(replace(app_config.llm, provider="bad"))
 
@@ -524,3 +592,116 @@ def test_ollama_openai_compatible_error_shapes_and_openai_readiness(analysis_res
     )
     with pytest.raises(LLMError, match="key is missing"):
         missing.check_ready()
+
+
+def test_openai_and_codex_http_error_messages(analysis_result):
+    detail_cases = [
+        (httpx.Response(400, json={"error": {"message": "model is unavailable"}}), "model .* unavailable"),
+        (httpx.Response(401, json={"message": "bad key"}), "API key was rejected"),
+        (httpx.Response(500, json={"detail": "server broke"}), "HTTP 500: server broke"),
+        (httpx.Response(503, text="plain failure"), "plain failure"),
+        (httpx.Response(502), "HTTP 502"),
+    ]
+    for response, message in detail_cases:
+        llm = CodexClient(
+            model="gpt-5.3-codex",
+            base_url="https://api.openai.test",
+            api_key="key",
+            timeout_seconds=1,
+            client=httpx.Client(
+                transport=httpx.MockTransport(lambda request, item=response: item)
+            ),
+        )
+        with pytest.raises(LLMError, match=message):
+            llm.analyze("x")
+
+    assert OpenAIClient._error_detail(httpx.Response(400, json={"message": " top "})) == "top"
+    assert OpenAIClient._error_detail(httpx.Response(400, json={"detail": " detail "})) == "detail"
+
+
+def test_codex_rejects_invalid_structured_result():
+    llm = CodexClient(
+        model="gpt-5.3-codex",
+        base_url="https://api.openai.test",
+        api_key="key",
+        timeout_seconds=1,
+        client=httpx.Client(
+            transport=httpx.MockTransport(
+                lambda request: httpx.Response(200, json={"output_text": '{"summary":"x"}'})
+            )
+        ),
+    )
+    with pytest.raises(LLMError, match="OpenAI Codex analysis failed"):
+        llm.analyze("x")
+
+
+def test_codex_pdf_upload_attaches_original_file_and_deletes_remote_copy(
+    analysis_result, tmp_path
+):
+    pdf = tmp_path / "whole-paper.pdf"
+    pdf.write_bytes(b"%PDF-1.7\noriginal-complete-pdf\n%%EOF")
+    requests: list[tuple[str, str, bytes]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = request.content
+        requests.append((request.method, request.url.path, body))
+        if request.method == "POST" and request.url.path == "/v1/files":
+            assert b'purpose' in body
+            assert b'user_data' in body
+            assert b'whole-paper.pdf' in body
+            assert b'original-complete-pdf' in body
+            return httpx.Response(200, json={"id": "file-paper-123"})
+        if request.method == "POST" and request.url.path == "/v1/responses":
+            payload = json.loads(body)
+            content = payload["input"][0]["content"]
+            assert content[0] == {"type": "input_file", "file_id": "file-paper-123"}
+            assert content[1]["type"] == "input_text"
+            assert "attached pdf" in content[1]["text"].lower().replace(" as a", "")
+            return httpx.Response(
+                200,
+                json={
+                    "output_text": analysis_result.model_dump_json(),
+                    "usage": {"input_tokens": 123, "output_tokens": 45},
+                },
+            )
+        if request.method == "DELETE" and request.url.path == "/v1/files/file-paper-123":
+            return httpx.Response(200, json={"id": "file-paper-123", "deleted": True})
+        return httpx.Response(404)
+
+    llm = CodexClient(
+        model="gpt-5.3-codex",
+        base_url="https://api.openai.test/v1",
+        api_key="secret",
+        timeout_seconds=1,
+        reasoning_effort="high",
+        client=httpx.Client(transport=httpx.MockTransport(handler)),
+    )
+    response = llm.analyze_pdf("Read the attached PDF in full", pdf)
+    assert response.result.name == analysis_result.name
+    assert response.usage["input_file_bytes"] == pdf.stat().st_size
+    assert [(method, path) for method, path, _ in requests] == [
+        ("POST", "/v1/files"),
+        ("POST", "/v1/responses"),
+        ("DELETE", "/v1/files/file-paper-123"),
+    ]
+
+
+def test_codex_pdf_upload_failure_is_actionable_and_does_not_call_responses(tmp_path):
+    pdf = tmp_path / "paper.pdf"
+    pdf.write_bytes(b"%PDF-1.4\n%%EOF")
+    paths = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        paths.append(request.url.path)
+        return httpx.Response(400, json={"error": {"message": "invalid PDF"}})
+
+    llm = CodexClient(
+        model="gpt-5.3-codex",
+        base_url="https://api.openai.test/v1",
+        api_key="secret",
+        timeout_seconds=1,
+        client=httpx.Client(transport=httpx.MockTransport(handler)),
+    )
+    with pytest.raises(LLMError, match="invalid PDF"):
+        llm.analyze_pdf("x", pdf)
+    assert paths == ["/v1/files"]

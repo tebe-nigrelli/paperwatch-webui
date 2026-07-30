@@ -198,8 +198,9 @@ def analyze_chunked_text(
         prompt_template_hash = stable_hash(prompt_path.read_text(encoding="utf-8"))
     except OSError as exc:
         raise LLMError(f"Cannot read prompt template: {exc}") from exc
+    cache_variant = llm_config.reasoning_effort or "default"
     final_digest = stable_hash(
-        f"chunked:{context_window_tokens}:{stable_hash(text)}:{prompt_template_hash}"
+        f"chunked:{context_window_tokens}:{cache_variant}:{stable_hash(text)}:{prompt_template_hash}"
     )
     cached_final = db.get_analysis(
         paper_id,
@@ -247,7 +248,7 @@ def analyze_chunked_text(
     notes: list[ChunkNotes] = []
     usage: dict[str, Any] = {}
     for index, chunk in enumerate(chunks):
-        digest = stable_hash(chunk)
+        digest = stable_hash(f"{cache_variant}:{chunk}")
         cached = db.get_analysis_chunk(
             paper_id=paper_id,
             provider=llm.provider,

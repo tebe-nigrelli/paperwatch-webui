@@ -1,8 +1,8 @@
-# Release audit — paperwatch 0.5.3
+# Release audit — paperwatch 0.5.5
 
 ## Result
 
-Version 0.5.3 is release-ready. It keeps the recent-paper-first interface and adds a one-year initial discovery window, default open-PDF downloads, larger complete-PDF extraction limits, one-shot local-model readiness checks, actionable missing-model errors, OpenAI-compatible local-server fallback, and resilient skipping of sparse OpenAlex work records.
+Version 0.5.5 is release-ready. It keeps the recent-paper-first interface and adds a one-year initial discovery window, default open-PDF downloads, larger complete-PDF extraction limits, one-shot local-model readiness checks, actionable missing-model errors, OpenAI-compatible local-server fallback, and resilient skipping of sparse OpenAlex work records.
 
 ## Usability review
 
@@ -79,6 +79,15 @@ The UI remains server-rendered Jinja with one CSS file and one small JavaScript 
 - Tag filtering on the author page.
 - Archived authors retain tags without polluting the active suggestion list.
 
+
+### Codex whole-PDF input
+
+- Codex full-text **Direct** and **Auto** analyses upload the original PDF through `/v1/files` with purpose `user_data`.
+- The Responses request references the uploaded `file_id` as an `input_file` beside the strict analysis prompt.
+- The temporary OpenAI file is deleted after success or failure.
+- No local text extraction or chunking occurs on this path; explicit **Chunk + merge** still uses the local map/reduce pipeline.
+- Cache identity includes the original PDF byte hash and reasoning effort.
+
 ## Simplicity and debt review
 
 - Existing pipeline, LLM, validation, and persistence logic is reused by the Web UI.
@@ -133,3 +142,13 @@ The UI remains server-rendered Jinja with one CSS file and one small JavaScript 
 - Open PDFs are used when known; access controls are never bypassed.
 - Model quality and effective context limits still depend on the selected model/runtime.
 - Live production credentials were not used in the deterministic release suite.
+
+## OpenAI Codex support
+
+- `provider = "codex"` is a first-class LLM profile type.
+- Codex calls use the OpenAI Responses API with the same strict JSON Schema contract as other remote OpenAI models.
+- `reasoning_effort` supports `low`, `medium`, `high`, and `xhigh`; omitted Codex effort defaults to `medium`.
+- Codex requires `OPENAI_API_KEY` or a profile `api_key`; the application does not invoke the Codex CLI or access its local login state.
+- Direct, chunked, multi-model, rerun, and saved-query paths all use the common LLM protocol.
+- Reasoning effort is included in direct and chunked cache identities, preventing stale cross-effort reuse.
+- Provider-specific authentication, model-access, and HTTP errors are actionable.

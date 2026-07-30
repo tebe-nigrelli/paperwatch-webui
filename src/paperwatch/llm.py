@@ -32,6 +32,9 @@ class LLMClient(Protocol):
     def analyze(self, prompt: str) -> LLMResponse:
         ...
 
+    def analyze_pdf(self, prompt: str, pdf_path: Path) -> LLMResponse:
+        ...
+
     def check_ready(self) -> None:
         ...
 
@@ -332,6 +335,7 @@ class OpenAIClient:
         base_url: str,
         api_key: str,
         timeout_seconds: float,
+        reasoning_effort: str | None = None,
         client: httpx.Client | None = None,
     ):
         self.model = model
@@ -340,6 +344,11 @@ class OpenAIClient:
         self._owns_client = client is None
         self.client = client or httpx.Client(timeout=timeout_seconds)
         self.api_key = api_key
+        self.reasoning_effort = reasoning_effort
+
+    @property
+    def provider_name(self) -> str:
+        return "OpenAI"
 
     def close(self) -> None:
         if self._owns_client:
@@ -347,7 +356,62 @@ class OpenAIClient:
 
     def check_ready(self) -> None:
         if not self.api_key:
-            raise LLMError("OpenAI API key is missing")
+            raise LLMError(f"{self.provider_name} API key is missing")
+
+    @staticmethod
+    def _error_detail(response: httpx.Response) -> str:
+        try:
+            payload = response.json()
+        except ValueError:
+            payload = None
+        if isinstance(payload, dict):
+            error = payload.get("error")
+            if isinstance(error, dict) and isinstance(error.get("message"), str):
+                return error["message"].strip()
+            for key in ("message", "detail"):
+                value = payload.get(key)
+                if isinstance(value, str) and value.strip():
+                    return value.strip()
+        text = response.text.strip()
+        return text[:500] if text else f"HTTP {response.status_code}"
+
+    def _http_error(self, response: httpx.Response) -> LLMError:
+        detail = self._error_detail(response)
+        if response.status_code in {400, 404} and "model" in detail.casefold():
+            return LLMError(
+                f"{self.provider_name} analysis failed: model {self.model!r} is unavailable. "
+                "Verify the model ID and that your OpenAI API project has access. "
+                f"Server response: {detail}"
+            )
+        if response.status_code in {401, 403}:
+            return LLMError(
+                f"{self.provider_name} analysis failed: the API key was rejected or lacks access. "
+                f"Server response: {detail}"
+            )
+        return LLMError(
+            f"{self.provider_name} analysis failed: HTTP {response.status_code}: {detail}"
+        )
+
+    def _request_payload(
+        self, prompt: str, *, schema: dict[str, Any], schema_name: str
+    ) -> dict[str, Any]:
+        payload: dict[str, Any] = {
+            "model": self.model,
+            "input": prompt,
+            "store": False,
+            "text": {
+                "format": {
+                    "type": "json_schema",
+                    "name": schema_name,
+                    "description": "Structured JSON response",
+                    "schema": schema,
+                    "strict": True,
+                }
+            },
+        }
+        if self.reasoning_effort:
+            payload["reasoning"] = {"effort": self.reasoning_effort}
+        return payload
 
     @staticmethod
     def _output_text(payload: dict[str, Any]) -> str:
@@ -372,6 +436,21 @@ class OpenAIClient:
                     return content["text"]
         raise LLMError("OpenAI response has no output text")
 
+    def _structured_response(
+        self, payload: Any
+    ) -> StructuredJSONResponse:
+        if not isinstance(payload, dict):
+            raise LLMError(f"{self.provider_name} returned an unexpected payload")
+        import json
+
+        data = json.loads(self._output_text(payload))
+        if not isinstance(data, dict):
+            raise LLMError(f"{self.provider_name} structured output must be a JSON object")
+        usage = payload.get("usage") or {}
+        if not isinstance(usage, dict):
+            usage = {}
+        return StructuredJSONResponse(data=data, usage=usage, raw=payload)
+
     def generate_json(
         self,
         prompt: str,
@@ -380,43 +459,20 @@ class OpenAIClient:
         schema_name: str,
     ) -> StructuredJSONResponse:
         if not self.api_key:
-            raise LLMError("OpenAI API key is missing")
+            raise LLMError(f"{self.provider_name} API key is missing")
         try:
             response = self.client.post(
                 f"{self.base_url}/responses",
                 headers={"Authorization": f"Bearer {self.api_key}"},
-                json={
-                    "model": self.model,
-                    "input": prompt,
-                    "store": False,
-                    "text": {
-                        "format": {
-                            "type": "json_schema",
-                            "name": schema_name,
-                            "description": "Structured JSON response",
-                            "schema": schema,
-                            "strict": True,
-                        }
-                    },
-                },
+                json=self._request_payload(prompt, schema=schema, schema_name=schema_name),
             )
-            response.raise_for_status()
-            payload = response.json()
-            if not isinstance(payload, dict):
-                raise LLMError("OpenAI returned an unexpected payload")
-            import json
-
-            data = json.loads(self._output_text(payload))
-            if not isinstance(data, dict):
-                raise LLMError("OpenAI structured output must be a JSON object")
-            usage = payload.get("usage") or {}
-            if not isinstance(usage, dict):
-                usage = {}
-            return StructuredJSONResponse(data=data, usage=usage, raw=payload)
+            if response.is_error:
+                raise self._http_error(response)
+            return self._structured_response(response.json())
         except LLMError:
             raise
         except (httpx.HTTPError, ValueError) as exc:
-            raise LLMError(f"OpenAI analysis failed: {exc}") from exc
+            raise LLMError(f"{self.provider_name} analysis failed: {exc}") from exc
 
     def analyze(self, prompt: str) -> LLMResponse:
         try:
@@ -430,8 +486,81 @@ class OpenAIClient:
         except LLMError:
             raise
         except ValidationError as exc:
-            raise LLMError(f"OpenAI analysis failed: {exc}") from exc
+            raise LLMError(f"{self.provider_name} analysis failed: {exc}") from exc
 
+
+
+class CodexClient(OpenAIClient):
+    """OpenAI Codex models through the Responses API."""
+
+    provider = "codex"
+
+    @property
+    def provider_name(self) -> str:
+        return "OpenAI Codex"
+
+    def analyze_pdf(self, prompt: str, pdf_path: Path) -> LLMResponse:
+        """Upload the original PDF, attach it to one Responses API request, then delete it."""
+        if not self.api_key:
+            raise LLMError(f"{self.provider_name} API key is missing")
+        path = Path(pdf_path)
+        if not path.is_file():
+            raise LLMError(f"PDF file does not exist: {path}")
+        file_id: str | None = None
+        headers = {"Authorization": f"Bearer {self.api_key}"}
+        try:
+            with path.open("rb") as handle:
+                uploaded = self.client.post(
+                    f"{self.base_url}/files",
+                    headers=headers,
+                    data={"purpose": "user_data"},
+                    files={"file": (path.name, handle, "application/pdf")},
+                )
+            if uploaded.is_error:
+                raise self._http_error(uploaded)
+            upload_payload = uploaded.json()
+            if not isinstance(upload_payload, dict) or not isinstance(
+                upload_payload.get("id"), str
+            ):
+                raise LLMError("OpenAI Codex file upload returned no file ID")
+            file_id = upload_payload["id"]
+
+            request_payload = self._request_payload(
+                prompt, schema=ANALYSIS_JSON_SCHEMA, schema_name="paper_analysis"
+            )
+            request_payload["input"] = [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "input_file", "file_id": file_id},
+                        {"type": "input_text", "text": prompt},
+                    ],
+                }
+            ]
+            response = self.client.post(
+                f"{self.base_url}/responses",
+                headers=headers,
+                json=request_payload,
+            )
+            if response.is_error:
+                raise self._http_error(response)
+            structured = self._structured_response(response.json())
+            result = AnalysisResult.model_validate(structured.data).model_copy(
+                update={"generated_by_model": model_attribution(self.model)}
+            )
+            usage = dict(structured.usage)
+            usage["input_file_bytes"] = path.stat().st_size
+            return LLMResponse(result=result, usage=usage, raw=structured.raw)
+        except LLMError:
+            raise
+        except (OSError, httpx.HTTPError, ValueError, ValidationError) as exc:
+            raise LLMError(f"{self.provider_name} PDF analysis failed: {exc}") from exc
+        finally:
+            if file_id:
+                try:
+                    self.client.delete(f"{self.base_url}/files/{file_id}", headers=headers)
+                except httpx.HTTPError:
+                    pass
 
 
 def configure_context_window(llm: LLMClient, context_window_tokens: int) -> None:
@@ -457,6 +586,16 @@ def create_llm(config: LLMConfig, *, client: httpx.Client | None = None) -> LLMC
             base_url=config.base_url or "https://api.openai.com/v1",
             api_key=config.api_key,
             timeout_seconds=config.timeout_seconds,
+            reasoning_effort=config.reasoning_effort,
+            client=client,
+        )
+    if config.provider == "codex":
+        return CodexClient(
+            model=config.model,
+            base_url=config.base_url or "https://api.openai.com/v1",
+            api_key=config.api_key,
+            timeout_seconds=config.timeout_seconds,
+            reasoning_effort=config.reasoning_effort or "medium",
             client=client,
         )
     raise LLMError(f"Unsupported LLM provider: {config.provider}")

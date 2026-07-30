@@ -1,4 +1,4 @@
-# Automated testing strategy — paperwatch 0.5.3
+# Automated testing strategy — paperwatch 0.5.5
 
 The default suite is deterministic and requires no live OpenAlex index, arXiv service, Ollama server, OpenAI account, PDF host, or external browser assets.
 
@@ -10,8 +10,8 @@ pytest
 
 Release result:
 
-- 172 tests passed
-- 95.39% branch-aware coverage
+- 183 tests passed
+- 95.13% branch-aware coverage
 - Python 3.13.5 release environment
 
 ## Feature coverage
@@ -79,3 +79,16 @@ The release audit then verifies:
 ## Deliberately excluded live tests
 
 The deterministic suite does not call production OpenAlex, arXiv, Ollama, or OpenAI endpoints. This avoids nondeterminism, credentials, costs, and upstream rate limits. Their current request/response contracts and error paths are represented by controlled fixtures and mock servers. A deployment should still perform one manual credentialed smoke run with its chosen model and network environment.
+
+## Codex coverage
+
+The offline suite verifies:
+
+- Codex provider configuration and `OPENAI_API_KEY` fallback;
+- Responses API endpoint, authorization, strict schema, and reasoning payload;
+- original PDF multipart upload, `input_file` attachment, and remote-file deletion;
+- direct/auto Codex PDF routing without local text extraction, including the daily pipeline;
+- provider-specific missing-key, rejected-key, inaccessible-model, and server errors;
+- factory creation and Web UI profile rendering;
+- distinct direct and chunked cache entries when reasoning effort changes;
+- validation of supported effort values and rejection on unsupported providers.

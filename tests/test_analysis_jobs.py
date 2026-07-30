@@ -380,3 +380,75 @@ def test_direct_analysis_rejects_context_that_cannot_hold_prompt(
     with Database(config.paths.database) as db:
         error = db.analysis_tasks_for_batch("tiny-context")[0]["error_text"]
         assert "use chunked analysis" in error
+
+
+def test_codex_fulltext_batch_uploads_original_pdf_without_extracting_text(
+    config_path, paper_record, analysis_result, monkeypatch
+):
+    with config_path.open("a", encoding="utf-8") as handle:
+        handle.write(
+            """
+
+[[llm_profiles]]
+name = "codex-review"
+provider = "codex"
+model = "gpt-5.3-codex"
+api_key = "secret"
+reasoning_effort = "high"
+timeout_seconds = 1
+max_input_chars = 5000
+context_window_tokens = 400000
+analyze_pdfs = true
+prompt_version = "test-v1"
+"""
+        )
+    config = load_config(config_path)
+    pdf = config.paths.pdf_dir / "complete.pdf"
+    pdf.parent.mkdir(parents=True, exist_ok=True)
+    pdf.write_bytes(b"%PDF-1.7\nTHE ORIGINAL COMPLETE PAPER\n%%EOF")
+    with Database(config.paths.database) as db:
+        paper_id, _ = db.upsert_paper(paper_record)
+        db.set_local_pdf(paper_id, str(pdf))
+        db.create_analysis_tasks(
+            batch_id="codex-pdf",
+            paper_id=paper_id,
+            scope="fulltext",
+            profiles=[("codex-review", "codex", "gpt-5.3-codex")],
+            analysis_strategy="auto",
+            context_window_tokens=400000,
+        )
+
+    uploaded = []
+
+    class FakeCodex:
+        provider = "codex"
+        model = "gpt-5.3-codex"
+
+        def analyze_pdf(self, prompt, pdf_path):
+            uploaded.append((prompt, Path(pdf_path).read_bytes()))
+            return LLMResponse(result=analysis_result, usage={"input_tokens": 10})
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr("paperwatch.analysis_jobs.create_llm", lambda profile: FakeCodex())
+    monkeypatch.setattr(
+        "paperwatch.analysis_jobs.extract_pdf_text",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("must not extract")),
+    )
+    assert run_analysis_batch(
+        config_path,
+        "codex-pdf",
+        paper_id,
+        "fulltext",
+        ("codex-review",),
+        "auto",
+        400000,
+    ) == {"completed": 1, "failed": 0}
+    assert uploaded[0][1] == pdf.read_bytes()
+    assert "attached as a PDF" in uploaded[0][0]
+    with Database(config.paths.database) as db:
+        analysis = db.paper_analyses(paper_id)[0]
+        assert analysis["provider"] == "codex"
+        assert analysis["analysis_strategy"] == "pdf_upload"
+        assert analysis["input_chars"] > 0
