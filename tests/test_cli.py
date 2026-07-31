@@ -56,7 +56,7 @@ def test_init_creates_config_and_prompt(tmp_path, capsys):
     assert destination.exists()
     assert (tmp_path / "prompts" / "analyze.txt").exists()
     from paperwatch.config import load_config
-    assert load_config(destination).llm.context_window_tokens == 8192
+    assert load_config(destination).llm.context_window_tokens == 16384
     assert str(destination) in capsys.readouterr().out
     assert cli.main(["init", str(destination)]) == 2
 

@@ -5,6 +5,8 @@ import inspect
 import io
 import json
 import re
+import shutil
+import subprocess
 import threading
 import uuid
 from dataclasses import asdict, dataclass
@@ -45,7 +47,9 @@ PAPER_KINDS = (
 )
 SCOPES = ("abstract", "fulltext")
 SORTS = ("newest", "oldest", "discovered", "title")
-PAGE_SIZES = (10, 25, 50, 100)
+PAGE_SIZES = (25, 100, 250, 500, 1000)
+DEFAULT_PAGE_SIZE = 100
+DEFAULT_CONTEXT_WINDOW_TOKENS = 16384
 
 
 @dataclass(frozen=True, slots=True)
@@ -61,7 +65,7 @@ class PaperFilters:
     date_to: str = ""
     sort: str = "newest"
     page: int = 1
-    page_size: int = 25
+    page_size: int = DEFAULT_PAGE_SIZE
 
     def selection(self) -> dict[str, Any]:
         return {
@@ -104,7 +108,7 @@ class PaperFilters:
             "date_from": self.date_from,
             "date_to": self.date_to,
             "sort": self.sort if self.sort != "newest" else "",
-            "page_size": str(self.page_size) if self.page_size != 25 else "",
+            "page_size": str(self.page_size) if self.page_size != DEFAULT_PAGE_SIZE else "",
             "page": str(page if page is not None else self.page),
         }
         return [(key, value) for key, value in values.items() if value and value != "1"]
@@ -411,9 +415,9 @@ async def _stage_uploaded_pdf(
 
 def _parse_filter_values(params: Any) -> PaperFilters:
     page = max(1, _int_or_none(params.get("page")) or 1)
-    page_size = _int_or_none(params.get("page_size")) or 25
+    page_size = _int_or_none(params.get("page_size")) or DEFAULT_PAGE_SIZE
     if page_size not in PAGE_SIZES:
-        page_size = 25
+        page_size = DEFAULT_PAGE_SIZE
     paper_kind = params.get("kind", "")
     if paper_kind not in PAPER_KINDS:
         paper_kind = ""
@@ -658,6 +662,11 @@ def _query_output(row: Any) -> dict[str, Any]:
             selection_items.append(f'From {data["selection"]["date_from"]}')
         if data["selection"].get("date_to"):
             selection_items.append(f'To {data["selection"]["date_to"]}')
+    source_scope = str(data["selection"].get("source_scope") or "abstract")
+    pdf_strategy = str(data["selection"].get("pdf_strategy") or "auto")
+    selection_items.append(f"Source: {source_scope}")
+    if source_scope == "fulltext":
+        selection_items.append(f"PDF strategy: {pdf_strategy}")
     data["selection_label"] = " · ".join(selection_items) or "All matching records"
     selection_query = urlencode([
         (key, value)
@@ -880,40 +889,14 @@ def create_app(
             tags=tags,
             active_tag=tag,
             author_query=query,
-            search_results=[],
-            search_name=name,
         )
 
-    @app.post("/authors/search", response_class=HTMLResponse)
-    async def search_authors(request: Request) -> HTMLResponse:
+    @app.post("/authors/search")
+    async def search_authors(request: Request) -> RedirectResponse:
         form = await request.form()
         name = str(form.get("name", "")).strip()[:200]
-        limit = _int_or_none(form.get("limit")) or 10
-        limit = min(max(limit, 1), 25)
-        results: list[AuthorCandidate] = []
-        error = ""
-        if name:
-            client = client_factory(config)
-            try:
-                results = client.search_authors(name, limit=limit)
-            except Exception as exc:
-                error = str(exc)
-            finally:
-                client.close()
-        with Database(config.paths.database) as db:
-            rows = db.list_authors_with_tags(tracked_only=True)
-            tags = db.list_tags()
-        return render(
-            request,
-            "authors.html",
-            authors=rows,
-            tags=tags,
-            active_tag="",
-            author_query="",
-            search_results=results,
-            search_name=name,
-            search_error=error,
-        )
+        target = f"/discover?mode=author&q={quote_plus(name)}" if name else "/discover?mode=author"
+        return RedirectResponse(target, status_code=303)
 
     @app.post("/authors/{openalex_id}/add")
     def add_author(openalex_id: str) -> RedirectResponse:
@@ -1070,26 +1053,59 @@ def create_app(
             if backup is not None:
                 backup.unlink(missing_ok=True)
 
-    @app.get("/search", response_class=HTMLResponse)
-    def search_papers(request: Request) -> HTMLResponse:
-        query = request.query_params.get("q", "").strip()[:500]
-        results: list[PaperRecord] = []
-        error = ""
-        if query:
+    @app.get("/discover", response_class=HTMLResponse)
+    def discover(request: Request) -> HTMLResponse:
+        requested_mode = request.query_params.get("mode", "").strip().lower()
+        legacy_paper_query = request.query_params.get("paper_q", "").strip()[:500]
+        legacy_author_query = request.query_params.get("author_q", "").strip()[:200]
+        if requested_mode not in {"paper", "author"}:
+            requested_mode = "author" if legacy_author_query and not legacy_paper_query else "paper"
+        query_limit = 500 if requested_mode == "paper" else 200
+        query = request.query_params.get("q", "").strip()[:query_limit]
+        if not query:
+            query = legacy_paper_query if requested_mode == "paper" else legacy_author_query
+        paper_query = query if requested_mode == "paper" else ""
+        author_query = query if requested_mode == "author" else ""
+        limit = _int_or_none(request.query_params.get("limit")) or 100
+        limit = min(max(limit, 1), 100)
+        paper_results: list[PaperRecord] = []
+        author_results: list[AuthorCandidate] = []
+        paper_error = ""
+        author_error = ""
+        if paper_query or author_query:
             client = client_factory(config)
             try:
-                results = client.search_works(query, limit=10)
-            except Exception as exc:
-                error = str(exc)
+                if paper_query:
+                    try:
+                        paper_results = client.search_works(paper_query, limit=limit)
+                    except Exception as exc:
+                        paper_error = str(exc)
+                if author_query:
+                    try:
+                        author_results = client.search_authors(author_query, limit=limit)
+                    except Exception as exc:
+                        author_error = str(exc)
             finally:
                 client.close()
         return render(
             request,
-            "search.html",
-            search_query=query,
-            search_results=results,
-            search_error=error,
+            "discover.html",
+            discover_mode=requested_mode,
+            discover_query=query,
+            paper_query=paper_query,
+            author_query=author_query,
+            search_limit=limit,
+            paper_results=paper_results,
+            author_results=author_results,
+            paper_error=paper_error,
+            author_error=author_error,
         )
+
+    @app.get("/search")
+    def search_papers(request: Request) -> RedirectResponse:
+        query = request.query_params.get("q", "").strip()[:500]
+        target = f"/discover?mode=paper&q={quote_plus(query)}" if query else "/discover?mode=paper"
+        return RedirectResponse(target, status_code=303)
 
     @app.post("/actions/run")
     def start_run() -> RedirectResponse:
@@ -1108,7 +1124,11 @@ def create_app(
         work_id = str(form.get("work_id", "")).strip()[:100]
         title = str(form.get("title", "")).strip()[:500]
         search_query = str(form.get("q", "")).strip()[:500]
-        target = f"/search?q={quote_plus(search_query)}" if search_query else "/search"
+        target = (
+            f"/discover?mode=paper&q={quote_plus(search_query)}"
+            if search_query
+            else "/discover?mode=paper"
+        )
         if not work_id:
             return RedirectResponse(
                 _notice_url(target, "Paper identifier cannot be empty", level="error"),
@@ -1143,7 +1163,7 @@ def create_app(
         else:
             message = "A fetch is already running."
             level = "warning"
-        return RedirectResponse(_notice_url("/", message, level=level), status_code=303)
+        return RedirectResponse(_notice_url("/discover", message, level=level), status_code=303)
 
     @app.get("/api/run-status")
     def run_status() -> JSONResponse:
@@ -1310,8 +1330,10 @@ def create_app(
         async_request = request.headers.get("x-paperwatch-async") == "1"
         form = await request.form()
         query_id = _int_or_none(form.get("query_id"))
-        profile_name = str(form.get("model", ""))
-        context = _int_or_none(form.get("context_window_tokens")) or 8192
+        profiles = tuple(str(value) for value in form.getlist("model") if str(value))
+        context = _int_or_none(form.get("context_window_tokens")) or DEFAULT_CONTEXT_WINDOW_TOKENS
+        source_scope = str(form.get("source_scope", "abstract"))
+        pdf_strategy = str(form.get("pdf_strategy", "auto"))
         with Database(config.paths.database) as db:
             paper = db.get_paper(paper_id)
             query = db.get_saved_query(query_id) if query_id is not None else None
@@ -1327,18 +1349,18 @@ def create_app(
 
         if query is None:
             return failure("Select a saved prompt.")
-        profile = next(
-            (item for item in config.available_llms if item.profile == profile_name), None
-        )
-        if profile is None:
-            return failure("Select a configured model.")
-        selection = {
-            "paper_ids": [paper_id],
-            "labels": [f"Paper: {paper['title']}"],
-        }
+        if source_scope == "abstract" and not paper["abstract"]:
+            return failure("This paper has no abstract to analyze.")
+        if source_scope == "fulltext" and not (paper["pdf_url"] or paper["local_pdf_path"]):
+            return failure("This paper has no PDF available for full-text analysis.")
         try:
             batch_id = collection_controller.start(
-                int(query["id"]), (profile_name,), context, selection=selection
+                int(query["id"]),
+                profiles,
+                context,
+                selection={"paper_ids": [paper_id], "labels": [f"Paper: {paper['title']}"]},
+                source_scope=source_scope,
+                pdf_strategy=pdf_strategy,
             )
         except ValueError as exc:
             return failure(str(exc))
@@ -1349,7 +1371,7 @@ def create_app(
             return RedirectResponse(
                 _notice_url(f"/papers/{paper_id}", message, level="warning"), status_code=303
             )
-        message = f"Started {query['name']} with {profile.model}."
+        message = f"Started {query['name']} with {len(set(profiles))} model(s)."
         if async_request:
             return JSONResponse({"ok": True, "batch_id": batch_id, "message": message})
         return RedirectResponse(
@@ -1368,8 +1390,7 @@ def create_app(
             status_code=200 if cancelled else 409,
         )
 
-    @app.get("/papers/{paper_id}/pdf")
-    def local_pdf(paper_id: int) -> FileResponse:
+    def local_pdf_path(paper_id: int) -> Path:
         with Database(config.paths.database) as db:
             paper = db.get_paper(paper_id)
         if paper is None or not paper["local_pdf_path"]:
@@ -1378,6 +1399,29 @@ def create_app(
         root = config.paths.pdf_dir.resolve()
         if not path.is_file() or (path != root and root not in path.parents):
             raise HTTPException(404, "Local PDF not found")
+        return path
+
+    @app.get("/papers/{paper_id}/pdf/open")
+    def open_local_pdf(paper_id: int) -> Response:
+        path = local_pdf_path(paper_id)
+        opener = shutil.which("xdg-open")
+        if opener is None:
+            raise HTTPException(503, "xdg-open is not available")
+        try:
+            subprocess.Popen(
+                [opener, str(path)],
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                start_new_session=True,
+            )
+        except OSError as exc:
+            raise HTTPException(500, f"Could not open PDF: {exc}") from exc
+        return Response(status_code=204)
+
+    @app.get("/papers/{paper_id}/pdf")
+    def local_pdf(paper_id: int) -> FileResponse:
+        path = local_pdf_path(paper_id)
         return FileResponse(
             path,
             media_type="application/pdf",
@@ -1473,8 +1517,6 @@ def create_app(
             with Database(config.paths.database) as db:
                 db.create_saved_query(
                     name=str(form.get("name", "")),
-                    source_type=str(form.get("source_type", "papers")),
-                    search_query="",
                     prompt=str(form.get("prompt", "")),
                 )
         except ValueError as exc:
@@ -1491,8 +1533,6 @@ def create_app(
                 changed = db.update_saved_query(
                     query_id,
                     name=str(form.get("name", "")),
-                    source_type=str(form.get("source_type", "papers")),
-                    search_query="",
                     prompt=str(form.get("prompt", "")),
                 )
             if not changed:
@@ -1506,17 +1546,32 @@ def create_app(
     @app.post("/queries/{query_id}/delete")
     def delete_query(query_id: int) -> RedirectResponse:
         with Database(config.paths.database) as db:
-            if not db.delete_saved_query(query_id):
+            query = db.get_saved_query(query_id)
+            if query is None:
                 raise HTTPException(404, "Saved query not found")
+            if bool(query["is_builtin"]):
+                return RedirectResponse(
+                    _notice_url("/queries", "Summarize is a built-in prompt and cannot be deleted.", level="warning"),
+                    status_code=303,
+                )
+            db.delete_saved_query(query_id)
         return RedirectResponse(_notice_url("/queries", "Saved query deleted."), status_code=303)
 
     @app.post("/queries/{query_id}/run")
     async def run_query(request: Request, query_id: int) -> RedirectResponse:
         form = await request.form()
         profiles = tuple(str(value) for value in form.getlist("model"))
-        context = _int_or_none(form.get("context_window_tokens")) or 8192
+        context = _int_or_none(form.get("context_window_tokens")) or DEFAULT_CONTEXT_WINDOW_TOKENS
+        source_scope = str(form.get("source_scope", "abstract"))
+        pdf_strategy = str(form.get("pdf_strategy", "auto"))
         try:
-            batch_id = collection_controller.start(query_id, profiles, context)
+            batch_id = collection_controller.start(
+                query_id,
+                profiles,
+                context,
+                source_scope=source_scope,
+                pdf_strategy=pdf_strategy,
+            )
         except ValueError as exc:
             return RedirectResponse(
                 _notice_url("/queries", str(exc), level="error"), status_code=303
@@ -1535,51 +1590,55 @@ def create_app(
     async def run_filtered_query(request: Request) -> RedirectResponse:
         form = await request.form()
         query_id = _int_or_none(form.get("query_id"))
-        profile_name = str(form.get("model", ""))
+        profiles = tuple(str(value) for value in form.getlist("model") if str(value))
+        context = _int_or_none(form.get("context_window_tokens")) or DEFAULT_CONTEXT_WINDOW_TOKENS
+        source_scope = str(form.get("source_scope", "abstract"))
+        pdf_strategy = str(form.get("pdf_strategy", "auto"))
         if query_id is None:
             return RedirectResponse(
-                _notice_url("/", "Select a saved query.", level="error"),
-                status_code=303,
+                _notice_url("/", "Select a saved query.", level="error"), status_code=303
             )
-        profile = next(
-            (item for item in config.available_llms if item.profile == profile_name),
-            None,
-        )
-        if profile is None:
+        available_profiles = {item.profile for item in config.available_llms}
+        if not profiles or any(name not in available_profiles for name in profiles):
             return RedirectResponse(
-                _notice_url("/", "Select a configured model.", level="error"),
-                status_code=303,
+                _notice_url("/", "Select a configured model.", level="error"), status_code=303
             )
         filters = _parse_filter_values(form)
         with Database(config.paths.database) as db:
             authors_for_labels = db.list_authors_with_tags(tracked_only=True)
             topics_for_labels = db.list_topics()
         selection = _selection_with_labels(
-            filters,
-            authors=authors_for_labels,
-            topics=topics_for_labels,
+            filters, authors=authors_for_labels, topics=topics_for_labels
         )
+        selected_ids: list[int] = []
+        raw_ids = str(form.get("paper_ids", ""))
+        for value in raw_ids.split(","):
+            paper_id = _int_or_none(value.strip())
+            if paper_id is not None and paper_id > 0:
+                selected_ids.append(paper_id)
+        if selected_ids:
+            selected_ids = list(dict.fromkeys(selected_ids))[:5000]
+            selection["paper_ids"] = selected_ids
+            selection["labels"] = [f"Selected papers: {len(selected_ids)}"]
         try:
             batch_id = collection_controller.start(
                 query_id,
-                (profile_name,),
-                profile.context_window_tokens,
+                profiles,
+                context,
                 selection=selection,
+                source_scope=source_scope,
+                pdf_strategy=pdf_strategy,
             )
         except ValueError as exc:
-            return RedirectResponse(
-                _notice_url("/", str(exc), level="error"), status_code=303
-            )
+            return RedirectResponse(_notice_url("/", str(exc), level="error"), status_code=303)
         if batch_id is None:
             return RedirectResponse(
-                _notice_url(
-                    "/", "Another collection query is already running.", level="warning"
-                ),
+                _notice_url("/", "Another collection query is already running.", level="warning"),
                 status_code=303,
             )
         target = _notice_url(
             f"/queries?focus={query_id}",
-            f"Started saved query for {profile.model}.",
+            f"Started saved query with {len(set(profiles))} model(s).",
         )
         return RedirectResponse(f"{target}#query-{query_id}", status_code=303)
 
@@ -1609,18 +1668,25 @@ def create_app(
                         "model": task["model"],
                         "paper_id": int(task["paper_id"]),
                         "paper_title": task["paper_title"],
+                        "papers": [{"id": int(task["paper_id"]), "title": task["paper_title"]}],
                         "started_at": task["started_at"] or task["created_at"],
                     }
                 )
             for query_run in db.active_query_runs():
                 paper_id: int | None = None
                 paper_title: str | None = None
+                papers_for_job: list[dict[str, Any]] = []
                 selection = _json_value(query_run["selection_json"], {})
                 values = selection.get("paper_ids") if isinstance(selection, dict) else None
-                if isinstance(values, list) and len(values) == 1:
-                    paper_id = _int_or_none(values[0])
-                    paper = db.get_paper(paper_id) if paper_id is not None else None
-                    paper_title = str(paper["title"]) if paper is not None else None
+                if isinstance(values, list):
+                    for value in values[:20]:
+                        selected_id = _int_or_none(value)
+                        paper = db.get_paper(selected_id) if selected_id is not None else None
+                        if paper is not None:
+                            papers_for_job.append({"id": selected_id, "title": str(paper["title"])})
+                    if len(papers_for_job) == 1:
+                        paper_id = int(papers_for_job[0]["id"])
+                        paper_title = str(papers_for_job[0]["title"])
                 active_jobs.append(
                     {
                         "kind": "Saved prompt",
@@ -1629,6 +1695,7 @@ def create_app(
                         "model": query_run["model"],
                         "paper_id": paper_id,
                         "paper_title": paper_title,
+                        "papers": papers_for_job,
                         "started_at": query_run["started_at"] or query_run["created_at"],
                     }
                 )

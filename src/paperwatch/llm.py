@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import json
 from pathlib import Path
+import shutil
+import subprocess
 from typing import Any, Protocol, TypeVar
 import threading
 
@@ -747,6 +750,143 @@ class CodexClient(OpenAIClient):
                     pass
 
 
+class ClaudeCodeClient:
+    """Claude Code headless mode using the user's existing local authentication."""
+
+    provider = "claude-code"
+
+    def __init__(
+        self,
+        *,
+        model: str,
+        command: str = "claude",
+        timeout_seconds: float = 600,
+        reasoning_effort: str | None = None,
+    ) -> None:
+        self.model = model
+        self.command = command
+        self.timeout_seconds = timeout_seconds
+        self.reasoning_effort = reasoning_effort
+        self._progress: ProgressCallback | None = None
+        self._cancel_event: threading.Event | None = None
+        self._process: subprocess.Popen[str] | None = None
+
+    def set_runtime(
+        self, progress: ProgressCallback | None, cancel_event: threading.Event | None
+    ) -> None:
+        self._progress = progress
+        self._cancel_event = cancel_event
+
+    def close(self) -> None:
+        process = self._process
+        if process is not None and process.poll() is None:
+            process.terminate()
+
+    def check_ready(self) -> None:
+        executable = shutil.which(self.command)
+        if executable is None and not Path(self.command).is_file():
+            raise LLMError(
+                f"Claude Code executable {self.command!r} was not found; install Claude Code or set command"
+            )
+
+    def _command(self, schema: dict[str, Any]) -> list[str]:
+        command = [
+            self.command,
+            "-p",
+            "Analyze the research-paper request supplied on stdin and return only the requested structured output.",
+            "--output-format",
+            "json",
+            "--json-schema",
+            json.dumps(schema, ensure_ascii=False, separators=(",", ":")),
+            "--model",
+            self.model,
+            "--safe-mode",
+            "--tools",
+            "",
+            "--strict-mcp-config",
+            "--permission-mode",
+            "dontAsk",
+            "--no-session-persistence",
+            "--system-prompt",
+            "You are a careful research-paper analyst. Do not use tools. Follow the user's source and output schema exactly.",
+        ]
+        if self.reasoning_effort:
+            command.extend(("--effort", self.reasoning_effort))
+        return command
+
+    def generate_json(
+        self,
+        prompt: str,
+        *,
+        schema: dict[str, Any],
+        schema_name: str,
+    ) -> StructuredJSONResponse:
+        del schema_name
+        self.check_ready()
+        check_cancelled(self._cancel_event)
+        try:
+            process = subprocess.Popen(
+                self._command(schema),
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                encoding="utf-8",
+            )
+            self._process = process
+            stdout, stderr = process.communicate(prompt, timeout=self.timeout_seconds)
+        except subprocess.TimeoutExpired as exc:
+            process.terminate()
+            try:
+                process.communicate(timeout=5)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.communicate()
+            raise LLMError(
+                f"Claude Code analysis timed out after {self.timeout_seconds:g} seconds"
+            ) from exc
+        except OSError as exc:
+            raise LLMError(f"Claude Code could not start: {exc}") from exc
+        finally:
+            self._process = None
+        check_cancelled(self._cancel_event)
+        if process.returncode != 0:
+            detail = stderr.strip() or stdout.strip() or f"exit status {process.returncode}"
+            raise LLMError(f"Claude Code analysis failed: {detail[:1000]}")
+        try:
+            payload = json.loads(stdout)
+        except json.JSONDecodeError as exc:
+            raise LLMError("Claude Code returned an invalid JSON envelope") from exc
+        if not isinstance(payload, dict):
+            raise LLMError("Claude Code returned an unexpected response envelope")
+        data = payload.get("structured_output")
+        if not isinstance(data, dict):
+            raise LLMError("Claude Code returned no structured_output object")
+        usage = payload.get("usage")
+        if not isinstance(usage, dict):
+            usage = {}
+        for key in ("total_cost_usd", "duration_ms", "duration_api_ms", "num_turns"):
+            if key in payload:
+                usage[key] = payload[key]
+        if self._progress is not None:
+            self._progress("output", json.dumps(data, ensure_ascii=False))
+        return StructuredJSONResponse(data=data, usage=usage, raw=payload)
+
+    def analyze(self, prompt: str) -> LLMResponse:
+        try:
+            response = self.generate_json(
+                prompt, schema=ANALYSIS_JSON_SCHEMA, schema_name="paper_analysis"
+            )
+            result = AnalysisResult.model_validate(response.data).model_copy(
+                update={"generated_by_model": model_attribution(self.model)}
+            )
+            return LLMResponse(result=result, usage=response.usage, raw=response.raw)
+        except LLMError:
+            raise
+        except ValidationError as exc:
+            raise LLMError(f"Claude Code analysis failed: {exc}") from exc
+
+
 def configure_job_runtime(
     llm: LLMClient,
     progress: ProgressCallback | None,
@@ -791,6 +931,13 @@ def create_llm(config: LLMConfig, *, client: httpx.Client | None = None) -> LLMC
             timeout_seconds=config.timeout_seconds,
             reasoning_effort=config.reasoning_effort or "medium",
             client=client,
+        )
+    if config.provider == "claude-code":
+        return ClaudeCodeClient(
+            model=config.model,
+            command=config.command,
+            timeout_seconds=config.timeout_seconds,
+            reasoning_effort=config.reasoning_effort,
         )
     raise LLMError(f"Unsupported LLM provider: {config.provider}")
 

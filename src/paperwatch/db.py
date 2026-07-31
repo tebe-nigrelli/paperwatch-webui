@@ -18,7 +18,14 @@ from .models import (
 )
 
 
-SCHEMA_VERSION = 8
+SCHEMA_VERSION = 9
+
+DEFAULT_SUMMARY_QUERY_NAME = "Summarize"
+DEFAULT_SUMMARY_QUERY_PROMPT = (
+    "Summarize each selected paper. Cover the research problem, methods, main results, "
+    "supporting evidence, limitations, and open questions. Keep every claim grounded in "
+    "the selected source text and preserve the paper title and paper_id."
+)
 
 
 def utcnow() -> str:
@@ -212,6 +219,7 @@ CREATE TABLE IF NOT EXISTS saved_queries (
     source_type TEXT NOT NULL CHECK (source_type IN ('papers', 'summaries')),
     search_query TEXT NOT NULL DEFAULT '',
     prompt TEXT NOT NULL,
+    is_builtin INTEGER NOT NULL DEFAULT 0,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL,
     last_run_at TEXT
@@ -305,6 +313,7 @@ class Database:
         self._ensure_analysis_columns()
         self._conn.executescript(EXTRA_SCHEMA)
         self._ensure_query_columns()
+        self._ensure_default_saved_queries()
         self._conn.executescript(TOPICS_SCHEMA)
         if version < 6:
             self._backfill_paper_topics()
@@ -351,14 +360,48 @@ class Database:
                     self._conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {definition}")
 
     def _ensure_query_columns(self) -> None:
-        columns = {
+        run_columns = {
             row["name"]
             for row in self._conn.execute("PRAGMA table_info(query_runs)").fetchall()
         }
-        if "selection_json" not in columns:
+        if "selection_json" not in run_columns:
             self._conn.execute(
                 "ALTER TABLE query_runs ADD COLUMN selection_json TEXT NOT NULL DEFAULT '{}'"
             )
+        query_columns = {
+            row["name"]
+            for row in self._conn.execute("PRAGMA table_info(saved_queries)").fetchall()
+        }
+        if "is_builtin" not in query_columns:
+            self._conn.execute(
+                "ALTER TABLE saved_queries ADD COLUMN is_builtin INTEGER NOT NULL DEFAULT 0"
+            )
+
+    def _ensure_default_saved_queries(self) -> None:
+        row = self._conn.execute(
+            "SELECT id FROM saved_queries WHERE is_builtin=1 ORDER BY id LIMIT 1"
+        ).fetchone()
+        if row is not None:
+            return
+        existing = self._conn.execute(
+            "SELECT id FROM saved_queries WHERE lower(name)=lower(?) ORDER BY id LIMIT 1",
+            (DEFAULT_SUMMARY_QUERY_NAME,),
+        ).fetchone()
+        if existing is not None:
+            self._conn.execute(
+                "UPDATE saved_queries SET name=?, is_builtin=1 WHERE id=?",
+                (DEFAULT_SUMMARY_QUERY_NAME, int(existing["id"])),
+            )
+            return
+        now = utcnow()
+        self._conn.execute(
+            """
+            INSERT INTO saved_queries(
+                name, source_type, search_query, prompt, is_builtin, created_at, updated_at
+            ) VALUES (?, 'papers', '', ?, 1, ?, ?)
+            """,
+            (DEFAULT_SUMMARY_QUERY_NAME, DEFAULT_SUMMARY_QUERY_PROMPT, now, now),
+        )
 
     def _backfill_paper_topics(self) -> None:
         rows = self._conn.execute(
@@ -1435,10 +1478,13 @@ class Database:
         return int(row["id"])
 
     def create_saved_query(
-        self, *, name: str, source_type: str, search_query: str, prompt: str
+        self,
+        *,
+        name: str,
+        prompt: str,
+        source_type: str = "papers",
+        search_query: str = "",
     ) -> int:
-        if source_type not in {"papers", "summaries"}:
-            raise ValueError("Query source must be papers or summaries")
         name = name.strip()
         prompt = prompt.strip()
         if not name or not prompt:
@@ -1447,10 +1493,11 @@ class Database:
         with self.transaction() as conn:
             cur = conn.execute(
                 """
-                INSERT INTO saved_queries(name, source_type, search_query, prompt, created_at, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?)
+                INSERT INTO saved_queries(
+                    name, source_type, search_query, prompt, is_builtin, created_at, updated_at
+                ) VALUES (?, 'papers', '', ?, 0, ?, ?)
                 """,
-                (name[:120], source_type, search_query.strip()[:300], prompt[:10000], now, now),
+                (name[:120], prompt[:10000], now, now),
             )
         return int(cur.lastrowid)
 
@@ -1459,12 +1506,10 @@ class Database:
         query_id: int,
         *,
         name: str,
-        source_type: str,
-        search_query: str,
         prompt: str,
+        source_type: str = "papers",
+        search_query: str = "",
     ) -> bool:
-        if source_type not in {"papers", "summaries"}:
-            raise ValueError("Query source must be papers or summaries")
         name = name.strip()
         prompt = prompt.strip()
         if not name or not prompt:
@@ -1473,16 +1518,19 @@ class Database:
             cur = conn.execute(
                 """
                 UPDATE saved_queries
-                SET name=?, source_type=?, search_query=?, prompt=?, updated_at=?
+                SET name=CASE WHEN is_builtin=1 THEN ? ELSE ? END,
+                    source_type='papers', search_query='', prompt=?, updated_at=?
                 WHERE id=?
                 """,
-                (name[:120], source_type, search_query.strip()[:300], prompt[:10000], utcnow(), query_id),
+                (DEFAULT_SUMMARY_QUERY_NAME, name[:120], prompt[:10000], utcnow(), query_id),
             )
         return cur.rowcount > 0
 
     def delete_saved_query(self, query_id: int) -> bool:
         with self.transaction() as conn:
-            cur = conn.execute("DELETE FROM saved_queries WHERE id=?", (query_id,))
+            cur = conn.execute(
+                "DELETE FROM saved_queries WHERE id=? AND is_builtin=0", (query_id,)
+            )
         return cur.rowcount > 0
 
     def get_saved_query(self, query_id: int) -> sqlite3.Row | None:
@@ -1496,7 +1544,7 @@ class Database:
                     (SELECT count(*) FROM query_runs qr WHERE qr.query_id=q.id) AS run_count,
                     (SELECT qr.status FROM query_runs qr WHERE qr.query_id=q.id ORDER BY qr.id DESC LIMIT 1) AS latest_status
                 FROM saved_queries q
-                ORDER BY q.updated_at DESC, q.id DESC
+                ORDER BY q.is_builtin DESC, q.updated_at DESC, q.id DESC
                 """
             ).fetchall()
         )
@@ -1589,7 +1637,7 @@ class Database:
         return list(
             self._conn.execute(
                 """
-                SELECT qr.*, q.name AS query_name, q.source_type, q.search_query
+                SELECT qr.*, q.name AS query_name
                 FROM query_runs qr JOIN saved_queries q ON q.id=qr.query_id
                 WHERE qr.status IN ('queued', 'running')
                 ORDER BY qr.id DESC
@@ -1602,7 +1650,7 @@ class Database:
             return list(
                 self._conn.execute(
                     """
-                    SELECT qr.*, q.name AS query_name, q.source_type, q.search_query
+                    SELECT qr.*, q.name AS query_name
                     FROM query_runs qr JOIN saved_queries q ON q.id=qr.query_id
                     ORDER BY qr.id DESC LIMIT ?
                     """,
@@ -1612,7 +1660,7 @@ class Database:
         return list(
             self._conn.execute(
                 """
-                SELECT qr.*, q.name AS query_name, q.source_type, q.search_query
+                SELECT qr.*, q.name AS query_name
                 FROM query_runs qr JOIN saved_queries q ON q.id=qr.query_id
                 WHERE qr.query_id=? ORDER BY qr.id DESC LIMIT ?
                 """,

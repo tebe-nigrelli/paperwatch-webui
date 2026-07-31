@@ -337,8 +337,11 @@ class QueryWebStub:
     def snapshot(self):
         return QueryBatchSnapshot(**asdict(self.state))
 
-    def start(self, query_id, profiles, context, *, selection=None):
-        self.calls.append((query_id, profiles, context, selection))
+    def start(
+        self, query_id, profiles, context, *, selection=None,
+        source_scope="abstract", pdf_strategy="auto",
+    ):
+        self.calls.append((query_id, profiles, context, selection, source_scope, pdf_strategy))
         self.state = QueryBatchSnapshot(
             running=True, batch_id="query-web", query_id=query_id,
             paper_id=selection["paper_ids"][0], profiles=profiles, stage="Queued",
@@ -395,7 +398,7 @@ def test_paper_async_jobs_saved_prompt_and_no_reload_ui(
         )
     )
     page = client.get(f"/papers/{paper_id}")
-    assert 'data-paper-job="analysis"' in page.text
+    assert 'data-paper-job="analysis"' not in page.text
     assert 'data-paper-job="query"' in page.text
     assert "Saved critique" in page.text
     assert "Saved result" in page.text and "Critical result" in page.text

@@ -10,35 +10,35 @@ pytest
 
 Release result:
 
-- 240 tests passed
-- 95.12% branch-aware coverage
+- 253 tests passed
+- 95.18% branch-aware coverage
 - Python 3.13.5 release environment
 
 ## Feature coverage
 
 | Area | Automated checks |
 |---|---|
-| Configuration | TOML parsing, generated defaults, relative paths, environment keys, ranges, metadata-only mode, multiple profiles, profile names, context windows |
+| Configuration | TOML parsing, generated defaults, relative paths, environment keys, ranges, metadata-only mode, Ollama/OpenAI/Codex/Claude Code profiles, profile names, commands, reasoning effort, context windows |
 | Author lifecycle | Add/update/re-enable, pause, non-destructive archive, archived-row retention, restoration, coauthor relinking |
 | Author tags | Multiple tags, normalization, suggestions, duplicate handling, removal, filtering, archived-author visibility rules |
 | Paper author controls | First-tracked/default-first selection, orange tracked-author markers, picker state, local searches, OpenAlex/Scholar/arXiv links, missing IDs, failed lookup notices |
-| OpenAlex | Authentication, author search/get, work filtering/sorting, cursor pagination, retries, malformed responses, sparse title-less work skipping, metadata normalization |
+| OpenAlex | Authentication, author search/get, exact work lookup/download, title search, work filtering/sorting, cursor pagination, retries, malformed responses, sparse title-less work skipping, metadata normalization |
 | Deduplication | DOI, arXiv, OpenAlex, title/year, and same-run coauthor cases |
 | arXiv enrichment | ID/title lookup, author verification, polite throttling, retries, malformed XML, missing fields, conditional calls |
 | PDFs | Safe paths, redirect handling, limits, PDF signatures, readable-upload validation, atomic writes, cache reuse, extraction failures |
-| LLM providers | Ollama/OpenAI strict-schema requests, Ollama `num_ctx`, model readiness, actionable missing-model errors, native/OpenAI-compatible local endpoints, context override, output variants, usage, malformed output, HTTP failures |
+| LLM providers | Ollama/OpenAI/Codex strict-schema requests, Claude Code headless JSON-schema execution, local command readiness/timeouts/termination, Ollama `num_ctx`, model readiness, actionable missing-model errors, native/OpenAI-compatible local endpoints, context override, output variants, usage, malformed output, HTTP failures |
 | Structured summaries | Exact keys/enums, narrative limits, `Setting: ` requirement, trusted metadata normalization, named-column and JSON round trips |
 | Chunked analysis | Paragraph splitting, overlap, chunk-size budgets, direct-fit checks, chunk-note cache, recursive reduction, final strict schema, context failures |
 | Multi-model analysis | Direct/auto/chunked modes, same-source runs, partial failures, cache reuse, context overrides, source validation |
-| Saved queries | Paper/summary search, summary-content matching, map/reduce grouping, oversized nested record compaction, model success/failure, CRUD, status recovery |
+| Saved queries | Protected built-in Summarize prompt, name/prompt-only CRUD, runtime abstract/full-PDF source, all-paper source compatibility preflight, PDF-only strategy validation, exact paper selection, map/reduce grouping, oversized record splitting/compaction, multi-model success/failure, status recovery |
 | Pipeline | Cursor-independent one-year download-only backfill, historical-analysis suppression, late-PDF analysis, normal initial/overlap windows, model preflight, automatic PDF chunking, cache behavior, error isolation, counters |
 | Concurrency | Separate cross-process fetch, paper-analysis, and saved-query locks; clean release behavior |
-| SQLite | Transactions, WAL, foreign keys, schema guards, migrations through schema v8, historical paper flags, tag/query/chunk persistence, integrity |
-| Recent-paper UI | Newest-first table, wrapping titles, tracked-author links, one leading topic, missing-PDF state, summary column, OpenAlex title search, manual PDF import, filter-preserving query runner, pagination, system-theme matching |
-| Paper UI | Centralized source/author/model actions, author picker state, model reruns, saved prompts, context input, no-reload fragment refresh, scroll preservation, live output, cancellation, stale-attempt recovery, analysis rendering, exports |
-| Author/query UI | Top-right OpenAlex author search, table-based filtering across identity/employment/tags, Enter-to-tag, icon pause/resume/archive controls, OpenAlex result table, prompt-only query CRUD, filtered query execution, persisted selections/outputs/errors |
-| Static resilience | System light/dark preference, hidden-state CSS precedence, no CDN dependency, responsive templates |
-| Web security | CSP, frame denial, MIME-sniff prevention, same-origin referrer policy, protected local-PDF paths, localhost default |
+| SQLite | Transactions, WAL, foreign keys, schema guards, migrations through schema v9, historical paper flags, tag/query/chunk persistence, integrity |
+| Recent-paper UI | Newest-first table, wrapping titles, tracked-author links, one leading topic, missing-PDF state, summary column, persistent row selection and selected-first sorting, full-filter JSON/CSV export, filter-preserving runtime prompt controls, 25–1000 pagination, system/light/dark theme control |
+| Paper UI | Consolidated identifier/external/action metadata panel, author picker state, model reruns, saved prompts, 16384-token default context input, no-reload fragment refresh, scroll preservation, live output, cancellation, stale-attempt recovery, analysis rendering, exports |
+| Discovery/author/query UI | Mutually exclusive Paper/Author OpenAlex discovery modes, review-before-download, manual PDF import/backfill, table-based author filtering, Enter-to-tag, icon pause/resume/archive controls, protected Summarize prompt, prompt-only query CRUD, runtime source/strategy/context/model controls, persisted selections/outputs/errors |
+| Static resilience | System/light/dark preference cycle, hidden-state CSS precedence, no CDN dependency, responsive templates |
+| Web security | CSP, frame denial, MIME-sniff prevention, same-origin referrer policy, protected local-PDF paths, safe `xdg-open` invocation without a shell, localhost default |
 | CLI/systemd | CLI commands, web invocation, daily timer, web service files, archive wording |
 | Packaging | Prompt/config/templates/assets/new modules included in wheel; installed command/server smoke tests |
 
@@ -78,7 +78,7 @@ The release audit then verifies:
 
 ## Deliberately excluded live tests
 
-The deterministic suite does not call production OpenAlex, arXiv, Ollama, or OpenAI endpoints. This avoids nondeterminism, credentials, costs, and upstream rate limits. Their current request/response contracts and error paths are represented by controlled fixtures and mock servers. A deployment should still perform one manual credentialed smoke run with its chosen model and network environment.
+The deterministic suite does not call production OpenAlex, arXiv, Ollama, or OpenAI endpoints or the Claude Code executable. This avoids nondeterminism, credentials, costs, and upstream rate limits. Their current request/response contracts and error paths are represented by controlled fixtures and mock servers. A deployment should still perform one manual credentialed smoke run with its chosen model and network environment.
 
 ## Codex coverage
 
@@ -92,3 +92,14 @@ The offline suite verifies:
 - factory creation and Web UI profile rendering;
 - distinct direct and chunked cache entries when reasoning effort changes;
 - validation of supported effort values and rejection on unsupported providers.
+
+
+## Claude Code coverage
+
+The offline suite verifies:
+
+- configuration without an API key and custom executable paths;
+- schema-constrained `claude -p` arguments, model and effort propagation, stdin prompt delivery, and usage metadata;
+- factory creation and model attribution;
+- missing executable, process-start failure, nonzero exit, malformed envelopes, missing structured output, and schema validation errors;
+- timeout termination followed by forced kill when graceful shutdown does not complete.

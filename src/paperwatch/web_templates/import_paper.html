@@ -6,7 +6,7 @@
     <h1>Import a PDF paper</h1>
     <p>Add a local paper with the same detail, analysis, query, export, and PDF actions as fetched papers.</p>
   </div>
-  <a class="button" href="/">Back to Recent</a>
+  <a class="button" href="/discover">Back to Discover</a>
 </section>
 
 <section class="panel">
@@ -23,7 +23,7 @@
       <label><span>arXiv ID</span><input name="arxiv_id" value="{{ import_values.get('arxiv_id', '') }}" placeholder="2607.12345"></label>
       <label class="full"><span>Abstract (optional)</span><textarea name="abstract" rows="8">{{ import_values.get('abstract', '') }}</textarea></label>
     </div>
-    <div class="import-actions"><button class="button button-primary" type="submit">Import paper</button><a class="button" href="/">Cancel</a></div>
+    <div class="import-actions"><button class="button button-primary" type="submit">Import paper</button><a class="button" href="/discover">Cancel</a></div>
   </form>
 </section>
 {% endblock %}

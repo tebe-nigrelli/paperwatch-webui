@@ -1,180 +1,82 @@
-# Release audit — paperwatch 0.6.2
+# Release audit — paperwatch 0.6.3
 
 ## Result
 
-Version 0.6.2 adds in-place paper jobs to the 0.6.1 interface. Summary and saved-prompt runs preserve scroll position, stream live Ollama output, support cancellation, refresh only the result section, and hide abandoned or failed attempts after restart. Existing fetch, analysis, PDF, topic, tag, export, Codex, and author behavior is retained.
+This revision consolidates discovery/import operations, makes saved prompts runtime-configurable and source-safe, adds persistent paper subset selection, restores a three-state system-aware theme toggle, opens local PDFs through the desktop, fixes exact OpenAlex work downloads, and adds Claude Code as an LLM provider.
 
+## Verified behavior
 
-### In-place paper jobs
+### Navigation and layout
 
-- Summary and saved-prompt forms submit asynchronously from the paper page.
-- The paper page is not reloaded when a job starts or finishes.
-- Only the results fragment is refreshed, and the previous vertical scroll position is restored.
-- Ollama JSON fragments and chunk/reduction progress are shown live.
-- Active jobs can be stopped; queued and active rows are finalized as cancelled.
-- Startup marks abandoned jobs inconclusive, while paper pages show only active or successful attempts.
+- The top bar defaults to the system light/dark preference and exposes a top-right control that cycles through system, light, and dark modes.
+- Diagnostics is the final navigation item.
+- Runs no longer contains an Operations section.
+- OpenAlex paper search, OpenAlex author search, one-year backfill, and manual PDF import are grouped on Discover.
+- Recent keeps local-library filtering, result counts, JSON/CSV exports, saved-prompt controls, and paper selection in compact panels.
+- Recent JSON/CSV links export the complete filtered result set, independent of the visible page.
+- Paper detail groups identifiers, external references, and paper actions in one compact metadata panel while keeping the link groups visually distinct.
 
-## Usability review
+### Saved prompts
 
-The primary routes require no nested search workflow:
+- A built-in **Summarize** prompt is created automatically, sorted first, editable only for prompt text, and cannot be deleted.
+- User-created saved queries store only a name and prompt at the application level; legacy schema columns remain inert for migration compatibility.
+- Source, PDF strategy, context-window size, one or more models, filters, and exact paper IDs are selected at run time.
+- The former separate “Run selected models” UI is removed; paper detail and Recent use the same saved-prompt execution model.
+- Abstract runs require every selected paper to contain an abstract. Full-PDF runs require every selected paper to have a usable local PDF or source URL.
+- PDF strategy is accepted only for full-PDF runs; Direct, Auto, and Chunk + merge remain available with bounded map/reduce processing.
 
-```text
-Recent table -> paper detail
-Recent filters + saved prompt + model -> query result
-Authors table -> filter, tag, pause/resume, archive
-```
+### Paper selection and discovery
 
-- Recent opens directly to a wrapping, horizontally resilient paper table.
-- Tracked author links immediately re-filter Recent.
-- PDF availability and missing state are visible without opening a paper.
-- Author management uses one table and compact icon actions.
-- Query definitions are separate from paper selection; selection happens once on Recent.
-- Light and high-contrast dark themes remain available from the corner button.
-- Diagnostics remain separate from the normal reading workflow.
+- Recent-page checkboxes persist selected paper IDs in browser local storage across searches and pagination.
+- Visible selected rows sort above unselected rows, and the runner sends the exact retained selection.
+- Recent page sizes now include 25, 100, 250, 500, and 1000.
+- Discover always has exactly one active Paper or Author mode and renders only that mode's results.
+- Discover reviews OpenAlex matches before download and requests at most the API-supported 100 results per search.
+- Exact OpenAlex downloads use `OpenAlexClient.get_work()` and validate work identifiers.
 
-## Added behavior
+### PDFs and desktop integration
 
-### Recent-paper interface
+- Local PDF links call `xdg-open` without a shell, allowing KDE/system file associations to choose the viewer.
+- The existing inline PDF endpoint remains available for compatibility and exports.
+- Local paths remain constrained to the configured PDF directory.
 
-- Newest-first table is the default route.
-- Columns combine date/journal, wrapping title, tracked-author links, the leading OpenAlex topic, PDF state, and latest summary.
-- Current filters can be passed directly to a saved query and selected model.
+### Claude Code
 
-### Centralized author controls
+- `provider = "claude-code"` invokes a locally authenticated Claude Code executable in headless, JSON-schema-constrained mode.
+- Custom executable paths, model selection, effort, timeout, usage metadata, cancellation, and process cleanup are supported.
+- Missing executables, launch failures, nonzero exits, malformed envelopes, missing structured output, schema failures, and hung processes produce actionable errors.
 
-- A picker exposes every coauthor on the paper page and defaults to the first tracked author in paper order, falling back to the first author.
-- Tracked coauthors are highlighted in orange; selected authors can be searched locally, opened on OpenAlex/Scholar/arXiv, or added/restored to tracking.
-- Authors without an OpenAlex ID still receive useful name-based local and external searches.
-- Removing from the author list only changes tracking flags; no historical data is deleted.
+## Compatibility review
 
-### Themes
-
-- Fixed corner switch for high-contrast light/dark modes.
-- Browser persistence with safe operation when local storage is unavailable.
-- Explicit `[hidden]` CSS prevents generic button styles from exposing unavailable controls.
-
-### Local-model full-text processing
-
-- Direct, automatic, and chunked modes.
-- Paragraph-aware chunks with overlap.
-- Structured chunk notes, recursive reduction, and strict final Research Paper Summary.
-- User-controlled context size.
-- Ollama `num_ctx` receives the selected context value.
-- Chunk cache keyed by content/model/prompt/context identity.
-- No silent full-paper truncation.
-- Complete PDF extraction defaults to a two-million-character safety ceiling before chunking.
-- Daily runs preflight the configured local model once instead of producing one identical failure per paper.
-- Missing models leave the initial author cursor untouched so the full lookback can be analyzed after installation.
-- Native Ollama and OpenAI-compatible local chat endpoints are supported.
-
-### Model reruns
-
-- One or several configured profiles can analyze the same source.
-- Stored results remain distinct by provider, model, prompt, scope, and content hash.
-- Partial failures preserve successful model outputs.
-- Identical work reuses valid cached rows.
-
-### Saved collection prompts
-
-- Editable named queries over matching papers or matching stored summary content.
-- Reusable prompt, selected models, and context size.
-- Persistent per-model output and error history.
-- Recursive map/reduce for larger result sets.
-- Oversized nested records are reduced to identity plus bounded content excerpts.
-- Query deletion does not affect papers or analyses.
-
-### Author tags
-
-- Many-to-many normalized tags.
-- Suggestions from existing visible author tags.
-- Tag filtering on the author page.
-- Archived authors retain tags without polluting the active suggestion list.
-
-
-### Codex whole-PDF input
-
-- Codex full-text **Direct** and **Auto** analyses upload the original PDF through `/v1/files` with purpose `user_data`.
-- The Responses request references the uploaded `file_id` as an `input_file` beside the strict analysis prompt.
-- The temporary OpenAI file is deleted after success or failure.
-- No local text extraction or chunking occurs on this path; explicit **Chunk + merge** still uses the local map/reduce pipeline.
-- Cache identity includes the original PDF byte hash and reasoning effort.
-
-## Simplicity and debt review
-
-- Existing pipeline, LLM, validation, and persistence logic is reused by the Web UI.
-- SQLite remains the only database and queue/status store.
-- Background work uses bounded in-process controllers plus cross-process file locks; there is no broker to administer.
-- External links are deterministic ID/name searches rather than fragile scraped profile inference.
-- Multi-model work is sequential to avoid surprise local GPU or API contention.
-- Saved-query processing shares the existing provider abstraction and context-budget logic.
-- Schema migrations are incremental through version 5 and retain prior analyses and relationships.
-- No `TODO`, `FIXME`, `HACK`, or `XXX` markers remain in source or tests.
+- Existing SQLite data migrates incrementally through schema version 9.
+- Legacy saved-query arguments and `/papers/{id}/pdf` remain accepted for API/backward compatibility.
+- Daily fetch, backfill, manual import, summaries, saved prompts, multi-model runs, exports, author tracking, tags, active-run links, PDF validation/redownload, Ollama recovery, OpenAI, and Codex paths remain covered.
+- New templates and static assets are included by the existing package-data rules.
 
 ## Verification
 
 | Check | Result |
 |---|---|
-| Deterministic tests | 172 passed |
-| Branch-aware coverage | 95.39% |
+| Deterministic tests | 253 passed |
+| Branch-aware coverage | 95.18% |
 | Enforced minimum | 95% |
 | Python compilation | Passed |
-| Generated default config | Parsed successfully |
-| Recent-paper-first navigation | Passed |
-| Direct paper and author links | Passed |
-| Unindexed coauthor behavior | Passed |
-| Non-destructive author removal/restoration | Passed |
-| Tags and suggestions | Passed |
-| High-contrast light/dark UI | Passed |
-| Direct/auto/chunked summary modes | Passed |
-| Ollama context propagation | Passed |
-| Multi-model partial failure/cache behavior | Passed |
-| Saved-query CRUD, rerun, and output persistence | Passed |
-| Oversized collection-record bounding | Passed |
-| Migrations through schema v5 | Passed |
-| Cross-process locking | Passed |
-| Rendered desktop/dark/mobile visual inspection | Passed |
-| Built-wheel contents and generated config | Passed |
-| Installed CLI and real local HTTP server | Passed |
-| Installed chunk/map/reduce execution and cache reuse | Passed |
-| One-year defaults and automatic PDF download | Passed |
-| Missing Ollama model preflight and actionable pull command | Passed |
-| OpenAI-compatible local-server fallback | Passed |
-| Sparse OpenAlex work records skipped without aborting author discovery | Passed |
-| SQLite integrity | `ok` |
-| systemd unit verification | Passed |
+| Wheel build | Passed |
+| Clean patch application | Passed |
+| Exact OpenAlex work lookup | Passed |
+| Protected built-in Summarize prompt | Passed |
+| Runtime source/PDF strategy/context/model selection | Passed |
+| Persistent exact paper selection | Passed |
+| System/light/dark three-state theme control | Passed |
+| Mixed-source saved-prompt rejection | Passed |
+| Full-filter JSON/CSV export | Passed |
+| KDE/system PDF opener path | Passed |
+| Claude Code success/error/timeout paths | Passed |
 
 ## Operational boundaries
 
-- The Web UI has no authentication and is intended for localhost use.
-- Background jobs are process-local after they start; persistent task rows preserve status, but this is not a distributed worker system.
-- Models run sequentially by design.
-- Google Scholar links are search links; Paperwatch does not scrape Scholar.
-- arXiv and OpenAlex links depend on available identifiers.
-- Open PDFs are used when known; access controls are never bypassed.
-- Model quality and effective context limits still depend on the selected model/runtime.
-- Live production credentials were not used in the deterministic release suite.
-
-## OpenAI Codex support
-
-- `provider = "codex"` is a first-class LLM profile type.
-- Codex calls use the OpenAI Responses API with the same strict JSON Schema contract as other remote OpenAI models.
-- `reasoning_effort` supports `low`, `medium`, `high`, and `xhigh`; omitted Codex effort defaults to `medium`.
-- Codex requires `OPENAI_API_KEY` or a profile `api_key`; the application does not invoke the Codex CLI or access its local login state.
-- Direct, chunked, multi-model, rerun, and saved-query paths all use the common LLM protocol.
-- Reasoning effort is included in direct and chunked cache identities, preventing stale cross-effort reuse.
-- Provider-specific authentication, model-access, and HTTP errors are actionable.
-
-
-## 0.5.6 corrective audit
-
-- The patch is based directly on the uploaded 0.5.5 source tree and preserves its Codex changes.
-- `paperwatch backfill --days 365` ignores existing `last_checked_at` cursors and defaults to a 5000-work-per-author safety cap.
-- Backfill runs download open PDFs without invoking any LLM.
-- Historical imports use `papers.auto_analyze = 0`; routine runs do not summarize the initial backlog.
-- A PDF first downloaded during a later normal run is analyzed once.
-- Recent-paper cards and paper details expose both downloaded and source PDF links.
-- Local PDFs are served inline and remain confined to the configured PDF directory.
-- PDF filters and dashboard totals include downloaded files even if the remote URL is absent.
-- The missing packaged `defaults/config.toml` is restored, so `paperwatch init` works again.
-
-Verification: 190 tests passed with 95.08% branch-aware coverage.
+- The Web UI is intended for localhost and has no authentication.
+- `xdg-open` acts on the machine running the paperwatch server; this is correct for the local desktop deployment model.
+- OpenAlex limits individual search responses to 100 records, while the local Recent table can display up to 1000 records per page.
+- Background jobs remain bounded in-process workers protected by cross-process locks, not a distributed queue.
+- LLM quality, supported model names, and practical context limits depend on the configured runtime.

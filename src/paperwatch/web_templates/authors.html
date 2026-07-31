@@ -1,36 +1,7 @@
 {% extends "base.html" %}
 {% block title %}Authors · paperwatch{% endblock %}
 {% block content %}
-<section class="page-heading authors-heading">
-  <div><h1>Authors</h1><p>Search, tag, pause, or archive tracked authors.</p></div>
-  <form method="post" action="/authors/search" class="author-openalex-search">
-    <strong>Find an author on OpenAlex</strong>
-    <div class="inline-search-row"><input name="name" value="{{ search_name or '' }}" placeholder="e.g. Geoffrey Hinton" aria-label="Author name" required><input type="hidden" name="limit" value="10"><button class="button button-primary button-small" type="submit">Search</button></div>
-  </form>
-</section>
-
-{% if search_error or search_results %}
-<section class="panel search-panel">
-  <div class="panel-heading"><h2>OpenAlex matches</h2><a href="/authors">Clear</a></div>
-  {% if search_error %}<div class="notice notice-error">{{ search_error }}</div>{% endif %}
-  {% if search_results %}
-  <div class="table-wrap search-results-table">
-    <table class="author-table">
-      <thead><tr><th>Name<br>University</th><th>Papers</th><th>Scholar</th><th>Add tag</th><th>Track</th><th></th></tr></thead>
-      <tbody>{% for item in search_results %}<tr>
-        <td class="author-identity-cell"><strong>{{ item.name }}</strong><small>{{ item.institution or 'University unavailable' }}</small></td>
-        <td>{{ item.works_count }}</td>
-        <td><div class="external-links"><a href="https://scholar.google.com/scholar?q=author%3A%22{{ item.name|urlencode }}%22" target="_blank" rel="noreferrer">Scholar</a><a href="https://openalex.org/authors/{{ item.openalex_id|lower }}" target="_blank" rel="noreferrer">OpenAlex</a><a href="https://arxiv.org/search/?query={{ item.name|urlencode }}&searchtype=author" target="_blank" rel="noreferrer">arXiv</a></div></td>
-        <td class="muted">After tracking</td>
-        <td class="icon-action-cell"><form method="post" action="/authors/{{ item.openalex_id }}/add"><button class="icon-button" type="submit" title="Track {{ item.name }}" aria-label="Track {{ item.name }}">＋</button></form></td>
-        <td></td>
-      </tr>{% endfor %}</tbody>
-    </table>
-  </div>
-  {% endif %}
-</section>
-{% endif %}
-
+<section class="page-heading"><h1>Authors</h1><p>Search, tag, pause, or archive tracked authors.</p></section>
 <section class="panel">
   <div class="panel-heading"><h2>Tracked authors</h2><span>{{ authors|length }} visible</span></div>
   <form method="get" action="/authors" class="author-filter-form">

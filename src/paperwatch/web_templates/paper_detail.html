@@ -4,20 +4,10 @@
 <section class="page-heading paper-heading">
   <div class="paper-meta"><span>{{ paper.publication_date or 'Unknown date' }}</span><span>{{ paper.venue or 'Venue unavailable' }}</span></div>
   <h1>{{ paper.title }}</h1>
-  <div class="button-group links">
-    {% if paper.arxiv_url %}<a class="button button-primary" href="{{ paper.arxiv_url }}" target="_blank" rel="noreferrer">arXiv</a>{% endif %}
-    <a class="button" href="{{ paper.google_scholar_url }}" target="_blank" rel="noreferrer">Google Scholar</a>
-    {% if paper.openalex_url %}<a class="button" href="{{ paper.openalex_url }}" target="_blank" rel="noreferrer">OpenAlex</a>{% endif %}
-    {% if paper.publication_url %}<a class="button" href="{{ paper.publication_url }}" target="_blank" rel="noreferrer">Publication</a>{% endif %}
-    {% if paper.local_pdf_path %}<a class="button button-primary" href="/papers/{{ paper.id }}/pdf" target="_blank" rel="noreferrer">Downloaded PDF</a>{% endif %}
-    {% if paper.pdf_url %}<a class="button" href="{{ paper.pdf_url }}" target="_blank" rel="noreferrer">Source PDF</a>{% endif %}
-    <a class="button" href="/papers/{{ paper.id }}/export.json">Export JSON</a>
-  </div>
   {% if topics %}<div class="topic-tags paper-topic-tags" aria-label="OpenAlex topics">{% for topic in topics %}<a class="tag topic-tag{% if topic.is_primary %} active{% endif %}" href="/?topic={{ topic.openalex_id }}" title="{% if topic.score is not none %}OpenAlex relevance {{ '%.3f'|format(topic.score) }}{% endif %}{% if topic.subfield_name %} · {{ topic.subfield_name }}{% endif %}">{{ topic.display_name }}</a>{% endfor %}</div>{% endif %}
 </section>
 
 <section class="panel author-picker-panel">
-  <div class="panel-heading"><div><h2>Author actions</h2><p>Pick an author once, then jump directly to local papers, external profiles, or tracking.</p></div></div>
   {% if authors %}
   {% set default_author = authors[default_author_index] %}
   {% set default_status = 'tracked' if default_author.is_tracked and default_author.tracked_enabled else ('paused' if default_author.is_tracked else 'not tracked') %}
@@ -35,35 +25,51 @@
   {% else %}<p class="muted">No author metadata is stored.</p>{% endif %}
 </section>
 
-<section class="panel metadata-grid">
-  <div><span>DOI</span><strong>{{ paper.doi or '—' }}</strong></div><div><span>arXiv</span><strong>{{ paper.arxiv_id or '—' }}</strong></div><div><span>OpenAlex</span><strong>{{ paper.openalex_id or '—' }}</strong></div><div><span>Fetched</span><strong>{{ paper.fetched_at }}</strong></div><div><span>Abstract source</span><strong>{{ paper.abstract_source or '—' }}</strong></div><div><span>PDF source</span><strong>{{ paper.pdf_source or '—' }}</strong></div>
+<section class="panel paper-reference-panel">
+  <div class="paper-reference-layout">
+    <div class="metadata-grid paper-reference-metadata">
+      <div><span>DOI</span><strong>{{ paper.doi or '—' }}</strong></div><div><span>arXiv</span><strong>{{ paper.arxiv_id or '—' }}</strong></div><div><span>OpenAlex</span><strong>{{ paper.openalex_id or '—' }}</strong></div><div><span>Fetched</span><strong>{{ paper.fetched_at }}</strong></div><div><span>Abstract source</span><strong>{{ paper.abstract_source or '—' }}</strong></div><div><span>PDF source</span><strong>{{ paper.pdf_source or '—' }}</strong></div>
+    </div>
+    <div class="paper-link-groups">
+      <div class="paper-link-group">
+        <span>External links</span>
+        <div class="button-group">
+          {% if paper.arxiv_url %}<a class="button button-primary" href="{{ paper.arxiv_url }}" target="_blank" rel="noreferrer">arXiv</a>{% endif %}
+          <a class="button" href="{{ paper.google_scholar_url }}" target="_blank" rel="noreferrer">Google Scholar</a>
+          {% if paper.openalex_url %}<a class="button" href="{{ paper.openalex_url }}" target="_blank" rel="noreferrer">OpenAlex</a>{% endif %}
+          {% if paper.publication_url %}<a class="button" href="{{ paper.publication_url }}" target="_blank" rel="noreferrer">Publication</a>{% endif %}
+        </div>
+      </div>
+      <div class="paper-link-group paper-link-group-actions">
+        <span>Paper actions</span>
+        <div class="button-group">
+          {% if paper.local_pdf_path %}<a class="button button-primary" href="/papers/{{ paper.id }}/pdf/open">Open PDF</a>{% endif %}
+          {% if paper.pdf_url %}<a class="button" href="{{ paper.pdf_url }}" target="_blank" rel="noreferrer">Source PDF</a>{% endif %}
+          <a class="button" href="/papers/{{ paper.id }}/export.json">Export JSON</a>
+        </div>
+      </div>
+    </div>
+  </div>
 </section>
 {% if paper.abstract %}<section class="panel prose"><div class="panel-heading"><h2>Source abstract</h2></div><p>{{ paper.abstract }}</p></section>{% endif %}
 
 <section class="panel model-runner">
-  <div class="panel-heading"><div><h2>Summarize or rerun</h2><p>Run additional models or rerun the same strict summary with multiple models. Full PDFs can be analyzed directly or chunked for smaller local contexts.</p></div>{% if analysis_state.running and analysis_state.paper_id == paper.id %}<span class="status status-running">running</span>{% endif %}</div>
-  {% if model_profiles and (paper.abstract or paper.pdf_url or paper.local_pdf_path) %}
-  <form id="analysis-form" data-paper-job="analysis" method="post" action="/papers/{{ paper.id }}/analyze">
-    <fieldset class="model-options"><legend>Models</legend>{% for profile in model_profiles %}<label class="model-option"><input type="checkbox" name="model" value="{{ profile.profile }}" {% if loop.first %}checked{% endif %}><span><strong>{{ profile.profile }}</strong><small>{{ profile.provider }} · {{ profile.model }}{% if profile.reasoning_effort %} · reasoning {{ profile.reasoning_effort }}{% endif %} · default context {{ profile.context_window_tokens }} tokens</small></span></label>{% endfor %}</fieldset>
-    <div class="model-run-actions">
-      <label><span>Source</span><select name="scope">{% if paper.pdf_url or paper.local_pdf_path %}<option value="fulltext">Full paper PDF</option>{% endif %}{% if paper.abstract %}<option value="abstract">Abstract</option>{% endif %}</select></label>
-      <label><span>PDF strategy</span><select name="strategy"><option value="auto">Auto</option><option value="chunked">Chunk + merge</option><option value="direct">Direct</option></select></label>
-      <label><span>Context window tokens</span><input type="number" name="context_window_tokens" min="512" max="1000000" value="8192"></label>
-      <button class="button button-primary" type="submit" {% if analysis_state.running %}disabled{% endif %}>Run selected models</button>
-    </div>
-    <p class="form-help">Codex Direct/Auto uploads the original PDF; Chunk + merge extracts text locally. Chunk size follows this context window, and chunk notes are cached.</p>
-  </form>
-  {% if saved_queries %}
+  <div class="panel-heading"><div><h2>Run saved prompt</h2><p>Choose the prompt, models, source, PDF handling, and context for this run.</p></div>{% if query_state.running and query_state.paper_id == paper.id %}<span class="status status-running">running</span>{% endif %}</div>
+  {% if saved_queries and model_profiles and (paper.abstract or paper.pdf_url or paper.local_pdf_path) %}
   <form id="saved-prompt-form" data-paper-job="query" method="post" action="/papers/{{ paper.id }}/prompt" class="saved-prompt-runner">
+    <label class="grow"><span>Saved prompt</span><select name="query_id" required>{% for query in saved_queries %}<option value="{{ query.id }}">{{ query.name }}</option>{% endfor %}</select></label>
+    <fieldset class="model-options"><legend>Models</legend>{% for profile in model_profiles %}<label class="model-option"><input type="checkbox" name="model" value="{{ profile.profile }}" {% if loop.first %}checked{% endif %}><span><strong>{{ profile.profile }}</strong><small>{{ profile.provider }} · {{ profile.model }}{% if profile.reasoning_effort %} · reasoning {{ profile.reasoning_effort }}{% endif %}</small></span></label>{% endfor %}</fieldset>
     <div class="model-run-actions">
-      <label class="grow"><span>Run saved prompt</span><select name="query_id" required><option value="">Choose a saved prompt</option>{% for query in saved_queries %}<option value="{{ query.id }}">{{ query.name }} · {{ query.source_type }}</option>{% endfor %}</select></label>
-      <label><span>Model</span><select name="model">{% for profile in model_profiles %}<option value="{{ profile.profile }}">{{ profile.profile }} · {{ profile.model }}</option>{% endfor %}</select></label>
-      <label><span>Context tokens</span><input type="number" name="context_window_tokens" min="512" max="1000000" value="8192"></label>
-      <button class="button" type="submit">Run prompt</button>
+      <label><span>Source</span><select name="source_scope" data-source-scope>{% if paper.abstract %}<option value="abstract">Abstract</option>{% endif %}{% if paper.pdf_url or paper.local_pdf_path %}<option value="fulltext">Full paper PDF</option>{% endif %}</select></label>
+      <label><span>PDF strategy</span><select name="pdf_strategy" data-pdf-strategy><option value="auto">Auto</option><option value="chunked">Chunk + merge</option><option value="direct">Direct</option></select></label>
+      <label><span>Context window tokens</span><input type="number" name="context_window_tokens" min="512" max="1000000" value="16384"></label>
+      <button class="button button-primary" type="submit" {% if query_state.running %}disabled{% endif %}>Run saved prompt</button>
     </div>
+    <p class="form-help">Auto uses one request when the selected source fits, otherwise it chunks and merges. Direct fails rather than truncating when the context is too small.</p>
   </form>
-  {% else %}<p class="form-help">Create a reusable prompt on <a href="/queries">Queries</a> to run it on this paper.</p>{% endif %}
-  {% elif not model_profiles %}<p class="muted">No active LLM profiles are configured.</p>{% else %}<p class="muted">No abstract or PDF is available.</p>{% endif %}
+  {% elif not saved_queries %}<p class="form-help">Create a reusable prompt on <a href="/queries">Queries</a>.</p>
+  {% elif not model_profiles %}<p class="muted">No active LLM profiles are configured.</p>
+  {% else %}<p class="muted">No abstract or PDF is available.</p>{% endif %}
   <div id="paper-jobs" class="live-job" data-paper-id="{{ paper.id }}" hidden>
     <div class="live-job-heading"><div><strong id="job-stage">Starting</strong><small id="job-message"></small></div><button id="job-cancel" class="button button-small button-danger" type="button">Stop</button></div>
     <pre id="job-output" aria-live="polite"></pre>

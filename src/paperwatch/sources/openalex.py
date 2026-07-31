@@ -176,6 +176,12 @@ class OpenAlexClient:
                     raise
         return papers
 
+    def get_work(self, work_id: str) -> PaperRecord:
+        identifier = short_openalex_id(clean_text(work_id))
+        if not identifier or not identifier.startswith("W"):
+            raise OpenAlexError("Invalid OpenAlex work id")
+        return self.parse_work(self._get(f"/works/{identifier}", {}))
+
     @staticmethod
     def _location_urls(work: dict[str, Any]) -> list[str]:
         values: list[str] = []

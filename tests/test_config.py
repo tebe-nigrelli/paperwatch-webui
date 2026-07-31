@@ -283,5 +283,42 @@ def test_reasoning_effort_is_rejected_for_ollama(config_path: Path):
             1,
         )
     )
-    with pytest.raises(ConfigError, match="only supported for openai or codex"):
+    with pytest.raises(ConfigError, match="only supported for openai, codex, or claude-code"):
+        load_config(config_path)
+
+
+def test_claude_code_profile_uses_local_command_without_api_key(config_path: Path, monkeypatch):
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    config_path.write_text(
+        config_path.read_text()
+        + """
+
+[[llm_profiles]]
+name = "claude-review"
+provider = "claude-code"
+model = "claude-sonnet-4-5"
+command = "/opt/claude/bin/claude"
+reasoning_effort = "high"
+"""
+    )
+    profile = load_config(config_path).llm_profile("claude-review")
+    assert profile.provider == "claude-code"
+    assert profile.command == "/opt/claude/bin/claude"
+    assert profile.api_key == ""
+    assert profile.reasoning_effort == "high"
+
+
+def test_claude_code_reasoning_effort_is_validated(config_path: Path):
+    config_path.write_text(
+        config_path.read_text()
+        + """
+
+[[llm_profiles]]
+name = "claude-bad"
+provider = "claude-code"
+model = "claude-sonnet-4-5"
+reasoning_effort = "minimal"
+"""
+    )
+    with pytest.raises(ConfigError, match="Claude Code profile.*low, medium, high, xhigh, or max"):
         load_config(config_path)

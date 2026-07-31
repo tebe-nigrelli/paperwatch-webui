@@ -49,8 +49,11 @@ class QueryStub:
     def snapshot(self):
         return QueryBatchSnapshot(**asdict(self.state))
 
-    def start(self, query_id, profiles, context, *, selection=None):
-        self.calls.append((query_id, profiles, context, selection))
+    def start(
+        self, query_id, profiles, context, *, selection=None,
+        source_scope="abstract", pdf_strategy="auto",
+    ):
+        self.calls.append((query_id, profiles, context, selection, source_scope, pdf_strategy))
         return "query-batch"
 
 
@@ -110,20 +113,30 @@ def test_recent_feed_theme_and_direct_links(
     assert "Tracked author(s)" in response.text
     assert "OpenAlex topics" in response.text
     assert "PDF file" in response.text
-    assert 'id="theme-toggle"' not in response.text
+    assert 'id="theme-toggle"' in response.text
+    assert 'data-default-theme="system"' in response.text
     assert "Queries" in response.text
     assert f'/papers/{paper_id}' in response.text
     assert "https://arxiv.org/abs/2607.12345" in response.text
     assert "scholar.google.com" in response.text
     assert "openalex.org/works/w456" in response.text
     js = client.get("/static/app.js").text
-    assert "paperwatch-theme" not in js
+    assert "paperwatch-theme" in js
+    assert 'dataset.defaultTheme || "system"' in js
+    assert 'system: "◐"' in js
+    assert 'light: "☀"' in js
+    assert 'dark: "☾"' in js
+    assert 'storageRemove(themeKey)' in js
     assert "author-picker" in js
-    assert "localStorage" not in js
+    assert "localStorage" in js
+    assert "PDF strategy only applies" not in js
+    assert "strategy.disabled = !usesPdf" in js
     css = client.get("/static/app.css").text
     assert "@media(prefers-color-scheme:dark)" in css
     assert "--bg:#05070a" in css
     assert "[hidden]{display:none!important}" in css
+    assert ".discover-mode-option.active" in css
+    assert "grid-template-columns:minmax(0,1fr) minmax(0,1fr) minmax(250px,.9fr)" in css
 
 
 def test_author_tags_filter_and_non_destructive_removal(
@@ -162,8 +175,10 @@ def test_paper_author_picker_and_chunked_multi_model_request(
     assert 'id="author-local"' in page.text
     assert 'id="author-track-form"' in page.text
     assert "Context window tokens" in page.text
+    assert 'name="context_window_tokens" min="512" max="1000000" value="16384"' in page.text
     assert "Chunk + merge" in page.text
-    assert "Run selected models" in page.text
+    assert "Run saved prompt" in page.text
+    assert "Run selected models" not in page.text
     response = client.post(
         f"/papers/{paper_id}/analyze",
         data={
@@ -190,15 +205,13 @@ def test_saved_query_create_edit_run_output_and_delete(
         "/queries",
         data={
             "name": "Compare evidence",
-            "source_type": "summaries",
-            "search_query": "Minimal",
             "prompt": "Compare the strongest evidence.",
         },
         follow_redirects=False,
     )
     assert response.status_code == 303
     with Database(config.paths.database) as db:
-        query_id = int(db.list_saved_queries()[0]["id"])
+        query_id = int(next(row["id"] for row in db.list_saved_queries() if row["name"] == "Compare evidence"))
         run_id = db.create_query_runs(
             batch_id="existing",
             query_id=query_id,
@@ -231,7 +244,7 @@ def test_saved_query_create_edit_run_output_and_delete(
     assert "One paper matched" in page.text
     assert "Search “Minimal”" in page.text
     assert "From 2026-01-01" in page.text
-    assert "Filter papers and run" in page.text
+    assert "Select papers and run" in page.text
     assert "Paper search" not in page.text
     recent = client.get("/")
     assert "Run on these" in recent.text
@@ -241,6 +254,10 @@ def test_saved_query_create_edit_run_output_and_delete(
         data={
             "query_id": str(query_id),
             "model": "default",
+            "source_scope": "fulltext",
+            "pdf_strategy": "chunked",
+            "context_window_tokens": "4096",
+            "paper_ids": "1",
             "q": "Minimal",
             "author": "A123",
             "topic": "T100",
@@ -257,18 +274,15 @@ def test_saved_query_create_edit_run_output_and_delete(
     assert response.headers["location"].startswith("/queries?focus=")
     assert f"#query-{query_id}" in response.headers["location"]
     assert "notice=Started+saved+query" in response.headers["location"]
-    assert query.calls[0][:3] == (query_id, ("default",), 8192)
+    assert query.calls[0][:3] == (query_id, ("default",), 4096)
     selection = query.calls[0][3]
+    assert selection["paper_ids"] == [1]
+    assert query.calls[0][4:] == ("fulltext", "chunked")
     assert selection["query"] == "Minimal"
     assert selection["author_id"] == "A123"
     assert selection["topic_id"] == "T100"
     assert selection["has_pdf"] is True
-    assert "Author: Ada Lovelace" in selection["labels"]
-    assert "Kind: machine learning" in selection["labels"]
-    assert "Scope: fulltext" in selection["labels"]
-    assert "Not analyzed" in selection["labels"]
-    assert "From 2026-01-01" in selection["labels"]
-    assert "To 2026-12-31" in selection["labels"]
+    assert selection["labels"] == ["Selected papers: 1"]
     client.post(
         f"/queries/{query_id}/edit",
         data={
@@ -323,12 +337,18 @@ def test_saved_query_validation_missing_routes_busy_and_status(
             self.busy = busy
             self.state = QueryBatchSnapshot(running=busy, batch_id='busy' if busy else None)
 
-        def start(self, query_id, profiles, context, *, selection=None):
+        def start(
+            self, query_id, profiles, context, *, selection=None,
+            source_scope="abstract", pdf_strategy="auto",
+        ):
             if self.error:
                 raise self.error
             if self.busy:
                 return None
-            return super().start(query_id, profiles, context, selection=selection)
+            return super().start(
+                query_id, profiles, context, selection=selection,
+                source_scope=source_scope, pdf_strategy=pdf_strategy,
+            )
 
     client = make_app(config_path)
     response = client.post(
@@ -337,7 +357,7 @@ def test_saved_query_validation_missing_routes_busy_and_status(
         follow_redirects=False,
     )
     assert response.status_code == 303
-    assert 'Query+source+must+be+papers+or+summaries' in response.headers['location']
+    assert 'Query+name+and+prompt+are+required' in response.headers['location']
 
     with Database(config.paths.database) as db:
         query_id = db.create_saved_query(

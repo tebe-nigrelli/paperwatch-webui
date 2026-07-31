@@ -15,9 +15,12 @@
     <nav aria-label="Primary navigation">
       <a href="/">Recent</a>
       <a href="/authors">Authors</a>
+      <a href="/discover">Discover</a>
       <a href="/queries">Queries</a>
       <a href="/runs">Runs</a>
+      <a href="/dashboard">Diagnostics</a>
     </nav>
+    <button id="theme-toggle" class="theme-toggle" type="button" data-default-theme="system" aria-label="Theme: follow system" title="Theme: follow system">◐</button>
   </div>
 </header>
 <main class="shell">
@@ -28,6 +31,6 @@
   {% if query_state.error %}<div class="notice notice-error">Collection query failed: {{ query_state.error }}</div>{% endif %}
   {% block content %}{% endblock %}
 </main>
-<footer class="shell footer"><a href="/dashboard">Diagnostics</a><span>Local research-paper monitor</span></footer>
+<footer class="shell footer"><span>Local research-paper monitor</span></footer>
 </body>
 </html>

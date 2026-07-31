@@ -208,8 +208,9 @@ def test_dashboard_assets_and_security_headers(config_path, seeded_web):
     assert "OpenAlex topics" in response.text
     assert "PDF file" in response.text
     assert "Minimal Agents" in response.text
-    assert "Downloaded PDF" in response.text
-    assert "Backfill 1 year PDFs" in response.text
+    assert "Open PDF" in response.text
+    assert "Backfill 1 year PDFs" not in response.text
+    assert "Discover" in response.text
     assert "broken PDF" in response.text
     assert response.headers["x-frame-options"] == "DENY"
     assert "default-src 'self'" in response.headers["content-security-policy"]
@@ -240,12 +241,18 @@ def test_author_search_add_toggle_remove(config_path, seeded_web):
     assert "Ada Lovelace" in client.get("/authors?q=Analytical+Engine").text
     assert "Ada Lovelace" not in client.get("/authors?q=unrelated").text
 
-    response = client.post("/authors/search", data={"name": "Grace Hopper", "limit": "25"})
-    assert response.status_code == 200
+    response = client.post(
+        "/authors/search", data={"name": "Grace Hopper", "limit": "25"},
+        follow_redirects=False,
+    )
+    assert response.status_code == 303
+    assert response.headers["location"] == "/discover?mode=author&q=Grace+Hopper"
+    response = client.get(
+        "/discover", params={"mode": "author", "q": "Grace Hopper", "limit": "25"}
+    )
     assert "Grace Hopper" in response.text
     assert "Find an author on OpenAlex" in response.text
-    assert "After tracking" in response.text
-    assert 'aria-label="Track Grace Hopper"' in response.text
+    assert ">Track</button>" in response.text
     assert instances[-1].search_calls == [("Grace Hopper", 25)]
     assert instances[-1].closed
 
@@ -324,7 +331,7 @@ def test_paper_list_filters_and_invalid_query_values(config_path, seeded_web):
 def test_paper_pagination_redirect(config_path, seeded_web, paper_record):
     config = seeded_web[0]
     with Database(config.paths.database) as db:
-        for index in range(15):
+        for index in range(30):
             copy = replace(
                 paper_record,
                 openalex_id=f"WX{index}",
@@ -334,10 +341,10 @@ def test_paper_pagination_redirect(config_path, seeded_web, paper_record):
             )
             db.upsert_paper(copy)
     client, _ = make_client(config_path)
-    response = client.get("/papers?page=99&page_size=10", follow_redirects=False)
+    response = client.get("/papers?page=99&page_size=25", follow_redirects=False)
     assert response.status_code == 303
     assert "page=2" in response.headers["location"]
-    assert "Previous" in client.get("/papers?page=2&page_size=10").text
+    assert "Previous" in client.get("/papers?page=2&page_size=25").text
 
 
 def test_paper_detail_and_exports(config_path, seeded_web):
@@ -352,10 +359,19 @@ def test_paper_detail_and_exports(config_path, seeded_web):
     assert "Recent tasks" in response.text
     assert f'href="/analyses/{analysis_id}"' in response.text
     assert response.text.index("Source metadata") < response.text.index("Recent tasks")
-    assert "Run additional models" in response.text
+    assert "Run saved prompt" in response.text
+    assert "Run additional models" not in response.text
     assert "Google Scholar" in response.text
     assert "OpenAlex" in response.text
     assert "arXiv" in response.text
+    assert "External links" in response.text
+    assert "Paper actions" in response.text
+    assert 'class="paper-reference-layout"' in response.text
+    assert 'class="metadata-grid paper-reference-metadata"' in response.text
+    assert "Author actions" not in response.text
+    assert "Pick an author once" not in response.text
+    assert response.text.index("DOI") < response.text.index("External links")
+    assert response.text.index("External links") < response.text.index("Paper actions")
     assert "Track author" in response.text
     assert "/?author=A123" in response.text
     assert "https://openalex.org/authors/a123" in response.text
@@ -408,6 +424,11 @@ def test_local_pdf_download_and_path_guard(config_path, seeded_web, tmp_path):
 
 def test_bulk_exports_preserve_structured_data(config_path, seeded_web):
     client, _ = make_client(config_path)
+    page = client.get("/?q=Minimal&page=7&page_size=25")
+    assert 'href="/exports/papers.json?q=Minimal"' in page.text
+    assert 'href="/exports/papers.csv?q=Minimal"' in page.text
+    assert "/exports/papers.json?q=Minimal&amp;page=" not in page.text
+
     response = client.get("/exports/papers.json?q=Minimal")
     assert response.status_code == 200
     assert len(response.json()) == 1
@@ -816,8 +837,8 @@ def test_manual_pdf_import_behaves_like_fetched_paper(config_path, seeded_web):
     detail = client.get(f"/papers/{paper_id}")
     assert detail.status_code == 200
     assert "A Manually Imported Paper" in detail.text
-    assert "Downloaded PDF" in detail.text
-    assert "Run selected models" in detail.text
+    assert "Open PDF" in detail.text
+    assert "Run selected models" not in detail.text
     assert "Run saved prompt" in detail.text
     assert "Manual Proceedings" in detail.text
     assert client.get(f"/papers/{paper_id}/pdf").status_code == 200
@@ -961,18 +982,22 @@ def test_recent_search_lists_matches_before_download(
     fake = PaperSearchClient()
     client, _ = make_client(config_path, controller=controller, fake=fake)
     page = client.get("/")
-    assert 'class="recent-paper-search" method="get" action="/search"' in page.text
-    assert "Search papers by title" in page.text
-    assert "Import PDF" in page.text
-    assert "Fetch now" not in page.text
-    authors_page = client.get("/authors")
-    assert 'class="recent-paper-search"' not in authors_page.text
+    assert "Search papers by title" not in page.text
+    assert "Import PDF" not in page.text
+    discover = client.get("/discover")
+    assert "Search papers by title" in discover.text
+    assert "Find on OpenAlex" in discover.text
+    assert 'class="discover-mode-option active" href="/discover?mode=paper"' in discover.text
+    assert 'class="discover-mode-option" href="/discover?mode=author"' in discover.text
+    assert "Import PDF" in discover.text
+    assert "Backfill 1 year" in discover.text
 
     response = client.get(
-        "/search", params={"q": "Minimal Agents for Reliable Machine Learning"}
+        "/discover",
+        params={"mode": "paper", "q": "Minimal Agents for Reliable Machine Learning"},
     )
     assert response.status_code == 200
-    assert fake.work_searches == [("Minimal Agents for Reliable Machine Learning", 10)]
+    assert fake.work_searches == [("Minimal Agents for Reliable Machine Learning", 100)]
     assert paper_record.title in response.text
     assert 'method="post" action="/actions/download"' in response.text
     assert f'name="work_id" value="{paper_record.openalex_id}"' in response.text
@@ -986,10 +1011,10 @@ def test_paper_search_error_and_empty_query(config_path, seeded_web):
 
     fake = FailingPaperSearchClient()
     client, instances = make_client(config_path, fake=fake)
-    empty = client.get("/search")
+    empty = client.get("/discover")
     assert empty.status_code == 200
     assert instances == []
-    failed = client.get("/search", params={"q": "A paper"})
+    failed = client.get("/discover", params={"mode": "paper", "q": "A paper"})
     assert "OpenAlex search unavailable" in failed.text
     assert fake.closed is True
 
@@ -1017,7 +1042,7 @@ def test_selected_search_result_starts_download(config_path, seeded_web):
     assert response.status_code == 303
     assert controller.modes == ["download"]
     assert controller.queries == ["W123"]
-    assert response.headers["location"].startswith("/search?q=paper+query")
+    assert response.headers["location"].startswith("/discover?mode=paper&q=paper+query")
     assert "Downloading+A+paper" in response.headers["location"]
 
     missing = client.post(
@@ -1129,3 +1154,126 @@ def test_run_controller_download_and_pipeline_mode(monkeypatch, config_path, tmp
     result = _run_pipeline(config_path, "download", "W123")
     assert result["paper_id"] == 55
     assert events == ["W123", "watch-close", "services-close"]
+
+
+def test_local_pdf_opens_with_system_application(config_path, seeded_web, monkeypatch):
+    _, paper_id, second_id, _, _ = seeded_web
+    client, _ = make_client(config_path)
+    launched = {}
+
+    monkeypatch.setattr("paperwatch.web.shutil.which", lambda command: "/usr/bin/xdg-open")
+
+    def popen(args, **kwargs):
+        launched["args"] = args
+        launched["kwargs"] = kwargs
+        return object()
+
+    monkeypatch.setattr("paperwatch.web.subprocess.Popen", popen)
+    response = client.get(f"/papers/{paper_id}/pdf/open")
+    assert response.status_code == 204
+    assert launched["args"][0] == "/usr/bin/xdg-open"
+    assert launched["args"][1].endswith("valid.pdf")
+    assert launched["kwargs"]["start_new_session"] is True
+    assert client.get(f"/papers/{second_id}/pdf/open").status_code == 404
+
+    monkeypatch.setattr("paperwatch.web.shutil.which", lambda command: None)
+    missing = client.get(f"/papers/{paper_id}/pdf/open")
+    assert missing.status_code == 503
+    assert "xdg-open is not available" in missing.text
+
+    monkeypatch.setattr("paperwatch.web.shutil.which", lambda command: "/usr/bin/xdg-open")
+
+    def fail_open(*args, **kwargs):
+        raise OSError("desktop launcher failed")
+
+    monkeypatch.setattr("paperwatch.web.subprocess.Popen", fail_open)
+    failed = client.get(f"/papers/{paper_id}/pdf/open")
+    assert failed.status_code == 500
+    assert "desktop launcher failed" in failed.text
+
+
+def test_nav_order_runs_copy_and_builtin_query_protection(config_path, seeded_web):
+    config, *_ = seeded_web
+    client, _ = make_client(config_path)
+    page = client.get("/").text
+    assert page.index('href="/dashboard"') > page.index('href="/runs"')
+    assert 'id="theme-toggle"' in page
+
+    runs = client.get("/runs").text
+    assert "Operations" not in runs
+    assert "Currently running" in runs
+
+    with Database(config.paths.database) as db:
+        builtin = next(row for row in db.list_saved_queries() if row["is_builtin"])
+        builtin_id = int(builtin["id"])
+    response = client.post(f"/queries/{builtin_id}/delete", follow_redirects=False)
+    assert response.status_code == 303
+    assert "cannot+be+deleted" in response.headers["location"]
+    with Database(config.paths.database) as db:
+        assert db.get_saved_query(builtin_id) is not None
+
+
+def test_discover_selects_one_search_mode_clamps_limit_and_reports_errors(
+    config_path, seeded_web, paper_record, author_candidate
+):
+    class CombinedClient(FakeAuthorClient):
+        def __init__(self):
+            super().__init__()
+            self.calls = []
+
+        def search_works(self, query, limit=10):
+            self.calls.append(("paper", query, limit))
+            return [paper_record]
+
+        def search_authors(self, query, limit=10):
+            self.calls.append(("author", query, limit))
+            return [author_candidate]
+
+    fake = CombinedClient()
+    client, _ = make_client(config_path, fake=fake)
+    response = client.get(
+        "/discover", params={"mode": "paper", "q": "Agents", "limit": "9999"}
+    )
+    assert response.status_code == 200
+    assert "Minimal Agents" in response.text
+    assert "Author matches" not in response.text
+    assert ">Track</button>" not in response.text
+    assert fake.calls == [("paper", "Agents", 100)]
+
+    response = client.get(
+        "/discover", params={"mode": "author", "q": "Ada", "limit": "9999"}
+    )
+    assert response.status_code == 200
+    assert "Ada Lovelace" in response.text
+    assert "Minimal Agents" not in response.text
+    assert "Paper matches" not in response.text
+    assert fake.calls[-1] == ("author", "Ada", 100)
+
+    legacy = client.get(
+        "/discover", params={"paper_q": "Agents", "author_q": "Ada", "limit": "9999"}
+    )
+    assert "Minimal Agents" in legacy.text
+    assert "Author matches" not in legacy.text
+    assert fake.calls[-1] == ("paper", "Agents", 100)
+
+    class BrokenClient(CombinedClient):
+        def search_works(self, query, limit=10):
+            raise RuntimeError("paper search unavailable")
+
+        def search_authors(self, query, limit=10):
+            raise RuntimeError("author search unavailable")
+
+    broken_fake = BrokenClient()
+    broken, _ = make_client(config_path, fake=broken_fake)
+    response = broken.get(
+        "/discover", params={"mode": "paper", "q": "Agents", "limit": "-2"}
+    )
+    assert "paper search unavailable" in response.text
+    assert "Showing up to 1 results" in response.text
+    assert broken_fake.calls == []
+
+    response = broken.get(
+        "/discover", params={"mode": "author", "q": "Ada", "limit": "-2"}
+    )
+    assert "author search unavailable" in response.text
+    assert "paper search unavailable" not in response.text

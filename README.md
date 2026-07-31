@@ -1,6 +1,6 @@
 # paperwatch
 
-Paperwatch is a local, daily research-paper tracker for a curated set of authors. It discovers papers through OpenAlex, fills missing abstract and open-PDF metadata from arXiv, stores everything in SQLite, and produces strict structured summaries with Ollama, OpenAI, or OpenAI Codex models.
+Paperwatch is a local, daily research-paper tracker for a curated set of authors. It discovers papers through OpenAlex, fills missing abstract and open-PDF metadata from arXiv, stores everything in SQLite, and produces strict structured summaries with Ollama, OpenAI, OpenAI Codex, or Claude Code models.
 
 Version 0.6.3 keeps the compact table-first interface and adds in-place, cancellable paper jobs. Summaries and saved prompts run without reloading the paper page, preserve vertical scroll, and show live model output while they run.
 
@@ -24,7 +24,7 @@ Failures are isolated per author, paper, PDF, model, or saved query. Cross-proce
 - Python 3.11+
 - An OpenAlex API key
 - Ollama, an OpenAI API key, or metadata-only mode
-- Optional OpenAI Codex API model access for Codex profiles
+- Optional OpenAI Codex API or locally authenticated Claude Code model access
 
 ## Install on Arch Linux
 
@@ -81,7 +81,7 @@ The home page is a newest-first table with these columns:
 - local/source PDF state, with missing PDFs highlighted;
 - the latest structured summary.
 
-Tracked author names link directly to the same table filtered to that author. Search, author, topic, kind, year, PDF, and summary filters stay on this page. The top-right paper-title search opens OpenAlex matches before any download starts, and **Import PDF** opens a manual import form for a local PDF, title, authors, source link, and optional abstract, date, venue, DOI, and arXiv ID. Imported papers use the same detail, analysis, saved-query, export, and PDF flows as fetched papers. A saved prompt and model can be selected beside the filters and run against exactly the currently matched papers or summaries.
+Tracked author names link directly to the same table filtered to that author. Search, author, topic, kind, year, PDF, and summary filters stay on this page. Checkboxes select an exact paper subset for a saved prompt; selections persist in the browser across filter/search changes and selected rows remain at the top whenever they are visible. The table supports page sizes up to 1000 records. Local PDF links ask the desktop through `xdg-open`, so on Arch Linux/KDE they use the configured system PDF application.
 
 ### Paper detail
 
@@ -106,32 +106,40 @@ There is no multi-page author drill-down required to perform these actions.
 
 ### Authors and tags
 
-The Authors page keeps OpenAlex author search at the top right and shows tracked authors in a searchable table. The table includes each tracked author’s name, institution, local paper count, tags, external links, and compact icon controls for pausing, resuming, or non-destructively removing tracking.
+The Authors page shows tracked authors in a searchable table. The table includes each tracked author’s name, institution, local paper count, tags, external links, and compact icon controls for pausing, resuming, or non-destructively removing tracking. OpenAlex author discovery is on the separate **Discover** page.
 
 - Search matches name, institution/employment, ORCID, OpenAlex ID, and tags.
 - The small **Add tag** field submits on Enter and clears after the redirect.
 - Multiple tags are supported and existing tags are suggested.
-- OpenAlex search results use the same table structure and can be tracked with one icon action.
+- Discover results can be tracked with one action.
 
 Removing an author sets `tracked = 0` and `enabled = 0`. It never deletes the author, papers, tags, analyses, or paper-author relationships.
 
+### Discover and import
+
+The Discover page contains the network/import operations that are separate from the local library. Exactly one **Paper** or **Author** search mode is active at a time, and only that mode's results are shown:
+
+- search papers by title on OpenAlex and review up to 100 matches before choosing one to download;
+- search OpenAlex authors before adding one to tracking;
+- import a local PDF with title, authors, source link, and optional abstract/date/venue/DOI/arXiv metadata;
+- run the one-year PDF backfill.
+
 ### Saved collection queries
 
-The Queries page stores reusable prompts only: a name, input source (`papers` or `summaries`), and prompt. It does not contain a second paper-search form.
+Saved queries contain only a name and prompt. **Summarize** is created automatically, remains first, and cannot be deleted. Source (`Abstract` or `Full paper PDF`), PDF strategy (`Auto`, `Direct`, or `Chunk + merge`), context-window size, models, filters, and exact selected paper IDs are chosen when each run starts rather than being stored in the query definition. Before a run starts, paperwatch verifies every selected paper has the chosen source; PDF strategy is available only for full-PDF runs.
 
-To run a query:
+To run a saved prompt:
 
-1. Filter the Recent table.
-2. Select a saved query.
-3. Select a configured model.
-4. Run it against the current result set.
-5. Open the saved output on Queries.
+1. Filter Recent and optionally select specific rows.
+2. Choose a saved prompt and one or more configured models.
+3. Choose source, PDF strategy, and context window.
+4. Run it and inspect persistent per-model output on Queries.
 
-Every query run records the exact filters, model, context, output, and any per-model error. Queries can be edited or deleted without deleting papers or paper analyses.
+The Runs page shows active summaries and saved prompts, including links to explicitly selected papers. Every completed query run records its runtime selection, models, context, output, and per-model errors.
 
 ## Light and dark themes
 
-The Web UI follows the operating system’s light or dark preference through `prefers-color-scheme`. Theme changes made in the desktop environment are reflected automatically; the browser does not keep a separate Paperwatch theme override.
+The Web UI follows the operating system’s light or dark preference by default. The top-right theme button cycles between the system preference, light mode, and dark mode. Explicit overrides are retained in the browser.
 
 ## LLM configuration
 
@@ -139,12 +147,12 @@ The primary `[llm]` profile is used by the daily pipeline and appears in Web UI 
 
 ```toml
 [llm]
-provider = "ollama" # ollama | openai | codex | none
+provider = "ollama" # ollama | openai | codex | claude-code | none
 model = "qwen3:8b"
 base_url = "http://localhost:11434"
 timeout_seconds = 180
 max_input_chars = 100000
-context_window_tokens = 8192
+context_window_tokens = 16384
 analyze_pdfs = true
 prompt_version = "v2"
 ```
@@ -185,9 +193,22 @@ max_input_chars = 1000000
 context_window_tokens = 400000
 analyze_pdfs = true
 prompt_version = "v2"
+
+[[llm_profiles]]
+name = "claude-review"
+provider = "claude-code"
+model = "sonnet"
+command = "claude"
+reasoning_effort = "high"
+timeout_seconds = 600
+max_input_chars = 1000000
+context_window_tokens = 200000
+analyze_pdfs = true
+prompt_version = "v2"
+
 ```
 
-Profile names must be unique and contain only letters, numbers, dots, dashes, or underscores. Codex profiles accept `low`, `medium`, `high`, or `xhigh` reasoning effort; `medium` is used when omitted. Selected models run sequentially to keep local GPU and API load predictable. A failed model does not discard successful outputs from the same batch.
+Profile names must be unique and contain only letters, numbers, dots, dashes, or underscores. Codex profiles accept `low`, `medium`, `high`, or `xhigh` reasoning effort. Claude Code profiles use the local `claude` executable and existing login, and accept `low`, `medium`, `high`, `xhigh`, or `max`. Selected models run sequentially to keep local GPU and API load predictable. A failed model does not discard successful outputs from the same batch.
 
 Metadata-only mode is supported:
 
@@ -343,6 +364,10 @@ the model. **Chunk + merge** remains an explicit alternative that extracts and p
 text locally in bounded chunks. The reasoning effort and PDF content hash are part of
 the analysis cache identity.
 
+## Claude Code CLI
+
+Set `provider = "claude-code"` in an LLM profile to run the locally installed Claude Code CLI in headless, schema-constrained mode. Paperwatch uses the existing Claude Code login, disables tools for the analysis request, and does not require an Anthropic API key. Set `command` when the executable is not named `claude`.
+
 ## Exports
 
 The UI supports:
@@ -368,7 +393,7 @@ Exports preserve structured nested analysis data through canonical JSON fields.
 - `analysis_chunks`: cached map/reduce chunk notes
 - `author_tags`: normalized tag vocabulary
 - `author_tag_links`: many-to-many author tags
-- `saved_queries`: editable collection searches and prompts
+- `saved_queries`: prompt-only definitions, including the protected built-in Summarize prompt
 - `query_runs`: per-model saved-query outputs and failures
 - `runs`: daily/manual fetch totals and status
 - `run_errors`: isolated pipeline failures with stage context

@@ -1,0 +1,71 @@
+{% extends "base.html" %}
+{% block title %}Discover · paperwatch{% endblock %}
+{% block content %}
+<section class="page-heading split">
+  <div><h1>Discover</h1><p>Find papers and authors on OpenAlex, import a local PDF, or backfill the previous year.</p></div>
+  <div class="button-group">
+    <a class="button button-primary" href="/papers/import">Import PDF</a>
+    <form method="post" action="/actions/backfill" data-confirm="Fetch the previous 365 days and download every available open PDF? Historical papers will not be summarized automatically."><button class="button" type="submit" {% if run_state.running %}disabled{% endif %}>Backfill 1 year</button></form>
+  </div>
+</section>
+
+<nav class="discover-mode-switch" aria-label="Discovery search type">
+  <a class="discover-mode-option{% if discover_mode == 'paper' %} active{% endif %}" href="/discover?mode=paper" aria-current="{{ 'page' if discover_mode == 'paper' else 'false' }}">
+    <strong>Paper</strong><span>Search by title</span>
+  </a>
+  <a class="discover-mode-option{% if discover_mode == 'author' %} active{% endif %}" href="/discover?mode=author" aria-current="{{ 'page' if discover_mode == 'author' else 'false' }}">
+    <strong>Author</strong><span>Find on OpenAlex</span>
+  </a>
+</nav>
+
+<section class="panel discover-search-panel">
+  {% if discover_mode == 'paper' %}
+  <div class="panel-heading"><div><h2>Search papers by title</h2><p>Review OpenAlex matches before choosing a paper to download.</p></div></div>
+  <form class="inline-search-row" method="get" action="/discover">
+    <input type="hidden" name="mode" value="paper">
+    <input name="q" value="{{ discover_query }}" placeholder="Paper title" aria-label="Paper title" required autofocus>
+    <input type="hidden" name="limit" value="{{ search_limit }}">
+    <button class="button button-primary" type="submit">Search</button>
+  </form>
+  {% else %}
+  <div class="panel-heading"><div><h2>Find an author on OpenAlex</h2><p>Review matches before adding an author to tracking.</p></div></div>
+  <form class="inline-search-row" method="get" action="/discover">
+    <input type="hidden" name="mode" value="author">
+    <input name="q" value="{{ discover_query }}" placeholder="Author name" aria-label="Author name" required autofocus>
+    <input type="hidden" name="limit" value="{{ search_limit }}">
+    <button class="button button-primary" type="submit">Search</button>
+  </form>
+  {% endif %}
+</section>
+
+{% if discover_mode == 'paper' and paper_query %}
+<section class="panel">
+  <div class="panel-heading"><div><h2>Paper matches</h2><p>Showing up to {{ search_limit }} results for “{{ paper_query }}”.</p></div><a href="/discover?mode=paper">Clear</a></div>
+  {% if paper_error %}<div class="notice notice-error">{{ paper_error }}</div>{% endif %}
+  {% if not paper_error %}<div class="table-wrap search-results-table"><table class="paper-search-table"><thead><tr><th>Paper</th><th>Authors</th><th>Published</th><th>PDF</th><th></th></tr></thead><tbody>
+  {% for item in paper_results %}<tr>
+    <td class="paper-search-title"><strong>{{ item.title }}</strong><small>{% if item.venue %}{{ item.venue }}{% elif item.doi %}doi:{{ item.doi }}{% else %}{{ item.openalex_id }}{% endif %}</small></td>
+    <td>{% for author in item.authors[:4] %}{{ author.name }}{% if not loop.last %}, {% endif %}{% endfor %}{% if item.authors|length > 4 %}<span class="muted"> +{{ item.authors|length - 4 }}</span>{% endif %}</td>
+    <td>{{ item.publication_date or 'Unknown' }}</td>
+    <td>{% if item.pdf_url %}<span class="file-status file-source">Available</span>{% else %}<span class="file-status file-missing">Not listed</span>{% endif %}</td>
+    <td class="paper-search-action">{% if item.openalex_id %}<form method="post" action="/actions/download"><input type="hidden" name="work_id" value="{{ item.openalex_id }}"><input type="hidden" name="title" value="{{ item.title }}"><input type="hidden" name="q" value="{{ paper_query }}"><button class="button button-primary button-small" type="submit" {% if run_state.running %}disabled{% endif %}>Download</button></form>{% endif %}</td>
+  </tr>{% else %}<tr><td colspan="5" class="empty">No matching papers found.</td></tr>{% endfor %}
+  </tbody></table></div>{% endif %}
+</section>
+{% endif %}
+
+{% if discover_mode == 'author' and author_query %}
+<section class="panel">
+  <div class="panel-heading"><div><h2>Author matches</h2><p>Showing up to {{ search_limit }} results for “{{ author_query }}”.</p></div><a href="/discover?mode=author">Clear</a></div>
+  {% if author_error %}<div class="notice notice-error">{{ author_error }}</div>{% endif %}
+  {% if not author_error %}<div class="table-wrap search-results-table"><table class="author-table"><thead><tr><th>Name<br>University</th><th>Papers</th><th>Profiles</th><th>Track</th></tr></thead><tbody>
+  {% for item in author_results %}<tr>
+    <td class="author-identity-cell"><strong>{{ item.name }}</strong><small>{{ item.institution or 'University unavailable' }}</small></td>
+    <td>{{ item.works_count }}</td>
+    <td><div class="external-links"><a href="https://scholar.google.com/scholar?q=author%3A%22{{ item.name|urlencode }}%22" target="_blank" rel="noreferrer">Scholar</a><a href="https://openalex.org/authors/{{ item.openalex_id|lower }}" target="_blank" rel="noreferrer">OpenAlex</a><a href="https://arxiv.org/search/?query={{ item.name|urlencode }}&searchtype=author" target="_blank" rel="noreferrer">arXiv</a></div></td>
+    <td class="icon-action-cell"><form method="post" action="/authors/{{ item.openalex_id }}/add"><button class="button button-primary button-small" type="submit">Track</button></form></td>
+  </tr>{% else %}<tr><td colspan="4" class="empty">No matching authors found.</td></tr>{% endfor %}
+  </tbody></table></div>{% endif %}
+</section>
+{% endif %}
+{% endblock %}

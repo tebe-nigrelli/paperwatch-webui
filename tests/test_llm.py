@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import json
+import subprocess
 
 import httpx
 import pytest
 
 from paperwatch.llm import (
+    ClaudeCodeClient,
     CodexClient,
     LLMError,
     OllamaClient,
@@ -13,6 +15,152 @@ from paperwatch.llm import (
     PromptBuilder,
     create_llm,
 )
+
+
+class FakeClaudeProcess:
+    def __init__(self, stdout: str = "", stderr: str = "", returncode: int = 0):
+        self.stdout = stdout
+        self.stderr = stderr
+        self.returncode = returncode
+        self.prompts: list[tuple[str | None, float | int | None]] = []
+        self.terminated = False
+        self.killed = False
+        self.running = False
+
+    def communicate(self, prompt=None, timeout=None):
+        self.prompts.append((prompt, timeout))
+        return self.stdout, self.stderr
+
+    def poll(self):
+        return None if self.running else self.returncode
+
+    def terminate(self):
+        self.terminated = True
+        self.running = False
+
+    def kill(self):
+        self.killed = True
+        self.running = False
+
+
+def test_claude_code_structured_request_response_and_factory(
+    app_config, analysis_result, monkeypatch
+):
+    envelope = {
+        "structured_output": analysis_result.model_dump(),
+        "usage": {"input_tokens": 12, "output_tokens": 34},
+        "total_cost_usd": 0.01,
+        "duration_ms": 1250,
+        "num_turns": 1,
+    }
+    process = FakeClaudeProcess(json.dumps(envelope))
+    seen = {}
+
+    def popen(args, **kwargs):
+        seen["args"] = args
+        seen["kwargs"] = kwargs
+        return process
+
+    monkeypatch.setattr("paperwatch.llm.shutil.which", lambda command: "/usr/bin/claude")
+    monkeypatch.setattr("paperwatch.llm.subprocess.Popen", popen)
+    output = []
+    llm = ClaudeCodeClient(
+        model="claude-sonnet-4-5", command="claude", timeout_seconds=9,
+        reasoning_effort="high",
+    )
+    llm.set_runtime(lambda kind, value: output.append((kind, value)), None)
+    response = llm.analyze("analyze this paper")
+
+    assert response.result.name == analysis_result.name
+    assert response.result.generated_by_model == "claude-sonnet-4-5 (version not exposed)"
+    assert response.usage["output_tokens"] == 34
+    assert response.usage["total_cost_usd"] == 0.01
+    assert process.prompts == [("analyze this paper", 9)]
+    assert seen["args"][0:3] == ["claude", "-p", seen["args"][2]]
+    assert "--json-schema" in seen["args"]
+    assert seen["args"][seen["args"].index("--model") + 1] == "claude-sonnet-4-5"
+    assert seen["args"][seen["args"].index("--effort") + 1] == "high"
+    assert seen["kwargs"]["stdin"] is subprocess.PIPE
+    assert output and output[0][0] == "output"
+
+    from dataclasses import replace
+
+    created = create_llm(
+        replace(
+            app_config.llm, provider="claude-code", model="claude-haiku-4-5",
+            command="custom-claude", reasoning_effort=None,
+        )
+    )
+    assert isinstance(created, ClaudeCodeClient)
+    assert created.command == "custom-claude"
+
+
+def test_claude_code_readiness_close_and_response_errors(
+    tmp_path, analysis_result, monkeypatch
+):
+    monkeypatch.setattr("paperwatch.llm.shutil.which", lambda command: None)
+    missing = ClaudeCodeClient(model="m", command="not-installed", timeout_seconds=1)
+    with pytest.raises(LLMError, match="was not found"):
+        missing.check_ready()
+
+    local_command = tmp_path / "claude-local"
+    local_command.write_text("stub")
+    local = ClaudeCodeClient(model="m", command=str(local_command), timeout_seconds=1)
+    local.check_ready()
+    running = FakeClaudeProcess()
+    running.running = True
+    local._process = running
+    local.close()
+    assert running.terminated
+
+    monkeypatch.setattr("paperwatch.llm.shutil.which", lambda command: "/usr/bin/claude")
+    cases = [
+        (FakeClaudeProcess("", "authentication failed", 1), "authentication failed"),
+        (FakeClaudeProcess("not-json"), "invalid JSON envelope"),
+        (FakeClaudeProcess("[]"), "unexpected response envelope"),
+        (FakeClaudeProcess(json.dumps({"usage": {}})), "no structured_output"),
+    ]
+    for process, message in cases:
+        monkeypatch.setattr("paperwatch.llm.subprocess.Popen", lambda *args, p=process, **kwargs: p)
+        with pytest.raises(LLMError, match=message):
+            ClaudeCodeClient(model="m", timeout_seconds=1).analyze("x")
+
+    malformed_result = dict(analysis_result.model_dump())
+    malformed_result.pop("name")
+    process = FakeClaudeProcess(
+        json.dumps({"structured_output": malformed_result, "usage": "invalid"})
+    )
+    monkeypatch.setattr("paperwatch.llm.subprocess.Popen", lambda *args, **kwargs: process)
+    with pytest.raises(LLMError, match="Claude Code analysis failed"):
+        ClaudeCodeClient(model="m", timeout_seconds=1).analyze("x")
+
+    def fail_start(*args, **kwargs):
+        raise OSError("cannot execute")
+
+    monkeypatch.setattr("paperwatch.llm.subprocess.Popen", fail_start)
+    with pytest.raises(LLMError, match="could not start"):
+        ClaudeCodeClient(model="m", timeout_seconds=1).analyze("x")
+
+
+def test_claude_code_timeout_terminates_then_kills(monkeypatch):
+    class TimeoutProcess(FakeClaudeProcess):
+        def communicate(self, prompt=None, timeout=None):
+            self.prompts.append((prompt, timeout))
+            if len(self.prompts) < 3:
+                raise subprocess.TimeoutExpired("claude", timeout)
+            return "", ""
+
+    process = TimeoutProcess()
+    process.running = True
+    monkeypatch.setattr("paperwatch.llm.shutil.which", lambda command: "/usr/bin/claude")
+    monkeypatch.setattr("paperwatch.llm.subprocess.Popen", lambda *args, **kwargs: process)
+    with pytest.raises(LLMError, match="timed out after 0.5 seconds"):
+        ClaudeCodeClient(model="m", timeout_seconds=0.5).generate_json(
+            "x", schema={}, schema_name="ignored"
+        )
+    assert process.terminated
+    assert process.killed
+    assert [timeout for _prompt, timeout in process.prompts] == [0.5, 5, None]
 
 
 def test_prompt_builder_includes_metadata_and_rejects_truncation(tmp_path, paper_record):

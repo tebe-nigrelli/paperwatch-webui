@@ -58,6 +58,7 @@ class LLMConfig:
     prompt_version: str
     reasoning_effort: str | None = None
     profile: str = "default"
+    command: str = "claude"
 
 
 @dataclass(frozen=True)
@@ -117,9 +118,9 @@ def _llm_config(
 ) -> LLMConfig:
     inherited = defaults or {}
     provider = str(section.get("provider", inherited.get("provider", "ollama"))).strip().lower()
-    if provider not in {"ollama", "openai", "codex", "none"}:
+    if provider not in {"ollama", "openai", "codex", "claude-code", "none"}:
         raise ConfigError(
-            f"LLM profile {profile!r} provider must be ollama, openai, codex, or none"
+            f"LLM profile {profile!r} provider must be ollama, openai, codex, claude-code, or none"
         )
     if not PROFILE_RE.fullmatch(profile):
         raise ConfigError(
@@ -142,7 +143,7 @@ def _llm_config(
         api_key=api_key,
         timeout_seconds=float(section.get("timeout_seconds", inherited.get("timeout_seconds", 180))),
         max_input_chars=int(section.get("max_input_chars", inherited.get("max_input_chars", 100_000))),
-        context_window_tokens=int(section.get("context_window_tokens", inherited.get("context_window_tokens", 8192))),
+        context_window_tokens=int(section.get("context_window_tokens", inherited.get("context_window_tokens", 16384))),
         analyze_pdfs=_bool(section, "analyze_pdfs", bool(inherited.get("analyze_pdfs", True))),
         prompt_version=str(section.get("prompt_version", inherited.get("prompt_version", "v1"))).strip(),
         reasoning_effort=(
@@ -155,6 +156,7 @@ def _llm_config(
             or ("medium" if provider == "codex" else None)
         ),
         profile=profile,
+        command=str(section.get("command", inherited.get("command", "claude"))).strip() or "claude",
     )
 
 
@@ -252,9 +254,9 @@ def load_config(path: str | Path = "config.toml") -> AppConfig:
         _positive(item.context_window_tokens, f"llm profile {item.profile} context_window_tokens")
         if item.provider != "none" and not item.model:
             raise ConfigError(f"LLM profile {item.profile!r} model cannot be empty")
-        if item.provider not in {"openai", "codex"} and item.reasoning_effort is not None:
+        if item.provider not in {"openai", "codex", "claude-code"} and item.reasoning_effort is not None:
             raise ConfigError(
-                f"LLM profile {item.profile!r} reasoning_effort is only supported for openai or codex"
+                f"LLM profile {item.profile!r} reasoning_effort is only supported for openai, codex, or claude-code"
             )
         if item.reasoning_effort not in {None, "none", "minimal", "low", "medium", "high", "xhigh", "max"}:
             raise ConfigError(
@@ -264,6 +266,17 @@ def load_config(path: str | Path = "config.toml") -> AppConfig:
         if item.provider == "codex" and item.reasoning_effort not in {"low", "medium", "high", "xhigh"}:
             raise ConfigError(
                 f"Codex profile {item.profile!r} reasoning_effort must be low, medium, high, or xhigh"
+            )
+        if item.provider == "claude-code" and item.reasoning_effort not in {
+            None,
+            "low",
+            "medium",
+            "high",
+            "xhigh",
+            "max",
+        }:
+            raise ConfigError(
+                f"Claude Code profile {item.profile!r} reasoning_effort must be low, medium, high, xhigh, or max"
             )
         if item.provider in {"openai", "codex"} and not item.api_key:
             provider_name = "OpenAI Codex" if item.provider == "codex" else "OpenAI"

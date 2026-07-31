@@ -319,3 +319,22 @@ def test_search_works_skips_sparse_title_records(openalex_work_json):
         ),
     )
     assert [paper.openalex_id for paper in api.search_works("Minimal")] == ["W456"]
+
+
+def test_get_work_fetches_exact_openalex_record(openalex_work_json):
+    seen = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen["path"] = request.url.path
+        return httpx.Response(200, json=openalex_work_json)
+
+    api = OpenAlexClient(
+        api_key="key",
+        base_url="https://openalex.test",
+        client=httpx.Client(transport=httpx.MockTransport(handler)),
+    )
+    paper = api.get_work("https://openalex.org/works/W456")
+    assert paper.openalex_id == "W456"
+    assert seen["path"] == "/works/W456"
+    with pytest.raises(OpenAlexError, match="Invalid OpenAlex work id"):
+        api.get_work("A123")

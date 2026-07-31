@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import inspect
 import json
+
+import httpx
 import secrets
 import threading
 from dataclasses import asdict, dataclass
@@ -10,6 +12,8 @@ from typing import Any, Callable
 
 from pydantic import ValidationError
 
+from . import USER_AGENT
+from .analysis_jobs import _paper_text
 from .chunking import context_char_budget
 from .config import load_config
 from .db import Database
@@ -52,32 +56,6 @@ def _paper_document(db: Database, row: Any) -> dict[str, Any]:
     }
 
 
-def _summary_documents(
-    db: Database,
-    row: Any,
-    *,
-    scope: str = "",
-    paper_kind: str = "",
-) -> list[dict[str, Any]]:
-    documents: list[dict[str, Any]] = []
-    for analysis in db.paper_analyses(int(row["id"])):
-        if scope and analysis["scope"] != scope:
-            continue
-        if paper_kind and analysis["paper_kind"] != paper_kind:
-            continue
-        documents.append(
-            {
-                "paper_id": int(row["id"]),
-                "title": row["title"],
-                "scope": analysis["scope"],
-                "provider": analysis["provider"],
-                "model": analysis["model"],
-                "summary": json.loads(analysis["result_json"]),
-            }
-        )
-    return documents
-
-
 def _selection_search_args(selection: dict[str, Any] | None) -> dict[str, Any]:
     selection = selection or {}
     return {
@@ -94,16 +72,7 @@ def _selection_search_args(selection: dict[str, Any] | None) -> dict[str, Any]:
     }
 
 
-def collect_query_documents(
-    db: Database,
-    source_type: str,
-    search_query: str = "",
-    *,
-    selection: dict[str, Any] | None = None,
-) -> list[dict[str, Any]]:
-    search_args = _selection_search_args(selection)
-    if not selection:
-        search_args["query"] = search_query
+def _selected_papers(db: Database, selection: dict[str, Any] | None) -> list[Any]:
     selected_ids: list[int] = []
     if selection and isinstance(selection.get("paper_ids"), list):
         for value in selection["paper_ids"]:
@@ -112,35 +81,99 @@ def collect_query_documents(
             except (TypeError, ValueError):
                 continue
     if selected_ids:
-        papers = [row for paper_id in selected_ids if (row := db.get_paper(paper_id)) is not None]
-    else:
-        papers, _ = db.search_papers(**search_args, limit=None, offset=0)
-    if source_type == "papers":
-        return [_paper_document(db, row) for row in papers]
-    if source_type == "summaries":
-        if selection:
-            return [
-                item
-                for row in papers
-                for item in _summary_documents(
-                    db,
-                    row,
-                    scope=search_args["scope"],
-                    paper_kind=search_args["paper_kind"],
-                )
-            ]
-        papers, _ = db.search_papers(limit=None, offset=0)
-        documents = [item for row in papers for item in _summary_documents(db, row)]
-        term = search_query.strip().casefold()
-        if not term:
-            return documents
-        return [
-            item
-            for item in documents
-            if term in json.dumps(item, ensure_ascii=False).casefold()
-        ]
-    raise ValueError("Query source must be papers or summaries")
+        return [row for paper_id in dict.fromkeys(selected_ids) if (row := db.get_paper(paper_id)) is not None]
+    papers, _ = db.search_papers(**_selection_search_args(selection), limit=None, offset=0)
+    return papers
 
+
+def validate_query_sources(
+    db: Database,
+    *,
+    selection: dict[str, Any] | None,
+    source_scope: str,
+    pdf_strategy: str,
+) -> int:
+    """Reject a saved-prompt run when any selected paper lacks its source."""
+    papers = _selected_papers(db, selection)
+    if not papers:
+        raise ValueError("No papers match the current selection")
+    if source_scope == "abstract":
+        if pdf_strategy != "auto":
+            raise ValueError("PDF strategy only applies when the source is Full paper PDF")
+        missing = [row for row in papers if not str(row["abstract"] or "").strip()]
+        source_label = "an abstract"
+    else:
+        missing = []
+        for row in papers:
+            pdf_url = str(row["pdf_url"] or "").strip()
+            local_value = str(row["local_pdf_path"] or "").strip()
+            local_pdf = Path(local_value).expanduser() if local_value else None
+            if not pdf_url and not (local_pdf and local_pdf.is_file()):
+                missing.append(row)
+        source_label = "a PDF"
+    if missing:
+        examples = ", ".join(str(row["title"]) for row in missing[:3])
+        remainder = len(missing) - min(3, len(missing))
+        suffix = f" and {remainder} more" if remainder else ""
+        noun = "paper" if len(missing) == 1 else "papers"
+        raise ValueError(
+            f"Cannot run this saved prompt: {len(missing)} selected {noun} "
+            f"do not have {source_label}: {examples}{suffix}"
+        )
+    return len(papers)
+
+
+def collect_query_documents(
+    db: Database,
+    source_scope: str = "abstract",
+    search_query: str = "",
+    *,
+    selection: dict[str, Any] | None = None,
+    config: Any | None = None,
+    pdf_client: httpx.Client | None = None,
+) -> list[dict[str, Any]]:
+    """Collect paper records using run-time source choices.
+
+    ``papers`` remains an accepted alias for older callers and means abstracts/metadata.
+    The legacy ``search_query`` argument is retained only for API compatibility.
+    """
+    if source_scope == "papers":
+        source_scope = "abstract"
+    if source_scope not in {"abstract", "fulltext"}:
+        raise ValueError("Query source must be abstract or fulltext")
+    effective_selection = dict(selection or {})
+    if search_query and not selection:
+        effective_selection["query"] = search_query
+    papers = _selected_papers(db, effective_selection)
+    documents: list[dict[str, Any]] = []
+    owns_client = False
+    if source_scope == "fulltext" and pdf_client is None:
+        if config is None:
+            raise ValueError("Full-text saved prompts require application configuration")
+        pdf_client = httpx.Client(
+            timeout=60,
+            follow_redirects=True,
+            headers={"User-Agent": USER_AGENT},
+        )
+        owns_client = True
+    try:
+        for row in papers:
+            document = _paper_document(db, row)
+            document["source"] = source_scope
+            if source_scope == "fulltext":
+                assert config is not None and pdf_client is not None
+                try:
+                    _paper, text = _paper_text(
+                        config, db, int(row["id"]), "fulltext", pdf_client
+                    )
+                except Exception as exc:
+                    raise ValueError(f"Could not load PDF for {row['title']}: {exc}") from exc
+                document["fulltext"] = text
+            documents.append(document)
+    finally:
+        if owns_client and pdf_client is not None:
+            pdf_client.close()
+    return documents
 
 def _query_prompt(user_prompt: str, documents: list[dict[str, Any]], *, merge: bool) -> str:
     if merge:
@@ -236,6 +269,31 @@ def _pack_documents(documents: list[dict[str, Any]], budget: int) -> list[list[d
     return groups
 
 
+def _split_oversized_document(document: dict[str, Any], budget: int) -> list[dict[str, Any]]:
+    if _json_size([document]) <= budget:
+        return [document]
+    content_key = next(
+        (key for key in ("fulltext", "abstract", "content_excerpt") if isinstance(document.get(key), str)),
+        None,
+    )
+    if content_key is None:
+        return [_compact_document(document, budget)]
+    content = str(document[content_key])
+    shell = {key: value for key, value in document.items() if key != content_key}
+    shell["chunk_index"] = 1
+    shell["chunk_count"] = 1
+    room = max(400, budget - _json_size([shell]) - 200)
+    chunks = [content[index:index + room] for index in range(0, len(content), room)] or [""]
+    result: list[dict[str, Any]] = []
+    for index, chunk in enumerate(chunks, 1):
+        item = dict(shell)
+        item["chunk_index"] = index
+        item["chunk_count"] = len(chunks)
+        item[content_key] = chunk
+        result.append(_compact_document(item, budget))
+    return result
+
+
 def run_query_for_model(
     llm: LLMClient,
     *,
@@ -243,6 +301,7 @@ def run_query_for_model(
     documents: list[dict[str, Any]],
     context_window_tokens: int,
     max_input_chars: int,
+    pdf_strategy: str = "auto",
     progress: ProgressCallback | None = None,
     cancel_event: threading.Event | None = None,
 ) -> tuple[BatchQueryResult, dict[str, Any], int]:
@@ -250,14 +309,31 @@ def run_query_for_model(
         return (
             BatchQueryResult(
                 title="No matching papers",
-                summary="No stored papers or summaries matched the saved search query.",
+                summary="No stored papers matched the selected filters.",
                 items=[],
             ),
             {},
             0,
         )
+    if pdf_strategy not in {"auto", "direct", "chunked"}:
+        raise ValueError("PDF strategy must be auto, direct, or chunked")
     budget = context_char_budget(context_window_tokens, max_input_chars)
-    groups = _pack_documents(documents, max(1_500, int(budget * 0.75)))
+    record_budget = max(1_500, int(budget * 0.75))
+    direct_fits = _json_size(documents) <= record_budget
+    if pdf_strategy == "direct" and not direct_fits:
+        raise LLMError(
+            "The selected papers exceed the context window; use Auto or Chunk + merge, "
+            "select fewer papers, or choose a larger context window"
+        )
+    if direct_fits and pdf_strategy in {"auto", "direct"}:
+        groups = [documents]
+    else:
+        expanded = [
+            chunk
+            for document in documents
+            for chunk in _split_oversized_document(document, record_budget)
+        ]
+        groups = _pack_documents(expanded, record_budget)
     usage: dict[str, Any] = {}
     partials: list[dict[str, Any]] = []
     input_chars = 0
@@ -276,10 +352,9 @@ def run_query_for_model(
 
     for round_index in range(6):
         check_cancelled(cancel_event)
-        encoded = json.dumps(partials, ensure_ascii=False)
         if len(partials) == 1:
             return BatchQueryResult.model_validate(partials[0]), usage, input_chars
-        merge_groups = _pack_documents(partials, max(1_500, int(budget * 0.75)))
+        merge_groups = _pack_documents(partials, record_budget)
         if len(merge_groups) >= len(partials):
             raise LLMError("Collection output exceeds the selected context window")
         next_partials: list[dict[str, Any]] = []
@@ -297,7 +372,6 @@ def run_query_for_model(
                     usage[key] = value
         partials = next_partials
     raise LLMError("Could not merge collection-query outputs")
-
 
 def run_query_batch(
     config_path: Path,
@@ -339,8 +413,13 @@ def run_query_batch(
                             error="Cancelled by user",
                         )
                 return {"completed": completed, "failed": failed, "cancelled": True}
+            source_scope = str(selection.get("source_scope") or "abstract")
+            pdf_strategy = str(selection.get("pdf_strategy") or "auto")
             documents = collect_query_documents(
-                db, query["source_type"], query["search_query"], selection=selection
+                db,
+                source_scope,
+                selection=selection,
+                config=config,
             )
             publish(progress, "message", f"Matched {len(documents)} record(s)")
             for profile_name in profile_names:
@@ -379,7 +458,9 @@ def run_query_batch(
                     result, _usage, input_chars = run_query_for_model(
                         llm, user_prompt=query["prompt"], documents=documents,
                         context_window_tokens=context_window_tokens,
-                        max_input_chars=profile.max_input_chars, progress=progress,
+                        max_input_chars=profile.max_input_chars,
+                        pdf_strategy=pdf_strategy,
+                        progress=progress,
                         cancel_event=cancel_event,
                     )
                     check_cancelled(cancel_event)
@@ -429,14 +510,27 @@ class QueryController:
         self._active_llm: LLMClient | None = None
 
     def start(
-        self, query_id: int, profiles: tuple[str, ...], context_window_tokens: int,
-        *, selection: dict[str, Any] | None = None,
+        self,
+        query_id: int,
+        profiles: tuple[str, ...],
+        context_window_tokens: int,
+        *,
+        selection: dict[str, Any] | None = None,
+        source_scope: str = "abstract",
+        pdf_strategy: str = "auto",
     ) -> str | None:
         with self._lock:
             if self._snapshot.running:
                 return None
             if not 512 <= context_window_tokens <= 1_000_000:
                 raise ValueError("Context window must be between 512 and 1000000 tokens")
+            if source_scope not in {"abstract", "fulltext"}:
+                raise ValueError("Query source must be abstract or fulltext")
+            if pdf_strategy not in {"auto", "direct", "chunked"}:
+                raise ValueError("PDF strategy must be auto, direct, or chunked")
+            selection = dict(selection or {})
+            selection["source_scope"] = source_scope
+            selection["pdf_strategy"] = pdf_strategy
             config = load_config(self.config_path)
             available = {item.profile: item for item in config.available_llms}
             selected = tuple(dict.fromkeys(profiles))
@@ -449,6 +543,12 @@ class QueryController:
             with Database(config.paths.database) as db:
                 if db.get_saved_query(query_id) is None:
                     raise ValueError("Saved query not found")
+                validate_query_sources(
+                    db,
+                    selection=selection,
+                    source_scope=source_scope,
+                    pdf_strategy=pdf_strategy,
+                )
                 db.create_query_runs(
                     batch_id=batch_id, query_id=query_id,
                     profiles=[(name, available[name].provider, available[name].model) for name in selected],

@@ -433,7 +433,8 @@ def test_chunk_cache_and_saved_query_lifecycle(tmp_path, paper_record):
             name=" Compare ", source_type="papers", search_query="Minimal", prompt=" Compare methods "
         )
         assert db.get_saved_query(query_id)["name"] == "Compare"
-        assert db.list_saved_queries()[0]["run_count"] == 0
+        assert db.get_saved_query(query_id)["is_builtin"] == 0
+        assert db.list_saved_queries()[0]["name"] == "Summarize"
         assert db.update_saved_query(
             query_id,
             name="Updated",
@@ -474,8 +475,12 @@ def test_chunk_cache_and_saved_query_lifecycle(tmp_path, paper_record):
         assert db.get_saved_query(query_id) is None
         assert db.list_query_runs(query_id) == []
         assert not db.delete_saved_query(query_id)
-        with pytest.raises(ValueError, match="papers or summaries"):
-            db.create_saved_query(name="x", source_type="bad", search_query="", prompt="x")
+        ignored_id = db.create_saved_query(
+            name="x", source_type="bad", search_query="ignored", prompt="x"
+        )
+        ignored = db.get_saved_query(ignored_id)
+        assert ignored["source_type"] == "papers"
+        assert ignored["search_query"] == ""
         with pytest.raises(ValueError, match="required"):
             db.create_saved_query(name="", source_type="papers", search_query="", prompt="")
         assert not db.update_saved_query(

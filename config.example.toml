@@ -24,13 +24,13 @@ max_pdf_bytes = 50000000
 max_pdf_chars = 2000000
 
 [llm]
-provider = "ollama" # ollama | openai | codex | none
+provider = "ollama" # ollama | openai | codex | claude-code | none
 model = "qwen3:8b"
 base_url = "http://localhost:11434"
 api_key = "" # Prefer OPENAI_API_KEY in the environment
 timeout_seconds = 180
 max_input_chars = 100000
-context_window_tokens = 8192
+context_window_tokens = 16384
 analyze_pdfs = true
 prompt_version = "v2"
 # Optional models shown in the paper-page multi-model picker.
@@ -43,7 +43,7 @@ prompt_version = "v2"
 # base_url = "http://localhost:11434"
 # timeout_seconds = 300
 # max_input_chars = 100000
-# context_window_tokens = 8192
+# context_window_tokens = 16384
 # analyze_pdfs = true
 # prompt_version = "v2"
 #
@@ -55,7 +55,7 @@ prompt_version = "v2"
 # api_key = "" # Prefer OPENAI_API_KEY
 # timeout_seconds = 300
 # max_input_chars = 100000
-# context_window_tokens = 8192
+# context_window_tokens = 16384
 # analyze_pdfs = true
 # prompt_version = "v2"
 #
@@ -74,3 +74,16 @@ prompt_version = "v2"
 # analyze_pdfs = true
 # prompt_version = "v2"
 
+
+# Claude Code CLI using the local `claude` login. No API key is read.
+# [[llm_profiles]]
+# name = "claude-review"
+# provider = "claude-code"
+# model = "sonnet"
+# command = "claude"
+# reasoning_effort = "high" # low | medium | high | xhigh | max
+# timeout_seconds = 600
+# max_input_chars = 1000000
+# context_window_tokens = 200000
+# analyze_pdfs = true
+# prompt_version = "v2"

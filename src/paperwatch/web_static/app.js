@@ -1,4 +1,114 @@
 (() => {
+  const storageGet = (key) => {
+    try { return window.localStorage.getItem(key); } catch (_) { return null; }
+  };
+  const storageSet = (key, value) => {
+    try { window.localStorage.setItem(key, value); } catch (_) { /* Browser storage is optional. */ }
+  };
+  const storageRemove = (key) => {
+    try { window.localStorage.removeItem(key); } catch (_) { /* Browser storage is optional. */ }
+  };
+  const themeToggle = document.getElementById("theme-toggle");
+  const themeKey = "paperwatch-theme";
+  const defaultTheme = themeToggle?.dataset.defaultTheme || "system";
+  const storedTheme = storageGet(themeKey);
+  if (storedTheme === "light" || storedTheme === "dark") {
+    document.documentElement.dataset.theme = storedTheme;
+  } else {
+    delete document.documentElement.dataset.theme;
+    if (storedTheme !== null) storageRemove(themeKey);
+  }
+  const themePreference = () => document.documentElement.dataset.theme || defaultTheme;
+  const effectiveTheme = () => document.documentElement.dataset.theme ||
+    (window.matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light");
+  const updateThemeButton = () => {
+    if (!themeToggle) return;
+    const preference = themePreference();
+    const next = preference === "system" ? "light" : preference === "light" ? "dark" : "system";
+    const labels = { system: "follow system", light: "light", dark: "dark" };
+    const icons = { system: "◐", light: "☀", dark: "☾" };
+    themeToggle.textContent = icons[preference];
+    themeToggle.setAttribute("aria-label", `Theme: ${labels[preference]}. Switch to ${labels[next]}`);
+    themeToggle.title = `Theme: ${labels[preference]}. Click for ${labels[next]}`;
+  };
+  if (themeToggle) {
+    themeToggle.addEventListener("click", () => {
+      const preference = themePreference();
+      const next = preference === "system" ? "light" : preference === "light" ? "dark" : "system";
+      if (next === "system") {
+        delete document.documentElement.dataset.theme;
+        storageRemove(themeKey);
+      } else {
+        document.documentElement.dataset.theme = next;
+        storageSet(themeKey, next);
+      }
+      updateThemeButton();
+    });
+    window.matchMedia("(prefers-color-scheme: dark)").addEventListener("change", updateThemeButton);
+    updateThemeButton();
+  }
+
+  document.querySelectorAll("form").forEach((form) => {
+    const source = form.querySelector("[data-source-scope]");
+    const strategy = form.querySelector("[data-pdf-strategy]");
+    if (!source || !strategy) return;
+    const syncSourceOptions = () => {
+      const usesPdf = source.value === "fulltext";
+      strategy.disabled = !usesPdf;
+      if (!usesPdf) strategy.value = "auto";
+      const label = strategy.closest("label");
+      if (label) label.classList.toggle("control-disabled", !usesPdf);
+    };
+    source.addEventListener("change", syncSourceOptions);
+    syncSourceOptions();
+  });
+
+  const paperTableBody = document.getElementById("paper-table-body");
+  if (paperTableBody) {
+    const selectionKey = "paperwatch-selected-papers";
+    const hiddenInput = document.getElementById("selected-paper-ids");
+    const status = document.getElementById("paper-selection-status");
+    const runLabel = document.getElementById("collection-run-label");
+    const clear = document.getElementById("clear-paper-selection");
+    let selected = new Set();
+    try {
+      const saved = JSON.parse(storageGet(selectionKey) || "[]");
+      if (Array.isArray(saved)) selected = new Set(saved.map(String));
+    } catch (_) {
+      storageRemove(selectionKey);
+    }
+    const rows = Array.from(paperTableBody.querySelectorAll("tr[data-paper-id]"));
+    const updateSelection = () => {
+      rows.forEach((row) => {
+        const id = String(row.dataset.paperId);
+        const checked = selected.has(id);
+        const checkbox = row.querySelector(".paper-select-toggle");
+        if (checkbox) checkbox.checked = checked;
+        row.classList.toggle("paper-selected", checked);
+      });
+      const ordered = [...rows.filter((row) => selected.has(String(row.dataset.paperId))), ...rows.filter((row) => !selected.has(String(row.dataset.paperId)))];
+      ordered.forEach((row) => paperTableBody.appendChild(row));
+      const ids = Array.from(selected);
+      storageSet(selectionKey, JSON.stringify(ids));
+      if (hiddenInput) hiddenInput.value = ids.join(",");
+      if (clear) clear.hidden = ids.length === 0;
+      if (runLabel) runLabel.textContent = ids.length ? `Run on ${ids.length} selected paper${ids.length === 1 ? "" : "s"}` : runLabel.dataset.defaultLabel || runLabel.textContent;
+      if (status) status.textContent = ids.length
+        ? "Selected papers stay active across searches and are sorted to the top."
+        : "Select rows to run on only those papers. Selections persist across searches.";
+    };
+    if (runLabel) runLabel.dataset.defaultLabel = runLabel.textContent;
+    paperTableBody.querySelectorAll(".paper-select-toggle").forEach((checkbox) => {
+      checkbox.addEventListener("change", () => {
+        const id = String(checkbox.value);
+        if (checkbox.checked) selected.add(id); else selected.delete(id);
+        updateSelection();
+      });
+    });
+    if (clear) clear.addEventListener("click", () => { selected.clear(); updateSelection(); });
+    updateSelection();
+  }
+
   const paperJobs = document.getElementById("paper-jobs");
   if (document.body.dataset.runRunning === "true" && !paperJobs) {
     window.setTimeout(() => window.location.reload(), 5000);
