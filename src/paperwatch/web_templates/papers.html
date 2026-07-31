@@ -2,14 +2,22 @@
 {% block title %}Recent papers · paperwatch{% endblock %}
 {% block content %}
 <section class="feed-toolbar">
-  <div>
+  <div class="feed-count">
     <strong>{{ total }} matching record{{ '' if total == 1 else 's' }}</strong>
     <span class="muted">{{ 'Recent papers' if is_home else 'Filtered papers' }}</span>
   </div>
-  <div class="button-group">
-    {% if is_home %}<form method="post" action="/actions/backfill" data-confirm="Fetch the previous 365 days and download every available open PDF? Historical papers will not be summarized automatically."><button class="button button-small" type="submit" {% if run_state.running %}disabled{% endif %}>Backfill 1 year PDFs</button></form>{% endif %}
-    <a class="button button-small" href="/exports/papers.json{% if filters.query_string %}?{{ filters.query_string }}{% endif %}">JSON</a>
-    <a class="button button-small" href="/exports/papers.csv{% if filters.query_string %}?{{ filters.query_string }}{% endif %}">CSV</a>
+  <div class="feed-toolbar-actions">
+    {% if is_home %}
+    <form class="recent-paper-search" method="get" action="/search">
+      <input name="q" aria-label="Search papers" placeholder="Search papers by title" required>
+      <button class="button button-primary button-small" type="submit">Search</button>
+    </form>
+    {% endif %}
+    <div class="button-group">
+      {% if is_home %}<a class="button button-small" href="/papers/import">Import PDF</a><form method="post" action="/actions/backfill" data-confirm="Fetch the previous 365 days and download every available open PDF? Historical papers will not be summarized automatically."><button class="button button-small" type="submit" {% if run_state.running %}disabled{% endif %}>Backfill 1 year PDFs</button></form>{% endif %}
+      <a class="button button-small" href="/exports/papers.json{% if filters.query_string %}?{{ filters.query_string }}{% endif %}">JSON</a>
+      <a class="button button-small" href="/exports/papers.csv{% if filters.query_string %}?{{ filters.query_string }}{% endif %}">CSV</a>
+    </div>
   </div>
 </section>
 

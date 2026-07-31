@@ -110,18 +110,18 @@ def test_recent_feed_theme_and_direct_links(
     assert "Tracked author(s)" in response.text
     assert "OpenAlex topics" in response.text
     assert "PDF file" in response.text
-    assert 'id="theme-toggle"' in response.text
+    assert 'id="theme-toggle"' not in response.text
     assert "Queries" in response.text
     assert f'/papers/{paper_id}' in response.text
     assert "https://arxiv.org/abs/2607.12345" in response.text
     assert "scholar.google.com" in response.text
     assert "openalex.org/works/w456" in response.text
     js = client.get("/static/app.js").text
-    assert "paperwatch-theme" in js
+    assert "paperwatch-theme" not in js
     assert "author-picker" in js
-    assert "storage unavailable" in js
+    assert "localStorage" not in js
     css = client.get("/static/app.css").text
-    assert 'html[data-theme="dark"]' in css
+    assert "@media(prefers-color-scheme:dark)" in css
     assert "--bg:#05070a" in css
     assert "[hidden]{display:none!important}" in css
 

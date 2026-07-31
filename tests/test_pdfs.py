@@ -269,3 +269,46 @@ def test_download_pdf_skips_empty_chunks_and_enforces_incremental_limit(tmp_path
             max_bytes=10,
             client=FakeClient([b"%PDF-", b"x" * 20]),
         )
+
+
+def test_validate_uploaded_pdf_accepts_readable_file_and_rejects_bad_files(tmp_path, monkeypatch):
+    from paperwatch.pdfs import validate_pdf_file
+
+    path = tmp_path / "paper.pdf"
+    path.write_bytes(PDF_BYTES)
+
+    class Reader:
+        is_encrypted = False
+        pages = [object()]
+
+    monkeypatch.setattr("paperwatch.pdfs.PdfReader", lambda *args, **kwargs: Reader())
+    validate_pdf_file(path)
+
+    path.write_bytes(b"not a complete pdf")
+    with pytest.raises(PDFError, match="not a complete PDF"):
+        validate_pdf_file(path)
+
+
+def test_validate_uploaded_pdf_rejects_encryption_and_wraps_reader_errors(tmp_path, monkeypatch):
+    from paperwatch.pdfs import validate_pdf_file
+
+    path = tmp_path / "paper.pdf"
+    path.write_bytes(PDF_BYTES)
+
+    class Encrypted:
+        is_encrypted = True
+        pages = []
+
+        def decrypt(self, password):
+            return 0
+
+    monkeypatch.setattr("paperwatch.pdfs.PdfReader", lambda *args, **kwargs: Encrypted())
+    with pytest.raises(PDFError, match="encrypted"):
+        validate_pdf_file(path)
+
+    monkeypatch.setattr(
+        "paperwatch.pdfs.PdfReader",
+        lambda *args, **kwargs: (_ for _ in ()).throw(OSError("broken reader")),
+    )
+    with pytest.raises(PDFError, match="not a readable PDF"):
+        validate_pdf_file(path)

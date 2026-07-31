@@ -1,25 +1,4 @@
 (() => {
-  const root = document.documentElement;
-  let stored = null;
-  try { stored = localStorage.getItem("paperwatch-theme"); } catch (_) { /* storage unavailable */ }
-  const preferredDark = window.matchMedia && window.matchMedia("(prefers-color-scheme: dark)").matches;
-  root.dataset.theme = stored || (preferredDark ? "dark" : "light");
-
-  const toggle = document.getElementById("theme-toggle");
-  if (toggle) {
-    const updateLabel = () => {
-      const dark = root.dataset.theme === "dark";
-      toggle.textContent = dark ? "☀" : "◐";
-      toggle.setAttribute("aria-label", dark ? "Use light mode" : "Use dark mode");
-    };
-    updateLabel();
-    toggle.addEventListener("click", () => {
-      root.dataset.theme = root.dataset.theme === "dark" ? "light" : "dark";
-      try { localStorage.setItem("paperwatch-theme", root.dataset.theme); } catch (_) { /* storage unavailable */ }
-      updateLabel();
-    });
-  }
-
   const paperJobs = document.getElementById("paper-jobs");
   if (document.body.dataset.runRunning === "true" && !paperJobs) {
     window.setTimeout(() => window.location.reload(), 5000);

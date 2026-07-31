@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import io
 import json
 import threading
 from dataclasses import asdict, replace
@@ -7,11 +8,22 @@ from pathlib import Path
 
 import pytest
 from fastapi.testclient import TestClient
+from pypdf import PdfWriter
 
 from paperwatch.analysis_jobs import AnalysisBatchSnapshot
 from paperwatch.db import Database
 from paperwatch.models import AuthorCandidate, PaperRecord, stable_hash
-from paperwatch.web import RunController, RunSnapshot, _parse_tristate, _run_pipeline, create_app
+from paperwatch.web import (
+    RunController,
+    RunSnapshot,
+    _manual_author_names,
+    _manual_paper_record,
+    _manual_publication_date,
+    _manual_source_url,
+    _parse_tristate,
+    _run_pipeline,
+    create_app,
+)
 
 
 class FakeAuthorClient:
@@ -162,6 +174,14 @@ def seeded_web(config_path, author_candidate, paper_record, analysis_result):
     return config, paper_id, second_id, analysis_id, run_id
 
 
+def valid_pdf_bytes() -> bytes:
+    stream = io.BytesIO()
+    writer = PdfWriter()
+    writer.add_blank_page(width=72, height=72)
+    writer.write(stream)
+    return stream.getvalue()
+
+
 def make_client(config_path, *, controller=None, analysis_controller=None, fake=None):
     instances = []
 
@@ -223,7 +243,7 @@ def test_author_search_add_toggle_remove(config_path, seeded_web):
     response = client.post("/authors/search", data={"name": "Grace Hopper", "limit": "25"})
     assert response.status_code == 200
     assert "Grace Hopper" in response.text
-    assert "Search OpenAlex" in response.text
+    assert "Find an author on OpenAlex" in response.text
     assert "After tracking" in response.text
     assert 'aria-label="Track Grace Hopper"' in response.text
     assert instances[-1].search_calls == [("Grace Hopper", 25)]
@@ -700,30 +720,337 @@ def test_backfill_action_starts_dedicated_mode(config_path, seeded_web):
     assert "One-year PDF backfill in progress" in page.text
 
 
-def test_header_fetch_search_passes_title_to_controller(config_path, seeded_web):
-    class SearchController(StubController):
+def test_manual_import_metadata_validation_helpers():
+    assert _manual_author_names("\n; Jane Doe; John Smith; Ada Lovelace") == [
+        "Jane Doe",
+        "John Smith",
+        "Ada Lovelace",
+    ]
+    assert _manual_publication_date("") is None
+    assert _manual_source_url(" https://example.test/paper ") == "https://example.test/paper"
+
+    for value, message in [
+        ("", "At least one author"),
+        (";".join(f"Author {index}" for index in range(201)), "At most 200 authors"),
+    ]:
+        with pytest.raises(ValueError, match=message):
+            _manual_author_names(value)
+    with pytest.raises(ValueError, match="Source link is required"):
+        _manual_source_url("")
+    with pytest.raises(ValueError, match="Source link is too long"):
+        _manual_source_url("https://example.test/" + "x" * 2000)
+    with pytest.raises(ValueError, match="Publication date"):
+        _manual_publication_date("not-a-date")
+
+    base = {
+        "title": "Manual",
+        "authors": "Jane Doe",
+        "source_link": "https://example.test/paper",
+    }
+    for changes, message in [
+        ({"title": ""}, "Title is required"),
+        ({"title": "x" * 1001}, "Title is too long"),
+        ({"abstract": "x" * 1_000_001}, "Abstract is too long"),
+        ({"venue": "x" * 501}, "Venue is too long"),
+        ({"arxiv_id": "invalid"}, "arXiv ID is invalid"),
+    ]:
+        with pytest.raises(ValueError, match=message):
+            _manual_paper_record(base | changes, filename="paper.pdf")
+
+
+def test_manual_pdf_import_behaves_like_fetched_paper(config_path, seeded_web):
+    client, _ = make_client(config_path)
+    form = client.get("/papers/import")
+    assert form.status_code == 200
+    assert 'enctype="multipart/form-data"' in form.text
+    assert 'name="pdf"' in form.text
+    assert 'name="title"' in form.text
+    assert 'name="authors"' in form.text
+    assert 'name="source_link"' in form.text
+    assert 'name="abstract"' in form.text
+
+    response = client.post(
+        "/papers/import",
+        data={
+            "title": "A Manually Imported Paper",
+            "authors": "Doe, Jane; Smith, John; Doe, Jane",
+            "source_link": "https://example.test/manual-paper",
+            "abstract": "A manually supplied abstract.",
+            "publication_date": "2026-07-30",
+            "venue": "Manual Proceedings",
+            "doi": "https://doi.org/10.5555/manual",
+            "arxiv_id": "2607.99999",
+        },
+        files={"pdf": ("manual.pdf", valid_pdf_bytes(), "application/pdf")},
+        follow_redirects=False,
+    )
+    assert response.status_code == 303
+    assert response.headers["location"].startswith("/papers/")
+    assert "Imported+A+Manually+Imported+Paper" in response.headers["location"]
+    paper_id = int(response.headers["location"].split("/papers/", 1)[1].split("?", 1)[0])
+
+    config = seeded_web[0]
+    with Database(config.paths.database) as db:
+        paper = db.get_paper(paper_id)
+        assert paper is not None
+        assert paper["title"] == "A Manually Imported Paper"
+        assert paper["doi"] == "10.5555/manual"
+        assert paper["arxiv_id"] == "2607.99999"
+        assert paper["publication_url"] == "https://example.test/manual-paper"
+        assert paper["pdf_source"] == "manual_upload"
+        assert paper["abstract_source"] == "manual"
+        assert paper["auto_analyze"] == 1
+        assert Path(paper["local_pdf_path"]).is_file()
+        authors = db.paper_authors(paper_id)
+        assert [row["name"] for row in authors] == ["Doe, Jane", "Smith, John"]
+        metadata = json.loads(paper["metadata_json"])
+        assert metadata["manual_import"] is True
+        assert metadata["original_filename"] == "manual.pdf"
+        db.create_saved_query(
+            name="Manual review",
+            source_type="papers",
+            search_query="",
+            prompt="Review this paper.",
+        )
+
+    detail = client.get(f"/papers/{paper_id}")
+    assert detail.status_code == 200
+    assert "A Manually Imported Paper" in detail.text
+    assert "Downloaded PDF" in detail.text
+    assert "Run selected models" in detail.text
+    assert "Run saved prompt" in detail.text
+    assert "Manual Proceedings" in detail.text
+    assert client.get(f"/papers/{paper_id}/pdf").status_code == 200
+    exported = client.get(f"/papers/{paper_id}/export.json").json()
+    assert exported["title"] == "A Manually Imported Paper"
+    assert exported["authors"][0]["name"] == "Doe, Jane"
+    assert "A Manually Imported Paper" in client.get("/").text
+
+
+def test_manual_pdf_import_validation(config_path, seeded_web):
+    client, _ = make_client(config_path)
+    missing = client.post(
+        "/papers/import",
+        data={
+            "title": "Missing PDF",
+            "authors": "Jane Doe",
+            "source_link": "https://example.test/paper",
+        },
+    )
+    assert missing.status_code == 400
+    assert "PDF file is required" in missing.text
+    assert 'value="Missing PDF"' in missing.text
+
+    bad_source = client.post(
+        "/papers/import",
+        data={"title": "Bad source", "authors": "Jane Doe", "source_link": "file:///tmp/paper"},
+        files={"pdf": ("paper.pdf", valid_pdf_bytes(), "application/pdf")},
+    )
+    assert bad_source.status_code == 400
+    assert "valid http or https URL" in bad_source.text
+
+    bad_pdf = client.post(
+        "/papers/import",
+        data={
+            "title": "Bad PDF",
+            "authors": "Jane Doe",
+            "source_link": "https://example.test/paper",
+        },
+        files={"pdf": ("paper.pdf", b"not a pdf", "application/pdf")},
+    )
+    assert bad_pdf.status_code == 400
+    assert "not a complete PDF" in bad_pdf.text
+
+    with Database(seeded_web[0].paths.database) as db:
+        rows, _ = db.search_papers(query="Missing PDF", limit=None, offset=0)
+        assert rows == []
+        rows, _ = db.search_papers(query="Bad PDF", limit=None, offset=0)
+        assert rows == []
+
+
+def test_manual_import_replaces_existing_pdf_safely(config_path, seeded_web):
+    client, _ = make_client(config_path)
+    payload = {
+        "title": "Replacement Test",
+        "authors": "Jane Doe",
+        "source_link": "https://example.test/replacement",
+        "publication_date": "2026-07-30",
+        "doi": "10.5555/replacement",
+    }
+    first = client.post(
+        "/papers/import",
+        data=payload,
+        files={"pdf": ("first.pdf", valid_pdf_bytes(), "application/pdf")},
+        follow_redirects=False,
+    )
+    assert first.status_code == 303
+    paper_id = int(first.headers["location"].split("/papers/", 1)[1].split("?", 1)[0])
+    config = seeded_web[0]
+    with Database(config.paths.database) as db:
+        path = Path(db.get_paper(paper_id)["local_pdf_path"])
+    path.write_bytes(valid_pdf_bytes() + b"\n% old copy")
+    replacement_pdf = valid_pdf_bytes()
+
+    second = client.post(
+        "/papers/import",
+        data=payload | {"abstract": "Updated metadata."},
+        files={"pdf": ("second.pdf", replacement_pdf, "application/pdf")},
+        follow_redirects=False,
+    )
+    assert second.status_code == 303
+    second_id = int(second.headers["location"].split("/papers/", 1)[1].split("?", 1)[0])
+    assert second_id == paper_id
+    assert path.read_bytes() == replacement_pdf
+    assert not list(path.parent.glob(path.name + ".backup-*"))
+    with Database(config.paths.database) as db:
+        assert db.get_paper(paper_id)["abstract"] == "Updated metadata."
+
+
+def test_manual_import_restores_previous_pdf_when_database_update_fails(
+    config_path, seeded_web, monkeypatch
+):
+    client, _ = make_client(config_path)
+    payload = {
+        "title": "Restore Test",
+        "authors": "Jane Doe",
+        "source_link": "https://example.test/restore",
+        "publication_date": "2026-07-30",
+        "doi": "10.5555/restore",
+    }
+    first = client.post(
+        "/papers/import",
+        data=payload,
+        files={"pdf": ("first.pdf", valid_pdf_bytes(), "application/pdf")},
+        follow_redirects=False,
+    )
+    assert first.status_code == 303
+    paper_id = int(first.headers["location"].split("/papers/", 1)[1].split("?", 1)[0])
+    config = seeded_web[0]
+    with Database(config.paths.database) as db:
+        path = Path(db.get_paper(paper_id)["local_pdf_path"])
+    original = path.read_bytes()
+
+    def fail_set_local_pdf(self, imported_paper_id, imported_path):
+        raise OSError("database write failed")
+
+    monkeypatch.setattr(Database, "set_local_pdf", fail_set_local_pdf)
+    failed = client.post(
+        "/papers/import",
+        data=payload | {"abstract": "This update should not replace the PDF."},
+        files={"pdf": ("second.pdf", valid_pdf_bytes(), "application/pdf")},
+    )
+    assert failed.status_code == 400
+    assert "database write failed" in failed.text
+    assert path.read_bytes() == original
+    assert not list(path.parent.glob(path.name + ".backup-*"))
+
+
+def test_recent_search_lists_matches_before_download(
+    config_path, seeded_web, paper_record
+):
+    class PaperSearchClient(FakeAuthorClient):
         def __init__(self):
             super().__init__()
+            self.work_searches = []
+
+        def search_works(self, query, limit=10):
+            self.work_searches.append((query, limit))
+            return [paper_record]
+
+    controller = StubController()
+    fake = PaperSearchClient()
+    client, _ = make_client(config_path, controller=controller, fake=fake)
+    page = client.get("/")
+    assert 'class="recent-paper-search" method="get" action="/search"' in page.text
+    assert "Search papers by title" in page.text
+    assert "Import PDF" in page.text
+    assert "Fetch now" not in page.text
+    authors_page = client.get("/authors")
+    assert 'class="recent-paper-search"' not in authors_page.text
+
+    response = client.get(
+        "/search", params={"q": "Minimal Agents for Reliable Machine Learning"}
+    )
+    assert response.status_code == 200
+    assert fake.work_searches == [("Minimal Agents for Reliable Machine Learning", 10)]
+    assert paper_record.title in response.text
+    assert 'method="post" action="/actions/download"' in response.text
+    assert f'name="work_id" value="{paper_record.openalex_id}"' in response.text
+    assert controller.modes == []
+
+
+def test_paper_search_error_and_empty_query(config_path, seeded_web):
+    class FailingPaperSearchClient(FakeAuthorClient):
+        def search_works(self, query, limit=10):
+            raise RuntimeError("OpenAlex search unavailable")
+
+    fake = FailingPaperSearchClient()
+    client, instances = make_client(config_path, fake=fake)
+    empty = client.get("/search")
+    assert empty.status_code == 200
+    assert instances == []
+    failed = client.get("/search", params={"q": "A paper"})
+    assert "OpenAlex search unavailable" in failed.text
+    assert fake.closed is True
+
+
+def test_selected_search_result_starts_download(config_path, seeded_web):
+    class DownloadController(StubController):
+        def __init__(self, starts=None):
+            super().__init__(starts=starts)
             self.queries = []
 
         def start(self, mode="run", query=None):
             self.modes.append(mode)
             self.queries.append(query)
-            return True
+            value = self.starts[min(self.calls, len(self.starts) - 1)]
+            self.calls += 1
+            return value
 
-    controller = SearchController()
+    controller = DownloadController()
     client, _ = make_client(config_path, controller=controller)
-    page = client.get("/")
-    assert 'method="post" action="/actions/run"' in page.text
     response = client.post(
-        "/actions/run",
-        data={"q": "Minimal Agents for Reliable Machine Learning"},
+        "/actions/download",
+        data={"work_id": "W123", "title": "A paper", "q": "paper query"},
         follow_redirects=False,
     )
     assert response.status_code == 303
-    assert controller.modes == ["search"]
-    assert controller.queries == ["Minimal Agents for Reliable Machine Learning"]
-    assert "Searching+for+and+downloading" in response.headers["location"]
+    assert controller.modes == ["download"]
+    assert controller.queries == ["W123"]
+    assert response.headers["location"].startswith("/search?q=paper+query")
+    assert "Downloading+A+paper" in response.headers["location"]
+
+    missing = client.post(
+        "/actions/download", data={"q": "paper query"}, follow_redirects=False
+    )
+    assert "Paper+identifier+cannot+be+empty" in missing.headers["location"]
+
+    busy = DownloadController(starts=[False])
+    busy_client, _ = make_client(config_path, controller=busy)
+    response = busy_client.post(
+        "/actions/download", data={"work_id": "W123"}, follow_redirects=False
+    )
+    assert "already+running" in response.headers["location"]
+
+    plain = StubController()
+    plain_client, _ = make_client(config_path, controller=plain)
+    response = plain_client.post(
+        "/actions/download", data={"work_id": "W123"}, follow_redirects=False
+    )
+    assert response.status_code == 303
+    assert plain.modes == ["download"]
+
+    class RejectDownloadController(DownloadController):
+        def start(self, mode="run", query=None):
+            raise ValueError("Download rejected")
+
+    rejected_client, _ = make_client(
+        config_path, controller=RejectDownloadController()
+    )
+    response = rejected_client.post(
+        "/actions/download", data={"work_id": "W123"}, follow_redirects=False
+    )
+    assert "Download+rejected" in response.headers["location"]
 
 
 def test_runs_page_lists_active_summary_and_prompt_links(config_path, seeded_web):
@@ -753,7 +1080,7 @@ def test_runs_page_lists_active_summary_and_prompt_links(config_path, seeded_web
     assert f'href="/papers/{paper_id}"' in response.text
 
 
-def test_run_controller_search_and_pipeline_mode(monkeypatch, config_path, tmp_path):
+def test_run_controller_download_and_pipeline_mode(monkeypatch, config_path, tmp_path):
     calls = []
 
     def runner(path, mode, query):
@@ -761,12 +1088,12 @@ def test_run_controller_search_and_pipeline_mode(monkeypatch, config_path, tmp_p
         return {"run_id": 9, "paper_id": 4, "status": "success"}
 
     controller = RunController(tmp_path / "config.toml", runner=runner)
-    assert controller.start("search", query="A paper")
+    assert controller.start("download", query="W123")
     controller.wait()
-    assert calls == [("search", "A paper")]
+    assert calls == [("download", "W123")]
     assert controller.snapshot().paper_id == 4
     with pytest.raises(ValueError, match="cannot be empty"):
-        controller.start("search")
+        controller.start("download")
 
     events = []
 
@@ -790,8 +1117,8 @@ def test_run_controller_search_and_pipeline_mode(monkeypatch, config_path, tmp_p
         def __init__(self, *args, **kwargs):
             pass
 
-        def fetch_title(self, title):
-            events.append(title)
+        def fetch_work(self, work_id):
+            events.append(work_id)
             return Stats(), 55
 
         def close(self):
@@ -799,6 +1126,6 @@ def test_run_controller_search_and_pipeline_mode(monkeypatch, config_path, tmp_p
 
     monkeypatch.setattr("paperwatch.cli.build_services", lambda config: Services())
     monkeypatch.setattr("paperwatch.pipeline.PaperWatch", Watch)
-    result = _run_pipeline(config_path, "search", "A paper")
+    result = _run_pipeline(config_path, "download", "W123")
     assert result["paper_id"] == 55
-    assert events == ["A paper", "watch-close", "services-close"]
+    assert events == ["W123", "watch-close", "services-close"]

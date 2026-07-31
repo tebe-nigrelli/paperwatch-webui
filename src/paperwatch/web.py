@@ -4,23 +4,35 @@ import csv
 import inspect
 import io
 import json
+import re
 import threading
+import uuid
 from dataclasses import asdict, dataclass
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable, Iterable
-from urllib.parse import quote_plus, urlencode
+from urllib.parse import quote_plus, urlencode, urlparse
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, RedirectResponse, Response
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
+from starlette.datastructures import UploadFile
 
 from .analysis_jobs import AnalysisController
 from .config import AppConfig, load_config
 from .db import Database
 from .locking import AnalysisAlreadyInProgress, analysis_lock
-from .models import AuthorCandidate, short_openalex_id
+from .models import (
+    AuthorCandidate,
+    PaperAuthor,
+    PaperRecord,
+    clean_text,
+    extract_arxiv_id,
+    short_openalex_id,
+    strip_doi,
+)
+from .pdfs import PDFError, safe_pdf_name, validate_pdf_file
 from .query_jobs import QueryController
 from .sources.openalex import OpenAlexClient
 
@@ -131,11 +143,11 @@ class RunController:
         self._thread: threading.Thread | None = None
 
     def start(self, mode: str = "run", query: str | None = None) -> bool:
-        if mode not in {"run", "backfill", "search"}:
+        if mode not in {"run", "backfill", "search", "download"}:
             raise ValueError("Unknown run mode")
         normalized_query = query.strip() if query else None
-        if mode == "search" and not normalized_query:
-            raise ValueError("Paper title cannot be empty")
+        if mode in {"search", "download"} and not normalized_query:
+            raise ValueError("Paper identifier cannot be empty")
         with self._lock:
             if self._snapshot.running:
                 return False
@@ -215,6 +227,8 @@ def _run_pipeline(
             )
         elif mode == "search":
             stats, paper_id = app.fetch_title(query or "")
+        elif mode == "download":
+            stats, paper_id = app.fetch_work(query or "")
         elif mode == "run":
             stats = app.run()
         else:
@@ -265,6 +279,134 @@ def _valid_date(value: str | None) -> str:
         return date.fromisoformat(value).isoformat()
     except ValueError:
         return ""
+
+
+def _manual_author_names(value: str) -> list[str]:
+    separator = r"[\n;]+" if re.search(r"[\n;]", value) else r","
+    names = [clean_text(item) for item in re.split(separator, value)]
+    unique: list[str] = []
+    seen: set[str] = set()
+    for name in names:
+        if not name:
+            continue
+        key = name.casefold()
+        if key not in seen:
+            seen.add(key)
+            unique.append(name)
+    if not unique:
+        raise ValueError("At least one author is required")
+    if len(unique) > 200:
+        raise ValueError("At most 200 authors can be imported")
+    return unique
+
+
+def _manual_source_url(value: str) -> str:
+    source = clean_text(value)
+    if not source:
+        raise ValueError("Source link is required")
+    if len(source) > 2000:
+        raise ValueError("Source link is too long")
+    parsed = urlparse(source)
+    if parsed.scheme.lower() not in {"http", "https"} or not parsed.netloc:
+        raise ValueError("Source link must be a valid http or https URL")
+    return source
+
+
+def _manual_publication_date(value: str) -> str | None:
+    cleaned = value.strip()
+    if not cleaned:
+        return None
+    try:
+        return date.fromisoformat(cleaned).isoformat()
+    except ValueError as exc:
+        raise ValueError("Publication date must use YYYY-MM-DD") from exc
+
+
+def _manual_paper_record(values: dict[str, str], *, filename: str) -> PaperRecord:
+    title = clean_text(values.get("title"))
+    if not title:
+        raise ValueError("Title is required")
+    if len(title) > 1000:
+        raise ValueError("Title is too long")
+    authors = _manual_author_names(values.get("authors", ""))
+    source_url = _manual_source_url(values.get("source_link", ""))
+    abstract = clean_text(values.get("abstract"))
+    if abstract and len(abstract) > 1_000_000:
+        raise ValueError("Abstract is too long")
+    venue = clean_text(values.get("venue"))
+    if venue and len(venue) > 500:
+        raise ValueError("Venue is too long")
+    doi = strip_doi(values.get("doi"))
+    arxiv_raw = clean_text(values.get("arxiv_id"))
+    arxiv_id = extract_arxiv_id(f"arxiv:{arxiv_raw}") if arxiv_raw else None
+    if arxiv_raw and not arxiv_id:
+        raise ValueError("arXiv ID is invalid")
+    publication_date = _manual_publication_date(values.get("publication_date", ""))
+    paper_authors = [
+        PaperAuthor(
+            openalex_id=None,
+            name=name,
+            position=(
+                "first"
+                if index == 0
+                else "last"
+                if index == len(authors) - 1
+                else "middle"
+            ),
+        )
+        for index, name in enumerate(authors)
+    ]
+    return PaperRecord(
+        openalex_id=None,
+        doi=doi,
+        arxiv_id=arxiv_id,
+        title=title,
+        abstract=abstract,
+        publication_date=publication_date,
+        updated_date=None,
+        venue=venue,
+        publication_url=source_url,
+        pdf_url=None,
+        abstract_source="manual" if abstract else None,
+        pdf_source="manual_upload",
+        authors=paper_authors,
+        metadata={
+            "manual_import": True,
+            "original_filename": Path(filename).name,
+            "source_link": source_url,
+            "imported_at": _utcnow(),
+        },
+    )
+
+
+async def _stage_uploaded_pdf(
+    upload: UploadFile,
+    *,
+    directory: Path,
+    max_bytes: int,
+) -> Path:
+    directory.mkdir(parents=True, exist_ok=True)
+    temporary = directory / f".manual-upload-{uuid.uuid4().hex}.pdf.part"
+    total = 0
+    try:
+        with temporary.open("xb") as handle:
+            while True:
+                chunk = await upload.read(64 * 1024)
+                if not chunk:
+                    break
+                total += len(chunk)
+                if total > max_bytes:
+                    raise PDFError(f"PDF exceeds maximum size of {max_bytes} bytes")
+                handle.write(chunk)
+        if total == 0:
+            raise PDFError("PDF file is empty")
+        validate_pdf_file(temporary)
+        return temporary
+    except Exception:
+        temporary.unlink(missing_ok=True)
+        raise
+    finally:
+        await upload.close()
 
 
 def _parse_filter_values(params: Any) -> PaperFilters:
@@ -834,32 +976,160 @@ def create_app(
             db.remove_author_tag(openalex_id, tag)
         return RedirectResponse(_notice_url("/authors", f"Removed tag {tag}."), status_code=303)
 
-    @app.post("/actions/run")
-    async def start_run(request: Request) -> RedirectResponse:
-        form = await request.form()
-        title = str(form.get("q", "")).strip()[:500]
-        mode = "search" if title else "run"
-        parameters = inspect.signature(controller.start).parameters
+    @app.get("/papers/import", response_class=HTMLResponse)
+    def import_paper_form(request: Request) -> HTMLResponse:
+        return render(
+            request,
+            "import_paper.html",
+            import_values={},
+            import_error="",
+        )
+
+    @app.post("/papers/import", response_class=HTMLResponse)
+    async def import_paper(request: Request) -> Response:
+        values: dict[str, str] = {}
+        staged: Path | None = None
+        backup: Path | None = None
+        destination: Path | None = None
+        upload: UploadFile | None = None
         try:
-            if "query" in parameters:
-                started = controller.start(mode, query=title or None)
-            else:
-                started = controller.start(mode)
-        except ValueError as exc:
+            form = await request.form(
+                max_files=1,
+                max_fields=20,
+                max_part_size=config.fetch.max_pdf_bytes,
+            )
+            values = {
+                key: str(form.get(key, ""))
+                for key in (
+                    "title",
+                    "authors",
+                    "source_link",
+                    "abstract",
+                    "publication_date",
+                    "venue",
+                    "doi",
+                    "arxiv_id",
+                )
+            }
+            form_upload = form.get("pdf")
+            if not isinstance(form_upload, UploadFile) or not form_upload.filename:
+                raise ValueError("PDF file is required")
+            upload = form_upload
+            paper = _manual_paper_record(values, filename=upload.filename)
+            staged = await _stage_uploaded_pdf(
+                upload,
+                directory=config.paths.pdf_dir,
+                max_bytes=config.fetch.max_pdf_bytes,
+            )
+            with Database(config.paths.database) as db:
+                paper_id, _ = db.upsert_paper(paper, auto_analyze=True)
+                stored = db.get_paper(paper_id)
+                if stored is None:
+                    raise RuntimeError("Imported paper could not be read back")
+                destination = config.paths.pdf_dir / safe_pdf_name(
+                    str(stored["identity_key"])
+                )
+            if destination.exists():
+                backup = destination.with_suffix(
+                    destination.suffix + f".backup-{uuid.uuid4().hex}"
+                )
+                destination.replace(backup)
+            staged.replace(destination)
+            staged = None
+            with Database(config.paths.database) as db:
+                db.set_local_pdf(paper_id, str(destination))
+            if backup is not None:
+                backup.unlink(missing_ok=True)
             return RedirectResponse(
-                _notice_url("/", str(exc), level="error"), status_code=303
+                _notice_url(
+                    f"/papers/{paper_id}",
+                    f"Imported {paper.title}.",
+                ),
+                status_code=303,
             )
+        except Exception as exc:
+            if destination is not None:
+                if backup is not None and backup.exists():
+                    destination.unlink(missing_ok=True)
+                    backup.replace(destination)
+                elif staged is None:
+                    destination.unlink(missing_ok=True)
+            response = render(
+                request,
+                "import_paper.html",
+                import_values=values,
+                import_error=str(exc),
+            )
+            response.status_code = 400
+            return response
+        finally:
+            if upload is not None:
+                await upload.close()
+            if staged is not None:
+                staged.unlink(missing_ok=True)
+            if backup is not None:
+                backup.unlink(missing_ok=True)
+
+    @app.get("/search", response_class=HTMLResponse)
+    def search_papers(request: Request) -> HTMLResponse:
+        query = request.query_params.get("q", "").strip()[:500]
+        results: list[PaperRecord] = []
+        error = ""
+        if query:
+            client = client_factory(config)
+            try:
+                results = client.search_works(query, limit=10)
+            except Exception as exc:
+                error = str(exc)
+            finally:
+                client.close()
+        return render(
+            request,
+            "search.html",
+            search_query=query,
+            search_results=results,
+            search_error=error,
+        )
+
+    @app.post("/actions/run")
+    def start_run() -> RedirectResponse:
+        started = controller.start("run")
         if started:
-            message = (
-                f"Searching for and downloading {title}."
-                if title
-                else "Fetch started. This page updates while it runs."
-            )
+            message = "Fetch started. This page updates while it runs."
             level = "success"
         else:
             message = "A fetch is already running."
             level = "warning"
-        target = f"/?q={quote_plus(title)}" if title else "/"
+        return RedirectResponse(_notice_url("/", message, level=level), status_code=303)
+
+    @app.post("/actions/download")
+    async def download_paper(request: Request) -> RedirectResponse:
+        form = await request.form()
+        work_id = str(form.get("work_id", "")).strip()[:100]
+        title = str(form.get("title", "")).strip()[:500]
+        search_query = str(form.get("q", "")).strip()[:500]
+        target = f"/search?q={quote_plus(search_query)}" if search_query else "/search"
+        if not work_id:
+            return RedirectResponse(
+                _notice_url(target, "Paper identifier cannot be empty", level="error"),
+                status_code=303,
+            )
+        parameters = inspect.signature(controller.start).parameters
+        try:
+            if "query" in parameters:
+                started = controller.start("download", query=work_id)
+            else:
+                started = controller.start("download")
+        except ValueError as exc:
+            return RedirectResponse(
+                _notice_url(target, str(exc), level="error"), status_code=303
+            )
+        if started:
+            message = f"Downloading {title or work_id}."
+            level = "success"
+        else:
+            message = "A fetch is already running."
+            level = "warning"
         return RedirectResponse(_notice_url(target, message, level=level), status_code=303)
 
     @app.post("/actions/backfill")

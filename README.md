@@ -81,7 +81,7 @@ The home page is a newest-first table with these columns:
 - local/source PDF state, with missing PDFs highlighted;
 - the latest structured summary.
 
-Tracked author names link directly to the same table filtered to that author. Search, author, topic, kind, year, PDF, and summary filters stay on this page. A saved prompt and model can be selected beside the filters and run against exactly the currently matched papers or summaries.
+Tracked author names link directly to the same table filtered to that author. Search, author, topic, kind, year, PDF, and summary filters stay on this page. The top-right paper-title search opens OpenAlex matches before any download starts, and **Import PDF** opens a manual import form for a local PDF, title, authors, source link, and optional abstract, date, venue, DOI, and arXiv ID. Imported papers use the same detail, analysis, saved-query, export, and PDF flows as fetched papers. A saved prompt and model can be selected beside the filters and run against exactly the currently matched papers or summaries.
 
 ### Paper detail
 
@@ -106,7 +106,7 @@ There is no multi-page author drill-down required to perform these actions.
 
 ### Authors and tags
 
-The Authors page is a searchable table. It shows each tracked author’s name, institution, local paper count, tags, external links, and compact icon controls for pausing, resuming, or non-destructively removing tracking.
+The Authors page keeps OpenAlex author search at the top right and shows tracked authors in a searchable table. The table includes each tracked author’s name, institution, local paper count, tags, external links, and compact icon controls for pausing, resuming, or non-destructively removing tracking.
 
 - Search matches name, institution/employment, ORCID, OpenAlex ID, and tags.
 - The small **Add tag** field submits on Enter and clears after the redirect.
@@ -131,12 +131,7 @@ Every query run records the exact filters, model, context, output, and any per-m
 
 ## Light and dark themes
 
-The fixed corner button switches between:
-
-- a high-contrast light theme;
-- a high-contrast dark theme.
-
-The choice is stored locally in the browser. If browser storage is unavailable, the UI still works and falls back safely.
+The Web UI follows the operating system’s light or dark preference through `prefers-color-scheme`. Theme changes made in the desktop environment are reflected automatically; the browser does not keep a separate Paperwatch theme override.
 
 ## LLM configuration
 

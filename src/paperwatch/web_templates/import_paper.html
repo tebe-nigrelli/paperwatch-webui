@@ -1,0 +1,29 @@
+{% extends "base.html" %}
+{% block title %}Import PDF · paperwatch{% endblock %}
+{% block content %}
+<section class="page-heading split import-heading">
+  <div>
+    <h1>Import a PDF paper</h1>
+    <p>Add a local paper with the same detail, analysis, query, export, and PDF actions as fetched papers.</p>
+  </div>
+  <a class="button" href="/">Back to Recent</a>
+</section>
+
+<section class="panel">
+  {% if import_error %}<div class="notice notice-error" role="alert">{{ import_error }}</div>{% endif %}
+  <form method="post" action="/papers/import" enctype="multipart/form-data" class="import-paper-form">
+    <div class="import-grid">
+      <label class="full"><span>PDF file</span><input type="file" name="pdf" accept="application/pdf,.pdf" required><small>Maximum size: {{ (config.fetch.max_pdf_bytes / 1000000)|round(1) }} MB</small></label>
+      <label class="full"><span>Title</span><input name="title" value="{{ import_values.get('title', '') }}" maxlength="1000" required autofocus></label>
+      <label class="full"><span>Authors</span><textarea name="authors" rows="3" required placeholder="One author per line, or separate authors with semicolons">{{ import_values.get('authors', '') }}</textarea><small>Use semicolons when an author name itself contains a comma.</small></label>
+      <label class="full"><span>Source link</span><input type="url" name="source_link" value="{{ import_values.get('source_link', '') }}" maxlength="2000" placeholder="https://example.org/paper" required></label>
+      <label><span>Publication date</span><input type="date" name="publication_date" value="{{ import_values.get('publication_date', '') }}"></label>
+      <label><span>Venue or journal</span><input name="venue" value="{{ import_values.get('venue', '') }}" maxlength="500"></label>
+      <label><span>DOI</span><input name="doi" value="{{ import_values.get('doi', '') }}" placeholder="10.1234/example"></label>
+      <label><span>arXiv ID</span><input name="arxiv_id" value="{{ import_values.get('arxiv_id', '') }}" placeholder="2607.12345"></label>
+      <label class="full"><span>Abstract (optional)</span><textarea name="abstract" rows="8">{{ import_values.get('abstract', '') }}</textarea></label>
+    </div>
+    <div class="import-actions"><button class="button button-primary" type="submit">Import paper</button><a class="button" href="/">Cancel</a></div>
+  </form>
+</section>
+{% endblock %}

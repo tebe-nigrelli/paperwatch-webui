@@ -1,4 +1,4 @@
-# Automated testing strategy — paperwatch 0.6.2
+# Automated testing strategy — paperwatch 0.6.3
 
 The default suite is deterministic and requires no live OpenAlex index, arXiv service, Ollama server, OpenAI account, PDF host, or external browser assets.
 
@@ -10,8 +10,8 @@ pytest
 
 Release result:
 
-- 211 tests passed
-- 95.08% branch-aware coverage
+- 240 tests passed
+- 95.12% branch-aware coverage
 - Python 3.13.5 release environment
 
 ## Feature coverage
@@ -25,7 +25,7 @@ Release result:
 | OpenAlex | Authentication, author search/get, work filtering/sorting, cursor pagination, retries, malformed responses, sparse title-less work skipping, metadata normalization |
 | Deduplication | DOI, arXiv, OpenAlex, title/year, and same-run coauthor cases |
 | arXiv enrichment | ID/title lookup, author verification, polite throttling, retries, malformed XML, missing fields, conditional calls |
-| PDFs | Safe paths, redirect handling, limits, PDF signatures, atomic writes, cache reuse, extraction failures |
+| PDFs | Safe paths, redirect handling, limits, PDF signatures, readable-upload validation, atomic writes, cache reuse, extraction failures |
 | LLM providers | Ollama/OpenAI strict-schema requests, Ollama `num_ctx`, model readiness, actionable missing-model errors, native/OpenAI-compatible local endpoints, context override, output variants, usage, malformed output, HTTP failures |
 | Structured summaries | Exact keys/enums, narrative limits, `Setting: ` requirement, trusted metadata normalization, named-column and JSON round trips |
 | Chunked analysis | Paragraph splitting, overlap, chunk-size budgets, direct-fit checks, chunk-note cache, recursive reduction, final strict schema, context failures |
@@ -34,10 +34,10 @@ Release result:
 | Pipeline | Cursor-independent one-year download-only backfill, historical-analysis suppression, late-PDF analysis, normal initial/overlap windows, model preflight, automatic PDF chunking, cache behavior, error isolation, counters |
 | Concurrency | Separate cross-process fetch, paper-analysis, and saved-query locks; clean release behavior |
 | SQLite | Transactions, WAL, foreign keys, schema guards, migrations through schema v8, historical paper flags, tag/query/chunk persistence, integrity |
-| Recent-paper UI | Newest-first table, wrapping titles, tracked-author links, one leading topic, missing-PDF state, summary column, filter-preserving query runner, pagination, high-contrast theme control |
+| Recent-paper UI | Newest-first table, wrapping titles, tracked-author links, one leading topic, missing-PDF state, summary column, OpenAlex title search, manual PDF import, filter-preserving query runner, pagination, system-theme matching |
 | Paper UI | Centralized source/author/model actions, author picker state, model reruns, saved prompts, context input, no-reload fragment refresh, scroll preservation, live output, cancellation, stale-attempt recovery, analysis rendering, exports |
-| Author/query UI | Table-based author filtering across identity/employment/tags, Enter-to-tag, icon pause/resume/archive controls, OpenAlex result table, prompt-only query CRUD, filtered query execution, persisted selections/outputs/errors |
-| Static resilience | Theme storage fallback, hidden-state CSS precedence, no CDN dependency, responsive templates |
+| Author/query UI | Top-right OpenAlex author search, table-based filtering across identity/employment/tags, Enter-to-tag, icon pause/resume/archive controls, OpenAlex result table, prompt-only query CRUD, filtered query execution, persisted selections/outputs/errors |
+| Static resilience | System light/dark preference, hidden-state CSS precedence, no CDN dependency, responsive templates |
 | Web security | CSP, frame denial, MIME-sniff prevention, same-origin referrer policy, protected local-PDF paths, localhost default |
 | CLI/systemd | CLI commands, web invocation, daily timer, web service files, archive wording |
 | Packaging | Prompt/config/templates/assets/new modules included in wheel; installed command/server smoke tests |

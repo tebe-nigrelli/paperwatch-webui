@@ -41,6 +41,22 @@ def _looks_like_pdf(path: Path) -> bool:
     return is_complete_pdf(path)
 
 
+def validate_pdf_file(path: Path) -> None:
+    """Raise ``PDFError`` when a local file is not a readable, unencrypted PDF."""
+    if not is_complete_pdf(path):
+        raise PDFError("Uploaded file is not a complete PDF")
+    try:
+        reader = PdfReader(str(path), strict=False)
+        if reader.is_encrypted and reader.decrypt("") == 0:
+            raise PDFError("Uploaded PDF is encrypted")
+        # Force pypdf to parse the page tree now rather than failing during analysis.
+        len(reader.pages)
+    except PDFError:
+        raise
+    except Exception as exc:
+        raise PDFError(f"Uploaded file is not a readable PDF: {exc}") from exc
+
+
 def download_pdf(
     url: str,
     destination: Path,

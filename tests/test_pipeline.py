@@ -844,3 +844,54 @@ def test_fetch_title_keeps_download_when_arxiv_enrichment_fails(
         assert stats.pdfs_downloaded == 1 and paper_id is not None
         errors = db.get_run_errors(stats.run_id)
         assert errors[0]["stage"] == "arxiv_enrichment"
+
+
+def test_fetch_work_downloads_exact_result_and_keeps_failed_record(
+    app_config, paper_record, analysis_result
+):
+    from dataclasses import replace
+
+    class WorkOpenAlex:
+        def __init__(self, paper=None, error=None):
+            self.paper = paper
+            self.error = error
+            self.calls = []
+
+        def get_work(self, work_id):
+            self.calls.append(work_id)
+            if self.error:
+                raise self.error
+            return self.paper
+
+    pdf_client = httpx.Client(
+        transport=httpx.MockTransport(
+            lambda request: httpx.Response(200, content=PDF_BYTES)
+        )
+    )
+    source = WorkOpenAlex(paper_record)
+    with Database(app_config.paths.database) as db:
+        app = PaperWatch(
+            app_config,
+            db=db,
+            openalex=source,
+            arxiv=None,
+            llm=FakeLLM(analysis_result),
+            pdf_client=pdf_client,
+        )
+        stats, paper_id = app.fetch_work("W456")
+        assert stats.status == "success" and paper_id is not None
+        assert source.calls == ["W456"]
+        assert Path(db.get_paper(paper_id)["local_pdf_path"]).is_file()
+        with pytest.raises(ValueError, match="cannot be empty"):
+            app.fetch_work(" ")
+
+        no_pdf = replace(paper_record, openalex_id="WNOFILE", pdf_url=None)
+        app.openalex = WorkOpenAlex(no_pdf)
+        failed, failed_paper_id = app.fetch_work("WNOFILE")
+        assert failed.status == "failed" and failed_paper_id is not None
+        assert db.get_run_errors(failed.run_id)[0]["stage"] == "paper_download"
+
+        app.openalex = WorkOpenAlex(error=RuntimeError("OpenAlex unavailable"))
+        failed, failed_paper_id = app.fetch_work("WBROKEN")
+        assert failed.status == "failed" and failed_paper_id is None
+        assert "OpenAlex unavailable" in db.get_run(failed.run_id)["error_text"]

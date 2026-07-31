@@ -41,6 +41,12 @@ class RunStats:
         }
 
 
+class _SelectedPaperDownloadError(RuntimeError):
+    def __init__(self, message: str, paper_id: int):
+        super().__init__(message)
+        self.paper_id = paper_id
+
+
 class PaperWatch:
     def __init__(
         self,
@@ -308,6 +314,13 @@ class PaperWatch:
         with run_lock(self.config.paths.database):
             return self._fetch_title_locked(query)
 
+    def fetch_work(self, work_id: str) -> tuple[RunStats, int | None]:
+        identifier = work_id.strip()
+        if not identifier:
+            raise ValueError("OpenAlex work id cannot be empty")
+        with run_lock(self.config.paths.database):
+            return self._fetch_work_locked(identifier)
+
     def _fetch_title_locked(self, title: str) -> tuple[RunStats, int | None]:
         stats = RunStats()
         stats.run_id = self.db.start_run()
@@ -317,14 +330,41 @@ class PaperWatch:
             paper = self._best_title_match(title, matches)
             if paper is None:
                 raise ValueError(f"No OpenAlex paper matched {title!r}")
-            stats.papers_found = 1
-            try:
-                paper = self._enrich_from_arxiv(paper)
-            except Exception as exc:
-                self._record_error(stats, stage="arxiv_enrichment", exc=exc, paper=paper)
-            paper_id, _ = self.db.upsert_paper(paper, auto_analyze=True)
+            return self._download_selected_paper(stats, paper)
+        except Exception as exc:
+            stats.status = "failed"
+            self._record_error(stats, stage="paper_search_download", exc=exc)
+            self.db.finish_run(
+                stats.run_id, "failed", stats.as_dict(), error_text=str(exc)
+            )
+            return stats, getattr(exc, "paper_id", paper_id)
+
+    def _fetch_work_locked(self, work_id: str) -> tuple[RunStats, int | None]:
+        stats = RunStats()
+        stats.run_id = self.db.start_run()
+        try:
+            paper = self.openalex.get_work(work_id)
+            return self._download_selected_paper(stats, paper)
+        except Exception as exc:
+            stats.status = "failed"
+            self._record_error(stats, stage="paper_download", exc=exc)
+            self.db.finish_run(
+                stats.run_id, "failed", stats.as_dict(), error_text=str(exc)
+            )
+            return stats, getattr(exc, "paper_id", None)
+
+    def _download_selected_paper(
+        self, stats: RunStats, paper: PaperRecord
+    ) -> tuple[RunStats, int | None]:
+        stats.papers_found = 1
+        try:
+            paper = self._enrich_from_arxiv(paper)
+        except Exception as exc:
+            self._record_error(stats, stage="arxiv_enrichment", exc=exc, paper=paper)
+        paper_id, _ = self.db.upsert_paper(paper, auto_analyze=True)
+        try:
             if not paper.pdf_url:
-                raise PDFError("The matched paper has no downloadable PDF")
+                raise PDFError("The selected paper has no downloadable PDF")
             destination = self.config.paths.pdf_dir / safe_pdf_name(paper.identity_key)
             downloaded = download_pdf(
                 paper.pdf_url,
@@ -335,16 +375,11 @@ class PaperWatch:
             if downloaded:
                 stats.pdfs_downloaded = 1
             self.db.set_local_pdf(paper_id, str(destination))
-            stats.status = "partial" if stats.errors_count else "success"
-            self.db.finish_run(stats.run_id, stats.status, stats.as_dict())
-            return stats, paper_id
         except Exception as exc:
-            stats.status = "failed"
-            self._record_error(stats, stage="paper_search_download", exc=exc)
-            self.db.finish_run(
-                stats.run_id, "failed", stats.as_dict(), error_text=str(exc)
-            )
-            return stats, paper_id
+            raise _SelectedPaperDownloadError(str(exc), paper_id) from exc
+        stats.status = "partial" if stats.errors_count else "success"
+        self.db.finish_run(stats.run_id, stats.status, stats.as_dict())
+        return stats, paper_id
 
     def run(
         self,
