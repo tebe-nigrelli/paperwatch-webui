@@ -81,7 +81,7 @@ The home page is a newest-first table with these columns:
 - local/source PDF state, with missing PDFs highlighted;
 - the latest structured summary.
 
-Tracked author names link directly to the same table filtered to that author. Search, author, topic, kind, year, PDF, and summary filters stay on this page. Checkboxes select an exact paper subset for a saved prompt; selections persist in the browser across filter/search changes and selected rows remain at the top whenever they are visible. The table supports page sizes up to 1000 records. Local PDF links ask the desktop through `xdg-open`, so on Arch Linux/KDE they use the configured system PDF application.
+Tracked author names link directly to the same table filtered to that author. Search, exact author, searchable multi-select author tags, topic, year, PDF, and summary filters stay on this page. Existing tags can be filtered in a dropdown, added with Enter, and removed from the active chip list; selecting several tags matches papers associated with any of those tagged tracked authors. Checkboxes select an exact paper subset for a saved prompt; selections persist in the browser across filter/search changes and selected rows remain at the top whenever they are visible. The table supports page sizes up to 1000 records. Local PDF links ask the desktop through `xdg-open`, so on Arch Linux/KDE they use the configured system PDF application.
 
 ### Paper detail
 

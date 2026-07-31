@@ -5,7 +5,7 @@ import sqlite3
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Iterator
+from typing import Any, Iterable, Iterator
 
 from .models import (
     AuthorCandidate,
@@ -821,6 +821,7 @@ class Database:
         *,
         query: str = "",
         author_id: str = "",
+        author_tags: Iterable[str] = (),
         topic_id: str = "",
         paper_kind: str = "",
         scope: str = "",
@@ -850,6 +851,45 @@ class Database:
                 "AND paa.openalex_author_id=?)"
             )
             params.append(self._author_id(author_id))
+        clean_author_tags = tuple(
+            dict.fromkeys(
+                " ".join(str(tag).strip().split())
+                for tag in author_tags
+                if str(tag).strip()
+            )
+        )
+        if clean_author_tags:
+            author_ids: list[str] = []
+            tag_names: list[str] = []
+            for value in clean_author_tags:
+                candidate = short_openalex_id(value) or ""
+                if candidate.startswith("A") and candidate[1:].isdigit():
+                    author_ids.append(candidate)
+                else:
+                    tag_names.append(value)
+
+            author_tag_clauses: list[str] = []
+            author_tag_params: list[Any] = []
+            if author_ids:
+                placeholders = ",".join("?" for _ in author_ids)
+                author_tag_clauses.append(
+                    "EXISTS (SELECT 1 FROM paper_authors pat "
+                    "WHERE pat.paper_id=p.id "
+                    f"AND pat.openalex_author_id IN ({placeholders}))"
+                )
+                author_tag_params.extend(author_ids)
+            if tag_names:
+                placeholders = ",".join("?" for _ in tag_names)
+                author_tag_clauses.append(
+                    "EXISTS (SELECT 1 FROM paper_authors pat "
+                    "JOIN author_tag_links atl ON atl.author_id=pat.tracked_author_id "
+                    "JOIN author_tags atg ON atg.id=atl.tag_id "
+                    "WHERE pat.paper_id=p.id "
+                    f"AND atg.name COLLATE NOCASE IN ({placeholders}))"
+                )
+                author_tag_params.extend(tag_names)
+            where.append("(" + " OR ".join(author_tag_clauses) + ")")
+            params.extend(author_tag_params)
         if topic_id:
             where.append(
                 "EXISTS (SELECT 1 FROM paper_topics ptt WHERE ptt.paper_id=p.id "

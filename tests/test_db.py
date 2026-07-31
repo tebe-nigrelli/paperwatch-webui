@@ -393,6 +393,58 @@ def test_author_tags_filter_suggestions_and_cleanup(tmp_path, author_candidate):
             db.add_author_tag("A123", "x" * 41)
 
 
+def test_search_papers_accepts_multiple_author_tag_toggles(
+    tmp_path, author_candidate, paper_record
+):
+    from dataclasses import replace
+
+    from paperwatch.models import PaperAuthor
+
+    with Database(tmp_path / "paper-tags.sqlite") as db:
+        db.add_author(author_candidate)
+        db.add_author(
+            replace(
+                author_candidate,
+                openalex_id="A456",
+                name="Grace Hopper",
+                institution="United States Navy",
+            )
+        )
+        ada_id, _ = db.upsert_paper(paper_record)
+        grace_id, _ = db.upsert_paper(
+            replace(
+                paper_record,
+                openalex_id="W789",
+                doi="10.1000/compiler",
+                arxiv_id=None,
+                title="Reliable Compiler Pipelines",
+                authors=[PaperAuthor("A456", "Grace Hopper", "first", True)],
+                topics=[],
+            )
+        )
+        assert db.add_author_tag("A123", "theory")
+        assert db.add_author_tag("A456", "systems")
+
+        rows, total = db.search_papers(author_tags=("A123", "A456"), sort="title")
+        assert total == 2
+        assert {row["id"] for row in rows} == {ada_id, grace_id}
+
+        rows, total = db.search_papers(author_tags=("https://openalex.org/A123",))
+        assert total == 1
+        assert rows[0]["id"] == ada_id
+
+        # Existing custom author-group tags remain valid for old links and saved selections.
+        rows, total = db.search_papers(
+            author_tags=(" theory ", "", "systems"), sort="title"
+        )
+        assert total == 2
+        assert {row["id"] for row in rows} == {ada_id, grace_id}
+        rows, total = db.search_papers(author_tags=("THEORY",))
+        assert total == 1
+        assert rows[0]["id"] == ada_id
+        assert db.search_papers(author_tags=("missing",))[1] == 0
+
+
 def test_chunk_cache_and_saved_query_lifecycle(tmp_path, paper_record):
     with Database(tmp_path / "extra.sqlite") as db:
         paper_id, _ = db.upsert_paper(paper_record)

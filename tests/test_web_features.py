@@ -164,6 +164,41 @@ def test_author_tags_filter_and_non_destructive_removal(
         assert db.list_tags() == []
 
 
+def test_recent_papers_use_searchable_multi_select_author_tags_instead_of_kind(
+    config_path, author_candidate, paper_record, analysis_result
+):
+    config, _ = seed(config_path, author_candidate, paper_record, analysis_result)
+    with Database(config.paths.database) as db:
+        assert db.add_author_tag("A123", "theory")
+        assert db.add_author_tag("A123", "ML")
+
+    client = make_app(config_path)
+    response = client.get("/", params=[("author_tag", "theory")])
+    assert response.status_code == 200
+    assert "Author tags" in response.text
+    assert "Search existing tags, then press Enter to add one." in response.text
+    assert 'data-author-tag-combobox' in response.text
+    assert 'data-author-tag-input role="combobox"' in response.text
+    assert 'data-author-tag-chip="theory"' in response.text
+    assert 'data-remove-author-tag="theory"' in response.text
+    assert 'name="author_tag" value="theory"' in response.text
+    assert 'data-value="ML"' in response.text
+    assert 'role="listbox"' in response.text
+    assert 'data-author-tags-action=' not in response.text
+    assert 'type="checkbox" name="author_tag"' not in response.text
+    assert 'data-persist-open="paperwatch-more-filters-open" open' in response.text
+    assert '<span>Kind</span>' not in response.text
+    assert 'name="kind"' not in response.text
+    assert "1 matching record" in response.text
+    js = client.get("/static/app.js").text
+    assert 'details[data-persist-open]' in js
+    assert 'storageSet(key, String(details.open))' in js
+    assert '[data-author-tag-combobox]' in js
+    assert 'event.key === "Enter"' in js
+    assert 'addTag(activeOption.dataset.value || "")' in js
+    assert '[data-remove-author-tag]' in js
+
+
 def test_paper_author_picker_and_chunked_multi_model_request(
     config_path, author_candidate, paper_record, analysis_result
 ):
@@ -260,6 +295,7 @@ def test_saved_query_create_edit_run_output_and_delete(
             "paper_ids": "1",
             "q": "Minimal",
             "author": "A123",
+            "author_tag": ["theory", "ML"],
             "topic": "T100",
             "kind": "machine_learning",
             "scope": "fulltext",
@@ -280,6 +316,7 @@ def test_saved_query_create_edit_run_output_and_delete(
     assert query.calls[0][4:] == ("fulltext", "chunked")
     assert selection["query"] == "Minimal"
     assert selection["author_id"] == "A123"
+    assert selection["author_tags"] == ["theory", "ML"]
     assert selection["topic_id"] == "T100"
     assert selection["has_pdf"] is True
     assert selection["labels"] == ["Selected papers: 1"]

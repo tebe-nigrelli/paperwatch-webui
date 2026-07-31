@@ -48,6 +48,156 @@
     updateThemeButton();
   }
 
+  document.querySelectorAll("details[data-persist-open]").forEach((details) => {
+    const key = details.dataset.persistOpen;
+    const saved = storageGet(key);
+    if (saved === "true") details.open = true;
+    else if (saved === "false") details.open = false;
+    details.addEventListener("toggle", () => storageSet(key, String(details.open)));
+  });
+
+  document.querySelectorAll("[data-author-tag-combobox]").forEach((fieldset) => {
+    const input = fieldset.querySelector("[data-author-tag-input]");
+    const selection = fieldset.querySelector("[data-author-tag-selection]");
+    const dropdown = fieldset.querySelector("[data-author-tag-options]");
+    const options = Array.from(fieldset.querySelectorAll("[data-author-tag-option]"));
+    const noMatch = fieldset.querySelector("[data-author-tag-no-match]");
+    if (!input || !selection || !dropdown) return;
+
+    let activeOption = null;
+    const normalized = (value) => value.trim().toLocaleLowerCase();
+    const selectedValues = () => new Set(
+      Array.from(selection.querySelectorAll('input[name="author_tag"]')).map((item) => normalized(item.value))
+    );
+    const visibleOptions = () => options.filter((option) => !option.hidden);
+    const syncExternalInputs = () => {
+      const values = Array.from(selection.querySelectorAll('input[name="author_tag"]')).map((item) => item.value);
+      document.querySelectorAll("form").forEach((form) => {
+        if (form.contains(fieldset)) return;
+        form.querySelectorAll('input[type="hidden"][name="author_tag"]').forEach((item) => item.remove());
+        values.forEach((value) => {
+          const hidden = document.createElement("input");
+          hidden.type = "hidden";
+          hidden.name = "author_tag";
+          hidden.value = value;
+          form.appendChild(hidden);
+        });
+      });
+    };
+    const setActive = (option) => {
+      options.forEach((candidate) => candidate.classList.remove("active"));
+      activeOption = option || null;
+      if (activeOption) {
+        activeOption.classList.add("active");
+        input.setAttribute("aria-activedescendant", activeOption.id);
+        activeOption.scrollIntoView({ block: "nearest" });
+      } else {
+        input.removeAttribute("aria-activedescendant");
+      }
+    };
+    const closeDropdown = () => {
+      dropdown.hidden = true;
+      input.setAttribute("aria-expanded", "false");
+      setActive(null);
+    };
+    const refreshOptions = ({ open = true } = {}) => {
+      const term = normalized(input.value);
+      const selected = selectedValues();
+      options.forEach((option) => {
+        const isSelected = selected.has(normalized(option.dataset.value || ""));
+        const matches = !term || normalized(option.dataset.value || "").includes(term);
+        option.hidden = isSelected || !matches;
+        option.setAttribute("aria-selected", String(isSelected));
+      });
+      const visible = visibleOptions();
+      if (noMatch) {
+        noMatch.textContent = term ? "No matching tags." : "All tags are selected.";
+        noMatch.hidden = options.length === 0 || visible.length > 0;
+      }
+      if (open) {
+        dropdown.hidden = false;
+        input.setAttribute("aria-expanded", "true");
+      }
+      setActive(visible[0] || null);
+    };
+    const createChip = (value) => {
+      const chip = document.createElement("span");
+      chip.className = "author-tag-chip";
+      chip.dataset.authorTagChip = value;
+      const label = document.createElement("span");
+      label.textContent = value;
+      const remove = document.createElement("button");
+      remove.type = "button";
+      remove.dataset.removeAuthorTag = value;
+      remove.setAttribute("aria-label", `Remove author tag ${value}`);
+      remove.textContent = "×";
+      const hidden = document.createElement("input");
+      hidden.type = "hidden";
+      hidden.name = "author_tag";
+      hidden.value = value;
+      chip.append(label, remove, hidden);
+      selection.insertBefore(chip, input);
+    };
+    const addTag = (value) => {
+      const clean = value.trim();
+      if (!clean || selectedValues().has(normalized(clean))) return;
+      createChip(clean);
+      input.value = "";
+      syncExternalInputs();
+      refreshOptions();
+      input.focus();
+    };
+    const removeTag = (value) => {
+      const target = normalized(value);
+      const chip = Array.from(selection.querySelectorAll("[data-author-tag-chip]")).find(
+        (candidate) => normalized(candidate.dataset.authorTagChip || "") === target
+      );
+      if (chip) chip.remove();
+      syncExternalInputs();
+      refreshOptions();
+      input.focus();
+    };
+
+    input.addEventListener("focus", () => refreshOptions());
+    input.addEventListener("input", () => refreshOptions());
+    input.addEventListener("keydown", (event) => {
+      const visible = visibleOptions();
+      const index = activeOption ? visible.indexOf(activeOption) : -1;
+      if (event.key === "ArrowDown") {
+        event.preventDefault();
+        if (dropdown.hidden) refreshOptions();
+        else setActive(visible[(index + 1) % Math.max(visible.length, 1)] || null);
+      } else if (event.key === "ArrowUp") {
+        event.preventDefault();
+        if (dropdown.hidden) refreshOptions();
+        else setActive(visible[(index <= 0 ? visible.length : index) - 1] || null);
+      } else if (event.key === "Enter") {
+        event.preventDefault();
+        if (dropdown.hidden) refreshOptions();
+        if (activeOption) addTag(activeOption.dataset.value || "");
+      } else if (event.key === "Escape") {
+        event.preventDefault();
+        closeDropdown();
+      }
+    });
+    options.forEach((option) => {
+      option.addEventListener("mousedown", (event) => event.preventDefault());
+      option.addEventListener("click", () => addTag(option.dataset.value || ""));
+      option.addEventListener("mousemove", () => setActive(option));
+    });
+    selection.addEventListener("click", (event) => {
+      const remove = event.target.closest("[data-remove-author-tag]");
+      if (remove) removeTag(remove.dataset.removeAuthorTag || "");
+      else if (event.target !== input) input.focus();
+    });
+    document.addEventListener("click", (event) => {
+      if (!fieldset.contains(event.target)) closeDropdown();
+    });
+    syncExternalInputs();
+    refreshOptions({ open: false });
+    closeDropdown();
+  });
+
   document.querySelectorAll("form").forEach((form) => {
     const source = form.querySelector("[data-source-scope]");
     const strategy = form.querySelector("[data-pdf-strategy]");

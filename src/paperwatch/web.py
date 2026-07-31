@@ -56,6 +56,7 @@ DEFAULT_CONTEXT_WINDOW_TOKENS = 16384
 class PaperFilters:
     query: str = ""
     author_id: str = ""
+    author_tags: tuple[str, ...] = ()
     topic_id: str = ""
     paper_kind: str = ""
     scope: str = ""
@@ -71,6 +72,7 @@ class PaperFilters:
         return {
             "query": self.query,
             "author_id": self.author_id,
+            "author_tags": list(self.author_tags),
             "topic_id": self.topic_id,
             "paper_kind": self.paper_kind,
             "scope": self.scope,
@@ -82,36 +84,38 @@ class PaperFilters:
         }
 
     def selection_items(self) -> list[tuple[str, str]]:
-        values = {
-            "q": self.query,
-            "author": self.author_id,
-            "topic": self.topic_id,
-            "kind": self.paper_kind,
-            "scope": self.scope,
-            "has_pdf": _bool_query(self.has_pdf),
-            "analyzed": _bool_query(self.analyzed),
-            "date_from": self.date_from,
-            "date_to": self.date_to,
-            "sort": self.sort if self.sort != "newest" else "",
-        }
-        return [(key, value) for key, value in values.items() if value]
+        items = [
+            ("q", self.query),
+            ("author", self.author_id),
+            *(("author_tag", tag) for tag in self.author_tags),
+            ("topic", self.topic_id),
+            ("kind", self.paper_kind),
+            ("scope", self.scope),
+            ("has_pdf", _bool_query(self.has_pdf)),
+            ("analyzed", _bool_query(self.analyzed)),
+            ("date_from", self.date_from),
+            ("date_to", self.date_to),
+            ("sort", self.sort if self.sort != "newest" else ""),
+        ]
+        return [(key, value) for key, value in items if value]
 
     def query_items(self, *, page: int | None = None) -> list[tuple[str, str]]:
-        values = {
-            "q": self.query,
-            "author": self.author_id,
-            "topic": self.topic_id,
-            "kind": self.paper_kind,
-            "scope": self.scope,
-            "has_pdf": _bool_query(self.has_pdf),
-            "analyzed": _bool_query(self.analyzed),
-            "date_from": self.date_from,
-            "date_to": self.date_to,
-            "sort": self.sort if self.sort != "newest" else "",
-            "page_size": str(self.page_size) if self.page_size != DEFAULT_PAGE_SIZE else "",
-            "page": str(page if page is not None else self.page),
-        }
-        return [(key, value) for key, value in values.items() if value and value != "1"]
+        items = [
+            ("q", self.query),
+            ("author", self.author_id),
+            *(("author_tag", tag) for tag in self.author_tags),
+            ("topic", self.topic_id),
+            ("kind", self.paper_kind),
+            ("scope", self.scope),
+            ("has_pdf", _bool_query(self.has_pdf)),
+            ("analyzed", _bool_query(self.analyzed)),
+            ("date_from", self.date_from),
+            ("date_to", self.date_to),
+            ("sort", self.sort if self.sort != "newest" else ""),
+            ("page_size", str(self.page_size) if self.page_size != DEFAULT_PAGE_SIZE else ""),
+            ("page", str(page if page is not None else self.page)),
+        ]
+        return [(key, value) for key, value in items if value and value != "1"]
 
     @property
     def query_string(self) -> str:
@@ -430,9 +434,27 @@ def _parse_filter_values(params: Any) -> PaperFilters:
     topic_id = short_openalex_id(params.get("topic", "").strip()[:64]) or ""
     if topic_id and not topic_id.startswith("T"):
         topic_id = ""
+    raw_author_tags = (
+        params.getlist("author_tag")
+        if hasattr(params, "getlist")
+        else params.get("author_tag", ())
+    )
+    if isinstance(raw_author_tags, str):
+        raw_author_tags = (raw_author_tags,)
+    author_tags: list[str] = []
+    seen_tags: set[str] = set()
+    for value in raw_author_tags or ():
+        tag = " ".join(str(value).strip().split())[:40]
+        normalized = tag.casefold()
+        if tag and normalized not in seen_tags:
+            author_tags.append(tag)
+            seen_tags.add(normalized)
+        if len(author_tags) >= 50:
+            break
     return PaperFilters(
         query=params.get("q", "").strip()[:200],
         author_id=params.get("author", "").strip()[:64],
+        author_tags=tuple(author_tags),
         topic_id=topic_id,
         paper_kind=paper_kind,
         scope=scope,
@@ -526,6 +548,7 @@ def _all_filtered(db: Database, filters: PaperFilters) -> list[Any]:
     rows, _ = db.search_papers(
         query=filters.query,
         author_id=filters.author_id,
+        author_tags=filters.author_tags,
         topic_id=filters.topic_id,
         paper_kind=filters.paper_kind,
         scope=filters.scope,
@@ -619,6 +642,17 @@ def _selection_with_labels(
             filters.author_id,
         )
         labels.append(f"Author: {name}")
+    if filters.author_tags:
+        author_names = {
+            str(row["openalex_id"]): str(row["name"])
+            for row in authors
+            if row["openalex_id"]
+        }
+        selected_authors = [
+            author_names.get(short_openalex_id(value) or value, value)
+            for value in filters.author_tags
+        ]
+        labels.append(f"Authors: {', '.join(selected_authors)}")
     if filters.topic_id:
         name = next(
             (
@@ -668,24 +702,27 @@ def _query_output(row: Any) -> dict[str, Any]:
     if source_scope == "fulltext":
         selection_items.append(f"PDF strategy: {pdf_strategy}")
     data["selection_label"] = " · ".join(selection_items) or "All matching records"
-    selection_query = urlencode([
-        (key, value)
-        for key, value in {
-            "q": data["selection"].get("query"),
-            "author": data["selection"].get("author_id"),
-            "topic": data["selection"].get("topic_id"),
-            "kind": data["selection"].get("paper_kind"),
-            "scope": data["selection"].get("scope"),
-            "has_pdf": _bool_query(data["selection"].get("has_pdf")),
-            "analyzed": _bool_query(data["selection"].get("analyzed")),
-            "date_from": data["selection"].get("date_from"),
-            "date_to": data["selection"].get("date_to"),
-            "sort": data["selection"].get("sort")
+    raw_tags = data["selection"].get("author_tags")
+    author_tags = raw_tags if isinstance(raw_tags, list) else []
+    selection_pairs = [
+        ("q", data["selection"].get("query")),
+        ("author", data["selection"].get("author_id")),
+        *(("author_tag", tag) for tag in author_tags if tag),
+        ("topic", data["selection"].get("topic_id")),
+        ("kind", data["selection"].get("paper_kind")),
+        ("scope", data["selection"].get("scope")),
+        ("has_pdf", _bool_query(data["selection"].get("has_pdf"))),
+        ("analyzed", _bool_query(data["selection"].get("analyzed"))),
+        ("date_from", data["selection"].get("date_from")),
+        ("date_to", data["selection"].get("date_to")),
+        (
+            "sort",
+            data["selection"].get("sort")
             if data["selection"].get("sort") != "newest"
             else "",
-        }.items()
-        if value
-    ])
+        ),
+    ]
+    selection_query = urlencode([(key, value) for key, value in selection_pairs if value])
     data["selection_url"] = f"/?{selection_query}" if selection_query else "/"
     return data
 
@@ -824,6 +861,7 @@ def create_app(
             rows, total = db.search_papers(
                 query=filters.query,
                 author_id=filters.author_id,
+                author_tags=filters.author_tags,
                 topic_id=filters.topic_id,
                 paper_kind=filters.paper_kind,
                 scope=filters.scope,
@@ -836,6 +874,7 @@ def create_app(
                 offset=offset,
             )
             author_rows = db.list_authors_with_tags(tracked_only=True)
+            tag_rows = db.list_tags()
             topic_rows = db.list_topics()
             saved_queries = [dict(row) for row in db.list_saved_queries()]
             recent_errors = db.recent_errors(3)
@@ -847,6 +886,7 @@ def create_app(
             papers=paper_views,
             filters=filters,
             authors=author_rows,
+            author_tags=tag_rows,
             topics=topic_rows,
             saved_queries=saved_queries,
             model_profiles=config.available_llms,
@@ -1177,6 +1217,7 @@ def create_app(
             rows, total = db.search_papers(
                 query=filters.query,
                 author_id=filters.author_id,
+                author_tags=filters.author_tags,
                 topic_id=filters.topic_id,
                 paper_kind=filters.paper_kind,
                 scope=filters.scope,
@@ -1188,7 +1229,8 @@ def create_app(
                 limit=filters.page_size,
                 offset=offset,
             )
-            author_rows = db.list_authors(tracked_only=True)
+            author_rows = db.list_authors_with_tags(tracked_only=True)
+            tag_rows = db.list_tags()
             topic_rows = db.list_topics()
             saved_queries = [dict(row) for row in db.list_saved_queries()]
             paper_views = [_paper_table_view(db, row) for row in rows]
@@ -1202,6 +1244,7 @@ def create_app(
             papers=paper_views,
             filters=filters,
             authors=author_rows,
+            author_tags=tag_rows,
             topics=topic_rows,
             saved_queries=saved_queries,
             model_profiles=config.available_llms,

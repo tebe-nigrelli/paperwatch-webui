@@ -92,10 +92,12 @@ def test_collect_documents_uses_recent_page_selection(
     config = load_config(config_path)
     with Database(config.paths.database) as db:
         db.add_author(author_candidate)
+        db.add_author_tag("A123", "theory")
         paper_id, _ = db.upsert_paper(paper_record)
         selection = {
             "query": "Minimal",
             "author_id": "A123",
+            "author_tags": ["theory", ""],
             "topic_id": "T100",
             "paper_kind": "",
             "scope": "",
@@ -117,6 +119,8 @@ def test_collect_documents_uses_recent_page_selection(
     args = _selection_search_args({"has_pdf": "yes", "analyzed": 1})
     assert args["has_pdf"] is None
     assert args["analyzed"] is None
+    assert args["author_tags"] == ()
+    assert _selection_search_args({"author_tags": "theory"})["author_tags"] == ()
     assert _selection_search_args(None)["sort"] == "newest"
 
 

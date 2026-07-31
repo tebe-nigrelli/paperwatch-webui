@@ -10,14 +10,28 @@
     <label class="grow"><span>Search title, abstract, or author</span><input name="q" value="{{ filters.query }}" placeholder="e.g. diffusion, scaling laws, author name"></label>
     <label><span>Author</span><select name="author"><option value="">All authors</option>{% for author in authors %}<option value="{{ author.openalex_id }}" {% if filters.author_id == author.openalex_id %}selected{% endif %}>{{ author.name }}</option>{% endfor %}</select></label>
     <label><span>Topic</span><select name="topic"><option value="">All topics</option>{% for topic in topics %}<option value="{{ topic.openalex_id }}" {% if filters.topic_id == topic.openalex_id %}selected{% endif %}>{{ topic.display_name }} ({{ topic.paper_count }})</option>{% endfor %}</select></label>
+    {% for tag in filters.author_tags %}<input type="hidden" name="author_tag" value="{{ tag }}">{% endfor %}
     <input type="hidden" name="page_size" value="{{ filters.page_size }}">
     <button class="button button-primary" type="submit">Filter</button>
-    {% if filters.query or filters.author_id or filters.topic_id or filters.paper_kind or filters.scope or filters.has_pdf is not none or filters.analyzed is not none or filters.date_from or filters.date_to %}<a class="button" href="/">Clear</a>{% endif %}
+    {% if filters.query or filters.author_id or filters.author_tags or filters.topic_id or filters.paper_kind or filters.scope or filters.has_pdf is not none or filters.analyzed is not none or filters.date_from or filters.date_to %}<a class="button" href="/">Clear</a>{% endif %}
   </form>
-  <details class="advanced-filters"><summary>More filters</summary>
+  <details class="advanced-filters" data-persist-open="paperwatch-more-filters-open"{% if filters.author_tags or filters.has_pdf is not none or filters.analyzed is not none or filters.date_from or filters.date_to or filters.sort != 'newest' or filters.page_size != 100 %} open{% endif %}><summary>More filters</summary>
     <form method="get" action="/" class="filter-grid">
       <input type="hidden" name="q" value="{{ filters.query }}"><input type="hidden" name="author" value="{{ filters.author_id }}"><input type="hidden" name="topic" value="{{ filters.topic_id }}">
-      <label><span>Kind</span><select name="kind"><option value="">Any</option>{% for kind in paper_kinds %}<option value="{{ kind }}" {% if filters.paper_kind == kind %}selected{% endif %}>{{ kind|replace('_',' ') }}</option>{% endfor %}</select></label>
+      <fieldset class="author-tag-filter wide" data-author-tag-combobox>
+        <legend>Author tags</legend>
+        <div class="author-tag-picker">
+          <div class="author-tag-selection" data-author-tag-selection>
+            {% for selected_tag in filters.author_tags %}<span class="author-tag-chip" data-author-tag-chip="{{ selected_tag }}"><span>{{ selected_tag }}</span><button type="button" data-remove-author-tag="{{ selected_tag }}" aria-label="Remove author tag {{ selected_tag }}">×</button><input type="hidden" name="author_tag" value="{{ selected_tag }}"></span>{% endfor %}
+            <input id="author-tag-search" type="search" data-author-tag-input role="combobox" aria-autocomplete="list" aria-expanded="false" aria-controls="author-tag-options" autocomplete="off" placeholder="Search existing tags">
+          </div>
+          <div id="author-tag-options" class="author-tag-dropdown" data-author-tag-options role="listbox" hidden>
+            {% for tag in author_tags %}<button id="author-tag-option-{{ loop.index }}" class="author-tag-option" type="button" role="option" data-author-tag-option data-value="{{ tag.name }}" aria-selected="{{ 'true' if tag.name in filters.author_tags else 'false' }}"{% if tag.name in filters.author_tags %} hidden{% endif %}><span>{{ tag.name }}</span><small>{{ tag.author_count }} author{{ '' if tag.author_count == 1 else 's' }}</small></button>{% else %}<div class="author-tag-empty" data-author-tag-empty>No existing author tags. Add tags from the Authors page first.</div>{% endfor %}
+            <div class="author-tag-empty" data-author-tag-no-match hidden>No matching tags.</div>
+          </div>
+        </div>
+        <small>Search existing tags, then press Enter to add one. Selected tags match any tagged author.</small>
+      </fieldset>
       <label><span>Analysis</span><select name="analyzed"><option value="">Any</option><option value="yes" {% if filters.analyzed is sameas true %}selected{% endif %}>Analyzed</option><option value="no" {% if filters.analyzed is sameas false %}selected{% endif %}>Not analyzed</option></select></label>
       <label><span>PDF</span><select name="has_pdf"><option value="">Any</option><option value="yes" {% if filters.has_pdf is sameas true %}selected{% endif %}>Available</option><option value="no" {% if filters.has_pdf is sameas false %}selected{% endif %}>Missing</option></select></label>
       <label><span>Sort</span><select name="sort"><option value="newest">Newest</option><option value="discovered" {% if filters.sort=='discovered' %}selected{% endif %}>Recently fetched</option><option value="oldest" {% if filters.sort=='oldest' %}selected{% endif %}>Oldest</option><option value="title" {% if filters.sort=='title' %}selected{% endif %}>Title</option></select></label>

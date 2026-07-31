@@ -61,6 +61,11 @@ def _selection_search_args(selection: dict[str, Any] | None) -> dict[str, Any]:
     return {
         "query": str(selection.get("query") or ""),
         "author_id": str(selection.get("author_id") or ""),
+        "author_tags": tuple(
+            str(tag)
+            for tag in selection.get("author_tags", ())
+            if str(tag).strip()
+        ) if isinstance(selection.get("author_tags"), (list, tuple)) else (),
         "topic_id": str(selection.get("topic_id") or ""),
         "paper_kind": str(selection.get("paper_kind") or ""),
         "scope": str(selection.get("scope") or ""),
