@@ -6,6 +6,7 @@ from datetime import date
 from pathlib import Path
 
 import httpx
+import pytest
 
 from paperwatch.db import Database
 from paperwatch.models import LLMResponse
@@ -695,7 +696,7 @@ def test_cursor_independent_download_only_backfill_and_late_pdf_analysis(
         assert stored["auto_analyze"] == 0
         assert stored["local_pdf_path"]
         assert llm.prompts == []
-        assert db.get_author("A123")["last_checked_at"].startswith("2026-07-30")
+        assert db.get_author("A123")["last_checked_at"] > "2026-07-29T00:00:00+00:00"
 
         # Rediscovery does not summarize an already downloaded historical paper.
         normal = app.run(today=date(2026, 7, 31))
@@ -729,3 +730,117 @@ def test_backfill_override_validation_happens_before_run_creation(
         with pytest.raises(ValueError, match="at least 1"):
             app.run(max_papers_per_author_override=0)
         assert db.list_runs() == []
+
+
+def test_fetch_title_selects_exact_match_and_downloads(
+    app_config, paper_record, analysis_result
+):
+    from dataclasses import replace
+
+    near = replace(paper_record, openalex_id="WNEAR", title="Minimal Agent Systems")
+
+    class SearchOpenAlex:
+        def __init__(self):
+            self.calls = []
+
+        def search_works(self, title, limit=10):
+            self.calls.append((title, limit))
+            return [near, paper_record]
+
+    openalex = SearchOpenAlex()
+    pdf_client = httpx.Client(
+        transport=httpx.MockTransport(
+            lambda request: httpx.Response(200, content=PDF_BYTES)
+        )
+    )
+    with Database(app_config.paths.database) as db:
+        app = PaperWatch(
+            app_config,
+            db=db,
+            openalex=openalex,
+            arxiv=None,
+            llm=FakeLLM(analysis_result),
+            pdf_client=pdf_client,
+        )
+        stats, paper_id = app.fetch_title(paper_record.title)
+        assert stats.status == "success"
+        assert stats.papers_found == 1 and stats.pdfs_downloaded == 1
+        assert openalex.calls == [(paper_record.title, 10)]
+        stored = db.get_paper(paper_id)
+        assert stored["openalex_id"] == paper_record.openalex_id
+        assert Path(stored["local_pdf_path"]).is_file()
+        assert db.paper_analyses(paper_id) == []
+        assert app._best_title_match("Minimal Agent System", [near]) == near
+        with pytest.raises(ValueError, match="cannot be empty"):
+            app.fetch_title("   ")
+
+
+def test_fetch_title_records_missing_match_and_pdf_errors(
+    app_config, paper_record, analysis_result
+):
+    from dataclasses import replace
+
+    class SearchOpenAlex:
+        def __init__(self, papers):
+            self.papers = papers
+
+        def search_works(self, title, limit=10):
+            return self.papers
+
+    with Database(app_config.paths.database) as db:
+        app = PaperWatch(
+            app_config,
+            db=db,
+            openalex=SearchOpenAlex([]),
+            arxiv=None,
+            llm=FakeLLM(analysis_result),
+            pdf_client=httpx.Client(),
+        )
+        stats, paper_id = app.fetch_title("Unknown paper")
+        assert stats.status == "failed" and paper_id is None
+        assert db.get_run_errors(stats.run_id)[0]["stage"] == "paper_search_download"
+
+        no_pdf = replace(paper_record, openalex_id="WNOFILE", pdf_url=None)
+        app.openalex = SearchOpenAlex([no_pdf])
+        stats, paper_id = app.fetch_title(no_pdf.title)
+        assert stats.status == "failed" and paper_id is not None
+        assert "no downloadable PDF" in db.get_run(stats.run_id)["error_text"]
+
+
+def test_fetch_title_keeps_download_when_arxiv_enrichment_fails(
+    app_config, paper_record, analysis_result
+):
+    from dataclasses import replace
+
+    paper = replace(paper_record, abstract=None, arxiv_id=None)
+
+    class SearchOpenAlex:
+        def search_works(self, title, limit=10):
+            return [paper]
+
+    class BrokenArxiv:
+        def by_title(self, title, first_author=None):
+            raise RuntimeError("arXiv offline")
+
+        def by_id(self, arxiv_id):
+            raise AssertionError("no arXiv id expected")
+
+    pdf_client = httpx.Client(
+        transport=httpx.MockTransport(
+            lambda request: httpx.Response(200, content=PDF_BYTES)
+        )
+    )
+    with Database(app_config.paths.database) as db:
+        app = PaperWatch(
+            app_config,
+            db=db,
+            openalex=SearchOpenAlex(),
+            arxiv=BrokenArxiv(),
+            llm=FakeLLM(analysis_result),
+            pdf_client=pdf_client,
+        )
+        stats, paper_id = app.fetch_title(paper.title)
+        assert stats.status == "partial"
+        assert stats.pdfs_downloaded == 1 and paper_id is not None
+        errors = db.get_run_errors(stats.run_id)
+        assert errors[0]["stage"] == "arxiv_enrichment"

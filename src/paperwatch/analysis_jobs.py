@@ -23,7 +23,7 @@ from .llm import (
     create_llm,
 )
 from .locking import analysis_lock
-from .pdfs import download_pdf, extract_pdf_text, safe_pdf_name
+from .pdfs import PDFError, download_pdf, extract_pdf_text, is_complete_pdf, safe_pdf_name
 
 
 @dataclass(slots=True)
@@ -59,11 +59,17 @@ def _paper_pdf_path(
     path: Path | None = None
     if row["local_pdf_path"]:
         candidate = Path(row["local_pdf_path"]).expanduser().resolve()
-        if candidate.is_file() and (candidate == root or root in candidate.parents):
+        if (
+            candidate.is_file()
+            and (candidate == root or root in candidate.parents)
+            and is_complete_pdf(candidate)
+        ):
             path = candidate
+        elif candidate.is_file() and (candidate == root or root in candidate.parents):
+            candidate.unlink(missing_ok=True)
     if path is None:
         if not paper.pdf_url:
-            raise ValueError("This paper has no PDF available for full-text analysis")
+            raise ValueError("This paper has no PDF available or the cached PDF is incomplete")
         path = root / safe_pdf_name(paper.identity_key)
         download_pdf(
             paper.pdf_url,
@@ -92,7 +98,21 @@ def _paper_text(
     if scope != "fulltext":
         raise ValueError("Analysis scope must be abstract or fulltext")
     paper, path = _paper_pdf_path(config, db, paper_id, pdf_client)
-    return paper, extract_pdf_text(path, max_chars=config.fetch.max_pdf_chars)
+    try:
+        text = extract_pdf_text(path, max_chars=config.fetch.max_pdf_chars)
+    except PDFError as exc:
+        if not paper.pdf_url or not str(exc).startswith("PDF text extraction failed:"):
+            raise
+        path.unlink(missing_ok=True)
+        download_pdf(
+            paper.pdf_url,
+            path,
+            max_bytes=config.fetch.max_pdf_bytes,
+            client=pdf_client,
+        )
+        db.set_local_pdf(paper_id, str(path))
+        text = extract_pdf_text(path, max_chars=config.fetch.max_pdf_chars)
+    return paper, text
 
 
 def _cancel_pending_tasks(

@@ -17,6 +17,10 @@ class LLMError(RuntimeError):
     pass
 
 
+class _OllamaOutputError(LLMError):
+    """A successful Ollama HTTP response with unusable model output."""
+
+
 TModel = TypeVar("TModel", bound=BaseModel)
 
 
@@ -208,23 +212,55 @@ class OllamaClient:
     def _decode_json_content(content: str) -> dict[str, Any]:
         import json
 
-        data = json.loads(content)
+        cleaned = content.strip()
+        if not cleaned:
+            raise _OllamaOutputError("Ollama response has no message content")
+        if cleaned.startswith("```"):
+            first_newline = cleaned.find("\n")
+            last_fence = cleaned.rfind("```")
+            if first_newline >= 0 and last_fence > first_newline:
+                cleaned = cleaned[first_newline + 1:last_fence].strip()
+        try:
+            data = json.loads(cleaned)
+        except json.JSONDecodeError as exc:
+            start = cleaned.find("{")
+            if start >= 0:
+                try:
+                    data, _ = json.JSONDecoder().raw_decode(cleaned[start:])
+                except json.JSONDecodeError:
+                    data = None
+                if isinstance(data, dict):
+                    return data
+            detail = (
+                "incomplete JSON"
+                if exc.pos >= max(0, len(cleaned) - 2) or "Unterminated" in exc.msg
+                else "invalid JSON"
+            )
+            raise _OllamaOutputError(
+                f"Ollama returned {detail}: {exc.msg} at character {exc.pos}"
+            ) from exc
         if not isinstance(data, dict):
-            raise LLMError("Ollama structured output must be a JSON object")
+            raise _OllamaOutputError("Ollama structured output must be a JSON object")
         return data
 
-    def _native_generate(
+    def _native_generate_once(
         self,
         prompt: str,
         *,
         schema: dict[str, Any],
+        force_stream: bool | None = None,
     ) -> StructuredJSONResponse | None:
         endpoint = f"{self.base_url}/api/chat"
         request_json = {
             "model": self.model,
             "messages": [{"role": "user", "content": prompt}],
-            "stream": self._progress is not None or self._cancel_event is not None,
+            "stream": (
+                self._progress is not None or self._cancel_event is not None
+                if force_stream is None
+                else force_stream
+            ),
             "format": schema,
+            "think": False,
             "options": {
                 "temperature": 0,
                 **(
@@ -246,13 +282,18 @@ class OllamaClient:
                 return None
             if response.is_error:
                 raise self._http_error(response, endpoint=endpoint)
-            payload = response.json()
+            try:
+                payload = response.json()
+            except ValueError as exc:
+                raise _OllamaOutputError(
+                    "Ollama returned an empty or invalid JSON response envelope"
+                ) from exc
             if not isinstance(payload, dict):
-                raise LLMError("Ollama returned an unexpected payload")
+                raise _OllamaOutputError("Ollama returned an unexpected payload")
             message = payload.get("message") or {}
             content = message.get("content") if isinstance(message, dict) else None
             if not isinstance(content, str):
-                raise LLMError("Ollama response has no message content")
+                raise _OllamaOutputError("Ollama response has no message content")
             usage = {
                 key: payload[key]
                 for key in ("prompt_eval_count", "eval_count", "total_duration")
@@ -304,13 +345,16 @@ class OllamaClient:
                             self._progress("output", fragment)
         except JobCancelled:
             raise
-        except (httpx.HTTPError, ValueError) as exc:
+        except httpx.HTTPError as exc:
             check_cancelled(self._cancel_event)
             raise LLMError(f"Ollama streaming response failed: {exc}") from exc
+        except ValueError as exc:
+            check_cancelled(self._cancel_event)
+            raise _OllamaOutputError(f"Ollama streaming response failed: {exc}") from exc
 
         content = "".join(content_parts)
         if not content:
-            raise LLMError("Ollama response has no message content")
+            raise _OllamaOutputError("Ollama response has no message content")
         usage = {
             key: final_payload[key]
             for key in ("prompt_eval_count", "eval_count", "total_duration")
@@ -319,6 +363,41 @@ class OllamaClient:
         return StructuredJSONResponse(
             data=self._decode_json_content(content), usage=usage, raw=final_payload
         )
+
+    def _native_generate(
+        self,
+        prompt: str,
+        *,
+        schema: dict[str, Any],
+    ) -> StructuredJSONResponse | None:
+        first_error: _OllamaOutputError | None = None
+        last_error: _OllamaOutputError | None = None
+        for attempt in range(2):
+            retry_prompt = prompt
+            if attempt:
+                retry_prompt = (
+                    prompt
+                    + "\n\nReturn one complete JSON object only. Do not include reasoning, "
+                    "markdown fences, commentary, or text outside the JSON object."
+                )
+            try:
+                return self._native_generate_once(
+                    retry_prompt, schema=schema, force_stream=False if attempt else None
+                )
+            except _OllamaOutputError as exc:
+                last_error = exc
+                if attempt == 0:
+                    first_error = exc
+                if attempt == 0 and self._progress is not None:
+                    self._progress(
+                        "message",
+                        "Ollama returned incomplete structured output; retrying once",
+                    )
+        assert last_error is not None
+        detail = str(last_error)
+        if first_error is not None and str(first_error) != detail:
+            detail = f"{detail}; initial response: {first_error}"
+        raise LLMError(f"Ollama analysis failed: {detail}") from last_error
 
     def _openai_compatible_generate(
         self,
@@ -348,7 +427,12 @@ class OllamaClient:
         )
         if response.is_error:
             raise self._http_error(response, endpoint=endpoint)
-        payload = response.json()
+        try:
+            payload = response.json()
+        except ValueError as exc:
+            raise LLMError(
+                "Ollama analysis failed: OpenAI-compatible endpoint returned an empty or invalid JSON envelope"
+            ) from exc
         if not isinstance(payload, dict):
             raise LLMError("Ollama returned an unexpected OpenAI-compatible payload")
         choices = payload.get("choices")
@@ -364,9 +448,11 @@ class OllamaClient:
         check_cancelled(self._cancel_event)
         if self._progress is not None:
             self._progress("output", content)
-        return StructuredJSONResponse(
-            data=self._decode_json_content(content), usage=usage, raw=payload
-        )
+        try:
+            data = self._decode_json_content(content)
+        except _OllamaOutputError as exc:
+            raise LLMError(f"Ollama analysis failed: {exc}") from exc
+        return StructuredJSONResponse(data=data, usage=usage, raw=payload)
 
     def generate_json(
         self,

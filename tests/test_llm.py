@@ -705,3 +705,70 @@ def test_codex_pdf_upload_failure_is_actionable_and_does_not_call_responses(tmp_
     with pytest.raises(LLMError, match="invalid PDF"):
         llm.analyze_pdf("x", pdf)
     assert paths == ["/v1/files"]
+
+
+def test_ollama_retries_empty_and_incomplete_structured_output(analysis_result):
+    responses = [
+        httpx.Response(200, content=b""),
+        httpx.Response(200, json={"message": {"content": analysis_result.model_dump_json()}}),
+    ]
+    requests = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(json.loads(request.content))
+        return responses.pop(0)
+
+    llm = OllamaClient(
+        model="deepseek-r1:8b",
+        base_url="http://ollama.test",
+        timeout_seconds=1,
+        client=httpx.Client(transport=httpx.MockTransport(handler)),
+    )
+    assert llm.analyze("paper").result.name == analysis_result.name
+    assert len(requests) == 2
+    assert all(item["think"] is False for item in requests)
+    assert requests[1]["stream"] is False
+    assert "complete JSON object" in requests[1]["messages"][0]["content"]
+
+    partial = analysis_result.model_dump_json()[:80]
+    responses.extend(
+        [
+            httpx.Response(200, json={"message": {"content": partial}}),
+            httpx.Response(200, json={"message": {"content": analysis_result.model_dump_json()}}),
+        ]
+    )
+    assert llm.analyze("paper").result.name == analysis_result.name
+
+
+def test_ollama_json_decoder_accepts_fences_and_extracts_object():
+    assert OllamaClient._decode_json_content('```json\n{"ok": true}\n```') == {"ok": True}
+    assert OllamaClient._decode_json_content('prefix {"ok": true} suffix') == {"ok": True}
+    with pytest.raises(LLMError, match="JSON object"):
+        OllamaClient._decode_json_content('[1, 2]')
+    with pytest.raises(LLMError, match="incomplete JSON"):
+        OllamaClient._decode_json_content('{"value": "unfinished')
+
+
+def test_ollama_json_decoder_reports_empty_and_invalid_output():
+    with pytest.raises(LLMError, match="no message content"):
+        OllamaClient._decode_json_content("   ")
+    with pytest.raises(LLMError, match="invalid JSON"):
+        OllamaClient._decode_json_content("not-json")
+
+
+def test_ollama_streaming_missing_model_is_actionable():
+    llm = OllamaClient(
+        model="missing:8b",
+        base_url="http://ollama.test",
+        timeout_seconds=1,
+        client=httpx.Client(
+            transport=httpx.MockTransport(
+                lambda request: httpx.Response(
+                    404, json={"error": "model missing:8b not found, pull it first"}
+                )
+            )
+        ),
+    )
+    llm.set_runtime(lambda kind, value: None, __import__("threading").Event())
+    with pytest.raises(LLMError, match=r"ollama pull missing:8b"):
+        llm.analyze("paper")

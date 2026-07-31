@@ -199,3 +199,73 @@ def test_download_pdf_owned_client_is_closed(tmp_path, monkeypatch):
     monkeypatch.setattr("paperwatch.pdfs.httpx.Client", FakeClient)
     assert download_pdf("https://example.test/a.pdf", tmp_path / "a.pdf", max_bytes=1000)
     assert created[0].closed
+
+
+def test_incomplete_pdf_is_not_cached(tmp_path):
+    from paperwatch.pdfs import is_complete_pdf
+
+    path = tmp_path / "partial.pdf"
+    path.write_bytes(b"%PDF-1.7\nmissing trailer")
+    assert is_complete_pdf(path) is False
+    path.write_bytes(PDF_BYTES)
+    assert is_complete_pdf(path) is True
+
+
+def test_pdf_completeness_handles_filesystem_errors(tmp_path, monkeypatch):
+    from pathlib import Path
+    from paperwatch.pdfs import is_complete_pdf
+
+    path = tmp_path / "paper.pdf"
+    path.write_bytes(PDF_BYTES)
+    original_stat = Path.stat
+
+    def broken_stat(self, *args, **kwargs):
+        if self == path:
+            raise OSError("disk error")
+        return original_stat(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "stat", broken_stat)
+    assert is_complete_pdf(path) is False
+
+
+def test_download_pdf_skips_empty_chunks_and_enforces_incremental_limit(tmp_path):
+    class StreamResponse:
+        headers = {}
+
+        def __init__(self, chunks):
+            self._chunks = chunks
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return None
+
+        def raise_for_status(self):
+            return None
+
+        def iter_bytes(self):
+            yield from self._chunks
+
+    class FakeClient:
+        def __init__(self, chunks):
+            self._chunks = chunks
+
+        def stream(self, *args, **kwargs):
+            return StreamResponse(self._chunks)
+
+    destination = tmp_path / "paper.pdf"
+    assert download_pdf(
+        "https://example.test/a.pdf",
+        destination,
+        max_bytes=1000,
+        client=FakeClient([b"", PDF_BYTES]),
+    )
+
+    with pytest.raises(PDFError, match="exceeds maximum size"):
+        download_pdf(
+            "https://example.test/b.pdf",
+            tmp_path / "too-large.pdf",
+            max_bytes=10,
+            client=FakeClient([b"%PDF-", b"x" * 20]),
+        )

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import csv
+import inspect
 import io
 import json
 import threading
@@ -105,6 +106,8 @@ class PaperFilters:
 class RunSnapshot:
     running: bool = False
     mode: str | None = None
+    query: str | None = None
+    paper_id: int | None = None
     started_at: str | None = None
     finished_at: str | None = None
     run_id: int | None = None
@@ -127,34 +130,43 @@ class RunController:
         self._snapshot = RunSnapshot()
         self._thread: threading.Thread | None = None
 
-    def start(self, mode: str = "run") -> bool:
-        if mode not in {"run", "backfill"}:
+    def start(self, mode: str = "run", query: str | None = None) -> bool:
+        if mode not in {"run", "backfill", "search"}:
             raise ValueError("Unknown run mode")
+        normalized_query = query.strip() if query else None
+        if mode == "search" and not normalized_query:
+            raise ValueError("Paper title cannot be empty")
         with self._lock:
             if self._snapshot.running:
                 return False
             self._snapshot = RunSnapshot(
                 running=True,
                 mode=mode,
+                query=normalized_query,
                 started_at=_utcnow(),
                 status="running",
             )
             self._thread = threading.Thread(
                 target=self._work,
-                args=(mode,),
+                args=(mode, normalized_query),
                 name="paperwatch-web-run",
                 daemon=True,
             )
             self._thread.start()
             return True
 
-    def _work(self, mode: str) -> None:
+    def _work(self, mode: str, query: str | None) -> None:
         try:
-            result = self._runner(self.config_path, mode)
+            parameter_count = len(inspect.signature(self._runner).parameters)
+            if parameter_count >= 3:
+                result = self._runner(self.config_path, mode, query)
+            else:
+                result = self._runner(self.config_path, mode)
             with self._lock:
                 self._snapshot.running = False
                 self._snapshot.finished_at = _utcnow()
                 self._snapshot.run_id = _int_or_none(result.get("run_id"))
+                self._snapshot.paper_id = _int_or_none(result.get("paper_id"))
                 self._snapshot.status = str(result.get("status") or "success")
                 self._snapshot.stats = dict(result)
         except Exception as exc:
@@ -174,7 +186,9 @@ class RunController:
             thread.join(timeout)
 
 
-def _run_pipeline(config_path: Path, mode: str = "run") -> dict[str, Any]:
+def _run_pipeline(
+    config_path: Path, mode: str = "run", query: str | None = None
+) -> dict[str, Any]:
     from .cli import build_services
     from .pipeline import PaperWatch
 
@@ -189,6 +203,7 @@ def _run_pipeline(config_path: Path, mode: str = "run") -> dict[str, Any]:
             arxiv=services.arxiv,
             llm=services.llm,
         )
+        paper_id: int | None = None
         if mode == "backfill":
             current_day = datetime.now(timezone.utc).date()
             stats = app.run(
@@ -198,11 +213,18 @@ def _run_pipeline(config_path: Path, mode: str = "run") -> dict[str, Any]:
                 historical=True,
                 max_papers_per_author_override=5000,
             )
+        elif mode == "search":
+            stats, paper_id = app.fetch_title(query or "")
         elif mode == "run":
             stats = app.run()
         else:
             raise ValueError("Unknown run mode")
-        return {"run_id": stats.run_id, "status": stats.status, **stats.as_dict()}
+        return {
+            "run_id": stats.run_id,
+            "status": stats.status,
+            "paper_id": paper_id,
+            **stats.as_dict(),
+        }
     finally:
         if app is not None:
             app.close()
@@ -813,14 +835,32 @@ def create_app(
         return RedirectResponse(_notice_url("/authors", f"Removed tag {tag}."), status_code=303)
 
     @app.post("/actions/run")
-    def start_run() -> RedirectResponse:
-        if controller.start():
-            message = "Fetch started. This page updates while it runs."
+    async def start_run(request: Request) -> RedirectResponse:
+        form = await request.form()
+        title = str(form.get("q", "")).strip()[:500]
+        mode = "search" if title else "run"
+        parameters = inspect.signature(controller.start).parameters
+        try:
+            if "query" in parameters:
+                started = controller.start(mode, query=title or None)
+            else:
+                started = controller.start(mode)
+        except ValueError as exc:
+            return RedirectResponse(
+                _notice_url("/", str(exc), level="error"), status_code=303
+            )
+        if started:
+            message = (
+                f"Searching for and downloading {title}."
+                if title
+                else "Fetch started. This page updates while it runs."
+            )
             level = "success"
         else:
             message = "A fetch is already running."
             level = "warning"
-        return RedirectResponse(_notice_url("/", message, level=level), status_code=303)
+        target = f"/?q={quote_plus(title)}" if title else "/"
+        return RedirectResponse(_notice_url(target, message, level=level), status_code=303)
 
     @app.post("/actions/backfill")
     def start_backfill() -> RedirectResponse:
@@ -1287,9 +1327,42 @@ def create_app(
 
     @app.get("/runs", response_class=HTMLResponse)
     def runs(request: Request) -> HTMLResponse:
+        active_jobs: list[dict[str, Any]] = []
         with Database(config.paths.database) as db:
             rows = db.list_runs(100)
-        return render(request, "runs.html", runs=rows)
+            for task in db.active_analysis_tasks():
+                active_jobs.append(
+                    {
+                        "kind": "Summary",
+                        "status": task["status"],
+                        "name": f"{task['scope']} analysis",
+                        "model": task["model"],
+                        "paper_id": int(task["paper_id"]),
+                        "paper_title": task["paper_title"],
+                        "started_at": task["started_at"] or task["created_at"],
+                    }
+                )
+            for query_run in db.active_query_runs():
+                paper_id: int | None = None
+                paper_title: str | None = None
+                selection = _json_value(query_run["selection_json"], {})
+                values = selection.get("paper_ids") if isinstance(selection, dict) else None
+                if isinstance(values, list) and len(values) == 1:
+                    paper_id = _int_or_none(values[0])
+                    paper = db.get_paper(paper_id) if paper_id is not None else None
+                    paper_title = str(paper["title"]) if paper is not None else None
+                active_jobs.append(
+                    {
+                        "kind": "Saved prompt",
+                        "status": query_run["status"],
+                        "name": query_run["query_name"],
+                        "model": query_run["model"],
+                        "paper_id": paper_id,
+                        "paper_title": paper_title,
+                        "started_at": query_run["started_at"] or query_run["created_at"],
+                    }
+                )
+        return render(request, "runs.html", runs=rows, active_jobs=active_jobs)
 
     @app.get("/runs/{run_id}", response_class=HTMLResponse)
     def run_detail(request: Request, run_id: int) -> HTMLResponse:

@@ -1214,6 +1214,18 @@ class Database:
             ).fetchall()
         )
 
+    def active_analysis_tasks(self) -> list[sqlite3.Row]:
+        return list(
+            self._conn.execute(
+                """
+                SELECT at.*, p.title AS paper_title
+                FROM analysis_tasks at JOIN papers p ON p.id=at.paper_id
+                WHERE at.status IN ('queued', 'running')
+                ORDER BY at.id DESC
+                """
+            ).fetchall()
+        )
+
     def visible_analysis_tasks_for_paper(
         self, paper_id: int, limit: int = 30
     ) -> list[sqlite3.Row]:
@@ -1570,6 +1582,18 @@ class Database:
         return list(
             self._conn.execute(
                 "SELECT * FROM query_runs WHERE batch_id=? ORDER BY id", (batch_id,)
+            ).fetchall()
+        )
+
+    def active_query_runs(self) -> list[sqlite3.Row]:
+        return list(
+            self._conn.execute(
+                """
+                SELECT qr.*, q.name AS query_name, q.source_type, q.search_query
+                FROM query_runs qr JOIN saved_queries q ON q.id=qr.query_id
+                WHERE qr.status IN ('queued', 'running')
+                ORDER BY qr.id DESC
+                """
             ).fetchall()
         )
 

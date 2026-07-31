@@ -23,14 +23,22 @@ def safe_pdf_name(identity_key: str) -> str:
     return f"{cleaned[:100]}-{digest}.pdf"
 
 
-def _looks_like_pdf(path: Path) -> bool:
+def is_complete_pdf(path: Path) -> bool:
+    """Return whether a file has both a PDF header and a final EOF marker."""
     try:
-        if not path.exists() or path.stat().st_size < 5:
+        if not path.exists() or path.stat().st_size < 10:
             return False
         with path.open("rb") as handle:
-            return b"%PDF-" in handle.read(1024)
+            header = handle.read(1024)
+            handle.seek(max(0, path.stat().st_size - 65536))
+            trailer = handle.read()
+        return b"%PDF-" in header and b"%%EOF" in trailer
     except OSError:
         return False
+
+
+def _looks_like_pdf(path: Path) -> bool:
+    return is_complete_pdf(path)
 
 
 def download_pdf(

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass
+from difflib import SequenceMatcher
 from datetime import date, datetime, timedelta, timezone
 from typing import Any
 
@@ -14,8 +15,8 @@ from .config import AppConfig
 from .db import Database
 from .llm import LLMClient
 from .locking import run_lock
-from .models import AnalysisResult, PaperRecord
-from .pdfs import download_pdf, extract_pdf_text, safe_pdf_name
+from .models import AnalysisResult, PaperRecord, normalize_title
+from .pdfs import PDFError, download_pdf, extract_pdf_text, safe_pdf_name
 from .sources.arxiv import ArxivClient
 from .sources.openalex import OpenAlexClient
 
@@ -284,6 +285,66 @@ class PaperWatch:
     @staticmethod
     def _run_identity(paper: PaperRecord) -> str:
         return paper.openalex_id or paper.doi or paper.arxiv_id or paper.identity_key
+
+    @staticmethod
+    def _best_title_match(title: str, papers: list[PaperRecord]) -> PaperRecord | None:
+        if not papers:
+            return None
+        normalized = normalize_title(title)
+        exact = next((paper for paper in papers if paper.normalized_title == normalized), None)
+        if exact is not None:
+            return exact
+        return max(
+            papers,
+            key=lambda paper: SequenceMatcher(
+                None, normalized, paper.normalized_title
+            ).ratio(),
+        )
+
+    def fetch_title(self, title: str) -> tuple[RunStats, int | None]:
+        query = title.strip()
+        if not query:
+            raise ValueError("Paper title cannot be empty")
+        with run_lock(self.config.paths.database):
+            return self._fetch_title_locked(query)
+
+    def _fetch_title_locked(self, title: str) -> tuple[RunStats, int | None]:
+        stats = RunStats()
+        stats.run_id = self.db.start_run()
+        paper_id: int | None = None
+        try:
+            matches = self.openalex.search_works(title, limit=10)
+            paper = self._best_title_match(title, matches)
+            if paper is None:
+                raise ValueError(f"No OpenAlex paper matched {title!r}")
+            stats.papers_found = 1
+            try:
+                paper = self._enrich_from_arxiv(paper)
+            except Exception as exc:
+                self._record_error(stats, stage="arxiv_enrichment", exc=exc, paper=paper)
+            paper_id, _ = self.db.upsert_paper(paper, auto_analyze=True)
+            if not paper.pdf_url:
+                raise PDFError("The matched paper has no downloadable PDF")
+            destination = self.config.paths.pdf_dir / safe_pdf_name(paper.identity_key)
+            downloaded = download_pdf(
+                paper.pdf_url,
+                destination,
+                max_bytes=self.config.fetch.max_pdf_bytes,
+                client=self.pdf_client,
+            )
+            if downloaded:
+                stats.pdfs_downloaded = 1
+            self.db.set_local_pdf(paper_id, str(destination))
+            stats.status = "partial" if stats.errors_count else "success"
+            self.db.finish_run(stats.run_id, stats.status, stats.as_dict())
+            return stats, paper_id
+        except Exception as exc:
+            stats.status = "failed"
+            self._record_error(stats, stage="paper_search_download", exc=exc)
+            self.db.finish_run(
+                stats.run_id, "failed", stats.as_dict(), error_text=str(exc)
+            )
+            return stats, paper_id
 
     def run(
         self,

@@ -269,3 +269,53 @@ def test_owned_client_can_be_closed():
     assert not api.client.is_closed
     api.close()
     assert api.client.is_closed
+
+
+def test_search_works_by_title(openalex_work_json):
+    seen = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.update(request.url.params)
+        return httpx.Response(200, json={"results": [None, openalex_work_json]})
+
+    api = OpenAlexClient(
+        api_key="key",
+        base_url="https://openalex.test",
+        client=httpx.Client(transport=httpx.MockTransport(handler)),
+    )
+    papers = api.search_works("Minimal Agents", limit=3)
+    assert [paper.openalex_id for paper in papers] == ["W456"]
+    assert seen["search"] == "Minimal Agents"
+    assert seen["per_page"] == "3"
+    with pytest.raises(OpenAlexError, match="cannot be empty"):
+        api.search_works(" ")
+    with pytest.raises(OpenAlexError, match="limit must be positive"):
+        api.search_works("Paper", limit=0)
+
+    malformed = OpenAlexClient(
+        api_key="key",
+        base_url="https://openalex.test",
+        client=httpx.Client(
+            transport=httpx.MockTransport(
+                lambda request: httpx.Response(200, json={"results": {}})
+            )
+        ),
+    )
+    with pytest.raises(OpenAlexError, match="malformed"):
+        malformed.search_works("Paper")
+
+
+def test_search_works_skips_sparse_title_records(openalex_work_json):
+    sparse = {"id": "https://openalex.org/WEMPTY", "display_name": None}
+    api = OpenAlexClient(
+        api_key="key",
+        base_url="https://openalex.test",
+        client=httpx.Client(
+            transport=httpx.MockTransport(
+                lambda request: httpx.Response(
+                    200, json={"results": [sparse, openalex_work_json]}
+                )
+            )
+        ),
+    )
+    assert [paper.openalex_id for paper in api.search_works("Minimal")] == ["W456"]

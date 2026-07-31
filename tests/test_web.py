@@ -698,3 +698,107 @@ def test_backfill_action_starts_dedicated_mode(config_path, seeded_web):
     assert controller.modes == ["backfill"]
     page = client.get("/")
     assert "One-year PDF backfill in progress" in page.text
+
+
+def test_header_fetch_search_passes_title_to_controller(config_path, seeded_web):
+    class SearchController(StubController):
+        def __init__(self):
+            super().__init__()
+            self.queries = []
+
+        def start(self, mode="run", query=None):
+            self.modes.append(mode)
+            self.queries.append(query)
+            return True
+
+    controller = SearchController()
+    client, _ = make_client(config_path, controller=controller)
+    page = client.get("/")
+    assert 'method="post" action="/actions/run"' in page.text
+    response = client.post(
+        "/actions/run",
+        data={"q": "Minimal Agents for Reliable Machine Learning"},
+        follow_redirects=False,
+    )
+    assert response.status_code == 303
+    assert controller.modes == ["search"]
+    assert controller.queries == ["Minimal Agents for Reliable Machine Learning"]
+    assert "Searching+for+and+downloading" in response.headers["location"]
+
+
+def test_runs_page_lists_active_summary_and_prompt_links(config_path, seeded_web):
+    config, paper_id, *_ = seeded_web
+    client, _ = make_client(config_path)
+    with Database(config.paths.database) as db:
+        db.create_analysis_tasks(
+            batch_id="active-summary",
+            paper_id=paper_id,
+            scope="abstract",
+            profiles=[("active", "ollama", "deepseek-r1:8b")],
+        )
+        query_id = db.create_saved_query(
+            name="Active script", source_type="papers", search_query="", prompt="Review"
+        )
+        db.create_query_runs(
+            batch_id="active-query",
+            query_id=query_id,
+            profiles=[("active", "ollama", "deepseek-r1:8b")],
+            context_window_tokens=8192,
+            selection={"paper_ids": [paper_id]},
+        )
+    response = client.get("/runs")
+    assert "Currently running" in response.text
+    assert "Active script" in response.text
+    assert "abstract analysis" in response.text
+    assert f'href="/papers/{paper_id}"' in response.text
+
+
+def test_run_controller_search_and_pipeline_mode(monkeypatch, config_path, tmp_path):
+    calls = []
+
+    def runner(path, mode, query):
+        calls.append((mode, query))
+        return {"run_id": 9, "paper_id": 4, "status": "success"}
+
+    controller = RunController(tmp_path / "config.toml", runner=runner)
+    assert controller.start("search", query="A paper")
+    controller.wait()
+    assert calls == [("search", "A paper")]
+    assert controller.snapshot().paper_id == 4
+    with pytest.raises(ValueError, match="cannot be empty"):
+        controller.start("search")
+
+    events = []
+
+    class Services:
+        db = object()
+        openalex = object()
+        arxiv = object()
+        llm = object()
+
+        def close(self):
+            events.append("services-close")
+
+    class Stats:
+        run_id = 10
+        status = "success"
+
+        def as_dict(self):
+            return {"papers_found": 1, "pdfs_downloaded": 1}
+
+    class Watch:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def fetch_title(self, title):
+            events.append(title)
+            return Stats(), 55
+
+        def close(self):
+            events.append("watch-close")
+
+    monkeypatch.setattr("paperwatch.cli.build_services", lambda config: Services())
+    monkeypatch.setattr("paperwatch.pipeline.PaperWatch", Watch)
+    result = _run_pipeline(config_path, "search", "A paper")
+    assert result["paper_id"] == 55
+    assert events == ["A paper", "watch-close", "services-close"]

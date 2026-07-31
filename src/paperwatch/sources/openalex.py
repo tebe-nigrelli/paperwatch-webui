@@ -147,6 +147,35 @@ class OpenAlexClient:
             raise OpenAlexError("Invalid OpenAlex author id")
         return self.parse_author(self._get(f"/authors/{identifier}", {}))
 
+    def search_works(self, title: str, limit: int = 10) -> list[PaperRecord]:
+        query = clean_text(title)
+        if not query:
+            raise OpenAlexError("Paper title cannot be empty")
+        if limit < 1:
+            raise OpenAlexError("Paper search limit must be positive")
+        payload = self._get(
+            "/works",
+            {
+                "search": query,
+                "per_page": min(limit, 100),
+            },
+        )
+        results = payload.get("results", [])
+        if results is None:
+            results = []
+        if not isinstance(results, list):
+            raise OpenAlexError("OpenAlex work results are malformed")
+        papers: list[PaperRecord] = []
+        for item in results:
+            if not isinstance(item, dict):
+                continue
+            try:
+                papers.append(self.parse_work(item))
+            except OpenAlexError as exc:
+                if str(exc) != "Work record is missing title":
+                    raise
+        return papers
+
     @staticmethod
     def _location_urls(work: dict[str, Any]) -> list[str]:
         values: list[str] = []

@@ -452,3 +452,104 @@ prompt_version = "test-v1"
         assert analysis["provider"] == "codex"
         assert analysis["analysis_strategy"] == "pdf_upload"
         assert analysis["input_chars"] > 0
+
+
+def test_fulltext_replaces_truncated_cached_pdf(
+    config_path, paper_record, monkeypatch
+):
+    import httpx
+    from paperwatch.analysis_jobs import _paper_text
+    from paperwatch.config import load_config
+
+    config = load_config(config_path)
+    cached = config.paths.pdf_dir / "truncated.pdf"
+    cached.parent.mkdir(parents=True, exist_ok=True)
+    cached.write_bytes(b"%PDF-1.7\ntruncated")
+    with Database(config.paths.database) as db:
+        paper_id, _ = db.upsert_paper(paper_record)
+        db.set_local_pdf(paper_id, str(cached))
+        client = httpx.Client(
+            transport=httpx.MockTransport(
+                lambda request: httpx.Response(
+                    200, content=b"%PDF-1.7\nreplacement\n%%EOF\n"
+                )
+            )
+        )
+        monkeypatch.setattr(
+            "paperwatch.analysis_jobs.extract_pdf_text", lambda path, max_chars: "text"
+        )
+        _, text = _paper_text(config, db, paper_id, "fulltext", client)
+        assert text == "text"
+        stored = db.get_paper(paper_id)
+        replacement = Path(stored["local_pdf_path"])
+        assert replacement != cached
+        assert b"replacement" in replacement.read_bytes()
+
+
+def test_fulltext_redownloads_when_cached_pdf_cannot_be_extracted(
+    config_path, paper_record, monkeypatch
+):
+    import httpx
+    from paperwatch.analysis_jobs import _paper_text
+    from paperwatch.config import load_config
+    from paperwatch.pdfs import PDFError, safe_pdf_name
+
+    config = load_config(config_path)
+    cached = config.paths.pdf_dir / safe_pdf_name(paper_record.identity_key)
+    cached.parent.mkdir(parents=True, exist_ok=True)
+    cached.write_bytes(b"%PDF-1.7\nold complete file\n%%EOF\n")
+    calls = []
+
+    def extract(path, max_chars):
+        calls.append(Path(path).read_bytes())
+        if len(calls) == 1:
+            raise PDFError("PDF text extraction failed: Stream has ended unexpectedly")
+        return "recovered text"
+
+    monkeypatch.setattr("paperwatch.analysis_jobs.extract_pdf_text", extract)
+    with Database(config.paths.database) as db:
+        paper_id, _ = db.upsert_paper(paper_record)
+        db.set_local_pdf(paper_id, str(cached))
+        client = httpx.Client(
+            transport=httpx.MockTransport(
+                lambda request: httpx.Response(
+                    200, content=b"%PDF-1.7\nnew complete file\n%%EOF\n"
+                )
+            )
+        )
+        _, text = _paper_text(config, db, paper_id, "fulltext", client)
+        assert text == "recovered text"
+        assert len(calls) == 2
+        assert b"new complete file" in cached.read_bytes()
+
+
+def test_fulltext_does_not_redownload_non_corruption_errors(
+    config_path, paper_record, monkeypatch
+):
+    import httpx
+    from paperwatch.analysis_jobs import _paper_text
+    from paperwatch.config import load_config
+    from paperwatch.pdfs import PDFError, safe_pdf_name
+
+    config = load_config(config_path)
+    cached = config.paths.pdf_dir / safe_pdf_name(paper_record.identity_key)
+    cached.parent.mkdir(parents=True, exist_ok=True)
+    cached.write_bytes(b"%PDF-1.7\ncomplete file\n%%EOF\n")
+    monkeypatch.setattr(
+        "paperwatch.analysis_jobs.extract_pdf_text",
+        lambda path, max_chars: (_ for _ in ()).throw(
+            PDFError("PDF contains no extractable text")
+        ),
+    )
+    requests = []
+    client = httpx.Client(
+        transport=httpx.MockTransport(
+            lambda request: requests.append(request) or httpx.Response(500)
+        )
+    )
+    with Database(config.paths.database) as db:
+        paper_id, _ = db.upsert_paper(paper_record)
+        db.set_local_pdf(paper_id, str(cached))
+        with pytest.raises(PDFError, match="no extractable text"):
+            _paper_text(config, db, paper_id, "fulltext", client)
+    assert requests == []
