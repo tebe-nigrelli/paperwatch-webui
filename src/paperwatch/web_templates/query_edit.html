@@ -1,0 +1,17 @@
+{% extends "base.html" %}
+{% block title %}{{ 'New query' if is_new else 'Edit ' ~ query.name }} · paperwatch{% endblock %}
+{% block content %}
+<section class="page-heading"><p class="eyebrow">Saved query</p><h1>{{ 'New query' if is_new else 'Edit ' ~ query.name }}</h1><p>The prompt and all model execution settings are stored together and reused for periodic and backward runs.</p></section>
+<section class="panel">
+  <form method="post" action="{{ '/queries' if is_new else '/queries/' ~ query.id ~ '/edit' }}" class="query-editor">
+    <label><span>Name</span><input name="name" value="{{ query.name }}" required {% if query.is_builtin %}readonly{% endif %}></label>
+    <label class="full"><span>Prompt</span><textarea name="prompt" rows="18" required>{{ query.prompt }}</textarea></label>
+    <fieldset class="model-checks full"><legend>Models</legend>{% for profile in model_profiles %}<label><input type="checkbox" name="model" value="{{ profile.profile }}" {% if profile.profile in query.model_profiles %}checked{% endif %}><span>{{ profile.profile }}<small>{{ profile.provider }} · {{ profile.model }}</small></span></label>{% else %}<p class="muted">No active LLM profiles are configured. The query can be saved, but it cannot run until a model is configured.</p>{% endfor %}</fieldset>
+    <label><span>Context tokens</span><input type="number" name="context_window_tokens" min="512" max="1000000" value="{{ query.context_window_tokens }}" required></label>
+    <label><span>Paper input</span><select name="paper_source_scope"><option value="auto" {% if query.paper_source_scope == 'auto' %}selected{% endif %}>Auto: PDF, then abstract</option><option value="abstract" {% if query.paper_source_scope == 'abstract' %}selected{% endif %}>Abstract only</option><option value="fulltext" {% if query.paper_source_scope == 'fulltext' %}selected{% endif %}>Full paper PDF</option></select></label>
+    <label><span>PDF processing</span><select name="pdf_strategy"><option value="auto" {% if query.pdf_strategy == 'auto' %}selected{% endif %}>Auto</option><option value="direct" {% if query.pdf_strategy == 'direct' %}selected{% endif %}>Direct</option><option value="chunked" {% if query.pdf_strategy == 'chunked' %}selected{% endif %}>Chunk + merge</option></select><small>Ignored for abstract-only and blog runs.</small></label>
+    <div class="button-group full"><button class="button button-primary" type="submit">{{ 'Create query' if is_new else 'Save changes' }}</button><a class="button" href="/queries{% if not is_new %}#query-{{ query.id }}{% endif %}">Cancel</a></div>
+  </form>
+  {% if not is_new and not query.is_builtin %}<form method="post" action="/queries/{{ query.id }}/delete" data-confirm="Delete this saved query and its run outputs?"><button class="button button-danger" type="submit">Delete query</button></form>{% endif %}
+</section>
+{% endblock %}

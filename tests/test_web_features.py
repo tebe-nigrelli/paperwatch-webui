@@ -342,7 +342,7 @@ def test_dashboard_tag_errors_removal_and_json_fallbacks(
 
     seed(config_path, author_candidate, paper_record, analysis_result)
     client = make_app(config_path)
-    assert client.get('/dashboard').status_code == 200
+    assert client.get('/dashboard').status_code == 404
     assert _json_value('', {'fallback': True}) == {'fallback': True}
     assert _json_value('{bad', []) == []
 

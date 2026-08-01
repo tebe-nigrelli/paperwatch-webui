@@ -207,7 +207,7 @@ def test_python_module_entrypoint_displays_help(monkeypatch, capsys):
     with pytest.raises(SystemExit) as exc:
         runpy.run_module("paperwatch.__main__", run_name="__main__")
     assert exc.value.code == 0
-    assert "Fetch and analyze recent papers" in capsys.readouterr().out
+    assert "Fetch recent papers and author blogs" in capsys.readouterr().out
 
 
 def test_web_command_runs_uvicorn(config_path, monkeypatch):
@@ -288,3 +288,47 @@ def test_backfill_command_uses_explicit_window_and_download_only(
     output = capsys.readouterr().out
     assert "since=2025-07-30" in output
     assert "analyses=0" in output
+
+
+def test_blog_add_list_and_import_commands(config_path, monkeypatch, tmp_path, capsys):
+    monkeypatch.setattr(cli, "build_services", service_factory)
+    assert cli.main(["--config", str(config_path), "author", "add", "A123"]) == 0
+    capsys.readouterr()
+
+    assert cli.main([
+        "--config", str(config_path), "blog", "add", "A123",
+        "https://example.com/blog#fragment", "--label", "Ada Blog",
+        "--relationship", "Direct author",
+    ]) == 0
+    assert "Linked https://example.com/blog" in capsys.readouterr().out
+
+    assert cli.main(["--config", str(config_path), "blog", "list"]) == 0
+    listed = capsys.readouterr().out
+    assert "Ada Blog" in listed and "Ada Lovelace" in listed
+
+    csv_path = tmp_path / "blogs.csv"
+    csv_path.write_text(
+        "Researcher / author,Current lab / organization,Primary applied-ML source,Primary source URL,Relationship to author\n"
+        "Grace Hopper,Navy,Grace Blog,https://example.com/grace,Direct author\n",
+        encoding="utf-8",
+    )
+    assert cli.main([
+        "--config", str(config_path), "blog", "import", str(csv_path), "--create-missing"
+    ]) == 0
+    output = capsys.readouterr().out
+    assert "links=1" in output and "created=1" in output
+
+
+def test_blog_import_command_reports_ambiguous_author(config_path, monkeypatch, tmp_path, capsys):
+    monkeypatch.setattr(cli, "build_services", service_factory)
+    config = cli.load_config(config_path)
+    with Database(config.paths.database) as db:
+        db.add_author(AuthorCandidate(openalex_id="A1", name="Same Name"))
+        db.add_manual_author("Same Name")
+    csv_path = tmp_path / "ambiguous.csv"
+    csv_path.write_text(
+        "Researcher / author,Primary source URL\nSame Name,https://example.com/blog\n",
+        encoding="utf-8",
+    )
+    assert cli.main(["--config", str(config_path), "blog", "import", str(csv_path)]) == 1
+    assert "ambiguous=1" in capsys.readouterr().out

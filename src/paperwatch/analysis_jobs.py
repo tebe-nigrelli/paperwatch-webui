@@ -43,6 +43,8 @@ class AnalysisBatchSnapshot:
     message: str = ""
     live_output: str = ""
     error: str | None = None
+    progress_current: int = 0
+    progress_total: int = 0
 
 
 def _paper_pdf_path(
@@ -144,6 +146,7 @@ def run_analysis_batch(
     selected = [profiles[name] for name in profile_names if name in profiles]
     completed = 0
     failed = 0
+    progress_done = 0
     publish(progress, "stage", "Preparing paper")
     with analysis_lock(config.paths.database):
         with Database(config.paths.database) as db, httpx.Client(
@@ -152,6 +155,7 @@ def run_analysis_batch(
             headers={"User-Agent": USER_AGENT},
         ) as pdf_client:
             tasks = {row["profile"]: row for row in db.analysis_tasks_for_batch(batch_id)}
+            publish(progress, "progress", f"0/{len(tasks)}")
             selected_names = {item.profile for item in selected}
             for name, task in tasks.items():
                 if name not in selected_names:
@@ -160,16 +164,20 @@ def run_analysis_batch(
                         error=f"Configured LLM profile {name!r} is no longer available",
                     )
                     failed += 1
+                    progress_done += 1
+                    publish(progress, "progress", f"{progress_done}/{len(tasks)}")
             try:
                 check_cancelled(cancel_event)
                 pdf_path: Path | None = None
                 text: str | None = None
-                needs_codex_file = (
+                needs_native_pdf = (
                     scope == "fulltext"
-                    and analysis_strategy != "chunked"
-                    and any(item.provider == "codex" for item in selected)
+                    and any(
+                        item.provider in {"codex", "claude-code"}
+                        for item in selected
+                    )
                 )
-                if needs_codex_file:
+                if needs_native_pdf:
                     publish(progress, "message", "Loading the source PDF")
                     paper, pdf_path = _paper_pdf_path(config, db, paper_id, pdf_client)
                 else:
@@ -214,12 +222,11 @@ def run_analysis_batch(
                     effective_strategy = analysis_strategy
                     if scope == "abstract":
                         effective_strategy = "direct"
-                    codex_pdf_upload = (
+                    native_pdf = (
                         scope == "fulltext"
-                        and profile.provider == "codex"
-                        and effective_strategy != "chunked"
+                        and profile.provider in {"codex", "claude-code"}
                     )
-                    if codex_pdf_upload:
+                    if native_pdf:
                         assert pdf_path is not None
                         publish(progress, "message", "Uploading and reading the complete PDF")
                         outcome = analyze_pdf_file(
@@ -292,6 +299,8 @@ def run_analysis_batch(
                     )
                     completed += 1
                     publish(progress, "message", f"Completed {profile.model}")
+                    progress_done += 1
+                    publish(progress, "progress", f"{progress_done}/{len(tasks)}")
                 except JobCancelled:
                     _cancel_pending_tasks(db, tasks, current_task_id=task_id)
                     return {"completed": completed, "failed": failed, "cancelled": True}
@@ -299,6 +308,8 @@ def run_analysis_batch(
                     db.finish_analysis_task(task_id, error=str(exc))
                     failed += 1
                     publish(progress, "message", f"{profile.model} failed: {exc}")
+                    progress_done += 1
+                    publish(progress, "progress", f"{progress_done}/{len(tasks)}")
                 finally:
                     if active_client is not None:
                         active_client(None)
@@ -407,6 +418,14 @@ class AnalysisController:
                 self._snapshot.live_output = ""
             elif kind == "output":
                 self._snapshot.live_output = (self._snapshot.live_output + value)[-100_000:]
+            elif kind == "progress":
+                current, separator, total = value.partition("/")
+                if separator:
+                    try:
+                        self._snapshot.progress_current = int(current)
+                        self._snapshot.progress_total = int(total)
+                    except ValueError:
+                        pass
 
     def _set_active_llm(self, llm: LLMClient | None) -> None:
         with self._lock:

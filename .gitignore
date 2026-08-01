@@ -30,6 +30,7 @@ htmlcov/
 
 # Local Paperwatch configuration and secrets
 config.toml
+authors/
 .env
 .env.*
 !.env.example

@@ -48,7 +48,7 @@
     <td>{% for author in item.authors[:4] %}{{ author.name }}{% if not loop.last %}, {% endif %}{% endfor %}{% if item.authors|length > 4 %}<span class="muted"> +{{ item.authors|length - 4 }}</span>{% endif %}</td>
     <td>{{ item.publication_date or 'Unknown' }}</td>
     <td>{% if item.pdf_url %}<span class="file-status file-source">Available</span>{% else %}<span class="file-status file-missing">Not listed</span>{% endif %}</td>
-    <td class="paper-search-action">{% if item.openalex_id %}<form method="post" action="/actions/download"><input type="hidden" name="work_id" value="{{ item.openalex_id }}"><input type="hidden" name="title" value="{{ item.title }}"><input type="hidden" name="q" value="{{ paper_query }}"><button class="button button-primary button-small" type="submit" {% if run_state.running %}disabled{% endif %}>Download</button></form>{% endif %}</td>
+    <td class="paper-search-action">{% if item.openalex_id %}<form method="post" action="/actions/download"><input type="hidden" name="work_id" value="{{ item.openalex_id }}"><input type="hidden" name="title" value="{{ item.title }}"><input type="hidden" name="q" value="{{ paper_query }}"><button class="button button-primary button-small" type="submit" {% if run_state.running %}disabled{% endif %}>Fetch now</button></form>{% endif %}</td>
   </tr>{% else %}<tr><td colspan="5" class="empty">No matching papers found.</td></tr>{% endfor %}
   </tbody></table></div>{% endif %}
 </section>

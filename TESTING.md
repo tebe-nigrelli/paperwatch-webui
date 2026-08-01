@@ -1,4 +1,4 @@
-# Automated testing strategy — paperwatch 0.6.3
+# Automated testing strategy — paperwatch 0.6.4
 
 The default suite is deterministic and requires no live OpenAlex index, arXiv service, Ollama server, OpenAI account, PDF host, or external browser assets.
 

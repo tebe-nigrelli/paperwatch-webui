@@ -1,7 +1,7 @@
 {% extends "base.html" %}
 {% block title %}Search papers · paperwatch{% endblock %}
 {% block content %}
-<section class="page-heading"><h1>Search papers</h1><p>Choose a matching OpenAlex paper before downloading it.</p></section>
+<section class="page-heading"><h1>Search papers</h1><p>Choose a matching OpenAlex paper, download its PDF, and check linked blogs.</p></section>
 
 <section class="panel">
   <form class="quick-filter-row" method="get" action="/search">
@@ -30,7 +30,7 @@
             <input type="hidden" name="work_id" value="{{ item.openalex_id }}">
             <input type="hidden" name="title" value="{{ item.title }}">
             <input type="hidden" name="q" value="{{ search_query }}">
-            <button class="button button-primary button-small" type="submit" {% if run_state.running %}disabled{% endif %}>Download</button>
+            <button class="button button-primary button-small" type="submit" {% if run_state.running %}disabled{% endif %}>Fetch now</button>
           </form>
           {% endif %}
         </td>

@@ -213,6 +213,52 @@
     syncSourceOptions();
   });
 
+  const automaticQueryForm = document.querySelector('form[data-auto-save="query-selections"]');
+  if (automaticQueryForm) {
+    const status = document.getElementById("automatic-query-status");
+    let saveTimer = null;
+    let saving = false;
+    let dirty = false;
+
+    const setStatus = (message, failed = false) => {
+      if (!status) return;
+      status.textContent = message;
+      status.classList.toggle("task-error", failed);
+      status.classList.toggle("muted", !failed);
+    };
+    const saveSelections = async () => {
+      if (saving) {
+        dirty = true;
+        return;
+      }
+      saving = true;
+      dirty = false;
+      setStatus("Saving…");
+      try {
+        const response = await fetch(automaticQueryForm.action, {
+          method: "POST",
+          body: new FormData(automaticQueryForm),
+          headers: { "X-Paperwatch-Async": "1", "Accept": "application/json" },
+        });
+        const payload = await response.json();
+        if (!response.ok || !payload.ok) throw new Error(payload.message || "Could not save selections");
+        setStatus("Saved");
+      } catch (error) {
+        setStatus(error.message || "Could not save selections", true);
+      } finally {
+        saving = false;
+        if (dirty) saveSelections();
+      }
+    };
+    Array.from(automaticQueryForm.elements)
+      .filter((element) => element.type === "checkbox")
+      .forEach((checkbox) => checkbox.addEventListener("change", () => {
+        setStatus("Unsaved changes");
+        if (saveTimer) window.clearTimeout(saveTimer);
+        saveTimer = window.setTimeout(saveSelections, 180);
+      }));
+  }
+
   const paperTableBody = document.getElementById("paper-table-body");
   if (paperTableBody) {
     const selectionKey = "paperwatch-selected-papers";
@@ -283,7 +329,8 @@
   }
 
   if (paperJobs) {
-    const paperId = Number(paperJobs.dataset.paperId);
+    const paperId = Number(paperJobs.dataset.paperId || 0);
+    const blogEntryId = Number(paperJobs.dataset.blogEntryId || 0);
     const stage = document.getElementById("job-stage");
     const message = document.getElementById("job-message");
     const output = document.getElementById("job-output");
@@ -334,9 +381,15 @@
         const query = await queryResponse.json();
         let kind = activeKind;
         let snapshot = kind === "query" ? query : analysis;
-        if (analysis.running && Number(analysis.paper_id) === paperId) { kind = "analysis"; snapshot = analysis; }
-        else if (query.running && Number(query.paper_id) === paperId) { kind = "query"; snapshot = query; }
-        const relevant = Number(snapshot.paper_id) === paperId && Boolean(snapshot.batch_id);
+        if (paperId && analysis.running && Number(analysis.paper_id) === paperId) { kind = "analysis"; snapshot = analysis; }
+        else if (query.running && (
+          (paperId && Number(query.paper_id) === paperId) ||
+          (blogEntryId && Number(query.blog_entry_id) === blogEntryId)
+        )) { kind = "query"; snapshot = query; }
+        const relevant = Boolean(snapshot.batch_id) && (
+          (paperId && Number(snapshot.paper_id) === paperId) ||
+          (blogEntryId && kind === "query" && Number(snapshot.blog_entry_id) === blogEntryId)
+        );
         if (relevant) showSnapshot(kind || "analysis", snapshot);
         const nowRunning = relevant && Boolean(snapshot.running);
         if (wasRunning && !nowRunning) await refreshResults();
@@ -397,6 +450,52 @@
       activeKind = initialQuery ? "query" : "analysis";
       wasRunning = true;
       pollTimer = window.setTimeout(poll, 100);
+    }
+  }
+
+  const runningJobsBody = document.getElementById("running-jobs-body");
+  if (runningJobsBody) {
+    const liveRows = Array.from(runningJobsBody.querySelectorAll("tr[data-live-kind]"))
+      .filter((row) => row.dataset.liveKind);
+    if (liveRows.length) {
+      const pollRunning = async () => {
+        try {
+          const response = await fetch("/api/running-status", { cache: "no-store" });
+          if (!response.ok) throw new Error("status unavailable");
+          const payload = await response.json();
+          let anyRunning = false;
+          liveRows.forEach((row) => {
+            const snapshot = payload[row.dataset.liveKind] || {};
+            anyRunning = anyRunning || Boolean(snapshot.running);
+            const progress = row.querySelector("[data-live-progress]");
+            const status = row.querySelector("[data-live-status]");
+            let message = row.querySelector("[data-live-message]");
+            if (progress) {
+              progress.textContent = snapshot.progress_total
+                ? `${snapshot.progress_current || 0}/${snapshot.progress_total}`
+                : "—";
+            }
+            if (status) {
+              const value = snapshot.cancel_requested
+                ? "stopping"
+                : (snapshot.running ? "running" : (snapshot.status || "complete"));
+              status.textContent = value;
+              status.className = `status status-${value}`;
+            }
+            if (!message && snapshot.message) {
+              message = document.createElement("small");
+              message.dataset.liveMessage = "";
+              row.cells[3]?.appendChild(message);
+            }
+            if (message) message.textContent = snapshot.message || "";
+          });
+          if (anyRunning) window.setTimeout(pollRunning, 600);
+          else window.location.reload();
+        } catch (_) {
+          window.setTimeout(pollRunning, 1500);
+        }
+      };
+      window.setTimeout(pollRunning, 200);
     }
   }
 

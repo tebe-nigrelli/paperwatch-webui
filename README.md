@@ -2,7 +2,7 @@
 
 Paperwatch is a local, daily research-paper tracker for a curated set of authors. It discovers papers through OpenAlex, fills missing abstract and open-PDF metadata from arXiv, stores everything in SQLite, and produces strict structured summaries with Ollama, OpenAI, OpenAI Codex, or Claude Code models.
 
-Version 0.6.3 keeps the compact table-first interface and adds in-place, cancellable paper jobs. Summaries and saved prompts run without reloading the paper page, preserve vertical scroll, and show live model output while they run.
+Version 0.8.4 fetches linked blogs concurrently with paper discovery and PDF archival. It also removes the Diagnostics page and transient fetch banners, and keeps collection prompt controls folded beneath More filters by default. The Queries table remains the sole source of truth for fetch-time model execution; with both automatic columns clear, Fetch now downloads and indexes content without contacting a model.
 
 ## Main flow
 
@@ -12,9 +12,16 @@ tracked OpenAlex authors
   -> identifier-aware deduplication
   -> conditional arXiv abstract/PDF enrichment
   -> SQLite metadata, ordered authorship, and ranked OpenAlex topics
-  -> primary-model abstract/full-text analysis
+  -> local archival of every exposed paper PDF
+  -> optional saved-query processing selected in the Web UI
   -> recent-paper feed
   -> optional model reruns, collection prompts, tags, and exports
+
+tracked author blog links
+  -> fetched in parallel with papers by the same daily run
+  -> RSS/Atom auto-discovery and individual post ingestion
+  -> normalized HTML snapshot and hash comparison when no feed works
+  -> new feed posts and changed snapshots stored in one blog-update feed
 ```
 
 Failures are isolated per author, paper, PDF, model, or saved query. Cross-process locks prevent the timer, manual fetch, and on-demand analysis jobs from modifying the same database concurrently.
@@ -115,6 +122,12 @@ The Authors page shows tracked authors in a searchable table. The table includes
 
 Removing an author sets `tracked = 0` and `enabled = 0`. It never deletes the author, papers, tags, analyses, or paper-author relationships.
 
+Authors can also be created manually. Supplying an OpenAlex author ID enables paper fetching; omitting it creates a paused, blog-only author. Each author has a blog-management page for linking personal, lab, or company sources. The Authors page can import the research-source CSV and match links by exact author name, optionally creating missing blog-only authors.
+
+### Blog updates
+
+Blogs are fetched during every normal paper run, so the systemd timer and manual `paperwatch run` command use one shared interval. Paperwatch automatically discovers RSS or Atom feeds advertised by a linked page, stores each later feed item as an individual update, and uses conditional feed requests on subsequent runs. The first feed synchronization is a hidden baseline. If no usable feed exists—or a known feed temporarily fails—the linked HTML page is normalized and compared as a snapshot instead. Snapshot changes retain unified diffs. Shared URLs are fetched once even when linked to several authors.
+
 ### Discover and import
 
 The Discover page contains the network/import operations that are separate from the local library. Exactly one **Paper** or **Author** search mode is active at a time, and only that mode's results are shown:
@@ -126,16 +139,18 @@ The Discover page contains the network/import operations that are separate from 
 
 ### Saved collection queries
 
-Saved queries contain only a name and prompt. **Summarize** is created automatically, remains first, and cannot be deleted. Source (`Abstract` or `Full paper PDF`), PDF strategy (`Auto`, `Direct`, or `Chunk + merge`), context-window size, models, filters, and exact selected paper IDs are chosen when each run starts rather than being stored in the query definition. Before a run starts, paperwatch verifies every selected paper has the chosen source; PDF strategy is available only for full-PDF runs.
+Saved queries work on both research papers and blog entries. **Summarize** is created automatically, remains first, and cannot be deleted. Query creation has its own page, and each query stores the complete execution policy: one or more configured model profiles, context-window size, paper input (`Auto`, `Abstract`, or `Full paper PDF`), and PDF strategy (`Auto`, `Direct`, or `Chunk + merge`). Blog runs use the stored feed item or normalized snapshot text and retain any version diff as additional context.
 
-To run a saved prompt:
+The Queries table has independent **New papers** and **New blog entries** columns. Saving those checkboxes selects the prompts that run after every normal timer or manual fetch. Each selected query runs only on records created by that fetch and uses its own stored models and settings. Initial blog baselines are excluded. When all boxes are clear, a fetch performs no model preflight and no model inference.
 
-1. Filter Recent and optionally select specific rows.
-2. Choose a saved prompt and one or more configured models.
-3. Choose source, PDF strategy, and context window.
-4. Run it and inspect persistent per-model output on Queries.
+To run a saved prompt manually:
 
-The Runs page shows active summaries and saved prompts, including links to explicitly selected papers. Every completed query run records its runtime selection, models, context, output, and per-model errors.
+1. Create or edit the query and choose its models, context, paper source, and PDF strategy.
+2. Filter Recent or open Blogs and optionally select specific rows.
+3. Choose the saved prompt and run it.
+4. Inspect persistent per-model output on Queries or the individual record page.
+
+The Runs page shows active saved prompts with links to explicitly selected papers or blog entries. Every completed query run records its runtime selection, models, context, output, and per-model errors.
 
 ## Light and dark themes
 
@@ -143,7 +158,7 @@ The Web UI follows the operating system’s light or dark preference by default.
 
 ## LLM configuration
 
-The primary `[llm]` profile is used by the daily pipeline and appears in Web UI model selectors.
+The primary `[llm]` profile appears in Web UI model selectors and is used only when a saved query or explicit manual analysis selects it. Fetch-time model execution is controlled by the **New papers** and **New blog entries** columns. The legacy `analyze_abstracts` and `analyze_pdfs` keys remain accepted for compatibility with explicit structured-analysis callers, but normal timer and Fetch now runs do not invoke them. PDF queries default to extracted text with chunk-and-merge; Codex and Claude Code instead read the complete PDF natively. Recent papers without a usable local PDF are retried for `fetch.retry_missing_pdf_days` days (90 by default).
 
 ```toml
 [llm]
@@ -153,7 +168,9 @@ base_url = "http://localhost:11434"
 timeout_seconds = 180
 max_input_chars = 100000
 context_window_tokens = 16384
-analyze_pdfs = true
+analyze_abstracts = false
+analyze_pdfs = false
+pdf_analysis_strategy = "chunked" # auto | direct | chunked
 prompt_version = "v2"
 ```
 
@@ -252,7 +269,7 @@ Defaults:
 initial_lookback_days = 365
 overlap_days = 30
 max_papers_per_author = 500
-download_pdfs = true
+download_pdfs = true # legacy compatibility key; available paper PDFs are always archived
 max_pdf_chars = 2000000
 ```
 
@@ -274,10 +291,10 @@ uv run paperwatch --config config.toml backfill --days 365
 
 The command ignores existing author cursors, requests the previous 365 calendar
 days, paginates up to 5000 works per author by default, and downloads every
-available open PDF. It does not call an LLM. Papers imported by the backfill are
-marked as historical so routine overlap runs do not summarize the backlog. If a
-historical paper's PDF becomes available for the first time during a later normal
-run, that newly downloaded PDF is summarized once.
+available open PDF. It does not fetch blogs, run saved queries, or call an LLM. Papers imported by the backfill are
+marked as historical so routine overlap runs do not send the backlog to automatic
+queries. If a historical paper's PDF becomes available during a later normal run,
+the file is downloaded; it is processed only when a selected query targets it.
 
 The same operation is available on the recent-papers page through **Backfill 1
 year PDFs**. Local files are linked as **Downloaded PDF** and remote origins as
@@ -409,6 +426,9 @@ paperwatch --config config.toml author list
 paperwatch --config config.toml author disable A123456789
 paperwatch --config config.toml author enable A123456789
 paperwatch --config config.toml author remove A123456789
+paperwatch --config config.toml blog add A123456789 https://example.com/blog/ --label 'Personal blog'
+paperwatch --config config.toml blog import researcher-blogs.csv --create-missing
+paperwatch --config config.toml blog list
 paperwatch --config config.toml run
 paperwatch --config config.toml backfill --days 365
 paperwatch --config config.toml papers

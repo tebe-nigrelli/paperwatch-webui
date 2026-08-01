@@ -22,6 +22,7 @@ max_papers_per_author = 500
 download_pdfs = true
 max_pdf_bytes = 50000000
 max_pdf_chars = 2000000
+retry_missing_pdf_days = 90
 
 [llm]
 provider = "ollama" # ollama | openai | codex | claude-code | none
@@ -31,10 +32,12 @@ api_key = "" # Prefer OPENAI_API_KEY in the environment
 timeout_seconds = 180
 max_input_chars = 100000
 context_window_tokens = 16384
-analyze_pdfs = true
+analyze_abstracts = false
+analyze_pdfs = false
+pdf_analysis_strategy = "chunked" # auto | direct | chunked
 prompt_version = "v2"
 # Optional models shown in the paper-page multi-model picker.
-# The primary [llm] profile remains the model used by the daily fetch.
+# Fetch-time model work is controlled only by the Queries table checkboxes.
 #
 # [[llm_profiles]]
 # name = "large-local"

@@ -43,6 +43,7 @@ class FetchConfig:
     download_pdfs: bool
     max_pdf_bytes: int
     max_pdf_chars: int
+    retry_missing_pdf_days: int
 
 
 @dataclass(frozen=True)
@@ -54,7 +55,9 @@ class LLMConfig:
     timeout_seconds: float
     max_input_chars: int
     context_window_tokens: int
+    analyze_abstracts: bool
     analyze_pdfs: bool
+    pdf_analysis_strategy: str
     prompt_version: str
     reasoning_effort: str | None = None
     profile: str = "default"
@@ -144,7 +147,18 @@ def _llm_config(
         timeout_seconds=float(section.get("timeout_seconds", inherited.get("timeout_seconds", 180))),
         max_input_chars=int(section.get("max_input_chars", inherited.get("max_input_chars", 100_000))),
         context_window_tokens=int(section.get("context_window_tokens", inherited.get("context_window_tokens", 16384))),
+        analyze_abstracts=_bool(
+            section,
+            "analyze_abstracts",
+            bool(inherited.get("analyze_abstracts", True)),
+        ),
         analyze_pdfs=_bool(section, "analyze_pdfs", bool(inherited.get("analyze_pdfs", True))),
+        pdf_analysis_strategy=str(
+            section.get(
+                "pdf_analysis_strategy",
+                inherited.get("pdf_analysis_strategy", "chunked"),
+            )
+        ).strip().lower(),
         prompt_version=str(section.get("prompt_version", inherited.get("prompt_version", "v1"))).strip(),
         reasoning_effort=(
             str(
@@ -230,6 +244,7 @@ def load_config(path: str | Path = "config.toml") -> AppConfig:
                 download_pdfs=_bool(fetch, "fetch.download_pdfs", True),
                 max_pdf_bytes=int(fetch.get("max_pdf_bytes", 50_000_000)),
                 max_pdf_chars=int(fetch.get("max_pdf_chars", 2_000_000)),
+                retry_missing_pdf_days=int(fetch.get("retry_missing_pdf_days", 90)),
             ),
             llm=primary_llm,
             llm_profiles=tuple(profiles),
@@ -246,12 +261,17 @@ def load_config(path: str | Path = "config.toml") -> AppConfig:
     _positive(cfg.fetch.max_papers_per_author, "fetch.max_papers_per_author")
     _positive(cfg.fetch.max_pdf_bytes, "fetch.max_pdf_bytes")
     _positive(cfg.fetch.max_pdf_chars, "fetch.max_pdf_chars")
+    _positive(cfg.fetch.retry_missing_pdf_days, "fetch.retry_missing_pdf_days")
     if not 0 <= cfg.arxiv.title_match_threshold <= 1:
         raise ConfigError("title_match_threshold must be between 0 and 1")
     for item in (cfg.llm, *cfg.llm_profiles):
         _positive(item.timeout_seconds, f"llm profile {item.profile} timeout_seconds")
         _positive(item.max_input_chars, f"llm profile {item.profile} max_input_chars")
         _positive(item.context_window_tokens, f"llm profile {item.profile} context_window_tokens")
+        if item.pdf_analysis_strategy not in {"auto", "direct", "chunked"}:
+            raise ConfigError(
+                f"LLM profile {item.profile!r} pdf_analysis_strategy must be auto, direct, or chunked"
+            )
         if item.provider != "none" and not item.model:
             raise ConfigError(f"LLM profile {item.profile!r} model cannot be empty")
         if item.provider not in {"openai", "codex", "claude-code"} and item.reasoning_effort is not None:

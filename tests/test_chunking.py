@@ -212,3 +212,43 @@ def test_direct_prompt_fit_respects_context_and_source_limit(
         context_window_tokens=8192,
     )
     assert not fits and prompt_chars == 0
+
+
+def test_single_verbose_chunk_note_is_compacted_instead_of_rejected(analysis_result):
+    from paperwatch.chunking import _compact_note_dict
+
+    raw = {
+        "section": "Very long section " * 40,
+        "substantive_content": "Detailed evidence and qualification. " * 120,
+        "definitions": ["definition " * 80, "second definition " * 60],
+        "methods": ["method " * 80],
+        "results": ["result " * 80],
+        "assumptions": ["assumption " * 80],
+        "evidence": ["evidence " * 80],
+        "limitations": ["limitation " * 80],
+        "bibliography_titles": ["title " * 80],
+    }
+    compact = _compact_note_dict(raw, 900)
+    import json
+
+    encoded = json.dumps(compact, ensure_ascii=False)
+    assert len(encoded) <= 900
+    assert "trimmed for merge" in encoded
+
+    note = ChunkNotes.model_validate(raw)
+    reduced = _reduce_to_budget(FakeChunkLLM(analysis_result), [note], 900, {})
+    assert len(reduced) <= 900
+
+
+def test_compaction_removes_short_list_items_when_strings_cannot_shrink():
+    from paperwatch.chunking import _compact_note_dict
+    import json
+
+    raw = {
+        "section": "short",
+        "values": ["x" * 40 for _ in range(12)],
+        "nested": {"items": ["y" * 40 for _ in range(6)]},
+    }
+    compact = _compact_note_dict(raw, 260)
+    assert len(compact["values"]) < len(raw["values"])
+    assert len(json.dumps(compact, ensure_ascii=False)) <= 300

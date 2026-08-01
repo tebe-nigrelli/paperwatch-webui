@@ -79,6 +79,7 @@ def test_claude_code_structured_request_response_and_factory(
     assert seen["args"][0:3] == ["claude", "-p", seen["args"][2]]
     assert "--json-schema" in seen["args"]
     assert seen["args"][seen["args"].index("--model") + 1] == "claude-sonnet-4-5"
+    assert seen["args"][seen["args"].index("--tools") + 1] == ""
     assert seen["args"][seen["args"].index("--effort") + 1] == "high"
     assert seen["kwargs"]["stdin"] is subprocess.PIPE
     assert output and output[0][0] == "output"
@@ -93,6 +94,41 @@ def test_claude_code_structured_request_response_and_factory(
     )
     assert isinstance(created, ClaudeCodeClient)
     assert created.command == "custom-claude"
+
+
+def test_claude_code_native_pdf_uses_read_tool(
+    tmp_path, analysis_result, monkeypatch
+):
+    pdf = tmp_path / "complete paper.pdf"
+    pdf.write_bytes(b"%PDF-1.7\nCOMPLETE PAPER\n%%EOF")
+    envelope = {
+        "structured_output": analysis_result.model_dump(),
+        "usage": {"input_tokens": 42},
+    }
+    process = FakeClaudeProcess(json.dumps(envelope))
+    seen = {}
+
+    def popen(args, **kwargs):
+        seen["args"] = args
+        seen["kwargs"] = kwargs
+        return process
+
+    monkeypatch.setattr("paperwatch.llm.shutil.which", lambda command: "/usr/bin/claude")
+    monkeypatch.setattr("paperwatch.llm.subprocess.Popen", popen)
+    response = ClaudeCodeClient(model="claude-sonnet-4-5").analyze_pdf(
+        "Summarize the paper", pdf
+    )
+
+    assert seen["args"][seen["args"].index("--tools") + 1] == "Read"
+    assert seen["kwargs"]["cwd"] == str(tmp_path)
+    assert "complete paper.pdf" in process.prompts[0][0]
+    assert "read the PDF directly and in full" in process.prompts[0][0]
+    assert response.usage["input_file_bytes"] == pdf.stat().st_size
+
+    with pytest.raises(LLMError, match="PDF file does not exist"):
+        ClaudeCodeClient(model="claude-sonnet-4-5").analyze_pdf(
+            "Summarize the paper", tmp_path / "missing.pdf"
+        )
 
 
 def test_claude_code_readiness_close_and_response_errors(
@@ -920,3 +956,34 @@ def test_ollama_streaming_missing_model_is_actionable():
     llm.set_runtime(lambda kind, value: None, __import__("threading").Event())
     with pytest.raises(LLMError, match=r"ollama pull missing:8b"):
         llm.analyze("paper")
+
+
+def test_ollama_structured_output_retries_twice_with_larger_output_budget(analysis_result):
+    partial = analysis_result.model_dump_json()[:100]
+    responses = [
+        httpx.Response(200, json={"message": {"content": partial}}),
+        httpx.Response(200, json={"message": {"content": partial}}),
+        httpx.Response(200, json={"message": {"content": analysis_result.model_dump_json()}}),
+    ]
+    requests = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(json.loads(request.content))
+        return responses.pop(0)
+
+    progress = []
+    llm = OllamaClient(
+        model="deepseek-r1:8b",
+        base_url="http://ollama.test",
+        timeout_seconds=1,
+        context_window_tokens=12_288,
+        client=httpx.Client(transport=httpx.MockTransport(handler)),
+    )
+    llm.set_runtime(lambda kind, value: progress.append((kind, value)), __import__("threading").Event())
+    response = llm.analyze("paper")
+    assert response.result.name == analysis_result.name
+    assert len(requests) == 3
+    limits = [item["options"]["num_predict"] for item in requests]
+    assert limits == sorted(limits)
+    assert limits[0] < limits[-1]
+    assert sum("larger output budget" in value for kind, value in progress if kind == "message") == 2

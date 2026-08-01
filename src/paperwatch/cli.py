@@ -10,6 +10,8 @@ from pathlib import Path
 from typing import Sequence
 
 from .config import AppConfig, ConfigError, load_config
+from .blog_import import import_blog_links_path
+from .blogs import normalize_blog_url
 from .db import Database
 from .llm import LLMClient, create_llm
 from .pipeline import PaperWatch
@@ -93,7 +95,23 @@ def _parser() -> argparse.ArgumentParser:
     remove = author_sub.add_parser("remove")
     remove.add_argument("openalex_id")
 
-    run = sub.add_parser("run", help="Fetch and analyze recent papers")
+    blog = sub.add_parser("blog", help="Manage author blog links")
+    blog_sub = blog.add_subparsers(dest="blog_command", required=True)
+    blog_add = blog_sub.add_parser("add", help="Link a blog to an author")
+    blog_add.add_argument("author_id")
+    blog_add.add_argument("url")
+    blog_add.add_argument("--label", default="")
+    blog_add.add_argument("--relationship", default="")
+    blog_import = blog_sub.add_parser("import", help="Import author blog links from CSV")
+    blog_import.add_argument("csv_path")
+    blog_import.add_argument(
+        "--create-missing",
+        action="store_true",
+        help="Create paused, blog-only authors when no exact name match exists",
+    )
+    blog_sub.add_parser("list", help="List stored blog links")
+
+    run = sub.add_parser("run", help="Fetch recent papers and author blogs")
     run.add_argument("--today", type=_iso_date, help="Testing override in YYYY-MM-DD format")
 
     backfill = sub.add_parser(
@@ -206,7 +224,8 @@ def _run(args: argparse.Namespace, services: Services) -> int:
     print(
         f"run={stats.run_id} status={stats.status} authors={stats.authors_checked} "
         f"papers={stats.papers_found} analyses={stats.papers_analyzed} "
-        f"pdfs={stats.pdfs_downloaded} errors={stats.errors_count}"
+        f"pdfs={stats.pdfs_downloaded} blogs={getattr(stats, 'blogs_checked', 0)} "
+        f"blog_updates={getattr(stats, 'blog_updates_found', 0)} errors={stats.errors_count}"
     )
     return 0 if stats.status == "success" else 1
 
@@ -258,6 +277,40 @@ def _list_runs(args: argparse.Namespace, services: Services) -> int:
     return 0
 
 
+def _blog_command(args: argparse.Namespace, services: Services) -> int:
+    if args.blog_command == "add":
+        url = normalize_blog_url(args.url)
+        services.db.add_author_blog(
+            args.author_id,
+            url,
+            label=args.label,
+            relationship=args.relationship,
+        )
+        print(f"Linked {url} to {args.author_id}")
+        return 0
+    if args.blog_command == "import":
+        stats = import_blog_links_path(
+            services.db,
+            args.csv_path,
+            create_missing=args.create_missing,
+        )
+        print(
+            f"rows={stats.rows} links={stats.links} created={stats.authors_created} "
+            f"missing={stats.authors_missing} ambiguous={stats.authors_ambiguous} "
+            f"invalid_urls={stats.invalid_urls}"
+        )
+        return 0 if not stats.authors_ambiguous else 1
+    if args.blog_command == "list":
+        for author in services.db.list_authors(tracked_only=True):
+            for blog in services.db.author_blogs(str(author["openalex_id"])):
+                print(
+                    f"{author['openalex_id']} | {author['name']} | "
+                    f"{blog['label'] or blog['title'] or 'Blog'} | {blog['url']}"
+                )
+        return 0
+    return 2
+
+
 
 def _serve_web(args: argparse.Namespace) -> int:
     import uvicorn
@@ -289,6 +342,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     try:
         if args.command == "author":
             return _author_command(args, services)
+        if args.command == "blog":
+            return _blog_command(args, services)
         if args.command == "run":
             return _run(args, services)
         if args.command == "backfill":

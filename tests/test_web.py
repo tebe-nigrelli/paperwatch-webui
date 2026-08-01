@@ -211,17 +211,22 @@ def test_dashboard_assets_and_security_headers(config_path, seeded_web):
     assert "Open PDF" in response.text
     assert "Backfill 1 year PDFs" not in response.text
     assert "Discover" in response.text
+    assert "Diagnostics" not in response.text
     assert "broken PDF" in response.text
+    assert response.text.index("More filters") < response.text.index("Run on these 2 papers")
+    assert '<details class="advanced-filters collection-runner-details">' in response.text
     assert response.headers["x-frame-options"] == "DENY"
     assert "default-src 'self'" in response.headers["content-security-policy"]
     assert client.get("/static/app.css").status_code == 200
     assert client.get("/static/app.js").status_code == 200
 
 
-def test_dashboard_running_and_error_states(config_path, seeded_web):
+def test_running_state_uses_header_control_without_feedback_banner(config_path, seeded_web):
     running = StubController(snapshot=RunSnapshot(running=True, started_at="now", status="running"))
     client, _ = make_client(config_path, controller=running)
-    assert "Fetch in progress" in client.get("/").text
+    page = client.get("/").text
+    assert "Stop fetch" in page
+    assert "Fetch in progress" not in page
 
     failed = StubController(snapshot=RunSnapshot(error="model down", status="failed"))
     client, _ = make_client(config_path, controller=failed)
@@ -459,7 +464,7 @@ def test_run_pages_action_and_status_api(config_path, seeded_web):
 
     response = client.post("/actions/run", follow_redirects=False)
     assert response.status_code == 303
-    assert "Fetch+started" in response.headers["location"]
+    assert response.headers["location"] == "/"
     assert controller.modes == ["run"]
     response = client.post("/actions/backfill", follow_redirects=False)
     assert "already+running" in response.headers["location"]
@@ -738,7 +743,8 @@ def test_backfill_action_starts_dedicated_mode(config_path, seeded_web):
     assert "One-year+PDF+backfill+started" in response.headers["location"]
     assert controller.modes == ["backfill"]
     page = client.get("/")
-    assert "One-year PDF backfill in progress" in page.text
+    assert "Stop fetch" in page.text
+    assert "One-year PDF backfill in progress" not in page.text
 
 
 def test_manual_import_metadata_validation_helpers():
@@ -1196,7 +1202,8 @@ def test_nav_order_runs_copy_and_builtin_query_protection(config_path, seeded_we
     config, *_ = seeded_web
     client, _ = make_client(config_path)
     page = client.get("/").text
-    assert page.index('href="/dashboard"') > page.index('href="/runs"')
+    assert 'href="/runs"' in page
+    assert 'href="/dashboard"' not in page
     assert 'id="theme-toggle"' in page
 
     runs = client.get("/runs").text
@@ -1277,3 +1284,110 @@ def test_discover_selects_one_search_mode_clamps_limit_and_reports_errors(
     )
     assert "author search unavailable" in response.text
     assert "paper search unavailable" not in response.text
+
+
+def test_paper_detail_shows_structured_prompt_summary(config_path, seeded_web, analysis_result):
+    _, paper_id, *_ = seeded_web
+    client, _ = make_client(config_path)
+    page = client.get(f"/papers/{paper_id}")
+    assert page.status_code == 200
+    assert "Prompt summary" in page.text
+    assert analysis_result.one_sentence_summary in page.text
+    assert "Open full analysis" in page.text
+
+
+def test_query_list_hides_prompt_and_edit_page_reveals_it(config_path):
+    config = __import__("paperwatch.config", fromlist=["load_config"]).load_config(config_path)
+    with Database(config.paths.database) as db:
+        query = db.list_saved_queries()[0]
+        query_id = int(query["id"])
+        prompt_prefix = "Summarize each selected paper"
+    client, _ = make_client(config_path)
+    listing = client.get("/queries")
+    assert listing.status_code == 200
+    assert prompt_prefix not in listing.text
+    assert "<th>Name</th>" in listing.text
+    edit = client.get(f"/queries/{query_id}/edit")
+    assert edit.status_code == 200
+    assert prompt_prefix in edit.text
+    assert client.get("/queries/999999/edit").status_code == 404
+
+
+def test_run_controller_reports_progress_and_accepts_cancellation(tmp_path):
+    entered = threading.Event()
+
+    def runner(_path, mode, query, progress, cancel_event):
+        assert mode == "run" and query is None
+        progress("stage", "Fetching papers, PDFs, and blogs")
+        progress("progress", "2/7")
+        progress("message", "Checked two authors")
+        entered.set()
+        assert cancel_event.wait(1)
+        return {"run_id": 44, "status": "cancelled", "papers_found": 2}
+
+    controller = RunController(tmp_path / "config.toml", runner=runner)
+    assert controller.start("run")
+    assert entered.wait(1)
+    snapshot = controller.snapshot()
+    assert snapshot.stage == "Fetching papers, PDFs, and blogs"
+    assert (snapshot.progress_current, snapshot.progress_total) == (2, 7)
+    assert snapshot.message == "Checked two authors"
+    controller._progress("progress", "invalid")
+    controller._progress("progress", "bad/value")
+    assert (controller.snapshot().progress_current, controller.snapshot().progress_total) == (0, 0)
+    assert controller.cancel() is True
+    controller.wait()
+    snapshot = controller.snapshot()
+    assert snapshot.cancelled is True
+    assert snapshot.status == "cancelled"
+    assert snapshot.stage == "Cancelled"
+    assert controller.cancel() is False
+
+
+def test_fetch_button_toggles_to_cancel_and_running_page_is_live(config_path):
+    class ToggleController:
+        def __init__(self):
+            self.cancelled = False
+            self.state = RunSnapshot(
+                running=True,
+                mode="run",
+                started_at="2026-08-01T07:00:00+00:00",
+                status="running",
+                progress_current=3,
+                progress_total=9,
+                stage="Fetching papers, PDFs, and blogs",
+                message="Checked author Tri Dao",
+            )
+
+        def snapshot(self):
+            return RunSnapshot(**asdict(self.state))
+
+        def cancel(self):
+            self.cancelled = True
+            self.state.cancel_requested = True
+            return True
+
+        def start(self, mode="run"):
+            return False
+
+    controller = ToggleController()
+    app = create_app(
+        config_path,
+        run_controller=controller,
+        analysis_controller=StubAnalysisController(),
+    )
+    client = TestClient(app)
+    dashboard = client.get("/")
+    assert "Stop fetch" in dashboard.text
+    assert "Request cancellation after the current fetch or model step." in dashboard.text
+    runs = client.get("/runs")
+    assert "3/9" in runs.text
+    assert "Checked author Tri Dao" in runs.text
+    status = client.get("/api/running-status").json()
+    assert status["fetch"]["progress_current"] == 3
+    assert status["fetch"]["progress_total"] == 9
+    response = client.post("/actions/run", follow_redirects=False)
+    assert response.status_code == 303
+    assert response.headers["location"] == "/"
+    assert controller.cancelled is True
+    assert "Fetch cancellation requested" not in client.get("/").text

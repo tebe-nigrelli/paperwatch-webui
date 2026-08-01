@@ -367,6 +367,8 @@ class ChunkNotes(StrictModel):
 
 class BatchQueryItem(StrictModel):
     paper_id: int | None
+    blog_entry_id: int | None = None
+    content_type: Literal["paper", "blog"] = "paper"
     title: str = Field(min_length=1)
     output: Narrative
 

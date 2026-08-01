@@ -31,6 +31,8 @@ class QueryBatchSnapshot:
     batch_id: str | None = None
     query_id: int | None = None
     paper_id: int | None = None
+    blog_entry_id: int | None = None
+    content_type: str = "papers"
     profiles: tuple[str, ...] = ()
     completed: int = 0
     failed: int = 0
@@ -40,11 +42,15 @@ class QueryBatchSnapshot:
     message: str = ""
     live_output: str = ""
     error: str | None = None
+    progress_current: int = 0
+    progress_total: int = 0
 
 
 def _paper_document(db: Database, row: Any) -> dict[str, Any]:
     return {
         "paper_id": int(row["id"]),
+        "blog_entry_id": None,
+        "content_type": "paper",
         "title": row["title"],
         "publication_date": row["publication_date"],
         "authors": [item["name"] for item in db.paper_authors(int(row["id"]))],
@@ -53,6 +59,29 @@ def _paper_document(db: Database, row: Any) -> dict[str, Any]:
         "doi": row["doi"],
         "arxiv_id": row["arxiv_id"],
         "openalex_id": row["openalex_id"],
+    }
+
+
+def _blog_document(row: Any) -> dict[str, Any]:
+    authors = [
+        name.strip()
+        for name in str(row["author_names"] or "").split(",")
+        if name.strip()
+    ]
+    published = str(row["published_at"] or row["fetched_at"] or "")
+    return {
+        "paper_id": None,
+        "blog_entry_id": int(row["id"]),
+        "content_type": "blog",
+        "title": row["title"],
+        "publication_date": published[:10] or None,
+        "authors": authors,
+        "blog": row["blog_title"],
+        "entry_kind": row["entry_kind"],
+        "change_kind": row["change_kind"],
+        "source_url": row["source_url"] or row["url"],
+        "content": row["normalized_text"],
+        "diff": row["diff_text"] or None,
     }
 
 
@@ -91,6 +120,19 @@ def _selected_papers(db: Database, selection: dict[str, Any] | None) -> list[Any
     return papers
 
 
+def _selected_blog_entries(db: Database, selection: dict[str, Any] | None) -> list[Any]:
+    selected_ids: list[int] = []
+    if selection and isinstance(selection.get("blog_entry_ids"), list):
+        for value in selection["blog_entry_ids"]:
+            try:
+                selected_ids.append(int(value))
+            except (TypeError, ValueError):
+                continue
+    if selected_ids:
+        return db.blog_entries_by_ids(selected_ids)
+    return db.list_blog_entries(limit=None)
+
+
 def validate_query_sources(
     db: Database,
     *,
@@ -98,11 +140,33 @@ def validate_query_sources(
     source_scope: str,
     pdf_strategy: str,
 ) -> int:
-    """Reject a saved-prompt run when any selected paper lacks its source."""
+    """Reject a saved-prompt run when any selected record lacks its source."""
+    content_type = str((selection or {}).get("content_type") or "papers")
+    if content_type == "blogs":
+        entries = _selected_blog_entries(db, selection)
+        if not entries:
+            raise ValueError("No blog entries match the current selection")
+        if source_scope != "blog":
+            raise ValueError("Blog saved prompts use the stored blog entry text")
+        if pdf_strategy != "auto":
+            raise ValueError("PDF strategy does not apply to blog entries")
+        return len(entries)
+    if content_type != "papers":
+        raise ValueError("Content type must be papers or blogs")
     papers = _selected_papers(db, selection)
     if not papers:
         raise ValueError("No papers match the current selection")
-    if source_scope == "abstract":
+    if source_scope == "auto":
+        missing = []
+        for row in papers:
+            local_value = str(row["local_pdf_path"] or "").strip()
+            local_pdf = Path(local_value).expanduser() if local_value else None
+            if not str(row["abstract"] or "").strip() and not str(row["pdf_url"] or "").strip() and not (
+                local_pdf and local_pdf.is_file()
+            ):
+                missing.append(row)
+        source_label = "an abstract or PDF"
+    elif source_scope == "abstract":
         if pdf_strategy != "auto":
             raise ValueError("PDF strategy only applies when the source is Full paper PDF")
         missing = [row for row in papers if not str(row["abstract"] or "").strip()]
@@ -142,17 +206,26 @@ def collect_query_documents(
     ``papers`` remains an accepted alias for older callers and means abstracts/metadata.
     The legacy ``search_query`` argument is retained only for API compatibility.
     """
+    content_type = str((selection or {}).get("content_type") or "papers")
+    if content_type == "blogs":
+        if source_scope not in {"blog", "papers"}:
+            raise ValueError("Blog query source must be blog")
+        return [_blog_document(row) for row in _selected_blog_entries(db, selection)]
+    if content_type != "papers":
+        raise ValueError("Content type must be papers or blogs")
     if source_scope == "papers":
         source_scope = "abstract"
-    if source_scope not in {"abstract", "fulltext"}:
-        raise ValueError("Query source must be abstract or fulltext")
+    if source_scope not in {"abstract", "fulltext", "auto"}:
+        raise ValueError(
+            "Query source must be abstract or fulltext; automatic runs may use auto"
+        )
     effective_selection = dict(selection or {})
     if search_query and not selection:
         effective_selection["query"] = search_query
     papers = _selected_papers(db, effective_selection)
     documents: list[dict[str, Any]] = []
     owns_client = False
-    if source_scope == "fulltext" and pdf_client is None:
+    if source_scope in {"fulltext", "auto"} and pdf_client is None:
         if config is None:
             raise ValueError("Full-text saved prompts require application configuration")
         pdf_client = httpx.Client(
@@ -164,8 +237,16 @@ def collect_query_documents(
     try:
         for row in papers:
             document = _paper_document(db, row)
-            document["source"] = source_scope
-            if source_scope == "fulltext":
+            effective_scope = source_scope
+            if source_scope == "auto":
+                local_value = str(row["local_pdf_path"] or "").strip()
+                local_pdf = Path(local_value).expanduser() if local_value else None
+                has_pdf = bool(str(row["pdf_url"] or "").strip()) or bool(
+                    local_pdf and local_pdf.is_file()
+                )
+                effective_scope = "fulltext" if has_pdf else "abstract"
+            document["source"] = effective_scope
+            if effective_scope == "fulltext":
                 assert config is not None and pdf_client is not None
                 try:
                     _paper, text = _paper_text(
@@ -184,14 +265,14 @@ def _query_prompt(user_prompt: str, documents: list[dict[str, Any]], *, merge: b
     if merge:
         instruction = (
             "Merge the partial outputs into one final result. Remove duplicates, preserve paper_id "
-            "and exact titles, and do not introduce claims absent from the partial outputs."
+            "or blog_entry_id and exact titles, and do not introduce claims absent from the partial outputs."
         )
     else:
         instruction = (
             "Apply the user's prompt independently and comparatively across the supplied records. "
-            "Every item must identify the relevant paper_id and exact title."
+            "Every item must identify the relevant paper_id or blog_entry_id, content_type, and exact title."
         )
-    return f"""You are analyzing a filtered collection of research papers.
+    return f"""You are analyzing a filtered collection of research papers and/or blog entries.
 Return exactly one JSON object matching the supplied schema. {instruction}
 The top-level summary should synthesize the collection. The items list should contain concrete, useful outputs rather than restating titles. Do not invent facts.
 
@@ -226,13 +307,20 @@ def _compact_document(document: dict[str, Any], budget: int) -> dict[str, Any]:
 
     compact = {
         key: document[key]
-        for key in ("paper_id", "title", "publication_date", "source")
+        for key in (
+            "paper_id",
+            "blog_entry_id",
+            "content_type",
+            "title",
+            "publication_date",
+            "source",
+        )
         if document.get(key) is not None
     }
     source = next(
         (
             document[key]
-            for key in ("abstract", "summary", "output", "items")
+            for key in ("fulltext", "abstract", "content", "summary", "output", "items")
             if document.get(key) not in (None, "", [], {})
         ),
         document,
@@ -252,7 +340,14 @@ def _compact_document(document: dict[str, Any], budget: int) -> dict[str, Any]:
         return compact
 
     # Pathological tiny budgets: retain identity before falling back to an empty record.
-    for key in ("source", "publication_date", "title", "paper_id"):
+    for key in (
+        "source",
+        "publication_date",
+        "title",
+        "paper_id",
+        "blog_entry_id",
+        "content_type",
+    ):
         compact.pop(key, None)
         if _json_size([compact]) <= budget:
             return compact
@@ -278,7 +373,11 @@ def _split_oversized_document(document: dict[str, Any], budget: int) -> list[dic
     if _json_size([document]) <= budget:
         return [document]
     content_key = next(
-        (key for key in ("fulltext", "abstract", "content_excerpt") if isinstance(document.get(key), str)),
+        (
+            key
+            for key in ("fulltext", "abstract", "content", "content_excerpt")
+            if isinstance(document.get(key), str)
+        ),
         None,
     )
     if content_key is None:
@@ -307,14 +406,18 @@ def run_query_for_model(
     context_window_tokens: int,
     max_input_chars: int,
     pdf_strategy: str = "auto",
+    content_type: str = "papers",
     progress: ProgressCallback | None = None,
     cancel_event: threading.Event | None = None,
 ) -> tuple[BatchQueryResult, dict[str, Any], int]:
+    if content_type not in {"papers", "blogs"}:
+        raise ValueError("Content type must be papers or blogs")
     if not documents:
+        noun = "blog entries" if content_type == "blogs" else "papers"
         return (
             BatchQueryResult(
-                title="No matching papers",
-                summary="No stored papers matched the selected filters.",
+                title=f"No matching {noun}",
+                summary=f"No stored {noun} matched the selected filters.",
                 items=[],
             ),
             {},
@@ -327,8 +430,8 @@ def run_query_for_model(
     direct_fits = _json_size(documents) <= record_budget
     if pdf_strategy == "direct" and not direct_fits:
         raise LLMError(
-            "The selected papers exceed the context window; use Auto or Chunk + merge, "
-            "select fewer papers, or choose a larger context window"
+            "The selected records exceed the context window; use Auto or Chunk + merge, "
+            "select fewer records, or choose a larger context window"
         )
     if direct_fits and pdf_strategy in {"auto", "direct"}:
         groups = [documents]
@@ -392,6 +495,7 @@ def run_query_batch(
     profiles = {item.profile: item for item in config.available_llms}
     completed = 0
     failed = 0
+    progress_done = 0
     publish(progress, "stage", "Preparing saved prompt")
     with analysis_lock(config.paths.database):
         with Database(config.paths.database) as db:
@@ -399,6 +503,7 @@ def run_query_batch(
             if query is None:
                 raise ValueError("Saved query not found")
             runs = {row["profile"]: row for row in db.query_runs_for_batch(batch_id)}
+            publish(progress, "progress", f"0/{len(runs)}")
             first_run = next(iter(runs.values()), None)
             selection: dict[str, Any] = {}
             if first_run is not None:
@@ -420,6 +525,7 @@ def run_query_batch(
                 return {"completed": completed, "failed": failed, "cancelled": True}
             source_scope = str(selection.get("source_scope") or "abstract")
             pdf_strategy = str(selection.get("pdf_strategy") or "auto")
+            content_type = str(selection.get("content_type") or "papers")
             documents = collect_query_documents(
                 db,
                 source_scope,
@@ -439,6 +545,8 @@ def run_query_batch(
                         error=f"Configured LLM profile {profile_name!r} is no longer available",
                     )
                     failed += 1
+                    progress_done += 1
+                    publish(progress, "progress", f"{progress_done}/{len(runs)}")
                     continue
                 try:
                     check_cancelled(cancel_event)
@@ -465,6 +573,7 @@ def run_query_batch(
                         context_window_tokens=context_window_tokens,
                         max_input_chars=profile.max_input_chars,
                         pdf_strategy=pdf_strategy,
+                        content_type=content_type,
                         progress=progress,
                         cancel_event=cancel_event,
                     )
@@ -475,6 +584,8 @@ def run_query_batch(
                     )
                     completed += 1
                     publish(progress, "message", f"Completed {profile.model}")
+                    progress_done += 1
+                    publish(progress, "progress", f"{progress_done}/{len(runs)}")
                 except JobCancelled:
                     db.finish_query_run(
                         run_id, matched_count=len(documents), input_chars=0,
@@ -493,6 +604,8 @@ def run_query_batch(
                     )
                     failed += 1
                     publish(progress, "message", f"{profile.model} failed: {exc}")
+                    progress_done += 1
+                    publish(progress, "progress", f"{progress_done}/{len(runs)}")
                 finally:
                     if active_client is not None:
                         active_client(None)
@@ -523,17 +636,29 @@ class QueryController:
         selection: dict[str, Any] | None = None,
         source_scope: str = "abstract",
         pdf_strategy: str = "auto",
+        content_type: str | None = None,
     ) -> str | None:
         with self._lock:
             if self._snapshot.running:
                 return None
             if not 512 <= context_window_tokens <= 1_000_000:
                 raise ValueError("Context window must be between 512 and 1000000 tokens")
-            if source_scope not in {"abstract", "fulltext"}:
-                raise ValueError("Query source must be abstract or fulltext")
+            selection = dict(selection or {})
+            content_type = str(content_type or selection.get("content_type") or "papers")
+            if content_type not in {"papers", "blogs"}:
+                raise ValueError("Content type must be papers or blogs")
+            if content_type == "blogs":
+                source_scope = "blog"
+                pdf_strategy = "auto"
+                selection["content_type"] = "blogs"
+            else:
+                selection.pop("content_type", None)
+                if source_scope not in {"abstract", "fulltext", "auto"}:
+                    raise ValueError(
+                        "Query source must be abstract or fulltext; automatic runs may use auto"
+                    )
             if pdf_strategy not in {"auto", "direct", "chunked"}:
                 raise ValueError("PDF strategy must be auto, direct, or chunked")
-            selection = dict(selection or {})
             selection["source_scope"] = source_scope
             selection["pdf_strategy"] = pdf_strategy
             config = load_config(self.config_path)
@@ -560,15 +685,22 @@ class QueryController:
                     context_window_tokens=context_window_tokens, selection=selection,
                 )
             paper_id = None
+            blog_entry_id = None
             if selection and isinstance(selection.get("paper_ids"), list) and selection["paper_ids"]:
                 try:
                     paper_id = int(selection["paper_ids"][0])
                 except (TypeError, ValueError):
                     paper_id = None
+            if isinstance(selection.get("blog_entry_ids"), list) and selection["blog_entry_ids"]:
+                try:
+                    blog_entry_id = int(selection["blog_entry_ids"][0])
+                except (TypeError, ValueError):
+                    blog_entry_id = None
             self._cancel_event = threading.Event()
             self._active_llm = None
             self._snapshot = QueryBatchSnapshot(
                 running=True, batch_id=batch_id, query_id=query_id, paper_id=paper_id,
+                blog_entry_id=blog_entry_id, content_type=content_type,
                 profiles=selected, stage="Queued", message="Preparing saved prompt",
             )
             self._thread = threading.Thread(
@@ -588,6 +720,14 @@ class QueryController:
                 self._snapshot.live_output = ""
             elif kind == "output":
                 self._snapshot.live_output = (self._snapshot.live_output + value)[-100_000:]
+            elif kind == "progress":
+                current, separator, total = value.partition("/")
+                if separator:
+                    try:
+                        self._snapshot.progress_current = int(current)
+                        self._snapshot.progress_total = int(total)
+                    except ValueError:
+                        pass
 
     def _set_active_llm(self, llm: LLMClient | None) -> None:
         with self._lock:

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import sqlite3
 from contextlib import contextmanager
 from datetime import datetime, timezone
@@ -18,7 +19,7 @@ from .models import (
 )
 
 
-SCHEMA_VERSION = 9
+SCHEMA_VERSION = 13
 
 DEFAULT_SUMMARY_QUERY_NAME = "Summarize"
 DEFAULT_SUMMARY_QUERY_PROMPT = (
@@ -108,6 +109,51 @@ CREATE TABLE IF NOT EXISTS run_errors (
     message TEXT NOT NULL,
     created_at TEXT NOT NULL
 );
+"""
+
+BLOGS_SCHEMA = """
+CREATE TABLE IF NOT EXISTS blogs (
+    id INTEGER PRIMARY KEY,
+    url TEXT NOT NULL UNIQUE,
+    title TEXT,
+    enabled INTEGER NOT NULL DEFAULT 1,
+    etag TEXT,
+    last_modified TEXT,
+    feed_url TEXT,
+    feed_etag TEXT,
+    feed_last_modified TEXT,
+    feed_initialized INTEGER NOT NULL DEFAULT 0,
+    feed_discovery_checked INTEGER NOT NULL DEFAULT 0,
+    last_fetch_method TEXT CHECK (last_fetch_method IN ('rss', 'snapshot')),
+    last_checked_at TEXT,
+    last_status INTEGER,
+    last_error TEXT,
+    added_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS author_blogs (
+    author_id INTEGER NOT NULL REFERENCES authors(id) ON DELETE CASCADE,
+    blog_id INTEGER NOT NULL REFERENCES blogs(id) ON DELETE CASCADE,
+    label TEXT,
+    relationship TEXT,
+    PRIMARY KEY (author_id, blog_id)
+);
+CREATE INDEX IF NOT EXISTS idx_author_blogs_blog ON author_blogs(blog_id, author_id);
+CREATE TABLE IF NOT EXISTS blog_entries (
+    id INTEGER PRIMARY KEY,
+    blog_id INTEGER NOT NULL REFERENCES blogs(id) ON DELETE CASCADE,
+    previous_entry_id INTEGER REFERENCES blog_entries(id) ON DELETE SET NULL,
+    title TEXT NOT NULL,
+    content_sha256 TEXT NOT NULL,
+    normalized_text TEXT NOT NULL,
+    diff_text TEXT NOT NULL DEFAULT '',
+    change_kind TEXT NOT NULL CHECK (change_kind IN ('baseline', 'changed', 'reset')),
+    entry_kind TEXT NOT NULL DEFAULT 'snapshot' CHECK (entry_kind IN ('rss', 'snapshot')),
+    external_id TEXT,
+    source_url TEXT,
+    published_at TEXT,
+    fetched_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_blog_entries_feed ON blog_entries(fetched_at DESC, id DESC);
 """
 
 
@@ -220,6 +266,14 @@ CREATE TABLE IF NOT EXISTS saved_queries (
     search_query TEXT NOT NULL DEFAULT '',
     prompt TEXT NOT NULL,
     is_builtin INTEGER NOT NULL DEFAULT 0,
+    auto_run_papers INTEGER NOT NULL DEFAULT 0,
+    auto_run_blogs INTEGER NOT NULL DEFAULT 0,
+    model_profiles_json TEXT NOT NULL DEFAULT '[]',
+    context_window_tokens INTEGER NOT NULL DEFAULT 16384,
+    paper_source_scope TEXT NOT NULL DEFAULT 'auto'
+        CHECK (paper_source_scope IN ('auto', 'abstract', 'fulltext')),
+    pdf_strategy TEXT NOT NULL DEFAULT 'chunked'
+        CHECK (pdf_strategy IN ('auto', 'direct', 'chunked')),
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL,
     last_run_at TEXT
@@ -276,7 +330,8 @@ CREATE INDEX IF NOT EXISTS idx_paper_topics_paper ON paper_topics(paper_id, topi
 """
 
 SCHEMA = (
-    COMMON_SCHEMA + ANALYSES_SCHEMA + ANALYSIS_TASKS_SCHEMA + EXTRA_SCHEMA + TOPICS_SCHEMA
+    COMMON_SCHEMA + ANALYSES_SCHEMA + ANALYSIS_TASKS_SCHEMA + EXTRA_SCHEMA
+    + TOPICS_SCHEMA + BLOGS_SCHEMA
 )
 
 
@@ -315,10 +370,61 @@ class Database:
         self._ensure_query_columns()
         self._ensure_default_saved_queries()
         self._conn.executescript(TOPICS_SCHEMA)
+        self._conn.executescript(BLOGS_SCHEMA)
+        self._ensure_blog_columns()
+        self._ensure_run_blog_columns()
         if version < 6:
             self._backfill_paper_topics()
         self._conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
         self._conn.commit()
+
+    def _ensure_run_blog_columns(self) -> None:
+        columns = {
+            row["name"] for row in self._conn.execute("PRAGMA table_info(runs)").fetchall()
+        }
+        for name in ("blogs_checked", "blog_updates_found"):
+            if name not in columns:
+                self._conn.execute(
+                    f"ALTER TABLE runs ADD COLUMN {name} INTEGER NOT NULL DEFAULT 0"
+                )
+
+    def _ensure_blog_columns(self) -> None:
+        blog_columns = {
+            row["name"] for row in self._conn.execute("PRAGMA table_info(blogs)").fetchall()
+        }
+        blog_definitions = {
+            "feed_url": "TEXT",
+            "feed_etag": "TEXT",
+            "feed_last_modified": "TEXT",
+            "feed_initialized": "INTEGER NOT NULL DEFAULT 0",
+            "feed_discovery_checked": "INTEGER NOT NULL DEFAULT 0",
+            "last_fetch_method": "TEXT",
+        }
+        for name, definition in blog_definitions.items():
+            if name not in blog_columns:
+                self._conn.execute(f"ALTER TABLE blogs ADD COLUMN {name} {definition}")
+
+        entry_columns = {
+            row["name"]
+            for row in self._conn.execute("PRAGMA table_info(blog_entries)").fetchall()
+        }
+        entry_definitions = {
+            "entry_kind": "TEXT NOT NULL DEFAULT 'snapshot'",
+            "external_id": "TEXT",
+            "source_url": "TEXT",
+            "published_at": "TEXT",
+        }
+        for name, definition in entry_definitions.items():
+            if name not in entry_columns:
+                self._conn.execute(
+                    f"ALTER TABLE blog_entries ADD COLUMN {name} {definition}"
+                )
+        self._conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_blog_entries_external
+            ON blog_entries(blog_id, entry_kind, external_id, id DESC)
+            """
+        )
 
     def _ensure_author_tracking_column(self) -> None:
         columns = {
@@ -376,6 +482,19 @@ class Database:
             self._conn.execute(
                 "ALTER TABLE saved_queries ADD COLUMN is_builtin INTEGER NOT NULL DEFAULT 0"
             )
+        query_additions = {
+            "auto_run_papers": "INTEGER NOT NULL DEFAULT 0",
+            "auto_run_blogs": "INTEGER NOT NULL DEFAULT 0",
+            "model_profiles_json": "TEXT NOT NULL DEFAULT '[]'",
+            "context_window_tokens": "INTEGER NOT NULL DEFAULT 16384",
+            "paper_source_scope": "TEXT NOT NULL DEFAULT 'auto'",
+            "pdf_strategy": "TEXT NOT NULL DEFAULT 'chunked'",
+        }
+        for name, definition in query_additions.items():
+            if name not in query_columns:
+                self._conn.execute(
+                    f"ALTER TABLE saved_queries ADD COLUMN {name} {definition}"
+                )
 
     def _ensure_default_saved_queries(self) -> None:
         row = self._conn.execute(
@@ -567,6 +686,48 @@ class Database:
             )
         return int(row["id"])
 
+    def add_manual_author(self, name: str, institution: str | None = None) -> int:
+        cleaned_name = " ".join(name.strip().split())
+        if not cleaned_name:
+            raise ValueError("Author name is required")
+        if len(cleaned_name) > 300:
+            raise ValueError("Author name is too long")
+        cleaned_institution = " ".join((institution or "").strip().split()) or None
+        digest = hashlib.sha256(cleaned_name.casefold().encode("utf-8")).hexdigest()[:16]
+        identifier = f"LOCAL-{digest}".upper()
+        now = utcnow()
+        metadata = {"manual": True, "papers_enabled": False}
+        with self.transaction() as conn:
+            conn.execute(
+                """
+                INSERT INTO authors (
+                    openalex_id, name, institution, enabled, tracked, added_at, metadata_json
+                ) VALUES (?, ?, ?, 0, 1, ?, ?)
+                ON CONFLICT(openalex_id) DO UPDATE SET
+                    name=excluded.name,
+                    institution=excluded.institution,
+                    tracked=1,
+                    metadata_json=excluded.metadata_json
+                """,
+                (identifier, cleaned_name, cleaned_institution, now, json_dumps(metadata)),
+            )
+            row = conn.execute(
+                "SELECT id FROM authors WHERE openalex_id=?", (identifier,)
+            ).fetchone()
+        assert row is not None
+        return int(row["id"])
+
+    def find_authors_by_name(self, name: str) -> list[sqlite3.Row]:
+        cleaned = " ".join(name.strip().split())
+        if not cleaned:
+            return []
+        return list(
+            self._conn.execute(
+                "SELECT * FROM authors WHERE tracked=1 AND name=? COLLATE NOCASE ORDER BY id",
+                (cleaned,),
+            ).fetchall()
+        )
+
     def list_authors(
         self,
         enabled_only: bool = False,
@@ -615,6 +776,295 @@ class Database:
                 "UPDATE authors SET last_checked_at = ? WHERE openalex_id = ?",
                 (checked_at or utcnow(), identifier),
             )
+
+    def add_author_blog(
+        self,
+        openalex_id: str,
+        url: str,
+        *,
+        label: str = "",
+        relationship: str = "",
+    ) -> int:
+        identifier = self._author_id(openalex_id)
+        cleaned_url = url.strip()
+        if not cleaned_url:
+            raise ValueError("Blog URL is required")
+        cleaned_label = " ".join(label.strip().split())[:300] or None
+        cleaned_relationship = " ".join(relationship.strip().split())[:300] or None
+        with self.transaction() as conn:
+            author = conn.execute(
+                "SELECT id FROM authors WHERE openalex_id=? AND tracked=1", (identifier,)
+            ).fetchone()
+            if author is None:
+                raise ValueError("Author not found")
+            conn.execute(
+                """
+                INSERT INTO blogs(url, title, enabled, added_at)
+                VALUES (?, ?, 1, ?)
+                ON CONFLICT(url) DO UPDATE SET enabled=1
+                """,
+                (cleaned_url, cleaned_label, utcnow()),
+            )
+            blog = conn.execute("SELECT id FROM blogs WHERE url=?", (cleaned_url,)).fetchone()
+            assert blog is not None
+            conn.execute(
+                """
+                INSERT INTO author_blogs(author_id, blog_id, label, relationship)
+                VALUES (?, ?, ?, ?)
+                ON CONFLICT(author_id, blog_id) DO UPDATE SET
+                    label=excluded.label,
+                    relationship=excluded.relationship
+                """,
+                (int(author["id"]), int(blog["id"]), cleaned_label, cleaned_relationship),
+            )
+        return int(blog["id"])
+
+    def remove_author_blog(self, openalex_id: str, blog_id: int) -> bool:
+        identifier = self._author_id(openalex_id)
+        with self.transaction() as conn:
+            author = conn.execute(
+                "SELECT id FROM authors WHERE openalex_id=?", (identifier,)
+            ).fetchone()
+            if author is None:
+                return False
+            cur = conn.execute(
+                "DELETE FROM author_blogs WHERE author_id=? AND blog_id=?",
+                (int(author["id"]), blog_id),
+            )
+        return cur.rowcount > 0
+
+    def author_blogs(self, openalex_id: str) -> list[sqlite3.Row]:
+        identifier = self._author_id(openalex_id)
+        return list(
+            self._conn.execute(
+                """
+                SELECT b.*, ab.label, ab.relationship,
+                    (SELECT count(*) FROM blog_entries be
+                     WHERE be.blog_id=b.id AND be.change_kind != 'baseline') AS entry_count
+                FROM authors a
+                JOIN author_blogs ab ON ab.author_id=a.id
+                JOIN blogs b ON b.id=ab.blog_id
+                WHERE a.openalex_id=?
+                ORDER BY COALESCE(ab.label, b.title, b.url) COLLATE NOCASE
+                """,
+                (identifier,),
+            ).fetchall()
+        )
+
+    def list_enabled_blogs(self) -> list[sqlite3.Row]:
+        return list(
+            self._conn.execute(
+                """
+                SELECT b.*
+                FROM blogs b
+                WHERE b.enabled=1 AND EXISTS (
+                    SELECT 1 FROM author_blogs ab
+                    JOIN authors a ON a.id=ab.author_id
+                    WHERE ab.blog_id=b.id AND a.tracked=1
+                )
+                ORDER BY b.id
+                """
+            ).fetchall()
+        )
+
+    def latest_blog_entry(
+        self,
+        blog_id: int,
+        *,
+        entry_kind: str = "snapshot",
+        external_id: str | None = None,
+    ) -> sqlite3.Row | None:
+        if external_id is None:
+            return self._conn.execute(
+                """
+                SELECT * FROM blog_entries
+                WHERE blog_id=? AND entry_kind=?
+                ORDER BY id DESC LIMIT 1
+                """,
+                (blog_id, entry_kind),
+            ).fetchone()
+        return self._conn.execute(
+            """
+            SELECT * FROM blog_entries
+            WHERE blog_id=? AND entry_kind=? AND external_id=?
+            ORDER BY id DESC LIMIT 1
+            """,
+            (blog_id, entry_kind, external_id),
+        ).fetchone()
+
+    def save_blog_entry(
+        self,
+        *,
+        blog_id: int,
+        title: str,
+        content_sha256: str,
+        normalized_text: str,
+        diff_text: str,
+        change_kind: str,
+        previous_entry_id: int | None,
+        entry_kind: str = "snapshot",
+        external_id: str | None = None,
+        source_url: str | None = None,
+        published_at: str | None = None,
+    ) -> int:
+        with self.transaction() as conn:
+            cur = conn.execute(
+                """
+                INSERT INTO blog_entries(
+                    blog_id, previous_entry_id, title, content_sha256,
+                    normalized_text, diff_text, change_kind, entry_kind,
+                    external_id, source_url, published_at, fetched_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    blog_id,
+                    previous_entry_id,
+                    title,
+                    content_sha256,
+                    normalized_text,
+                    diff_text,
+                    change_kind,
+                    entry_kind,
+                    external_id,
+                    source_url,
+                    published_at,
+                    utcnow(),
+                ),
+            )
+        return int(cur.lastrowid)
+
+    def mark_blog_checked(
+        self,
+        blog_id: int,
+        *,
+        status: int | None,
+        etag: str | None = None,
+        last_modified: str | None = None,
+        title: str | None = None,
+        error: str | None = None,
+        fetch_method: str | None = None,
+        feed_url: str | None = None,
+        feed_initialized: bool | None = None,
+        feed_discovery_checked: bool | None = None,
+    ) -> None:
+        with self.transaction() as conn:
+            if fetch_method == "rss":
+                conn.execute(
+                    """
+                    UPDATE blogs SET last_checked_at=?, last_status=?, last_error=?,
+                        feed_etag=COALESCE(?, feed_etag),
+                        feed_last_modified=COALESCE(?, feed_last_modified),
+                        feed_url=COALESCE(?, feed_url), title=COALESCE(?, title),
+                        last_fetch_method='rss',
+                        feed_initialized=COALESCE(?, feed_initialized),
+                        feed_discovery_checked=COALESCE(?, feed_discovery_checked)
+                    WHERE id=?
+                    """,
+                    (
+                        utcnow(),
+                        status,
+                        error,
+                        etag,
+                        last_modified,
+                        feed_url,
+                        title,
+                        int(feed_initialized) if feed_initialized is not None else None,
+                        (
+                            int(feed_discovery_checked)
+                            if feed_discovery_checked is not None
+                            else None
+                        ),
+                        blog_id,
+                    ),
+                )
+            else:
+                conn.execute(
+                    """
+                    UPDATE blogs SET last_checked_at=?, last_status=?, last_error=?,
+                        etag=COALESCE(?, etag), last_modified=COALESCE(?, last_modified),
+                        feed_url=COALESCE(?, feed_url), title=COALESCE(?, title),
+                        last_fetch_method=COALESCE(?, last_fetch_method),
+                        feed_initialized=COALESCE(?, feed_initialized),
+                        feed_discovery_checked=COALESCE(?, feed_discovery_checked)
+                    WHERE id=?
+                    """,
+                    (
+                        utcnow(),
+                        status,
+                        error,
+                        etag,
+                        last_modified,
+                        feed_url,
+                        title,
+                        fetch_method,
+                        int(feed_initialized) if feed_initialized is not None else None,
+                        (
+                            int(feed_discovery_checked)
+                            if feed_discovery_checked is not None
+                            else None
+                        ),
+                        blog_id,
+                    ),
+                )
+
+    def list_blog_entries(self, limit: int | None = 100) -> list[sqlite3.Row]:
+        sql = """
+            SELECT be.*, b.url, COALESCE(b.title, be.title) AS blog_title,
+                (SELECT group_concat(name, ', ') FROM (
+                    SELECT DISTINCT a.name AS name
+                    FROM author_blogs ab JOIN authors a ON a.id=ab.author_id
+                    WHERE ab.blog_id=b.id ORDER BY a.name COLLATE NOCASE
+                )) AS author_names
+            FROM blog_entries be JOIN blogs b ON b.id=be.blog_id
+            WHERE be.change_kind != 'baseline'
+            ORDER BY be.fetched_at DESC, be.id DESC
+        """
+        if limit is None:
+            return list(self._conn.execute(sql).fetchall())
+        return list(self._conn.execute(sql + " LIMIT ?", (limit,)).fetchall())
+
+    def blog_entries_by_ids(self, entry_ids: Iterable[int]) -> list[sqlite3.Row]:
+        ids: list[int] = []
+        for value in entry_ids:
+            try:
+                parsed = int(value)
+            except (TypeError, ValueError):
+                continue
+            if parsed > 0 and parsed not in ids:
+                ids.append(parsed)
+        if not ids:
+            return []
+        placeholders = ",".join("?" for _ in ids)
+        rows = self._conn.execute(
+            f"""
+            SELECT be.*, b.url, COALESCE(b.title, be.title) AS blog_title,
+                (SELECT group_concat(name, ', ') FROM (
+                    SELECT DISTINCT a.name AS name
+                    FROM author_blogs ab JOIN authors a ON a.id=ab.author_id
+                    WHERE ab.blog_id=b.id ORDER BY a.name COLLATE NOCASE
+                )) AS author_names
+            FROM blog_entries be JOIN blogs b ON b.id=be.blog_id
+            WHERE be.id IN ({placeholders}) AND be.change_kind != 'baseline'
+            """,
+            ids,
+        ).fetchall()
+        by_id = {int(row["id"]): row for row in rows}
+        return [by_id[value] for value in ids if value in by_id]
+
+    def get_blog_entry(self, entry_id: int) -> sqlite3.Row | None:
+        return self._conn.execute(
+            """
+            SELECT be.*, b.url, COALESCE(b.title, be.title) AS blog_title,
+                (SELECT group_concat(name, ', ') FROM (
+                    SELECT DISTINCT a.name AS name
+                    FROM author_blogs ab JOIN authors a ON a.id=ab.author_id
+                    WHERE ab.blog_id=b.id ORDER BY a.name COLLATE NOCASE
+                )) AS author_names
+            FROM blog_entries be JOIN blogs b ON b.id=be.blog_id
+            WHERE be.id=?
+            """,
+            (entry_id,),
+        ).fetchone()
 
     def _find_existing_paper(self, paper: PaperRecord) -> sqlite3.Row | None:
         row = self._conn.execute(
@@ -775,6 +1225,19 @@ class Database:
         return list(
             self._conn.execute(
                 "SELECT * FROM papers ORDER BY publication_date DESC, id DESC LIMIT ?", (limit,)
+            ).fetchall()
+        )
+
+    def list_recent_papers_for_pdf_retry(self, since: str) -> list[sqlite3.Row]:
+        """Return recent papers whose local PDF may need to be fetched again."""
+        return list(
+            self._conn.execute(
+                """
+                SELECT * FROM papers
+                WHERE COALESCE(publication_date, discovered_at) >= ?
+                ORDER BY COALESCE(publication_date, discovered_at) DESC, id DESC
+                """,
+                (since,),
             ).fetchall()
         )
 
@@ -1364,7 +1827,9 @@ class Database:
                     )), '') AS tags,
                     (SELECT count(DISTINCT pa.paper_id)
                      FROM paper_authors pa
-                     WHERE pa.tracked_author_id=a.id) AS paper_count
+                     WHERE pa.tracked_author_id=a.id) AS paper_count,
+                    (SELECT count(*) FROM author_blogs ab
+                     WHERE ab.author_id=a.id) AS blog_count
                 FROM authors a
                 {where_sql}
                 ORDER BY a.name COLLATE NOCASE
@@ -1517,6 +1982,27 @@ class Database:
         assert row is not None
         return int(row["id"])
 
+    @staticmethod
+    def _query_execution_values(
+        *,
+        model_profiles: Iterable[str],
+        context_window_tokens: int,
+        paper_source_scope: str,
+        pdf_strategy: str,
+    ) -> tuple[str, int, str, str]:
+        profiles = list(dict.fromkeys(
+            value.strip() for value in model_profiles if value.strip()
+        ))
+        if not 512 <= context_window_tokens <= 1_000_000:
+            raise ValueError("Context window must be between 512 and 1000000 tokens")
+        if paper_source_scope not in {"auto", "abstract", "fulltext"}:
+            raise ValueError("Paper source must be auto, abstract, or fulltext")
+        if pdf_strategy not in {"auto", "direct", "chunked"}:
+            raise ValueError("PDF strategy must be auto, direct, or chunked")
+        if paper_source_scope == "abstract":
+            pdf_strategy = "auto"
+        return json_dumps(profiles), context_window_tokens, paper_source_scope, pdf_strategy
+
     def create_saved_query(
         self,
         *,
@@ -1524,20 +2010,46 @@ class Database:
         prompt: str,
         source_type: str = "papers",
         search_query: str = "",
+        auto_run_papers: bool = False,
+        auto_run_blogs: bool = False,
+        model_profiles: Iterable[str] = (),
+        context_window_tokens: int = 16384,
+        paper_source_scope: str = "auto",
+        pdf_strategy: str = "chunked",
     ) -> int:
         name = name.strip()
         prompt = prompt.strip()
         if not name or not prompt:
             raise ValueError("Query name and prompt are required")
+        profiles_json, context, scope, strategy = self._query_execution_values(
+            model_profiles=model_profiles,
+            context_window_tokens=context_window_tokens,
+            paper_source_scope=paper_source_scope,
+            pdf_strategy=pdf_strategy,
+        )
         now = utcnow()
         with self.transaction() as conn:
             cur = conn.execute(
                 """
                 INSERT INTO saved_queries(
-                    name, source_type, search_query, prompt, is_builtin, created_at, updated_at
-                ) VALUES (?, 'papers', '', ?, 0, ?, ?)
+                    name, source_type, search_query, prompt, is_builtin,
+                    auto_run_papers, auto_run_blogs, model_profiles_json,
+                    context_window_tokens, paper_source_scope, pdf_strategy,
+                    created_at, updated_at
+                ) VALUES (?, 'papers', '', ?, 0, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
-                (name[:120], prompt[:10000], now, now),
+                (
+                    name[:120],
+                    prompt[:10000],
+                    1 if auto_run_papers else 0,
+                    1 if auto_run_blogs else 0,
+                    profiles_json,
+                    context,
+                    scope,
+                    strategy,
+                    now,
+                    now,
+                ),
             )
         return int(cur.lastrowid)
 
@@ -1549,22 +2061,79 @@ class Database:
         prompt: str,
         source_type: str = "papers",
         search_query: str = "",
+        auto_run_papers: bool | None = None,
+        auto_run_blogs: bool | None = None,
+        model_profiles: Iterable[str] = (),
+        context_window_tokens: int = 16384,
+        paper_source_scope: str = "auto",
+        pdf_strategy: str = "chunked",
     ) -> bool:
         name = name.strip()
         prompt = prompt.strip()
         if not name or not prompt:
             raise ValueError("Query name and prompt are required")
+        profiles_json, context, scope, strategy = self._query_execution_values(
+            model_profiles=model_profiles,
+            context_window_tokens=context_window_tokens,
+            paper_source_scope=paper_source_scope,
+            pdf_strategy=pdf_strategy,
+        )
         with self.transaction() as conn:
             cur = conn.execute(
                 """
                 UPDATE saved_queries
                 SET name=CASE WHEN is_builtin=1 THEN ? ELSE ? END,
-                    source_type='papers', search_query='', prompt=?, updated_at=?
+                    source_type='papers', search_query='', prompt=?,
+                    auto_run_papers=CASE WHEN ? IS NULL THEN auto_run_papers ELSE ? END,
+                    auto_run_blogs=CASE WHEN ? IS NULL THEN auto_run_blogs ELSE ? END,
+                    model_profiles_json=?, context_window_tokens=?,
+                    paper_source_scope=?, pdf_strategy=?, updated_at=?
                 WHERE id=?
                 """,
-                (DEFAULT_SUMMARY_QUERY_NAME, name[:120], prompt[:10000], utcnow(), query_id),
+                (
+                    DEFAULT_SUMMARY_QUERY_NAME,
+                    name[:120],
+                    prompt[:10000],
+                    None if auto_run_papers is None else int(auto_run_papers),
+                    0 if auto_run_papers is None else int(auto_run_papers),
+                    None if auto_run_blogs is None else int(auto_run_blogs),
+                    0 if auto_run_blogs is None else int(auto_run_blogs),
+                    profiles_json,
+                    context,
+                    scope,
+                    strategy,
+                    utcnow(),
+                    query_id,
+                ),
             )
         return cur.rowcount > 0
+
+    def update_automatic_queries(
+        self,
+        query_ids: Iterable[int],
+        *,
+        paper_query_ids: Iterable[int],
+        blog_query_ids: Iterable[int],
+    ) -> None:
+        all_ids = list(dict.fromkeys(int(value) for value in query_ids))
+        paper_ids = {int(value) for value in paper_query_ids}
+        blog_ids = {int(value) for value in blog_query_ids}
+        now = utcnow()
+        with self.transaction() as conn:
+            for query_id in all_ids:
+                conn.execute(
+                    """
+                    UPDATE saved_queries
+                    SET auto_run_papers=?, auto_run_blogs=?, updated_at=?
+                    WHERE id=?
+                    """,
+                    (
+                        1 if query_id in paper_ids else 0,
+                        1 if query_id in blog_ids else 0,
+                        now,
+                        query_id,
+                    ),
+                )
 
     def delete_saved_query(self, query_id: int) -> bool:
         with self.transaction() as conn:
@@ -1586,6 +2155,16 @@ class Database:
                 FROM saved_queries q
                 ORDER BY q.is_builtin DESC, q.updated_at DESC, q.id DESC
                 """
+            ).fetchall()
+        )
+
+    def list_automatic_queries(self, content_type: str) -> list[sqlite3.Row]:
+        if content_type not in {"papers", "blogs"}:
+            raise ValueError("Content type must be papers or blogs")
+        column = "auto_run_papers" if content_type == "papers" else "auto_run_blogs"
+        return list(
+            self._conn.execute(
+                f"SELECT * FROM saved_queries WHERE {column}=1 ORDER BY id"
             ).fetchall()
         )
 
@@ -1734,6 +2313,31 @@ class Database:
                     break
         return matched
 
+    def query_runs_for_blog_entry(
+        self, entry_id: int, *, successful_only: bool = True, limit: int = 100
+    ) -> list[sqlite3.Row]:
+        rows = self.list_query_runs(limit=max(limit * 5, 100))
+        matched: list[sqlite3.Row] = []
+        for row in rows:
+            if successful_only and row["status"] != "success":
+                continue
+            try:
+                selection = json.loads(row["selection_json"] or "{}")
+            except (TypeError, json.JSONDecodeError):
+                continue
+            entry_ids = selection.get("blog_entry_ids") if isinstance(selection, dict) else None
+            if not isinstance(entry_ids, list):
+                continue
+            try:
+                ids = {int(value) for value in entry_ids}
+            except (TypeError, ValueError):
+                continue
+            if entry_id in ids:
+                matched.append(row)
+                if len(matched) >= limit:
+                    break
+        return matched
+
     def fail_incomplete_query_runs(self, message: str) -> int:
         with self.transaction() as conn:
             cur = conn.execute(
@@ -1765,7 +2369,7 @@ class Database:
                 """
                 UPDATE runs SET finished_at=?, status=?, authors_checked=?,
                     papers_found=?, papers_analyzed=?, pdfs_downloaded=?,
-                    errors_count=?, error_text=?
+                    blogs_checked=?, blog_updates_found=?, errors_count=?, error_text=?
                 WHERE id=?
                 """,
                 (
@@ -1775,6 +2379,8 @@ class Database:
                     stats.get("papers_found", 0),
                     stats.get("papers_analyzed", 0),
                     stats.get("pdfs_downloaded", 0),
+                    stats.get("blogs_checked", 0),
+                    stats.get("blog_updates_found", 0),
                     stats.get("errors_count", 0),
                     error_text,
                     run_id,

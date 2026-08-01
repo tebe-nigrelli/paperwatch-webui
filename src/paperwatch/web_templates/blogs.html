@@ -1,0 +1,30 @@
+{% extends "base.html" %}
+{% block title %}Blog updates · paperwatch{% endblock %}
+{% block content %}
+<section class="page-heading"><h1>Blog updates</h1><p>New RSS or Atom posts and changed HTML snapshots from blogs linked to tracked authors. Initial feed and snapshot baselines are hidden.</p></section>
+{% if entries and saved_queries and model_profiles %}
+<section class="panel model-runner">
+  <div class="panel-heading"><div><h2>Run saved prompt</h2><p>Apply a paper-compatible saved prompt to the blog entries shown below.</p></div>{% if query_state.running and query_state.content_type == 'blogs' %}<span class="status status-running">running</span>{% endif %}</div>
+  <form method="post" action="/queries/run-blogs" class="saved-prompt-runner">
+    {% for entry in entries %}<input type="hidden" name="blog_entry_id" value="{{ entry.id }}">{% endfor %}
+    <label class="grow"><span>Saved prompt</span><select name="query_id" required>{% for query in saved_queries %}<option value="{{ query.id }}" {% if selected_query_id == query.id %}selected{% endif %}>{{ query.name }}</option>{% endfor %}</select></label>
+    <fieldset class="model-options"><legend>Models</legend>{% for profile in model_profiles %}<label class="model-option"><input type="checkbox" name="model" value="{{ profile.profile }}" {% if loop.first %}checked{% endif %}><span><strong>{{ profile.profile }}</strong><small>{{ profile.provider }} · {{ profile.model }}</small></span></label>{% endfor %}</fieldset>
+    <div class="model-run-actions"><label><span>Context window tokens</span><input type="number" name="context_window_tokens" min="512" max="1000000" value="16384"></label><button class="button button-primary" type="submit" {% if query_state.running %}disabled{% endif %}>Run on visible blogs</button></div>
+  </form>
+</section>
+{% endif %}
+<section class="panel paper-table-panel blog-updates-panel" aria-label="Blog updates">
+  <div class="panel-heading"><h2>Recent changes</h2><span>{{ entries|length }}</span></div>
+  <div class="table-wrap"><table class="paper-table blog-table"><thead><tr><th>Date<br>Source</th><th>Title</th><th>Tracked author(s)</th><th>Type</th><th>Change</th><th>Original</th><th>Details</th></tr></thead><tbody>
+  {% for entry in entries %}<tr>
+    <td class="paper-date-cell"><strong>{{ (entry.published_at or entry.fetched_at)[:10] }}</strong><small>{{ entry.blog_title }}</small></td>
+    <td class="paper-title-cell"><a href="/blogs/{{ entry.id }}">{{ entry.title }}</a></td>
+    <td class="paper-authors-cell">{{ entry.author_names or 'None tracked' }}</td>
+    <td><span class="status status-success">{{ 'RSS post' if entry.entry_kind == 'rss' else 'snapshot' }}</span></td>
+    <td><span class="status status-{{ 'failed' if entry.change_kind == 'reset' else 'success' }}">{% if entry.entry_kind == 'rss' and not entry.previous_entry_id %}new{% else %}{{ entry.change_kind }}{% endif %}</span></td>
+    <td><a href="{{ entry.source_url or entry.url }}" target="_blank" rel="noreferrer">Open source</a></td>
+    <td><a href="/blogs/{{ entry.id }}">{{ 'Read entry' if entry.entry_kind == 'rss' and not entry.diff_text else 'View changes' }}</a></td>
+  </tr>{% else %}<tr><td colspan="7" class="empty">No blog updates yet. The first fetch establishes a baseline.</td></tr>{% endfor %}
+  </tbody></table></div>
+</section>
+{% endblock %}

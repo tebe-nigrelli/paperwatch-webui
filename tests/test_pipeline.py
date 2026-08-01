@@ -9,8 +9,8 @@ import httpx
 import pytest
 
 from paperwatch.db import Database
-from paperwatch.models import LLMResponse
-from paperwatch.pipeline import PaperWatch
+from paperwatch.models import BatchQueryResult, LLMResponse
+from paperwatch.pipeline import PaperWatch, RunStats
 from paperwatch.sources.arxiv import ArxivEntry
 
 
@@ -110,8 +110,12 @@ def test_end_to_end_enrichment_pdf_analysis_and_cache(
             llm=llm,
             pdf_client=pdf_client,
         )
-        first = app.run(today=date(2026, 7, 24))
-        second = app.run(today=date(2026, 7, 24))
+        first = app.run(
+            today=date(2026, 7, 24), analyze_discovered_papers=True
+        )
+        second = app.run(
+            today=date(2026, 7, 24), analyze_discovered_papers=True
+        )
 
         assert first.status == "success"
         assert first.authors_checked == 1
@@ -149,11 +153,51 @@ def test_pdf_is_always_processed_when_enabled(
             llm=llm,
             pdf_client=pdf_client,
         )
-        stats = app.run(today=date(2026, 7, 24))
+        stats = app.run(
+            today=date(2026, 7, 24), analyze_discovered_papers=True
+        )
         assert stats.status == "success"
         assert stats.papers_analyzed == 2
         assert stats.pdfs_downloaded == 1
         assert db.list_papers()[0]["local_pdf_path"] is not None
+
+
+def test_fetch_does_not_run_models_without_automatic_query_selection(
+    app_config, author_candidate, paper_record
+):
+    class NoImplicitLLM:
+        provider = "ollama"
+        model = "test-model"
+
+        def check_ready(self):
+            raise AssertionError("fetch must not preflight a model")
+
+        def analyze(self, prompt):
+            raise AssertionError("fetch must not run an implicit summary")
+
+        def close(self):
+            pass
+
+    with Database(app_config.paths.database) as db:
+        db.add_author(author_candidate)
+        app = PaperWatch(
+            app_config,
+            db=db,
+            openalex=FakeOpenAlex([paper_record]),
+            arxiv=None,
+            llm=NoImplicitLLM(),
+            pdf_client=httpx.Client(
+                transport=httpx.MockTransport(
+                    lambda request: httpx.Response(200, content=PDF_BYTES)
+                )
+            ),
+        )
+        stats = app.run(today=date(2026, 7, 24))
+        assert stats.status == "success"
+        assert stats.pdfs_downloaded == 1
+        assert stats.papers_analyzed == 0
+        assert db._conn.execute("SELECT count(*) FROM analyses").fetchone()[0] == 0
+        assert db.list_query_runs() == []
 
 
 def test_discovery_error_is_recorded_without_crashing(app_config, author_candidate, analysis_result):
@@ -167,7 +211,9 @@ def test_discovery_error_is_recorded_without_crashing(app_config, author_candida
             llm=FakeLLM(analysis_result),
             pdf_client=httpx.Client(transport=httpx.MockTransport(lambda request: httpx.Response(500))),
         )
-        stats = app.run(today=date(2026, 7, 24))
+        stats = app.run(
+            today=date(2026, 7, 24), analyze_discovered_papers=True
+        )
         assert stats.status == "partial"
         assert stats.authors_checked == 0
         assert stats.errors_count == 1
@@ -191,7 +237,9 @@ def test_pdf_error_does_not_erase_abstract_analysis(
             llm=llm,
             pdf_client=pdf_client,
         )
-        stats = app.run(today=date(2026, 7, 24))
+        stats = app.run(
+            today=date(2026, 7, 24), analyze_discovered_papers=True
+        )
         assert stats.status == "partial"
         assert stats.papers_analyzed == 1
         assert stats.errors_count == 1
@@ -225,13 +273,17 @@ def test_pdf_can_be_downloaded_without_llm(app_config, author_candidate, paper_r
             llm=NoLLM(),
             pdf_client=pdf_client,
         )
-        stats = app.run(today=date(2026, 7, 24))
+        stats = app.run(
+            today=date(2026, 7, 24), analyze_discovered_papers=True
+        )
         assert stats.status == "success"
         assert stats.papers_analyzed == 0
         assert stats.pdfs_downloaded == 1
 
 
-def test_complete_openalex_record_skips_arxiv(app_config, author_candidate, paper_record, analysis_result):
+def test_complete_openalex_record_skips_arxiv_and_downloads_pdf_even_when_legacy_flag_is_false(
+    app_config, author_candidate, paper_record, analysis_result
+):
     class FailArxiv:
         def by_id(self, value):
             raise AssertionError("arXiv should not be queried")
@@ -239,7 +291,11 @@ def test_complete_openalex_record_skips_arxiv(app_config, author_candidate, pape
         def by_title(self, *args):
             raise AssertionError("arXiv should not be queried")
 
-    config = replace(app_config, fetch=replace(app_config.fetch, download_pdfs=False))
+    config = replace(
+        app_config,
+        fetch=replace(app_config.fetch, download_pdfs=False),
+        llm=replace(app_config.llm, analyze_pdfs=False),
+    )
     with Database(config.paths.database) as db:
         db.add_author(author_candidate)
         app = PaperWatch(
@@ -248,9 +304,18 @@ def test_complete_openalex_record_skips_arxiv(app_config, author_candidate, pape
             openalex=FakeOpenAlex([paper_record]),
             arxiv=FailArxiv(),
             llm=FakeLLM(analysis_result),
-            pdf_client=httpx.Client(),
+            pdf_client=httpx.Client(
+                transport=httpx.MockTransport(
+                    lambda request: httpx.Response(200, content=PDF_BYTES)
+                )
+            ),
         )
-        assert app.run(today=date(2026, 7, 24)).status == "success"
+        stats = app.run(
+            today=date(2026, 7, 24), analyze_discovered_papers=True
+        )
+        assert stats.status == "success"
+        assert stats.pdfs_downloaded == 1
+        assert db.list_papers()[0]["local_pdf_path"]
 
 
 def test_arxiv_id_lookup_and_no_match_paths(app_config, author_candidate, paper_record, analysis_result):
@@ -326,7 +391,9 @@ def test_duplicate_paper_across_authors_is_processed_once(
             llm=FakeLLM(analysis_result),
             pdf_client=httpx.Client(),
         )
-        stats = app.run(today=date(2026, 7, 24))
+        stats = app.run(
+            today=date(2026, 7, 24), analyze_discovered_papers=True
+        )
         assert stats.authors_checked == 2
         assert stats.papers_found == 1
         assert stats.papers_analyzed == 1
@@ -354,7 +421,9 @@ def test_no_abstract_no_pdf_and_pdf_disabled_paths(
             llm=llm,
             pdf_client=httpx.Client(),
         )
-        stats = app.run(today=date(2026, 7, 24))
+        stats = app.run(
+            today=date(2026, 7, 24), analyze_discovered_papers=True
+        )
         assert stats.papers_analyzed == 0
         assert llm.prompts == []
 
@@ -376,7 +445,9 @@ def test_pdf_download_without_fulltext_analysis(
             llm=FakeLLM(analysis_result),
             pdf_client=pdf_client,
         )
-        stats = app.run(today=date(2026, 7, 24))
+        stats = app.run(
+            today=date(2026, 7, 24), analyze_discovered_papers=True
+        )
         assert stats.pdfs_downloaded == 1
         assert stats.papers_analyzed == 1
 
@@ -405,7 +476,9 @@ def test_arxiv_and_abstract_errors_are_isolated(
             llm=BrokenLLM(analysis_result),
             pdf_client=httpx.Client(),
         )
-        stats = app.run(today=date(2026, 7, 24))
+        stats = app.run(
+            today=date(2026, 7, 24), analyze_discovered_papers=True
+        )
         assert stats.status == "partial"
         assert stats.errors_count == 2
         stages = {row[0] for row in db._conn.execute("SELECT stage FROM run_errors")}
@@ -425,7 +498,9 @@ def test_paper_processing_and_fatal_run_errors(app_config, author_candidate, pap
             llm=FakeLLM(analysis_result),
             pdf_client=httpx.Client(),
         )
-        stats = app.run(today=date(2026, 7, 24))
+        stats = app.run(
+            today=date(2026, 7, 24), analyze_discovered_papers=True
+        )
         assert stats.status == "partial"
         assert db._conn.execute("SELECT stage FROM run_errors").fetchone()[0] == "paper_processing"
 
@@ -479,7 +554,11 @@ def test_pipeline_enforces_exact_title_and_configured_model(
 ):
     from dataclasses import replace
 
-    config = replace(app_config, fetch=replace(app_config.fetch, download_pdfs=False))
+    config = replace(
+        app_config,
+        fetch=replace(app_config.fetch, download_pdfs=False),
+        llm=replace(app_config.llm, analyze_pdfs=False),
+    )
     wrong = analysis_result.model_copy(
         update={"name": "Hallucinated title", "generated_by_model": "hallucinated-model"}
     )
@@ -491,9 +570,15 @@ def test_pipeline_enforces_exact_title_and_configured_model(
             openalex=FakeOpenAlex([paper_record]),
             arxiv=None,
             llm=FakeLLM(wrong),
-            pdf_client=httpx.Client(),
+            pdf_client=httpx.Client(
+                transport=httpx.MockTransport(
+                    lambda request: httpx.Response(200, content=PDF_BYTES)
+                )
+            ),
         )
-        stats = app.run(today=date(2026, 7, 24))
+        stats = app.run(
+            today=date(2026, 7, 24), analyze_discovered_papers=True
+        )
         assert stats.status == "success"
         row = db._conn.execute("SELECT name, generated_by_model FROM analyses").fetchone()
         assert row["name"] == paper_record.title
@@ -581,11 +666,18 @@ def test_missing_ollama_model_is_reported_once_and_preserves_initial_cursor(
             openalex=FakeOpenAlex([paper_record]),
             arxiv=None,
             llm=llm,
-            pdf_client=httpx.Client(),
+            pdf_client=httpx.Client(
+                transport=httpx.MockTransport(
+                    lambda request: httpx.Response(200, content=PDF_BYTES)
+                )
+            ),
         )
-        stats = app.run(today=date(2026, 7, 24))
+        stats = app.run(
+            today=date(2026, 7, 24), analyze_discovered_papers=True
+        )
         assert stats.status == "partial"
         assert stats.errors_count == 1
+        assert stats.pdfs_downloaded == 1
         error = db._conn.execute(
             "SELECT stage, message FROM run_errors"
         ).fetchone()
@@ -646,7 +738,64 @@ def test_daily_codex_fulltext_uploads_original_pdf_without_text_extraction(
             llm=llm,
             pdf_client=pdf_client,
         )
-        stats = app.run(today=date(2026, 7, 24))
+        stats = app.run(
+            today=date(2026, 7, 24), analyze_discovered_papers=True
+        )
+        assert stats.status == "success"
+        assert stats.papers_analyzed == 2
+        assert llm.uploads[0][1] == PDF_BYTES
+        analyses = db.paper_analyses(db.list_papers()[0]["id"])
+        assert {row["analysis_strategy"] for row in analyses} == {"direct", "pdf_upload"}
+
+
+def test_daily_claude_code_reads_original_pdf_without_text_extraction(
+    app_config, author_candidate, paper_record, analysis_result, monkeypatch
+):
+    config = replace(
+        app_config,
+        llm=replace(
+            app_config.llm,
+            provider="claude-code",
+            model="claude-sonnet-4-5",
+            api_key=None,
+            reasoning_effort="high",
+            pdf_analysis_strategy="chunked",
+        ),
+    )
+
+    class FakeClaude(FakeLLM):
+        provider = "claude-code"
+        model = "claude-sonnet-4-5"
+
+        def __init__(self, result):
+            super().__init__(result)
+            self.uploads = []
+
+        def analyze_pdf(self, prompt, pdf_path):
+            self.uploads.append((prompt, Path(pdf_path).read_bytes()))
+            return LLMResponse(result=self.result, usage={"input_tokens": 100})
+
+    llm = FakeClaude(analysis_result)
+    pdf_client = httpx.Client(
+        transport=httpx.MockTransport(lambda request: httpx.Response(200, content=PDF_BYTES))
+    )
+    monkeypatch.setattr(
+        "paperwatch.pipeline.extract_pdf_text",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("must not extract")),
+    )
+    with Database(config.paths.database) as db:
+        db.add_author(author_candidate)
+        app = PaperWatch(
+            config,
+            db=db,
+            openalex=FakeOpenAlex([paper_record]),
+            arxiv=None,
+            llm=llm,
+            pdf_client=pdf_client,
+        )
+        stats = app.run(
+            today=date(2026, 7, 24), analyze_discovered_papers=True
+        )
         assert stats.status == "success"
         assert stats.papers_analyzed == 2
         assert llm.uploads[0][1] == PDF_BYTES
@@ -699,13 +848,17 @@ def test_cursor_independent_download_only_backfill_and_late_pdf_analysis(
         assert db.get_author("A123")["last_checked_at"] > "2026-07-29T00:00:00+00:00"
 
         # Rediscovery does not summarize an already downloaded historical paper.
-        normal = app.run(today=date(2026, 7, 31))
+        normal = app.run(
+            today=date(2026, 7, 31), analyze_discovered_papers=True
+        )
         assert normal.papers_analyzed == 0
         assert llm.prompts == []
 
         # If the PDF first becomes downloadable later, analyze that new download once.
         Path(stored["local_pdf_path"]).unlink()
-        late = app.run(today=date(2026, 8, 1))
+        late = app.run(
+            today=date(2026, 8, 1), analyze_discovered_papers=True
+        )
         assert late.pdfs_downloaded == 1
         assert late.papers_analyzed == 1
         assert len(llm.prompts) == 1
@@ -895,3 +1048,464 @@ def test_fetch_work_downloads_exact_result_and_keeps_failed_record(
         failed, failed_paper_id = app.fetch_work("WBROKEN")
         assert failed.status == "failed" and failed_paper_id is None
         assert "OpenAlex unavailable" in db.get_run(failed.run_id)["error_text"]
+
+
+def test_manual_fetch_downloads_pdf_and_checks_blogs(
+    app_config, author_candidate, paper_record, monkeypatch
+):
+    from paperwatch.blogs import BlogFetch
+
+    config = replace(
+        app_config,
+        fetch=replace(app_config.fetch, download_pdfs=False),
+        llm=replace(app_config.llm, provider="none", analyze_pdfs=False),
+    )
+    fetched_urls = []
+
+    def fake_blog(client, row):
+        fetched_urls.append(row["url"])
+        return BlogFetch(
+            status_code=200,
+            title="Blog",
+            method="snapshot",
+            snapshot_text="baseline text",
+            snapshot_sha256="baseline-hash",
+        )
+
+    monkeypatch.setattr("paperwatch.pipeline.fetch_blog", fake_blog)
+
+    class WorkOpenAlex(FakeOpenAlex):
+        def get_work(self, work_id):
+            return paper_record
+
+    class NoLLM:
+        provider = "none"
+        model = "none"
+
+        def close(self):
+            pass
+
+    with Database(config.paths.database) as db:
+        db.add_author(author_candidate)
+        db.add_author_blog(author_candidate.openalex_id, "https://example.test/blog")
+        app = PaperWatch(
+            config,
+            db=db,
+            openalex=WorkOpenAlex(),
+            arxiv=None,
+            llm=NoLLM(),
+            pdf_client=httpx.Client(
+                transport=httpx.MockTransport(
+                    lambda request: httpx.Response(200, content=PDF_BYTES)
+                )
+            ),
+        )
+        stats, paper_id = app.fetch_work("W456")
+        assert paper_id is not None
+        assert stats.pdfs_downloaded == 1
+        assert stats.blogs_checked == 1
+        assert fetched_urls == ["https://example.test/blog"]
+        assert db.get_paper(paper_id)["local_pdf_path"]
+
+def test_automatic_saved_queries_target_new_papers_and_blogs(
+    app_config, paper_record, analysis_result, monkeypatch
+):
+    class NoopOpenAlex:
+        def close(self):
+            pass
+
+    captured: list[tuple[str, dict]] = []
+
+    def collect(db, source_scope, **kwargs):
+        selection = kwargs["selection"]
+        captured.append((source_scope, selection))
+        identity_key = "paper_ids" if selection["content_type"] == "papers" else "blog_entry_ids"
+        return [
+            {
+                "title": "new record",
+                identity_key[:-1]: selection[identity_key][0],
+                "content": "evidence",
+            }
+        ]
+
+    def run_model(llm, **kwargs):
+        content_type = kwargs["content_type"]
+        return (
+            BatchQueryResult(
+                title=f"{content_type} result",
+                summary="done",
+                items=[],
+            ),
+            {"tokens": 1},
+            12,
+        )
+
+    monkeypatch.setattr("paperwatch.query_jobs.collect_query_documents", collect)
+    monkeypatch.setattr("paperwatch.query_jobs.run_query_for_model", run_model)
+
+    with Database(app_config.paths.database) as db:
+        paper_id, _ = db.upsert_paper(paper_record)
+        db.create_saved_query(
+            name="New papers",
+            prompt="Summarize new papers",
+            auto_run_papers=True,
+        )
+        db.create_saved_query(
+            name="New blogs",
+            prompt="Summarize new blogs",
+            auto_run_blogs=True,
+        )
+        app = PaperWatch(
+            app_config,
+            db=db,
+            openalex=NoopOpenAlex(),
+            arxiv=None,
+            llm=FakeLLM(analysis_result),
+            pdf_client=httpx.Client(
+                transport=httpx.MockTransport(
+                    lambda request: httpx.Response(200, content=PDF_BYTES)
+                )
+            ),
+        )
+        stats = RunStats(
+            run_id=db.start_run(),
+            new_paper_ids=[paper_id, paper_id],
+            new_blog_entry_ids=[17, 17],
+        )
+        app._run_automatic_queries(stats)
+        runs = db.list_query_runs()
+        assert len(runs) == 2
+        assert {row["status"] for row in runs} == {"success"}
+        assert {row["matched_count"] for row in runs} == {1}
+        assert [scope for scope, _selection in captured] == ["auto", "blog"]
+        paper_selection = captured[0][1]
+        blog_selection = captured[1][1]
+        assert paper_selection["paper_ids"] == [paper_id]
+        assert blog_selection["blog_entry_ids"] == [17]
+        assert paper_selection["content_type"] == "papers"
+        assert blog_selection["content_type"] == "blogs"
+
+        def fail_model(llm, **kwargs):
+            raise RuntimeError("query failed")
+
+        monkeypatch.setattr("paperwatch.query_jobs.run_query_for_model", fail_model)
+        failed = RunStats(run_id=db.start_run(), new_blog_entry_ids=[17])
+        app._run_automatic_queries(failed)
+        assert failed.errors_count == 1
+        assert db.get_run_errors(failed.run_id)[0]["stage"] == "automatic_blogs_query"
+        assert db.list_query_runs()[0]["status"] == "failed"
+
+        no_targets = RunStats(run_id=db.start_run())
+        app._run_automatic_queries(no_targets)
+        app._llm_available = False
+        app._run_automatic_queries(
+            RunStats(run_id=db.start_run(), new_paper_ids=[paper_id])
+        )
+
+def test_selected_fetch_checks_blogs_and_automatic_queries(
+    app_config, author_candidate, paper_record, analysis_result, monkeypatch
+):
+    from paperwatch.blogs import BlogFetch
+
+    class WorkOpenAlex:
+        def get_work(self, work_id):
+            return paper_record
+
+    with Database(app_config.paths.database) as db:
+        db.add_author(author_candidate)
+        db.add_author_blog(author_candidate.openalex_id, "https://example.test/blog")
+        app = PaperWatch(
+            app_config,
+            db=db,
+            openalex=WorkOpenAlex(),
+            arxiv=None,
+            llm=FakeLLM(analysis_result),
+            pdf_client=httpx.Client(
+                transport=httpx.MockTransport(
+                    lambda request: httpx.Response(200, content=PDF_BYTES)
+                )
+            ),
+        )
+        calls: list[str] = []
+
+        def blogs(rows):
+            calls.append("blogs")
+            return [(
+                rows[0],
+                BlogFetch(
+                    status_code=200,
+                    title="Blog",
+                    method="snapshot",
+                    snapshot_text="baseline",
+                    snapshot_sha256="baseline-hash",
+                ),
+                None,
+            )]
+
+        def queries(stats):
+            calls.append("queries")
+
+        monkeypatch.setattr(app, "_fetch_blog_batch", blogs)
+        monkeypatch.setattr(app, "_run_automatic_queries", queries)
+        stats, paper_id = app.fetch_work("W456")
+        assert paper_id is not None
+        assert stats.pdfs_downloaded == 1
+        assert stats.blogs_checked == 1
+        assert calls == ["blogs", "queries"]
+
+
+def test_normal_fetch_starts_blog_network_work_while_papers_are_discovered(
+    app_config, author_candidate, monkeypatch
+):
+    from paperwatch.blogs import BlogFetch
+    import threading
+
+    blog_started = threading.Event()
+    paper_started = threading.Event()
+
+    class ParallelOpenAlex:
+        def recent_works(self, *args, **kwargs):
+            assert blog_started.wait(1), "blog fetch did not start before paper discovery"
+            paper_started.set()
+            return []
+
+    class NoLLM:
+        provider = "none"
+        model = "none"
+
+        def close(self):
+            pass
+
+    def fake_blog(client, row):
+        blog_started.set()
+        assert paper_started.wait(1), "paper discovery did not overlap the blog fetch"
+        return BlogFetch(
+            status_code=200,
+            title="Blog",
+            method="snapshot",
+            snapshot_text="baseline",
+            snapshot_sha256="baseline-hash",
+        )
+
+    monkeypatch.setattr("paperwatch.pipeline.fetch_blog", fake_blog)
+    with Database(app_config.paths.database) as db:
+        db.add_author(author_candidate)
+        db.add_author_blog(author_candidate.openalex_id, "https://example.test/blog")
+        app = PaperWatch(
+            app_config,
+            db=db,
+            openalex=ParallelOpenAlex(),
+            arxiv=None,
+            llm=NoLLM(),
+            pdf_client=httpx.Client(
+                transport=httpx.MockTransport(
+                    lambda request: httpx.Response(200, text="unused")
+                )
+            ),
+        )
+        stats = app.run(today=date(2026, 8, 1))
+        assert stats.status == "success"
+        assert stats.authors_checked == 1
+        assert stats.blogs_checked == 1
+
+
+
+def test_available_pdf_is_archived_when_legacy_download_toggle_is_false_and_abstracts_are_disabled(
+    app_config, author_candidate, paper_record, analysis_result, monkeypatch
+):
+    from paperwatch.analysis import AnalysisOutcome
+    from paperwatch.chunking import ChunkedAnalysisOutcome
+
+    config = replace(
+        app_config,
+        fetch=replace(app_config.fetch, download_pdfs=False),
+        llm=replace(
+            app_config.llm,
+            analyze_abstracts=False,
+            pdf_analysis_strategy="chunked",
+        ),
+    )
+
+    class ChunkCapableLLM(FakeLLM):
+        def generate_json(self, *args, **kwargs):
+            raise AssertionError("chunk helper is patched")
+
+    chunk_calls: list[str] = []
+
+    def chunked(**kwargs):
+        chunk_calls.append(kwargs["text"])
+        analysis_id = kwargs["db"].save_analysis(
+            paper_id=kwargs["paper_id"],
+            scope="fulltext",
+            provider="fake",
+            model="fake-model",
+            prompt_version=config.llm.prompt_version,
+            content_sha256="default-chunked",
+            input_chars=len(kwargs["text"]),
+            result=analysis_result,
+            usage={},
+            analysis_strategy="chunked",
+            context_window_tokens=config.llm.context_window_tokens,
+            chunk_count=2,
+        )
+        return ChunkedAnalysisOutcome(
+            AnalysisOutcome(analysis_result, analysis_id, True), 2
+        )
+
+    monkeypatch.setattr("paperwatch.pipeline.extract_pdf_text", lambda *args, **kwargs: "pdf text")
+    monkeypatch.setattr("paperwatch.pipeline.analyze_chunked_text", chunked)
+    with Database(config.paths.database) as db:
+        db.add_author(author_candidate)
+        app = PaperWatch(
+            config,
+            db=db,
+            openalex=FakeOpenAlex([paper_record]),
+            arxiv=None,
+            llm=ChunkCapableLLM(analysis_result),
+            pdf_client=httpx.Client(
+                transport=httpx.MockTransport(
+                    lambda request: httpx.Response(200, content=PDF_BYTES)
+                )
+            ),
+        )
+        stats = app.run(
+            today=date(2026, 7, 24), analyze_discovered_papers=True
+        )
+        stored = db.list_papers()[0]
+        assert stats.status == "success"
+        assert stats.pdfs_downloaded == 1
+        assert Path(stored["local_pdf_path"]).read_bytes() == PDF_BYTES
+        assert chunk_calls == ["pdf text"]
+        assert db._conn.execute(
+            "SELECT count(*) FROM analyses WHERE scope='abstract'"
+        ).fetchone()[0] == 0
+
+
+def test_recent_missing_pdf_is_refreshed_and_retried(
+    app_config, paper_record, analysis_result
+):
+    stored_paper = deepcopy(paper_record)
+    stored_paper.pdf_url = None
+    stored_paper.pdf_source = None
+
+    class RefreshingOpenAlex(FakeOpenAlex):
+        def __init__(self):
+            super().__init__([])
+            self.work_calls: list[str] = []
+
+        def get_work(self, work_id):
+            self.work_calls.append(work_id)
+            return deepcopy(paper_record)
+
+    class NoLLM:
+        provider = "none"
+        model = ""
+
+        def close(self):
+            pass
+
+    config = replace(app_config, llm=replace(app_config.llm, provider="none", model=""))
+    openalex = RefreshingOpenAlex()
+    progress: list[tuple[str, str]] = []
+    with Database(config.paths.database) as db:
+        paper_id, _ = db.upsert_paper(stored_paper)
+        app = PaperWatch(
+            config,
+            db=db,
+            openalex=openalex,
+            arxiv=None,
+            llm=NoLLM(),
+            progress=lambda kind, value: progress.append((kind, value)),
+            pdf_client=httpx.Client(
+                transport=httpx.MockTransport(
+                    lambda request: httpx.Response(200, content=PDF_BYTES)
+                )
+            ),
+        )
+        stats = app.run(today=date(2026, 7, 24))
+        row = db.get_paper(paper_id)
+        assert stats.status == "success"
+        assert stats.pdfs_downloaded == 1
+        assert openalex.work_calls == ["W456"]
+        assert Path(row["local_pdf_path"]).is_file()
+        assert ("progress", "1/1") in progress
+        assert any(value.startswith("Retried PDF") for kind, value in progress if kind == "message")
+
+
+def test_fetch_run_can_be_cancelled_before_network_work(
+    app_config, author_candidate, analysis_result
+):
+    import threading
+
+    event = threading.Event()
+    event.set()
+    progress: list[tuple[str, str]] = []
+    with Database(app_config.paths.database) as db:
+        db.add_author(author_candidate)
+        app = PaperWatch(
+            app_config,
+            db=db,
+            openalex=FakeOpenAlex([]),
+            arxiv=None,
+            llm=FakeLLM(analysis_result),
+            cancel_event=event,
+            progress=lambda kind, value: progress.append((kind, value)),
+        )
+        stats = app.run(today=date(2026, 7, 24))
+        assert stats.status == "cancelled"
+        assert db.list_runs(1)[0]["status"] == "cancelled"
+        assert ("progress", "0/1") in progress
+
+
+def test_pdf_retry_uses_stored_url_when_refresh_fails_and_records_bad_pdf(
+    app_config, paper_record
+):
+    first = deepcopy(paper_record)
+    first.openalex_id = "WRETRY1"
+    first.doi = "10.1000/retry1"
+    first.arxiv_id = "2607.10001"
+    first.title = "Retry from stored URL"
+    first.pdf_url = "https://papers.test/good.pdf"
+    first.publication_date = "2026-07-20"
+    second = deepcopy(paper_record)
+    second.openalex_id = "WRETRY2"
+    second.doi = "10.1000/retry2"
+    second.arxiv_id = "2607.10002"
+    second.title = "Retry invalid PDF"
+    second.pdf_url = "https://papers.test/bad.pdf"
+    second.publication_date = "2026-07-19"
+
+    class FailingRefresh(FakeOpenAlex):
+        def get_work(self, work_id):
+            raise RuntimeError("OpenAlex temporarily unavailable")
+
+    class NoLLM:
+        provider = "none"
+        model = ""
+
+        def close(self):
+            pass
+
+    def handler(request):
+        if request.url.path.endswith("good.pdf"):
+            return httpx.Response(200, content=PDF_BYTES)
+        return httpx.Response(200, content=b"not a pdf")
+
+    config = replace(app_config, llm=replace(app_config.llm, provider="none", model=""))
+    with Database(config.paths.database) as db:
+        first_id, _ = db.upsert_paper(first)
+        db.upsert_paper(second)
+        app = PaperWatch(
+            config,
+            db=db,
+            openalex=FailingRefresh([]),
+            arxiv=None,
+            llm=NoLLM(),
+            pdf_client=httpx.Client(transport=httpx.MockTransport(handler)),
+        )
+        stats = app.run(today=date(2026, 7, 24))
+        assert stats.status == "partial"
+        assert stats.pdfs_downloaded == 1
+        assert Path(db.get_paper(first_id)["local_pdf_path"]).is_file()
+        errors = db.get_run_errors(stats.run_id)
+        assert any(row["stage"] == "pdf_retry" and "Retry invalid PDF" in row["message"] for row in errors)

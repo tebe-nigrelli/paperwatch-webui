@@ -1,5 +1,5 @@
 [Unit]
-Description=Run paperwatch once per day
+Description=Check papers and author blogs once per day
 
 [Timer]
 OnCalendar=daily

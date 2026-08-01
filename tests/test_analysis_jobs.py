@@ -454,6 +454,76 @@ prompt_version = "test-v1"
         assert analysis["input_chars"] > 0
 
 
+def test_claude_code_fulltext_batch_reads_original_pdf_natively(
+    config_path, paper_record, analysis_result, monkeypatch
+):
+    with config_path.open("a", encoding="utf-8") as handle:
+        handle.write(
+            """
+
+[[llm_profiles]]
+name = "claude-review"
+provider = "claude-code"
+model = "claude-sonnet-4-5"
+command = "claude"
+reasoning_effort = "high"
+timeout_seconds = 1
+max_input_chars = 5000
+context_window_tokens = 200000
+analyze_pdfs = true
+prompt_version = "test-v1"
+"""
+        )
+    config = load_config(config_path)
+    pdf = config.paths.pdf_dir / "complete.pdf"
+    pdf.parent.mkdir(parents=True, exist_ok=True)
+    pdf.write_bytes(b"%PDF-1.7\nTHE ORIGINAL COMPLETE PAPER\n%%EOF")
+    with Database(config.paths.database) as db:
+        paper_id, _ = db.upsert_paper(paper_record)
+        db.set_local_pdf(paper_id, str(pdf))
+        db.create_analysis_tasks(
+            batch_id="claude-pdf",
+            paper_id=paper_id,
+            scope="fulltext",
+            profiles=[("claude-review", "claude-code", "claude-sonnet-4-5")],
+            analysis_strategy="chunked",
+            context_window_tokens=200000,
+        )
+
+    read_files = []
+
+    class FakeClaude:
+        provider = "claude-code"
+        model = "claude-sonnet-4-5"
+
+        def analyze_pdf(self, prompt, pdf_path):
+            read_files.append((prompt, Path(pdf_path).read_bytes()))
+            return LLMResponse(result=analysis_result, usage={"input_tokens": 10})
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr("paperwatch.analysis_jobs.create_llm", lambda profile: FakeClaude())
+    monkeypatch.setattr(
+        "paperwatch.analysis_jobs.extract_pdf_text",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("must not extract")),
+    )
+    assert run_analysis_batch(
+        config_path,
+        "claude-pdf",
+        paper_id,
+        "fulltext",
+        ("claude-review",),
+        "chunked",
+        200000,
+    ) == {"completed": 1, "failed": 0}
+    assert read_files[0][1] == pdf.read_bytes()
+    with Database(config.paths.database) as db:
+        analysis = db.paper_analyses(paper_id)[0]
+        assert analysis["provider"] == "claude-code"
+        assert analysis["analysis_strategy"] == "pdf_upload"
+
+
 def test_fulltext_replaces_truncated_cached_pdf(
     config_path, paper_record, monkeypatch
 ):
@@ -553,3 +623,18 @@ def test_fulltext_does_not_redownload_non_corruption_errors(
         with pytest.raises(PDFError, match="no extractable text"):
             _paper_text(config, db, paper_id, "fulltext", client)
     assert requests == []
+
+
+def test_analysis_controller_tracks_numeric_progress_and_ignores_invalid(config_path):
+    controller = AnalysisController(config_path, runner=lambda *args: {"completed": 0, "failed": 0})
+    controller._progress("stage", "Summarizing")
+    controller._progress("message", "Model one")
+    controller._progress("reset_output", "")
+    controller._progress("output", "partial")
+    controller._progress("progress", "2/5")
+    controller._progress("progress", "bad/value")
+    snapshot = controller.snapshot()
+    assert snapshot.stage == "Summarizing"
+    assert snapshot.message == "Model one"
+    assert snapshot.live_output == "partial"
+    assert (snapshot.progress_current, snapshot.progress_total) == (2, 5)

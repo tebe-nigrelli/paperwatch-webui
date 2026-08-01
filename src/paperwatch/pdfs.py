@@ -3,10 +3,12 @@ from __future__ import annotations
 import hashlib
 import re
 from pathlib import Path
+import threading
 
 import httpx
 
 from . import USER_AGENT
+from .job_runtime import check_cancelled
 from pypdf import PdfReader
 
 
@@ -64,6 +66,7 @@ def download_pdf(
     max_bytes: int,
     client: httpx.Client | None = None,
     timeout_seconds: float = 60,
+    cancel_event: threading.Event | None = None,
 ) -> bool:
     if not url.lower().startswith(("http://", "https://")):
         raise PDFError("PDF URL must use http or https")
@@ -82,6 +85,7 @@ def download_pdf(
     temporary = destination.with_suffix(destination.suffix + ".part")
     total = 0
     try:
+        check_cancelled(cancel_event)
         with http.stream("GET", url) as response:
             response.raise_for_status()
             length = response.headers.get("content-length")
@@ -89,6 +93,7 @@ def download_pdf(
                 raise PDFError(f"PDF exceeds maximum size of {max_bytes} bytes")
             with temporary.open("wb") as handle:
                 for chunk in response.iter_bytes():
+                    check_cancelled(cancel_event)
                     if not chunk:
                         continue
                     total += len(chunk)

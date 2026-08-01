@@ -322,3 +322,46 @@ reasoning_effort = "minimal"
     )
     with pytest.raises(ConfigError, match="Claude Code profile.*low, medium, high, xhigh, or max"):
         load_config(config_path)
+
+
+def test_pdf_retry_and_analysis_defaults_and_overrides(config_path: Path):
+    loaded = load_config(config_path)
+    assert loaded.fetch.retry_missing_pdf_days == 90
+    assert loaded.llm.analyze_abstracts is True
+    assert loaded.llm.pdf_analysis_strategy == "chunked"
+
+    text = config_path.read_text()
+    text = text.replace(
+        "max_pdf_chars = 10000",
+        "max_pdf_chars = 10000\nretry_missing_pdf_days = 14",
+    )
+    text = text.replace(
+        'analyze_pdfs = true',
+        'analyze_abstracts = false\nanalyze_pdfs = true\npdf_analysis_strategy = "direct"',
+    )
+    config_path.write_text(text)
+    loaded = load_config(config_path)
+    assert loaded.fetch.retry_missing_pdf_days == 14
+    assert loaded.llm.analyze_abstracts is False
+    assert loaded.llm.pdf_analysis_strategy == "direct"
+
+
+def test_new_pdf_retry_and_strategy_values_are_validated(config_path: Path):
+    original = config_path.read_text()
+    config_path.write_text(
+        original.replace(
+            "max_pdf_chars = 10000",
+            "max_pdf_chars = 10000\nretry_missing_pdf_days = 0",
+        )
+    )
+    with pytest.raises(ConfigError, match="retry_missing_pdf_days"):
+        load_config(config_path)
+
+    config_path.write_text(
+        original.replace(
+            'analyze_pdfs = true',
+            'analyze_pdfs = true\npdf_analysis_strategy = "sometimes"',
+        )
+    )
+    with pytest.raises(ConfigError, match="pdf_analysis_strategy"):
+        load_config(config_path)

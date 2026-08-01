@@ -1,30 +1,33 @@
 {% extends "base.html" %}
 {% block title %}Saved queries · paperwatch{% endblock %}
 {% block content %}
-<section class="page-heading"><h1>Saved queries</h1><p>Save only a name and prompt. Choose papers, models, source, PDF strategy, and context when running it.</p></section>
-<section class="panel compact-panel">
-  <form method="post" action="/queries" class="query-editor query-editor-simple">
-    <label><span>Name</span><input name="name" placeholder="e.g. Compare scaling-law assumptions" required></label>
-    <label class="full"><span>Prompt</span><textarea name="prompt" rows="4" placeholder="Compare the methods and list the strongest evidence for each paper." required></textarea></label>
-    <button class="button button-primary" type="submit">Save query</button>
-  </form>
+<section class="page-heading split">
+  <div><h1>Saved queries</h1><p>Each prompt stores its models, context window, and paper input strategy. Select papers and run manually, or check New papers or New blog entries to run it after a fetch. When all boxes are clear, fetching does not run a model.</p></div>
+  <a class="button button-primary" href="/queries/new">New query</a>
 </section>
-<section class="query-list">
-{% for query in queries %}
-<article class="panel query-card" id="query-{{ query.id }}">
-  <div class="panel-heading"><div><h2>{{ query.name }}{% if query.is_builtin %} <span class="badge">Built in</span>{% endif %}</h2><p>{{ query.run_count }} run{{ '' if query.run_count == 1 else 's' }}</p></div><span class="status status-{{ query.latest_status or 'disabled' }}">{{ query.latest_status or 'not run' }}</span></div>
-  <p class="query-prompt">{{ query.prompt }}</p>
-  <div class="query-card-actions"><a class="button button-primary" href="/">Select papers and run</a><details class="query-edit"><summary>Edit{% if not query.is_builtin %} or delete{% endif %}</summary>
-    <form method="post" action="/queries/{{ query.id }}/edit" class="query-editor compact">
-      <label><span>Name</span><input name="name" value="{{ query.name }}" required {% if query.is_builtin %}readonly{% endif %}></label>
-      <label class="full"><span>Prompt</span><textarea name="prompt" rows="4" required>{{ query.prompt }}</textarea></label>
-      <button class="button" type="submit">Save changes</button>
-    </form>
-    {% if not query.is_builtin %}<form method="post" action="/queries/{{ query.id }}/delete" data-confirm="Delete this saved query and its run outputs?"><button class="button button-danger button-small" type="submit">Delete query</button></form>{% endif %}
-  </details></div>
-  {% set qruns = runs_by_query.get(query.id, []) %}
-  {% if qruns %}<div class="query-results"><h3>Outputs</h3>{% for run in qruns %}<details {% if loop.first %}open{% endif %}><summary>{{ run.model }} · {{ run.status }} · {{ run.matched_count }} records · {{ run.created_at }}</summary><p class="query-selection"><a href="{{ run.selection_url }}">{{ run.selection_label }}</a></p>{% if run.error_text %}<div class="notice notice-error">{{ run.error_text }}</div>{% elif run.output %}<h4>{{ run.output["title"] }}</h4><p>{{ run.output["summary"] }}</p><ol>{% for item in run.output["items"] %}<li>{% if item["paper_id"] %}<a href="/papers/{{ item["paper_id"] }}">{{ item["title"] }}</a>{% else %}<strong>{{ item["title"] }}</strong>{% endif %}<p>{{ item["output"] }}</p></li>{% endfor %}</ol><details><summary>Raw JSON</summary><pre>{{ run.output|prettyjson }}</pre></details>{% else %}<p class="muted">Queued or running.</p>{% endif %}</details>{% endfor %}</div>{% endif %}
-</article>
-{% endfor %}
+
+<form id="automatic-query-form" method="post" action="/queries/automatic" data-auto-save="query-selections"></form>
+<section class="panel">
+  <div class="panel-heading"><div><h2>Queries</h2><p>These two columns are the only fetch-time model triggers.</p></div><div class="query-selection-meta"><span>{{ queries|length }}</span><small id="automatic-query-status" class="muted" aria-live="polite">Changes save automatically</small></div></div>
+  <div class="table-wrap"><table><thead><tr><th>Name</th><th>Models</th><th>Context</th><th>Paper input</th><th>New papers</th><th>New blog entries</th><th>Runs</th><th>Latest</th><th>Actions</th></tr></thead><tbody>
+  {% for query in queries %}<tr id="query-{{ query.id }}">
+    <td><input type="hidden" name="query_id" value="{{ query.id }}" form="automatic-query-form"><strong>{{ query.name }}</strong>{% if query.is_builtin %}<small><span class="badge">Built in</span></small>{% endif %}<small>Updated {{ query.updated_at }}</small></td>
+    <td>{% for model in query.selected_models %}<span class="badge">{{ model.profile }}</span><small>{{ model.model }}</small>{% else %}<span class="muted">No model</span>{% endfor %}</td>
+    <td>{{ query.context_window_tokens }}</td>
+    <td>{{ {'auto':'Auto', 'abstract':'Abstract', 'fulltext':'Full PDF'}.get(query.paper_source_scope, query.paper_source_scope) }}{% if query.paper_source_scope != 'abstract' %}<small>{{ {'auto':'Auto', 'direct':'Direct', 'chunked':'Chunk + merge'}.get(query.pdf_strategy, query.pdf_strategy) }}</small>{% endif %}</td>
+    <td><label class="table-check"><input type="checkbox" name="auto_run_papers" value="{{ query.id }}" form="automatic-query-form" {% if query.auto_run_papers %}checked{% endif %}><span class="sr-only">Run {{ query.name }} on new papers</span></label></td>
+    <td><label class="table-check"><input type="checkbox" name="auto_run_blogs" value="{{ query.id }}" form="automatic-query-form" {% if query.auto_run_blogs %}checked{% endif %}><span class="sr-only">Run {{ query.name }} on new blog entries</span></label></td>
+    <td>{{ query.run_count }}</td>
+    <td><span class="status status-{{ query.latest_status or 'disabled' }}">{{ query.latest_status or 'not run' }}</span></td>
+    <td><div class="button-group"><a class="button button-small button-primary" href="/queries/{{ query.id }}/edit">Edit</a><a class="button button-small" href="/?query_id={{ query.id }}">Papers</a><a class="button button-small" href="/blogs?query_id={{ query.id }}">Blogs</a></div></td>
+  </tr>{% else %}<tr><td colspan="9" class="empty">No saved queries.</td></tr>{% endfor %}
+  </tbody></table></div>
+</section>
+
+<section class="panel">
+  <div class="panel-heading"><h2>Recent outputs</h2><span>{{ runs|length }}</span></div>
+  <div class="table-wrap"><table><thead><tr><th>Query</th><th>Model</th><th>Status</th><th>Records</th><th>Created</th><th>Output</th></tr></thead><tbody>
+  {% for run in runs %}<tr><td><a href="#query-{{ run.query_id }}">{{ run.query_name }}</a></td><td>{{ run.model }}</td><td><span class="status status-{{ run.status }}">{{ run.status }}</span>{% if run.error_text %}<small class="task-error">{{ run.error_text }}</small>{% endif %}</td><td>{{ run.matched_count }}{% if run.selection_label %}<small>{{ run.selection_label }}</small>{% endif %}</td><td>{{ run.created_at }}</td><td>{% if run.output %}<details><summary>{{ run.output.title }}</summary><p>{{ run.output.summary }}</p><ol>{% for item in run.output["items"] %}<li>{% if item["blog_entry_id"] %}<a href="/blogs/{{ item["blog_entry_id"] }}">{{ item["title"] }}</a>{% elif item["paper_id"] %}<a href="/papers/{{ item["paper_id"] }}">{{ item["title"] }}</a>{% else %}<strong>{{ item["title"] }}</strong>{% endif %}<p>{{ item["output"] }}</p></li>{% endfor %}</ol></details>{% else %}<span class="muted">Queued or running</span>{% endif %}</td></tr>{% else %}<tr><td colspan="6" class="empty">No query outputs.</td></tr>{% endfor %}
+  </tbody></table></div>
 </section>
 {% endblock %}

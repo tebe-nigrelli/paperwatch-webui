@@ -1,0 +1,27 @@
+{% extends "base.html" %}
+{% block title %}{{ entry.title }} · paperwatch{% endblock %}
+{% block content %}
+<section class="page-heading split"><div><p class="eyebrow">{{ 'RSS post' if entry.entry_kind == 'rss' else 'Blog snapshot' }} · {{ entry.change_kind }}</p><h1>{{ entry.title }}</h1><p>{{ entry.author_names or 'No tracked author' }} · {{ entry.published_at or entry.fetched_at }}</p></div><div class="button-group"><a class="button" href="/blogs">Back to updates</a><a class="button button-primary" href="{{ entry.source_url or entry.url }}" target="_blank" rel="noreferrer">Open original</a></div></section>
+{% if entry.entry_kind == 'rss' and not entry.diff_text %}
+<section class="panel"><div class="panel-heading"><h2>Feed entry</h2><span>{{ entry.blog_title }}</span></div><pre class="blog-diff">{{ entry.normalized_text }}</pre></section>
+{% else %}
+<section class="panel"><div class="panel-heading"><h2>Version difference</h2><span>{{ entry.blog_title }}</span></div><pre class="blog-diff">{{ entry.diff_text or 'No textual difference stored.' }}</pre></section>
+<details class="panel"><summary>Current normalized text</summary><pre class="blog-diff">{{ entry.normalized_text }}</pre></details>
+{% endif %}
+
+<section class="panel model-runner">
+  <div class="panel-heading"><div><h2>Run saved prompt</h2><p>Use the same reusable prompts and model profiles available for research papers.</p></div>{% if query_state.running and query_state.blog_entry_id == entry.id %}<span class="status status-running">running</span>{% endif %}</div>
+  {% if saved_queries and model_profiles %}
+  <form id="saved-prompt-form" data-paper-job="query" method="post" action="/blogs/{{ entry.id }}/prompt" class="saved-prompt-runner">
+    <label class="grow"><span>Saved prompt</span><select name="query_id" required>{% for query in saved_queries %}<option value="{{ query.id }}">{{ query.name }}</option>{% endfor %}</select></label>
+    <fieldset class="model-options"><legend>Models</legend>{% for profile in model_profiles %}<label class="model-option"><input type="checkbox" name="model" value="{{ profile.profile }}" {% if loop.first %}checked{% endif %}><span><strong>{{ profile.profile }}</strong><small>{{ profile.provider }} · {{ profile.model }}</small></span></label>{% endfor %}</fieldset>
+    <div class="model-run-actions"><label><span>Source</span><input value="Stored blog entry" disabled></label><label><span>Context window tokens</span><input type="number" name="context_window_tokens" min="512" max="1000000" value="16384"></label><button class="button button-primary" type="submit" {% if query_state.running %}disabled{% endif %}>Run saved prompt</button></div>
+  </form>
+  {% elif not saved_queries %}<p class="form-help">Create a reusable prompt on <a href="/queries">Queries</a>.</p>{% else %}<p class="muted">No active LLM profiles are configured.</p>{% endif %}
+  <div id="paper-jobs" class="live-job" data-blog-entry-id="{{ entry.id }}" hidden><div class="live-job-heading"><div><strong id="job-stage">Starting</strong><small id="job-message"></small></div><button id="job-cancel" class="button button-small button-danger" type="button">Stop</button></div><pre id="job-output" aria-live="polite"></pre></div>
+</section>
+
+<div id="paper-results">
+{% if prompt_runs %}<section class="panel prompt-results"><div class="panel-heading"><div><h2>Saved prompt results</h2><p>Completed prompts run on this blog entry.</p></div></div>{% for run in prompt_runs %}<article class="prompt-result"><div class="panel-heading"><div><h3>{{ run.query_name }} · {{ run.model }}</h3><p>{{ run.created_at }} · {{ run.matched_count }} matched record{{ '' if run.matched_count == 1 else 's' }}</p></div><a class="button button-small" href="/queries#query-{{ run.query_id }}">Saved query</a></div>{% if run.output %}<h4>{{ run.output.title }}</h4><p class="lead">{{ run.output.summary }}</p>{% if run.output["items"] %}<div class="object-list">{% for item in run.output["items"] %}<article>{% if item.blog_entry_id %}<a href="/blogs/{{ item.blog_entry_id }}"><strong>{{ item.title }}</strong></a>{% elif item.paper_id %}<a href="/papers/{{ item.paper_id }}"><strong>{{ item.title }}</strong></a>{% else %}<strong>{{ item.title }}</strong>{% endif %}<p>{{ item.output }}</p></article>{% endfor %}</div>{% endif %}{% endif %}</article>{% endfor %}</section>{% endif %}
+</div>
+{% endblock %}

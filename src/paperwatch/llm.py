@@ -252,6 +252,7 @@ class OllamaClient:
         *,
         schema: dict[str, Any],
         force_stream: bool | None = None,
+        output_tokens: int | None = None,
     ) -> StructuredJSONResponse | None:
         endpoint = f"{self.base_url}/api/chat"
         request_json = {
@@ -266,6 +267,7 @@ class OllamaClient:
             "think": False,
             "options": {
                 "temperature": 0,
+                **({"num_predict": output_tokens} if output_tokens else {}),
                 **(
                     {"num_ctx": self.context_window_tokens}
                     if self.context_window_tokens is not None
@@ -375,26 +377,36 @@ class OllamaClient:
     ) -> StructuredJSONResponse | None:
         first_error: _OllamaOutputError | None = None
         last_error: _OllamaOutputError | None = None
-        for attempt in range(2):
+        context = self.context_window_tokens or 16_384
+        output_limits = (
+            max(1_024, min(4_096, context // 4)),
+            max(2_048, min(8_192, context // 3)),
+            max(3_072, min(12_288, context // 2)),
+        )
+        for attempt in range(3):
             retry_prompt = prompt
             if attempt:
                 retry_prompt = (
                     prompt
                     + "\n\nReturn one complete JSON object only. Do not include reasoning, "
-                    "markdown fences, commentary, or text outside the JSON object."
+                    "markdown fences, commentary, or text outside the JSON object. "
+                    "Keep strings concise so every required field is completed before stopping."
                 )
             try:
                 return self._native_generate_once(
-                    retry_prompt, schema=schema, force_stream=False if attempt else None
+                    retry_prompt,
+                    schema=schema,
+                    force_stream=False if attempt else None,
+                    output_tokens=output_limits[attempt],
                 )
             except _OllamaOutputError as exc:
                 last_error = exc
                 if attempt == 0:
                     first_error = exc
-                if attempt == 0 and self._progress is not None:
+                if attempt < 2 and self._progress is not None:
                     self._progress(
                         "message",
-                        "Ollama returned incomplete structured output; retrying once",
+                        "Ollama returned incomplete structured output; retrying with a larger output budget",
                     )
         assert last_error is not None
         detail = str(last_error)
@@ -789,7 +801,18 @@ class ClaudeCodeClient:
                 f"Claude Code executable {self.command!r} was not found; install Claude Code or set command"
             )
 
-    def _command(self, schema: dict[str, Any]) -> list[str]:
+    def _command(
+        self, schema: dict[str, Any], *, allow_pdf_read: bool = False
+    ) -> list[str]:
+        tools = "Read" if allow_pdf_read else ""
+        system_prompt = (
+            "You are a careful research-paper analyst. Use only the Read tool to read "
+            "the PDF path supplied by the user, read the complete document, and follow "
+            "the user's output schema exactly."
+            if allow_pdf_read
+            else "You are a careful research-paper analyst. Do not use tools. Follow the "
+            "user's source and output schema exactly."
+        )
         command = [
             self.command,
             "-p",
@@ -802,39 +825,55 @@ class ClaudeCodeClient:
             self.model,
             "--safe-mode",
             "--tools",
-            "",
+            tools,
             "--strict-mcp-config",
             "--permission-mode",
             "dontAsk",
             "--no-session-persistence",
             "--system-prompt",
-            "You are a careful research-paper analyst. Do not use tools. Follow the user's source and output schema exactly.",
+            system_prompt,
         ]
         if self.reasoning_effort:
             command.extend(("--effort", self.reasoning_effort))
         return command
 
-    def generate_json(
+    def _generate_json(
         self,
         prompt: str,
         *,
         schema: dict[str, Any],
-        schema_name: str,
+        pdf_path: Path | None = None,
     ) -> StructuredJSONResponse:
-        del schema_name
         self.check_ready()
         check_cancelled(self._cancel_event)
+        process_prompt = prompt
+        popen_kwargs: dict[str, Any] = {
+            "stdin": subprocess.PIPE,
+            "stdout": subprocess.PIPE,
+            "stderr": subprocess.PIPE,
+            "text": True,
+            "encoding": "utf-8",
+        }
+        if pdf_path is not None:
+            path = Path(pdf_path).resolve()
+            if not path.is_file():
+                raise LLMError(f"PDF file does not exist: {path}")
+            process_prompt = (
+                f"The complete PDF is the local file {json.dumps(str(path))}. Use the Read "
+                "tool to read the PDF directly and in full, "
+                "including figures, tables, appendices, footnotes, and bibliography. Do not "
+                f"use an extracted-text substitute.\n\n{prompt}"
+            )
+            popen_kwargs["cwd"] = str(path.parent)
         try:
             process = subprocess.Popen(
-                self._command(schema),
-                stdin=subprocess.PIPE,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-                encoding="utf-8",
+                self._command(schema, allow_pdf_read=pdf_path is not None),
+                **popen_kwargs,
             )
             self._process = process
-            stdout, stderr = process.communicate(prompt, timeout=self.timeout_seconds)
+            stdout, stderr = process.communicate(
+                process_prompt, timeout=self.timeout_seconds
+            )
         except subprocess.TimeoutExpired as exc:
             process.terminate()
             try:
@@ -868,9 +907,21 @@ class ClaudeCodeClient:
         for key in ("total_cost_usd", "duration_ms", "duration_api_ms", "num_turns"):
             if key in payload:
                 usage[key] = payload[key]
+        if pdf_path is not None:
+            usage["input_file_bytes"] = Path(pdf_path).stat().st_size
         if self._progress is not None:
             self._progress("output", json.dumps(data, ensure_ascii=False))
         return StructuredJSONResponse(data=data, usage=usage, raw=payload)
+
+    def generate_json(
+        self,
+        prompt: str,
+        *,
+        schema: dict[str, Any],
+        schema_name: str,
+    ) -> StructuredJSONResponse:
+        del schema_name
+        return self._generate_json(prompt, schema=schema)
 
     def analyze(self, prompt: str) -> LLMResponse:
         try:
@@ -885,6 +936,20 @@ class ClaudeCodeClient:
             raise
         except ValidationError as exc:
             raise LLMError(f"Claude Code analysis failed: {exc}") from exc
+
+    def analyze_pdf(self, prompt: str, pdf_path: Path) -> LLMResponse:
+        try:
+            response = self._generate_json(
+                prompt, schema=ANALYSIS_JSON_SCHEMA, pdf_path=Path(pdf_path)
+            )
+            result = AnalysisResult.model_validate(response.data).model_copy(
+                update={"generated_by_model": model_attribution(self.model)}
+            )
+            return LLMResponse(result=result, usage=response.usage, raw=response.raw)
+        except LLMError:
+            raise
+        except (OSError, ValidationError) as exc:
+            raise LLMError(f"Claude Code PDF analysis failed: {exc}") from exc
 
 
 def configure_job_runtime(

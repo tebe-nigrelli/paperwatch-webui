@@ -22,8 +22,11 @@ from fastapi.templating import Jinja2Templates
 from starlette.datastructures import UploadFile
 
 from .analysis_jobs import AnalysisController
+from .blog_import import import_blog_links
+from .blogs import normalize_blog_url
 from .config import AppConfig, load_config
 from .db import Database
+from .job_runtime import ProgressCallback
 from .locking import AnalysisAlreadyInProgress, analysis_lock
 from .models import (
     AuthorCandidate,
@@ -134,6 +137,12 @@ class RunSnapshot:
     status: str | None = None
     stats: dict[str, Any] | None = None
     error: str | None = None
+    cancelled: bool = False
+    cancel_requested: bool = False
+    progress_current: int = 0
+    progress_total: int = 0
+    stage: str = ""
+    message: str = ""
 
 
 class RunController:
@@ -149,6 +158,7 @@ class RunController:
         self._lock = threading.Lock()
         self._snapshot = RunSnapshot()
         self._thread: threading.Thread | None = None
+        self._cancel_event = threading.Event()
 
     def start(self, mode: str = "run", query: str | None = None) -> bool:
         if mode not in {"run", "backfill", "search", "download"}:
@@ -159,12 +169,15 @@ class RunController:
         with self._lock:
             if self._snapshot.running:
                 return False
+            self._cancel_event = threading.Event()
             self._snapshot = RunSnapshot(
                 running=True,
                 mode=mode,
                 query=normalized_query,
                 started_at=_utcnow(),
                 status="running",
+                stage="Queued",
+                message="Preparing fetch",
             )
             self._thread = threading.Thread(
                 target=self._work,
@@ -178,7 +191,15 @@ class RunController:
     def _work(self, mode: str, query: str | None) -> None:
         try:
             parameter_count = len(inspect.signature(self._runner).parameters)
-            if parameter_count >= 3:
+            if parameter_count >= 5:
+                result = self._runner(
+                    self.config_path,
+                    mode,
+                    query,
+                    self._progress,
+                    self._cancel_event,
+                )
+            elif parameter_count >= 3:
                 result = self._runner(self.config_path, mode, query)
             else:
                 result = self._runner(self.config_path, mode)
@@ -189,12 +210,41 @@ class RunController:
                 self._snapshot.paper_id = _int_or_none(result.get("paper_id"))
                 self._snapshot.status = str(result.get("status") or "success")
                 self._snapshot.stats = dict(result)
+                self._snapshot.cancelled = self._snapshot.status == "cancelled"
+                self._snapshot.cancel_requested = False
+                self._snapshot.stage = (
+                    "Cancelled" if self._snapshot.cancelled else "Complete"
+                )
         except Exception as exc:
             with self._lock:
                 self._snapshot.running = False
                 self._snapshot.finished_at = _utcnow()
                 self._snapshot.status = "failed"
                 self._snapshot.error = str(exc)
+                self._snapshot.cancel_requested = False
+                self._snapshot.stage = "Failed"
+                self._snapshot.message = str(exc)
+
+    def _progress(self, kind: str, value: str) -> None:
+        with self._lock:
+            if kind == "stage":
+                self._snapshot.stage = value[:200]
+            elif kind == "message":
+                self._snapshot.message = value[:1000]
+            elif kind == "progress":
+                current, separator, total = value.partition("/")
+                if separator:
+                    self._snapshot.progress_current = _int_or_none(current) or 0
+                    self._snapshot.progress_total = _int_or_none(total) or 0
+
+    def cancel(self) -> bool:
+        with self._lock:
+            if not self._snapshot.running:
+                return False
+            self._snapshot.cancel_requested = True
+            self._snapshot.message = "Stopping after the current network operation"
+            self._cancel_event.set()
+        return True
 
     def snapshot(self) -> RunSnapshot:
         with self._lock:
@@ -207,7 +257,11 @@ class RunController:
 
 
 def _run_pipeline(
-    config_path: Path, mode: str = "run", query: str | None = None
+    config_path: Path,
+    mode: str = "run",
+    query: str | None = None,
+    progress: ProgressCallback | None = None,
+    cancel_event: threading.Event | None = None,
 ) -> dict[str, Any]:
     from .cli import build_services
     from .pipeline import PaperWatch
@@ -222,6 +276,8 @@ def _run_pipeline(
             openalex=services.openalex,
             arxiv=services.arxiv,
             llm=services.llm,
+            progress=progress,
+            cancel_event=cancel_event,
         )
         paper_id: int | None = None
         if mode == "backfill":
@@ -318,6 +374,15 @@ def _manual_source_url(value: str) -> str:
     if parsed.scheme.lower() not in {"http", "https"} or not parsed.netloc:
         raise ValueError("Source link must be a valid http or https URL")
     return source
+
+
+def _manual_openalex_author_id(value: str) -> str | None:
+    cleaned = short_openalex_id(clean_text(value))
+    if not cleaned:
+        return None
+    if not re.fullmatch(r"A\d+", cleaned):
+        raise ValueError("OpenAlex author ID must look like A123456789")
+    return cleaned
 
 
 def _manual_publication_date(value: str) -> str | None:
@@ -483,6 +548,63 @@ def _json_value(value: Any, fallback: Any) -> Any:
 
 def _row_dict(row: Any) -> dict[str, Any]:
     return dict(row) if row is not None else {}
+
+
+def _query_profile_names(value: Any) -> tuple[str, ...]:
+    decoded = _json_value(value, [])
+    if not isinstance(decoded, list):
+        return ()
+    return tuple(dict.fromkeys(
+        str(item).strip() for item in decoded if str(item).strip()
+    ))
+
+
+def _query_view(row: Any, config: AppConfig) -> dict[str, Any]:
+    query = _row_dict(row)
+    available = {item.profile: item for item in config.available_llms}
+    selected = _query_profile_names(query.get("model_profiles_json"))
+    if not selected and available:
+        selected = (next(iter(available)),)
+    query["model_profiles"] = list(selected)
+    query["selected_models"] = [
+        {
+            "profile": name,
+            "model": available[name].model if name in available else "Unavailable",
+            "provider": available[name].provider if name in available else "missing",
+        }
+        for name in selected
+    ]
+    query["context_window_tokens"] = int(
+        query.get("context_window_tokens") or DEFAULT_CONTEXT_WINDOW_TOKENS
+    )
+    query["paper_source_scope"] = str(query.get("paper_source_scope") or "auto")
+    query["pdf_strategy"] = str(query.get("pdf_strategy") or "chunked")
+    return query
+
+
+def _query_execution_form(form: Any, config: AppConfig) -> dict[str, Any]:
+    available = {item.profile: item for item in config.available_llms}
+    profiles = tuple(dict.fromkeys(
+        str(value).strip() for value in form.getlist("model") if str(value).strip()
+    ))
+    unknown = [name for name in profiles if name not in available]
+    if unknown:
+        raise ValueError(f"Unknown configured model profile(s): {', '.join(unknown)}")
+    if available and not profiles:
+        profiles = (next(iter(available)),)
+    context = _int_or_none(form.get("context_window_tokens"))
+    if context is None:
+        context = config.llm.context_window_tokens
+    source_scope = str(form.get("paper_source_scope", "auto"))
+    pdf_strategy = str(form.get("pdf_strategy", "chunked"))
+    if source_scope == "abstract":
+        pdf_strategy = "auto"
+    return {
+        "model_profiles": profiles,
+        "context_window_tokens": context,
+        "paper_source_scope": source_scope,
+        "pdf_strategy": pdf_strategy,
+    }
 
 
 def _analysis_view(row: Any) -> dict[str, Any]:
@@ -696,7 +818,11 @@ def _query_output(row: Any) -> dict[str, Any]:
             selection_items.append(f'From {data["selection"]["date_from"]}')
         if data["selection"].get("date_to"):
             selection_items.append(f'To {data["selection"]["date_to"]}')
-    source_scope = str(data["selection"].get("source_scope") or "abstract")
+    content_type = str(data["selection"].get("content_type") or "papers")
+    source_scope = str(
+        data["selection"].get("source_scope")
+        or ("blog" if content_type == "blogs" else "abstract")
+    )
     pdf_strategy = str(data["selection"].get("pdf_strategy") or "auto")
     selection_items.append(f"Source: {source_scope}")
     if source_scope == "fulltext":
@@ -723,7 +849,10 @@ def _query_output(row: Any) -> dict[str, Any]:
         ),
     ]
     selection_query = urlencode([(key, value) for key, value in selection_pairs if value])
-    data["selection_url"] = f"/?{selection_query}" if selection_query else "/"
+    if content_type == "blogs":
+        data["selection_url"] = "/blogs"
+    else:
+        data["selection_url"] = f"/?{selection_query}" if selection_query else "/"
     return data
 
 
@@ -896,31 +1025,17 @@ def create_app(
             recent_errors=recent_errors,
         )
 
-    @app.get("/dashboard", response_class=HTMLResponse)
-    def dashboard(request: Request) -> HTMLResponse:
-        with Database(config.paths.database) as db:
-            stats = db.dashboard_stats()
-            papers, _ = db.search_papers(limit=8, offset=0)
-            runs = db.list_runs(8)
-            errors = db.recent_errors(6)
-        return render(
-            request,
-            "dashboard.html",
-            stats=stats,
-            papers=papers,
-            runs=runs,
-            errors=errors,
-        )
-
     @app.get("/authors", response_class=HTMLResponse)
     def authors(request: Request) -> HTMLResponse:
         tag = request.query_params.get("tag", "").strip()[:40]
         name = request.query_params.get("name", "").strip()[:200]
         query = request.query_params.get("q", "").strip()[:200]
         with Database(config.paths.database) as db:
-            rows = db.list_authors_with_tags(
+            rows = [dict(row) for row in db.list_authors_with_tags(
                 tracked_only=True, tag=tag, query=query
-            )
+            )]
+            for row in rows:
+                row["is_local"] = str(row["openalex_id"]).startswith("LOCAL-")
             tags = db.list_tags()
         return render(
             request,
@@ -930,6 +1045,219 @@ def create_app(
             active_tag=tag,
             author_query=query,
         )
+
+    @app.post("/authors/manual")
+    async def add_manual_author(request: Request) -> RedirectResponse:
+        form = await request.form()
+        name = clean_text(str(form.get("name", ""))) or ""
+        institution = clean_text(str(form.get("institution", "")))
+        try:
+            if not name:
+                raise ValueError("Author name is required")
+            openalex_id = _manual_openalex_author_id(str(form.get("openalex_id", "")))
+            with Database(config.paths.database) as db:
+                if openalex_id:
+                    db.add_author(
+                        AuthorCandidate(
+                            openalex_id=openalex_id,
+                            name=name,
+                            institution=institution,
+                            metadata={"manual": True},
+                        )
+                    )
+                else:
+                    db.add_manual_author(name, institution)
+        except ValueError as exc:
+            return RedirectResponse(
+                _notice_url("/authors", str(exc), level="error"), status_code=303
+            )
+        suffix = " Papers are paused until an OpenAlex ID is provided." if not openalex_id else ""
+        return RedirectResponse(
+            _notice_url("/authors", f"Added {name}.{suffix}"), status_code=303
+        )
+
+    @app.post("/authors/blogs/manual")
+    async def import_single_author_blog(request: Request) -> RedirectResponse:
+        form = await request.form()
+        openalex_id = str(form.get("openalex_id", "")).strip()
+        try:
+            if not openalex_id:
+                raise ValueError("Choose an author")
+            url = normalize_blog_url(str(form.get("url", "")))
+            with Database(config.paths.database) as db:
+                db.add_author_blog(openalex_id, url)
+        except ValueError as exc:
+            return RedirectResponse(
+                _notice_url("/authors", str(exc), level="error"), status_code=303
+            )
+        return RedirectResponse(
+            _notice_url("/authors", "Blog linked."), status_code=303
+        )
+
+    @app.post("/authors/blogs/import")
+    async def import_author_blogs(request: Request) -> RedirectResponse:
+        form = await request.form()
+        upload = form.get("csv_file")
+        create_missing = str(form.get("create_missing", "")) in {"1", "true", "on"}
+        if not isinstance(upload, UploadFile) or not upload.filename:
+            return RedirectResponse(
+                _notice_url("/authors", "Choose a CSV file.", level="error"),
+                status_code=303,
+            )
+        try:
+            raw = await upload.read(5_000_001)
+            if len(raw) > 5_000_000:
+                raise ValueError("CSV file exceeds 5 MB")
+            text = raw.decode("utf-8-sig")
+            with Database(config.paths.database) as db:
+                stats = import_blog_links(
+                    db,
+                    io.StringIO(text, newline=""),
+                    create_missing=create_missing,
+                )
+        except (UnicodeDecodeError, ValueError) as exc:
+            return RedirectResponse(
+                _notice_url("/authors", f"Could not import blogs: {exc}", level="error"),
+                status_code=303,
+            )
+        finally:
+            await upload.close()
+        message = (
+            f"Imported {stats.links} blog links; created {stats.authors_created} authors, "
+            f"skipped {stats.authors_missing} missing and {stats.authors_ambiguous} ambiguous authors."
+        )
+        return RedirectResponse(_notice_url("/authors", message), status_code=303)
+
+    @app.get("/authors/{openalex_id}/blogs", response_class=HTMLResponse)
+    def author_blogs(request: Request, openalex_id: str) -> HTMLResponse:
+        with Database(config.paths.database) as db:
+            author = db.get_author(openalex_id)
+            if author is None or not author["tracked"]:
+                raise HTTPException(404, "Author not found")
+            blogs = db.author_blogs(openalex_id)
+        return render(
+            request,
+            "author_blogs.html",
+            author=author,
+            blogs=blogs,
+        )
+
+    @app.post("/authors/{openalex_id}/blogs")
+    async def add_author_blog(request: Request, openalex_id: str) -> RedirectResponse:
+        form = await request.form()
+        try:
+            url = normalize_blog_url(str(form.get("url", "")))
+            label = str(form.get("label", ""))
+            relationship = str(form.get("relationship", ""))
+            with Database(config.paths.database) as db:
+                db.add_author_blog(
+                    openalex_id,
+                    url,
+                    label=label,
+                    relationship=relationship,
+                )
+        except ValueError as exc:
+            return RedirectResponse(
+                _notice_url(
+                    f"/authors/{quote_plus(openalex_id)}/blogs",
+                    str(exc),
+                    level="error",
+                ),
+                status_code=303,
+            )
+        return RedirectResponse(
+            _notice_url(f"/authors/{quote_plus(openalex_id)}/blogs", "Blog linked."),
+            status_code=303,
+        )
+
+    @app.post("/authors/{openalex_id}/blogs/{blog_id}/remove")
+    def remove_author_blog(openalex_id: str, blog_id: int) -> RedirectResponse:
+        with Database(config.paths.database) as db:
+            if not db.remove_author_blog(openalex_id, blog_id):
+                raise HTTPException(404, "Blog link not found")
+        return RedirectResponse(
+            _notice_url(f"/authors/{quote_plus(openalex_id)}/blogs", "Blog unlinked."),
+            status_code=303,
+        )
+
+    @app.get("/blogs", response_class=HTMLResponse)
+    def blog_feed(request: Request) -> HTMLResponse:
+        selected_query_id = _int_or_none(request.query_params.get("query_id"))
+        with Database(config.paths.database) as db:
+            entries = db.list_blog_entries(250)
+            saved_queries = [dict(row) for row in db.list_saved_queries()]
+        return render(
+            request,
+            "blogs.html",
+            entries=entries,
+            saved_queries=saved_queries,
+            selected_query_id=selected_query_id,
+            model_profiles=config.available_llms,
+        )
+
+    @app.get("/blogs/{entry_id}", response_class=HTMLResponse)
+    def blog_entry(request: Request, entry_id: int) -> HTMLResponse:
+        with Database(config.paths.database) as db:
+            entry = db.get_blog_entry(entry_id)
+            saved_queries = [dict(row) for row in db.list_saved_queries()]
+            prompt_runs = [
+                _query_output(row) for row in db.query_runs_for_blog_entry(entry_id)
+            ]
+        if entry is None:
+            raise HTTPException(404, "Blog update not found")
+        return render(
+            request,
+            "blog_detail.html",
+            entry=entry,
+            saved_queries=saved_queries,
+            prompt_runs=prompt_runs,
+            model_profiles=config.available_llms,
+        )
+
+    @app.post("/blogs/{entry_id}/prompt")
+    async def prompt_blog_entry(request: Request, entry_id: int) -> Response:
+        async_request = request.headers.get("x-paperwatch-async") == "1"
+        form = await request.form()
+        query_id = _int_or_none(form.get("query_id"))
+        profiles = tuple(str(value) for value in form.getlist("model") if str(value))
+        context = _int_or_none(form.get("context_window_tokens")) or DEFAULT_CONTEXT_WINDOW_TOKENS
+        with Database(config.paths.database) as db:
+            entry = db.get_blog_entry(entry_id)
+            query = db.get_saved_query(query_id) if query_id is not None else None
+        if entry is None:
+            raise HTTPException(404, "Blog update not found")
+
+        def failure(message: str, status_code: int = 400) -> Response:
+            if async_request:
+                return JSONResponse({"ok": False, "message": message}, status_code=status_code)
+            return RedirectResponse(
+                _notice_url(f"/blogs/{entry_id}", message, level="error"), status_code=303
+            )
+
+        if query is None:
+            return failure("Select a saved prompt.")
+        try:
+            batch_id = collection_controller.start(
+                int(query["id"]),
+                profiles,
+                context,
+                selection={
+                    "content_type": "blogs",
+                    "blog_entry_ids": [entry_id],
+                    "labels": [f"Blog entry: {entry['title']}"],
+                },
+                source_scope="blog",
+                pdf_strategy="auto",
+                content_type="blogs",
+            )
+        except ValueError as exc:
+            return failure(str(exc))
+        if batch_id is None:
+            return failure("Another saved prompt is already running.", status_code=409)
+        message = f"Started {query['name']} with {len(set(profiles))} model(s)."
+        if async_request:
+            return JSONResponse({"ok": True, "batch_id": batch_id, "message": message})
+        return RedirectResponse(_notice_url(f"/blogs/{entry_id}", message), status_code=303)
 
     @app.post("/authors/search")
     async def search_authors(request: Request) -> RedirectResponse:
@@ -1149,14 +1477,11 @@ def create_app(
 
     @app.post("/actions/run")
     def start_run() -> RedirectResponse:
-        started = controller.start("run")
-        if started:
-            message = "Fetch started. This page updates while it runs."
-            level = "success"
+        if controller.snapshot().running:
+            controller.cancel()
         else:
-            message = "A fetch is already running."
-            level = "warning"
-        return RedirectResponse(_notice_url("/", message, level=level), status_code=303)
+            controller.start("run")
+        return RedirectResponse("/", status_code=303)
 
     @app.post("/actions/download")
     async def download_paper(request: Request) -> RedirectResponse:
@@ -1185,7 +1510,7 @@ def create_app(
                 _notice_url(target, str(exc), level="error"), status_code=303
             )
         if started:
-            message = f"Downloading {title or work_id}."
+            message = f"Downloading {title or work_id} and fetching linked blogs."
             level = "success"
         else:
             message = "A fetch is already running."
@@ -1212,6 +1537,7 @@ def create_app(
     @app.get("/papers", response_class=HTMLResponse)
     def papers(request: Request) -> HTMLResponse:
         filters = _parse_filters(request)
+        selected_query_id = _int_or_none(request.query_params.get("query_id"))
         offset = (filters.page - 1) * filters.page_size
         with Database(config.paths.database) as db:
             rows, total = db.search_papers(
@@ -1247,6 +1573,7 @@ def create_app(
             author_tags=tag_rows,
             topics=topic_rows,
             saved_queries=saved_queries,
+            selected_query_id=selected_query_id,
             model_profiles=config.available_llms,
             total=total,
             pages=pages,
@@ -1268,6 +1595,7 @@ def create_app(
             analysis_tasks = [
                 dict(row) for row in db.visible_analysis_tasks_for_paper(paper_id)
             ]
+            analyses = [_analysis_view(row) for row in db.paper_analyses(paper_id)]
             saved_queries = [dict(row) for row in db.list_saved_queries()]
             prompt_runs = [
                 _query_output(row) for row in db.query_runs_for_paper(paper_id)
@@ -1280,6 +1608,7 @@ def create_app(
             default_author_index=default_author_index,
             topics=topic_rows,
             analysis_tasks=analysis_tasks,
+            analyses=analyses,
             saved_queries=saved_queries,
             prompt_runs=prompt_runs,
             model_profiles=config.available_llms,
@@ -1540,7 +1869,7 @@ def create_app(
     @app.get("/queries", response_class=HTMLResponse)
     def queries(request: Request) -> HTMLResponse:
         with Database(config.paths.database) as db:
-            saved = [dict(row) for row in db.list_saved_queries()]
+            saved = [_query_view(row, config) for row in db.list_saved_queries()]
             runs = [_query_output(row) for row in db.list_query_runs(limit=100)]
         runs_by_query: dict[int, list[dict[str, Any]]] = {}
         for row in runs:
@@ -1549,7 +1878,42 @@ def create_app(
             request,
             "queries.html",
             queries=saved,
+            runs=runs,
             runs_by_query=runs_by_query,
+            model_profiles=config.available_llms,
+        )
+
+    @app.get("/queries/new", response_class=HTMLResponse)
+    def query_new_page(request: Request) -> HTMLResponse:
+        selected = [config.available_llms[0].profile] if config.available_llms else []
+        query = {
+            "name": "",
+            "prompt": "",
+            "is_builtin": False,
+            "model_profiles": selected,
+            "context_window_tokens": config.llm.context_window_tokens,
+            "paper_source_scope": "auto",
+            "pdf_strategy": "chunked",
+        }
+        return render(
+            request,
+            "query_edit.html",
+            query=query,
+            is_new=True,
+            model_profiles=config.available_llms,
+        )
+
+    @app.get("/queries/{query_id}/edit", response_class=HTMLResponse)
+    def query_edit_page(request: Request, query_id: int) -> HTMLResponse:
+        with Database(config.paths.database) as db:
+            query = db.get_saved_query(query_id)
+            if query is None:
+                raise HTTPException(404, "Saved query not found")
+        return render(
+            request,
+            "query_edit.html",
+            query=_query_view(query, config),
+            is_new=False,
             model_profiles=config.available_llms,
         )
 
@@ -1557,34 +1921,93 @@ def create_app(
     async def create_query(request: Request) -> RedirectResponse:
         form = await request.form()
         try:
+            execution = _query_execution_form(form, config)
             with Database(config.paths.database) as db:
-                db.create_saved_query(
+                query_id = db.create_saved_query(
                     name=str(form.get("name", "")),
                     prompt=str(form.get("prompt", "")),
+                    auto_run_papers=str(form.get("auto_run_papers", ""))
+                    in {"1", "true", "on"},
+                    auto_run_blogs=str(form.get("auto_run_blogs", ""))
+                    in {"1", "true", "on"},
+                    **execution,
                 )
         except ValueError as exc:
             return RedirectResponse(
-                _notice_url("/queries", str(exc), level="error"), status_code=303
+                _notice_url("/queries/new", str(exc), level="error"), status_code=303
             )
-        return RedirectResponse(_notice_url("/queries", "Saved query created."), status_code=303)
+        return RedirectResponse(
+            _notice_url(f"/queries/{query_id}/edit", "Saved query created."),
+            status_code=303,
+        )
 
     @app.post("/queries/{query_id}/edit")
     async def edit_query(request: Request, query_id: int) -> RedirectResponse:
         form = await request.form()
         try:
+            execution = _query_execution_form(form, config)
+            legacy_target_form = not any(
+                key in form
+                for key in (
+                    "model", "context_window_tokens", "paper_source_scope", "pdf_strategy"
+                )
+            )
             with Database(config.paths.database) as db:
                 changed = db.update_saved_query(
                     query_id,
                     name=str(form.get("name", "")),
                     prompt=str(form.get("prompt", "")),
+                    auto_run_papers=(
+                        str(form.get("auto_run_papers", "")) in {"1", "true", "on"}
+                        if legacy_target_form else None
+                    ),
+                    auto_run_blogs=(
+                        str(form.get("auto_run_blogs", "")) in {"1", "true", "on"}
+                        if legacy_target_form else None
+                    ),
+                    **execution,
                 )
             if not changed:
                 raise HTTPException(404, "Saved query not found")
         except ValueError as exc:
             return RedirectResponse(
-                _notice_url("/queries", str(exc), level="error"), status_code=303
+                _notice_url(f"/queries/{query_id}/edit", str(exc), level="error"),
+                status_code=303,
             )
-        return RedirectResponse(_notice_url("/queries", "Saved query updated."), status_code=303)
+        return RedirectResponse(
+            _notice_url(f"/queries/{query_id}/edit", "Saved query updated."),
+            status_code=303,
+        )
+
+    @app.post("/queries/automatic")
+    async def update_automatic_queries(request: Request) -> Response:
+        form = await request.form()
+        query_ids = [
+            value for raw in form.getlist("query_id")
+            if (value := _int_or_none(raw)) is not None
+        ]
+        paper_ids = [
+            value for raw in form.getlist("auto_run_papers")
+            if (value := _int_or_none(raw)) is not None
+        ]
+        blog_ids = [
+            value for raw in form.getlist("auto_run_blogs")
+            if (value := _int_or_none(raw)) is not None
+        ]
+        with Database(config.paths.database) as db:
+            db.update_automatic_queries(
+                query_ids,
+                paper_query_ids=paper_ids,
+                blog_query_ids=blog_ids,
+            )
+        if request.headers.get("X-Paperwatch-Async") == "1":
+            return JSONResponse(
+                {"ok": True, "message": "Automatic query selections updated."}
+            )
+        return RedirectResponse(
+            _notice_url("/queries", "Automatic query selections updated."),
+            status_code=303,
+        )
 
     @app.post("/queries/{query_id}/delete")
     def delete_query(query_id: int) -> RedirectResponse:
@@ -1685,6 +2108,136 @@ def create_app(
         )
         return RedirectResponse(f"{target}#query-{query_id}", status_code=303)
 
+    @app.post("/queries/{query_id}/run-existing/{content_type}")
+    async def run_query_on_existing(
+        request: Request, query_id: int, content_type: str
+    ) -> RedirectResponse:
+        if content_type not in {"papers", "blogs"}:
+            raise HTTPException(404, "Unknown content type")
+        form = await request.form()
+        with Database(config.paths.database) as db:
+            stored = db.get_saved_query(query_id)
+            if stored is None:
+                raise HTTPException(404, "Saved query not found")
+            query = _query_view(stored, config)
+            selection: dict[str, Any] = {
+                "content_type": content_type,
+                "labels": [f"All existing {content_type}"],
+            }
+            if content_type == "papers":
+                rows, _ = db.search_papers(limit=None, offset=0)
+                eligible_ids = [
+                    int(row["id"])
+                    for row in rows
+                    if str(row["abstract"] or "").strip()
+                    or str(row["pdf_url"] or "").strip()
+                    or str(row["local_pdf_path"] or "").strip()
+                ]
+                selection["paper_ids"] = eligible_ids
+        requested_profiles = tuple(
+            str(value) for value in form.getlist("model") if str(value).strip()
+        )
+        profiles = requested_profiles or tuple(query["model_profiles"])
+        if not profiles:
+            return RedirectResponse(
+                _notice_url(
+                    f"/queries/{query_id}/edit",
+                    "Select at least one configured model before running this query.",
+                    level="error",
+                ),
+                status_code=303,
+            )
+        source_scope = (
+            "blog" if content_type == "blogs" else str(query["paper_source_scope"])
+        )
+        pdf_strategy = (
+            "auto" if content_type == "blogs" else str(query["pdf_strategy"])
+        )
+        try:
+            batch_id = collection_controller.start(
+                query_id,
+                profiles,
+                _int_or_none(form.get("context_window_tokens"))
+                or int(query["context_window_tokens"]),
+                selection=selection,
+                source_scope=source_scope,
+                pdf_strategy=pdf_strategy,
+                content_type=content_type,
+            )
+        except ValueError as exc:
+            return RedirectResponse(
+                _notice_url("/queries", str(exc), level="error"), status_code=303
+            )
+        if batch_id is None:
+            return RedirectResponse(
+                _notice_url(
+                    "/queries",
+                    "Another saved prompt is already running.",
+                    level="warning",
+                ),
+                status_code=303,
+            )
+        return RedirectResponse(
+            _notice_url(
+                "/queries",
+                f"Started {query['name']} on all existing {content_type} with "
+                f"{len(profiles)} saved model(s).",
+            ),
+            status_code=303,
+        )
+
+    @app.post("/queries/run-blogs")
+    async def run_blog_query(request: Request) -> RedirectResponse:
+        form = await request.form()
+        query_id = _int_or_none(form.get("query_id"))
+        profiles = tuple(str(value) for value in form.getlist("model") if str(value))
+        context = _int_or_none(form.get("context_window_tokens")) or DEFAULT_CONTEXT_WINDOW_TOKENS
+        if query_id is None:
+            return RedirectResponse(
+                _notice_url("/blogs", "Select a saved query.", level="error"),
+                status_code=303,
+            )
+        selected_ids: list[int] = []
+        for raw in form.getlist("blog_entry_id"):
+            entry_id = _int_or_none(raw)
+            if entry_id is not None and entry_id > 0:
+                selected_ids.append(entry_id)
+        selection: dict[str, Any] = {
+            "content_type": "blogs",
+            "labels": [
+                f"Visible blog entries: {len(set(selected_ids))}"
+                if selected_ids
+                else "All blog entries"
+            ],
+        }
+        if selected_ids:
+            selection["blog_entry_ids"] = list(dict.fromkeys(selected_ids))[:5000]
+        try:
+            batch_id = collection_controller.start(
+                query_id,
+                profiles,
+                context,
+                selection=selection,
+                source_scope="blog",
+                pdf_strategy="auto",
+                content_type="blogs",
+            )
+        except ValueError as exc:
+            return RedirectResponse(
+                _notice_url("/blogs", str(exc), level="error"), status_code=303
+            )
+        if batch_id is None:
+            return RedirectResponse(
+                _notice_url(
+                    "/blogs", "Another saved prompt is already running.", level="warning"
+                ),
+                status_code=303,
+            )
+        return RedirectResponse(
+            _notice_url("/blogs", "Started saved query on blog entries."),
+            status_code=303,
+        )
+
     @app.get("/api/query-status")
     def query_status() -> JSONResponse:
         return JSONResponse(asdict(collection_controller.snapshot()))
@@ -1697,15 +2250,49 @@ def create_app(
             status_code=200 if cancelled else 409,
         )
 
+    @app.get("/api/running-status")
+    def running_status() -> JSONResponse:
+        return JSONResponse(
+            {
+                "fetch": asdict(controller.snapshot()),
+                "analysis": asdict(model_controller.snapshot()),
+                "query": asdict(collection_controller.snapshot()),
+            }
+        )
+
     @app.get("/runs", response_class=HTMLResponse)
     def runs(request: Request) -> HTMLResponse:
         active_jobs: list[dict[str, Any]] = []
+        fetch_snapshot = controller.snapshot()
+        analysis_snapshot = model_controller.snapshot()
+        query_snapshot = collection_controller.snapshot()
+        if fetch_snapshot.running:
+            active_jobs.append(
+                {
+                    "kind": "Fetch",
+                    "live_kind": "fetch",
+                    "status": "running",
+                    "name": fetch_snapshot.stage or "Fetch now",
+                    "model": "—",
+                    "papers": [],
+                    "blogs": [],
+                    "started_at": fetch_snapshot.started_at,
+                    "progress_current": fetch_snapshot.progress_current,
+                    "progress_total": fetch_snapshot.progress_total,
+                    "message": fetch_snapshot.message,
+                }
+            )
         with Database(config.paths.database) as db:
             rows = db.list_runs(100)
             for task in db.active_analysis_tasks():
+                live = (
+                    analysis_snapshot.running
+                    and str(task["batch_id"]) == str(analysis_snapshot.batch_id)
+                )
                 active_jobs.append(
                     {
                         "kind": "Summary",
+                        "live_kind": "analysis" if live else "",
                         "status": task["status"],
                         "name": f"{task['scope']} analysis",
                         "model": task["model"],
@@ -1713,12 +2300,20 @@ def create_app(
                         "paper_title": task["paper_title"],
                         "papers": [{"id": int(task["paper_id"]), "title": task["paper_title"]}],
                         "started_at": task["started_at"] or task["created_at"],
+                        "progress_current": analysis_snapshot.progress_current if live else 0,
+                        "progress_total": analysis_snapshot.progress_total if live else 0,
+                        "message": analysis_snapshot.message if live else "",
                     }
                 )
             for query_run in db.active_query_runs():
+                live = (
+                    query_snapshot.running
+                    and str(query_run["batch_id"]) == str(query_snapshot.batch_id)
+                )
                 paper_id: int | None = None
                 paper_title: str | None = None
                 papers_for_job: list[dict[str, Any]] = []
+                blogs_for_job: list[dict[str, Any]] = []
                 selection = _json_value(query_run["selection_json"], {})
                 values = selection.get("paper_ids") if isinstance(selection, dict) else None
                 if isinstance(values, list):
@@ -1730,16 +2325,36 @@ def create_app(
                     if len(papers_for_job) == 1:
                         paper_id = int(papers_for_job[0]["id"])
                         paper_title = str(papers_for_job[0]["title"])
+                blog_values = (
+                    selection.get("blog_entry_ids")
+                    if isinstance(selection, dict)
+                    else None
+                )
+                if isinstance(blog_values, list):
+                    selected_blog_ids = [
+                        value
+                        for value in (_int_or_none(item) for item in blog_values[:20])
+                        if value is not None
+                    ]
+                    for entry in db.blog_entries_by_ids(selected_blog_ids):
+                        blogs_for_job.append(
+                            {"id": int(entry["id"]), "title": str(entry["title"])}
+                        )
                 active_jobs.append(
                     {
                         "kind": "Saved prompt",
+                        "live_kind": "query" if live else "",
                         "status": query_run["status"],
                         "name": query_run["query_name"],
                         "model": query_run["model"],
                         "paper_id": paper_id,
                         "paper_title": paper_title,
                         "papers": papers_for_job,
+                        "blogs": blogs_for_job,
                         "started_at": query_run["started_at"] or query_run["created_at"],
+                        "progress_current": query_snapshot.progress_current if live else 0,
+                        "progress_total": query_snapshot.progress_total if live else 0,
+                        "message": query_snapshot.message if live else "",
                     }
                 )
         return render(request, "runs.html", runs=rows, active_jobs=active_jobs)

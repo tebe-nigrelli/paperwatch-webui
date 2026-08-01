@@ -127,6 +127,57 @@ def _sum_usage(target: dict[str, Any], incoming: dict[str, Any]) -> None:
             target[key] = value
 
 
+def _compact_note_dict(item: dict[str, Any], budget: int) -> dict[str, Any]:
+    """Deterministically shrink one note so a small merge context can accept it."""
+    compact = json.loads(json.dumps(item, ensure_ascii=False))
+    marker = " … [trimmed for merge]"
+    while len(json.dumps(compact, ensure_ascii=False)) > budget:
+        slots: list[tuple[Any, Any, str]] = []
+
+        def collect(value: Any) -> None:
+            if isinstance(value, dict):
+                for key, child in value.items():
+                    if isinstance(child, str):
+                        slots.append((value, key, child))
+                    else:
+                        collect(child)
+            elif isinstance(value, list):
+                for index, child in enumerate(value):
+                    if isinstance(child, str):
+                        slots.append((value, index, child))
+                    else:
+                        collect(child)
+
+        collect(compact)
+        shrinkable = [slot for slot in slots if len(slot[2]) > 48]
+        if shrinkable:
+            container, key, text = max(shrinkable, key=lambda slot: len(slot[2]))
+            excess = len(json.dumps(compact, ensure_ascii=False)) - budget
+            keep = max(24, len(text) - max(excess, len(text) // 3))
+            container[key] = text[:keep].rstrip() + marker
+            continue
+
+        lists: list[list[Any]] = []
+
+        def collect_lists(value: Any) -> None:
+            if isinstance(value, dict):
+                for child in value.values():
+                    collect_lists(child)
+            elif isinstance(value, list):
+                if value:
+                    lists.append(value)
+                for child in value:
+                    collect_lists(child)
+
+        collect_lists(compact)
+        removable = [value for value in lists if len(value) > 1]
+        if removable:
+            max(removable, key=len).pop()
+            continue
+        break
+    return compact
+
+
 def _generate_notes(
     llm: LLMClient,
     prompt: str,
@@ -153,7 +204,10 @@ def _reduce_to_budget(
     progress: ProgressCallback | None = None,
     cancel_event: threading.Event | None = None,
 ) -> str:
-    current = [item.model_dump() for item in notes]
+    per_note_budget = max(300, int(budget * 0.8))
+    current = [
+        _compact_note_dict(item.model_dump(), per_note_budget) for item in notes
+    ]
     for round_index in range(1, 7):
         check_cancelled(cancel_event)
         encoded = json.dumps(current, ensure_ascii=False)
@@ -173,10 +227,15 @@ def _reduce_to_budget(
         if group:
             groups.append(group)
         if len(groups) >= len(current):
-            # The model cannot receive even one note with this context setting.
-            raise LLMError(
-                "Chunk notes exceed the selected context window; choose a larger context window"
-            )
+            # At this point each note is already compacted. Compact once more to
+            # the exact final budget instead of failing on a single verbose note.
+            current = [
+                _compact_note_dict(item, max(250, budget - 32)) for item in current
+            ]
+            encoded = json.dumps(current, ensure_ascii=False)
+            if len(encoded) <= budget:
+                return encoded
+            raise LLMError("Could not compact chunk notes for the selected context window")
         reduced: list[dict[str, Any]] = []
         for group_index, group_items in enumerate(groups):
             check_cancelled(cancel_event)

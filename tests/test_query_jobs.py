@@ -587,3 +587,320 @@ def test_query_batch_uses_runtime_source_and_pdf_strategy(
     assert captured["source_scope"] == "fulltext"
     assert captured["pdf_strategy"] == "direct"
     assert captured["selection"]["paper_ids"] == [paper_id]
+
+
+def test_blog_query_documents_validation_batch_and_controller(
+    config_path, author_candidate, monkeypatch
+):
+    config = load_config(config_path)
+    with Database(config.paths.database) as db:
+        db.add_author(author_candidate)
+        blog_id = db.add_author_blog(
+            author_candidate.openalex_id,
+            "https://example.test/blog",
+            label="Ada blog",
+        )
+        baseline_id = db.save_blog_entry(
+            blog_id=blog_id,
+            title="Baseline",
+            content_sha256="baseline",
+            normalized_text="old text",
+            diff_text="",
+            change_kind="baseline",
+            previous_entry_id=None,
+        )
+        entry_id = db.save_blog_entry(
+            blog_id=blog_id,
+            title="New systems note",
+            content_sha256="changed",
+            normalized_text="A detailed note about efficient inference.",
+            diff_text="-old\n+new",
+            change_kind="changed",
+            previous_entry_id=baseline_id,
+            entry_kind="rss",
+            external_id="post-1",
+            source_url="https://example.test/blog/post-1",
+            published_at="2026-07-30T10:00:00+00:00",
+        )
+        documents = collect_query_documents(
+            db,
+            "blog",
+            selection={
+                "content_type": "blogs",
+                "blog_entry_ids": [entry_id, "bad", -1, entry_id],
+            },
+        )
+        assert len(documents) == 1
+        assert documents[0]["blog_entry_id"] == entry_id
+        assert documents[0]["content_type"] == "blog"
+        assert documents[0]["authors"] == [author_candidate.name]
+        assert "efficient inference" in documents[0]["content"]
+        assert documents[0]["diff"] == "-old\n+new"
+        assert db.blog_entries_by_ids(["bad", entry_id, entry_id, -1])[0]["id"] == entry_id
+
+        selection = {"content_type": "blogs", "blog_entry_ids": [entry_id]}
+        assert validate_query_sources(
+            db, selection=selection, source_scope="blog", pdf_strategy="auto"
+        ) == 1
+        with pytest.raises(ValueError, match="stored blog entry text"):
+            validate_query_sources(
+                db, selection=selection, source_scope="abstract", pdf_strategy="auto"
+            )
+        with pytest.raises(ValueError, match="does not apply"):
+            validate_query_sources(
+                db, selection=selection, source_scope="blog", pdf_strategy="direct"
+            )
+        with pytest.raises(ValueError, match="No blog entries"):
+            validate_query_sources(
+                db,
+                selection={"content_type": "blogs", "blog_entry_ids": [999999]},
+                source_scope="blog",
+                pdf_strategy="auto",
+            )
+        with pytest.raises(ValueError, match="papers or blogs"):
+            collect_query_documents(db, selection={"content_type": "videos"})
+        with pytest.raises(ValueError, match="Blog query source"):
+            collect_query_documents(db, "abstract", selection=selection)
+
+        query_id = db.create_saved_query(name="Blog summary", prompt="Summarize the post")
+        db.create_query_runs(
+            batch_id="blog-batch",
+            query_id=query_id,
+            profiles=[("default", "ollama", "test-model")],
+            context_window_tokens=2048,
+            selection={
+                **selection,
+                "source_scope": "blog",
+                "pdf_strategy": "auto",
+            },
+        )
+
+    client = FakeQueryLLM()
+    monkeypatch.setattr("paperwatch.query_jobs.create_llm", lambda profile: client)
+    result = run_query_batch(
+        config_path, "blog-batch", query_id, ("default",), 2048
+    )
+    assert result == {"completed": 1, "failed": 0}
+    assert "efficient inference" in client.calls[0]
+    with Database(config.paths.database) as db:
+        assert db.query_runs_for_blog_entry(entry_id)[0]["status"] == "success"
+
+    gate = threading.Event()
+
+    def runner(path, batch, query, profiles, context):
+        gate.wait(1)
+        return {"completed": 1, "failed": 0}
+
+    controller = QueryController(config_path, runner=runner)
+    batch_id = controller.start(
+        query_id,
+        ("default", "default"),
+        2048,
+        selection={"content_type": "blogs", "blog_entry_ids": [entry_id]},
+        source_scope="abstract",
+        pdf_strategy="chunked",
+        content_type="blogs",
+    )
+    assert batch_id
+    snapshot = controller.snapshot()
+    assert snapshot.blog_entry_id == entry_id
+    assert snapshot.content_type == "blogs"
+    with Database(config.paths.database) as db:
+        stored = db.query_runs_for_batch(batch_id)[0]
+        selection_json = __import__("json").loads(stored["selection_json"])
+        assert selection_json["source_scope"] == "blog"
+        assert selection_json["pdf_strategy"] == "auto"
+    gate.set()
+    controller.wait()
+    with pytest.raises(ValueError, match="papers or blogs"):
+        controller.start(
+            query_id,
+            ("default",),
+            2048,
+            selection={"blog_entry_ids": [entry_id]},
+            content_type="videos",
+        )
+
+def test_run_query_for_model_rejects_unknown_content_type():
+    with pytest.raises(ValueError, match="papers or blogs"):
+        run_query_for_model(
+            FakeQueryLLM(),
+            user_prompt="x",
+            documents=[],
+            context_window_tokens=2048,
+            max_input_chars=5000,
+            content_type="videos",
+        )
+
+def test_blog_query_records_without_diffs_and_run_lookup(config_path, author_candidate):
+    config = load_config(config_path)
+    with Database(config.paths.database) as db:
+        db.add_author(author_candidate)
+        blog_id = db.add_author_blog(author_candidate.openalex_id, "https://example.test/feed")
+        entry_id = db.save_blog_entry(
+            blog_id=blog_id,
+            title="Feed item",
+            content_sha256="feed-item",
+            normalized_text="Complete feed item body",
+            diff_text="",
+            change_kind="changed",
+            previous_entry_id=None,
+            entry_kind="rss",
+            external_id="item-1",
+        )
+        documents = collect_query_documents(db, "blog", selection={"content_type": "blogs"})
+        assert documents == [
+            {
+                "paper_id": None,
+                "blog_entry_id": entry_id,
+                "content_type": "blog",
+                "title": "Feed item",
+                "publication_date": documents[0]["publication_date"],
+                "authors": [author_candidate.name],
+                "blog": "Feed item",
+                "entry_kind": "rss",
+                "change_kind": "changed",
+                "source_url": "https://example.test/feed",
+                "content": "Complete feed item body",
+                "diff": None,
+            }
+        ]
+        assert [row["id"] for row in db.blog_entries_by_ids([None, "bad", -1, entry_id, entry_id])] == [entry_id]
+        with pytest.raises(ValueError, match="Content type"):
+            validate_query_sources(
+                db,
+                selection={"content_type": "videos"},
+                source_scope="abstract",
+                pdf_strategy="auto",
+            )
+
+        query_id = db.create_saved_query(name="Lookup", prompt="Review")
+        run_id = db.create_query_runs(
+            batch_id="blog-success",
+            query_id=query_id,
+            profiles=[("default", "ollama", "test-model")],
+            context_window_tokens=2048,
+            selection={"content_type": "blogs", "blog_entry_ids": [entry_id]},
+        )[0]
+        db.start_query_run(run_id)
+        db.finish_query_run(
+            run_id,
+            matched_count=1,
+            input_chars=10,
+            output={"title": "Done", "summary": "Done", "items": []},
+        )
+        failed_id = db.create_query_runs(
+            batch_id="blog-failed",
+            query_id=query_id,
+            profiles=[("default", "ollama", "test-model")],
+            context_window_tokens=2048,
+            selection={"content_type": "blogs", "blog_entry_ids": [str(entry_id)]},
+        )[0]
+        db.finish_query_run(failed_id, matched_count=0, input_chars=0, error="failed")
+        malformed_id = db.create_query_runs(
+            batch_id="blog-malformed",
+            query_id=query_id,
+            profiles=[("default", "ollama", "test-model")],
+            context_window_tokens=2048,
+        )[0]
+        db._conn.execute(
+            "UPDATE query_runs SET selection_json='{bad' WHERE id=?", (malformed_id,)
+        )
+        db._conn.commit()
+        assert [row["id"] for row in db.query_runs_for_blog_entry(entry_id)] == [run_id]
+        assert {row["id"] for row in db.query_runs_for_blog_entry(entry_id, successful_only=False)} == {
+            run_id,
+            failed_id,
+        }
+
+    llm = FakeQueryLLM()
+    result, _usage, chars = run_query_for_model(
+        llm,
+        user_prompt="Summarize",
+        documents=[
+            {
+                "blog_entry_id": entry_id,
+                "content_type": "blog",
+                "title": "Large blog",
+                "content": "applied ML evidence " * 1500,
+            }
+        ],
+        context_window_tokens=1024,
+        max_input_chars=4000,
+        content_type="blogs",
+    )
+    assert result.title == "Collection comparison"
+    assert chars > 0
+    assert len(llm.calls) > 1
+
+def test_query_source_edge_cases_cover_blog_fallback_and_auto_missing(
+    config_path, author_candidate, paper_record
+):
+    config = load_config(config_path)
+    with Database(config.paths.database) as db:
+        db.add_author(author_candidate)
+        blog_id = db.add_author_blog(author_candidate.openalex_id, "https://example.test/edge")
+        baseline = db.save_blog_entry(
+            blog_id=blog_id,
+            title="Baseline",
+            content_sha256="edge-base",
+            normalized_text="base",
+            diff_text="",
+            change_kind="baseline",
+            previous_entry_id=None,
+        )
+        entry_id = db.save_blog_entry(
+            blog_id=blog_id,
+            title="Edge entry",
+            content_sha256="edge-new",
+            normalized_text="edge content",
+            diff_text="+edge content",
+            change_kind="changed",
+            previous_entry_id=baseline,
+        )
+        all_blog_docs = collect_query_documents(
+            db,
+            "blog",
+            selection={"content_type": "blogs", "blog_entry_ids": ["invalid"]},
+        )
+        assert [item["blog_entry_id"] for item in all_blog_docs] == [entry_id]
+
+        paper_without_source = replace(
+            paper_record,
+            openalex_id="W-NO-SOURCE",
+            doi="10.1000/no-source",
+            arxiv_id=None,
+            title="No source paper",
+            abstract=None,
+            pdf_url=None,
+        )
+        missing_id, _ = db.upsert_paper(paper_without_source)
+        with pytest.raises(ValueError, match="abstract or PDF"):
+            validate_query_sources(
+                db,
+                selection={"paper_ids": [missing_id]},
+                source_scope="auto",
+                pdf_strategy="auto",
+            )
+        with pytest.raises(ValueError, match="papers or blogs"):
+            validate_query_sources(
+                db,
+                selection={"content_type": "videos"},
+                source_scope="abstract",
+                pdf_strategy="auto",
+            )
+
+
+def test_query_controller_tracks_numeric_progress_and_ignores_invalid(config_path):
+    controller = QueryController(config_path, runner=lambda *args: {"completed": 0, "failed": 0})
+    controller._progress("stage", "Running prompt")
+    controller._progress("message", "Model one")
+    controller._progress("reset_output", "")
+    controller._progress("output", "partial")
+    controller._progress("progress", "3/8")
+    controller._progress("progress", "bad/value")
+    snapshot = controller.snapshot()
+    assert snapshot.stage == "Running prompt"
+    assert snapshot.message == "Model one"
+    assert snapshot.live_output == "partial"
+    assert (snapshot.progress_current, snapshot.progress_total) == (3, 8)

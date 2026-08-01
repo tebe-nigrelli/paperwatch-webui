@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "paperwatch"
-version = "0.6.3"
+version = "0.8.4"
 description = "Minimal daily paper tracker for selected authors"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -14,6 +14,7 @@ dependencies = [
   "pypdf>=5,<7",
   "fastapi>=0.115,<1",
   "jinja2>=3.1,<4",
+  "beautifulsoup4>=4.12,<5",
   "python-multipart>=0.0.18,<1",
   "uvicorn>=0.30,<1",
 ]

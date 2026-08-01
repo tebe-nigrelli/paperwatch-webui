@@ -53,6 +53,16 @@
 </section>
 {% if paper.abstract %}<section class="panel prose"><div class="panel-heading"><h2>Source abstract</h2></div><p>{{ paper.abstract }}</p></section>{% endif %}
 
+{% if analyses %}
+{% set latest_analysis = analyses[0] %}
+<section class="panel analysis-summary">
+  <div class="panel-heading"><div><h2>Prompt summary</h2><p>{{ latest_analysis.scope }} · {{ latest_analysis.model }} · {{ latest_analysis.created_at }}</p></div><a class="button button-small" href="/analyses/{{ latest_analysis.id }}">Open full analysis</a></div>
+  <p class="lead">{{ latest_analysis.result.one_sentence_summary }}</p>
+  <div class="analysis-grid"><section><h3>Summary</h3><p>{{ latest_analysis.result.abstract_summary }}</p></section><section><h3>Research problem</h3><p>{{ latest_analysis.result.research_problem }}</p></section><section><h3>Conclusion</h3><p>{{ latest_analysis.result.conclusion_summary }}</p></section></div>
+  {% if analyses|length > 1 %}<details><summary>Other prompt summaries</summary><div class="object-list">{% for analysis in analyses[1:] %}<article><a href="/analyses/{{ analysis.id }}"><strong>{{ analysis.scope }} · {{ analysis.model }}</strong></a><p>{{ analysis.result.one_sentence_summary }}</p><small>{{ analysis.created_at }}</small></article>{% endfor %}</div></details>{% endif %}
+</section>
+{% endif %}
+
 <section class="panel model-runner">
   <div class="panel-heading"><div><h2>Run saved prompt</h2><p>Choose the prompt, models, source, PDF handling, and context for this run.</p></div>{% if query_state.running and query_state.paper_id == paper.id %}<span class="status status-running">running</span>{% endif %}</div>
   {% if saved_queries and model_profiles and (paper.abstract or paper.pdf_url or paper.local_pdf_path) %}
@@ -60,8 +70,8 @@
     <label class="grow"><span>Saved prompt</span><select name="query_id" required>{% for query in saved_queries %}<option value="{{ query.id }}">{{ query.name }}</option>{% endfor %}</select></label>
     <fieldset class="model-options"><legend>Models</legend>{% for profile in model_profiles %}<label class="model-option"><input type="checkbox" name="model" value="{{ profile.profile }}" {% if loop.first %}checked{% endif %}><span><strong>{{ profile.profile }}</strong><small>{{ profile.provider }} · {{ profile.model }}{% if profile.reasoning_effort %} · reasoning {{ profile.reasoning_effort }}{% endif %}</small></span></label>{% endfor %}</fieldset>
     <div class="model-run-actions">
-      <label><span>Source</span><select name="source_scope" data-source-scope>{% if paper.abstract %}<option value="abstract">Abstract</option>{% endif %}{% if paper.pdf_url or paper.local_pdf_path %}<option value="fulltext">Full paper PDF</option>{% endif %}</select></label>
-      <label><span>PDF strategy</span><select name="pdf_strategy" data-pdf-strategy><option value="auto">Auto</option><option value="chunked">Chunk + merge</option><option value="direct">Direct</option></select></label>
+      <label><span>Source</span><select name="source_scope" data-source-scope>{% if paper.pdf_url or paper.local_pdf_path %}<option value="fulltext">Full paper PDF</option>{% endif %}{% if paper.abstract %}<option value="abstract">Abstract</option>{% endif %}</select></label>
+      <label><span>PDF strategy</span><select name="pdf_strategy" data-pdf-strategy><option value="chunked">Chunk + merge</option><option value="auto">Auto</option><option value="direct">Direct</option></select></label>
       <label><span>Context window tokens</span><input type="number" name="context_window_tokens" min="512" max="1000000" value="16384"></label>
       <button class="button button-primary" type="submit" {% if query_state.running %}disabled{% endif %}>Run saved prompt</button>
     </div>
