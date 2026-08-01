@@ -123,9 +123,18 @@ def test_manual_author_and_blog_management_ui(config_path):
     assert manage.status_code == 200
     assert "Manual blog" in manage.text
     assert "Direct author" in manage.text
+    assert f'action="/authors/{manual_id}/blogs/' in manage.text
+    assert 'title="Edit the URL and press Enter"' in manage.text
+    assert "Mark broken" in manage.text
     authors = client.get("/authors")
     assert "1 · Manage" in authors.text
     assert "Blog-only" in authors.text
+    assert 'id="toggle-author-ids"' not in authors.text
+    assert 'id="tracked-authors-table"' in authors.text
+    assert 'class="author-openalex-column"' in authors.text
+    assert 'data-author-openalex-column hidden' not in authors.text
+    assert 'title="Edit the ID and press Enter"' in authors.text
+    assert ">Save</button>" not in authors.text
 
     invalid_blog = client.post(
         f"/authors/{manual_id}/blogs",
@@ -136,6 +145,59 @@ def test_manual_author_and_blog_management_ui(config_path):
 
     with Database(config.paths.database) as db:
         blog_id = int(db.author_blogs(manual_id)[0]["id"])
+
+    broken = client.post(
+        f"/authors/{manual_id}/blogs/{blog_id}/availability",
+        data={"broken": "1"},
+        follow_redirects=False,
+    )
+    assert broken.status_code == 303
+    with Database(config.paths.database) as db:
+        blog = db.author_blogs(manual_id)[0]
+        assert blog["enabled"] == 0
+        assert "Marked broken" in blog["last_error"]
+        assert all(int(row["id"]) != blog_id for row in db.list_enabled_blogs())
+    broken_page = client.get(f"/authors/{manual_id}/blogs")
+    assert "blog-source-broken" in broken_page.text
+    assert "Restore" in broken_page.text
+
+    restored = client.post(
+        f"/authors/{manual_id}/blogs/{blog_id}/availability",
+        data={"broken": "0"},
+        follow_redirects=False,
+    )
+    assert restored.status_code == 303
+    edited = client.post(
+        f"/authors/{manual_id}/blogs/{blog_id}/edit",
+        data={"url": "https://example.com/new-blog#updates"},
+        follow_redirects=False,
+    )
+    assert edited.status_code == 303
+    with Database(config.paths.database) as db:
+        blog = db.author_blogs(manual_id)[0]
+        assert blog["url"] == "https://example.com/new-blog"
+        assert blog["enabled"] == 1
+        assert blog["last_error"] is None
+
+    invalid_edit = client.post(
+        f"/authors/{manual_id}/blogs/{blog_id}/edit",
+        data={"url": "http://127.0.0.1/broken"},
+        follow_redirects=False,
+    )
+    assert "level=error" in invalid_edit.headers["location"]
+    missing_edit = client.post(
+        f"/authors/{manual_id}/blogs/9999/edit",
+        data={"url": "https://example.com/missing"},
+        follow_redirects=False,
+    )
+    assert missing_edit.status_code == 404
+    missing_availability = client.post(
+        f"/authors/{manual_id}/blogs/9999/availability",
+        data={"broken": "1"},
+        follow_redirects=False,
+    )
+    assert missing_availability.status_code == 404
+
     removed = client.post(
         f"/authors/{manual_id}/blogs/{blog_id}/remove", follow_redirects=False
     )
@@ -517,3 +579,81 @@ def test_saved_query_auto_targets_and_backward_routes(config_path):
         follow_redirects=False,
     )
     assert "invalid+backward+run" in invalid.headers["location"]
+
+
+def test_author_openalex_id_is_editable_inline(config_path):
+    config = load_config(config_path)
+    client = client_for(config_path)
+    client.post(
+        "/authors/manual",
+        data={"name": "Editable Person", "institution": "Local Lab", "openalex_id": ""},
+    )
+    client.post(
+        "/authors/manual",
+        data={"name": "Existing Person", "institution": "Other Lab", "openalex_id": "A123"},
+    )
+    with Database(config.paths.database) as db:
+        local_id = str(db.find_authors_by_name("Editable Person")[0]["openalex_id"])
+
+    page = client.get("/authors")
+    assert 'class="author-openalex-form"' in page.text
+    assert f'action="/authors/{local_id}/openalex-id"' in page.text
+    assert 'id="tracked-authors-table"' in page.text
+    assert 'class="author-openalex-column"' in page.text
+    assert 'data-author-openalex-column hidden' not in page.text
+    assert 'id="toggle-author-ids"' not in page.text
+    assert 'title="Edit the ID and press Enter"' in page.text
+    assert page.text.index('href="/blogs"') < page.text.index('href="/authors"')
+
+    blank = client.post(
+        f"/authors/{local_id}/openalex-id",
+        data={"openalex_id": ""},
+        follow_redirects=False,
+    )
+    assert blank.status_code == 303
+    assert "level=error" in blank.headers["location"]
+
+    invalid = client.post(
+        f"/authors/{local_id}/openalex-id",
+        data={"openalex_id": "bad"},
+        follow_redirects=False,
+    )
+    assert invalid.status_code == 303
+    assert "level=error" in invalid.headers["location"]
+
+    duplicate = client.post(
+        f"/authors/{local_id}/openalex-id",
+        data={"openalex_id": "A123"},
+        follow_redirects=False,
+    )
+    assert duplicate.status_code == 303
+    assert "level=error" in duplicate.headers["location"]
+
+    updated = client.post(
+        f"/authors/{local_id}/openalex-id",
+        data={"openalex_id": "a987654"},
+        follow_redirects=False,
+    )
+    assert updated.status_code == 303
+    assert "A987654" in updated.headers["location"]
+    with Database(config.paths.database) as db:
+        author = db.get_author("A987654")
+        assert author is not None and author["enabled"] == 1
+        assert db.get_author(local_id) is None
+
+    missing = client.post(
+        "/authors/A404/openalex-id",
+        data={"openalex_id": "A555"},
+        follow_redirects=False,
+    )
+    assert missing.status_code == 404
+
+    css = client.get("/static/app.css")
+    assert ".shell{width:min(1240px" in css.text
+    assert ".author-blogs-column" in css.text
+    assert ".author-blog-table" in css.text
+    javascript = client.get("/static/app.js")
+    assert 'getElementById("toggle-author-ids")' not in javascript.text
+    assert '.author-table.author-ids-visible' not in css.text
+    assert '/static/app.css?v=0.8.8' in page.text
+    assert '/static/app.js?v=0.8.8' in page.text

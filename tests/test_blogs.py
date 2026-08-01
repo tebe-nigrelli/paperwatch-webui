@@ -323,6 +323,79 @@ def test_blog_database_lifecycle_and_run_stats(app_config, author_candidate):
     client.close()
 
 
+def test_editing_and_marking_shared_blog_sources(tmp_path, author_candidate):
+    second_author = AuthorCandidate(openalex_id="A456", name="Grace Hopper")
+    with Database(tmp_path / "editable-blogs.sqlite") as db:
+        db.add_author(author_candidate)
+        db.add_author(second_author)
+        blog_id = db.add_author_blog(
+            "A123",
+            "https://example.com/original",
+            label="Shared source",
+        )
+        assert db.add_author_blog("A456", "https://example.com/original") == blog_id
+        entry_id = db.save_blog_entry(
+            blog_id=blog_id,
+            title="Historical post",
+            content_sha256="old",
+            normalized_text="old text",
+            diff_text="",
+            change_kind="baseline",
+            previous_entry_id=None,
+        )
+        db._conn.execute(
+            """
+            UPDATE blogs SET enabled=0, etag='etag', last_modified='date',
+                feed_url='https://example.com/feed', feed_etag='feed-etag',
+                feed_last_modified='feed-date', feed_initialized=1,
+                feed_discovery_checked=1, last_fetch_method='rss',
+                last_checked_at='2026-08-01', last_status=500, last_error='failed'
+            WHERE id=?
+            """,
+            (blog_id,),
+        )
+        db._conn.commit()
+
+        first = db.author_blogs("A123")[0]
+        assert first["linked_author_count"] == 2
+        assert db.update_author_blog_url(
+            "A123", blog_id, "https://example.com/replacement"
+        ) is True
+        for author_id in ("A123", "A456"):
+            row = db.author_blogs(author_id)[0]
+            assert row["id"] == blog_id
+            assert row["url"] == "https://example.com/replacement"
+            assert row["enabled"] == 1
+            assert row["feed_url"] is None
+            assert row["last_checked_at"] is None
+            assert row["last_error"] is None
+        assert db.get_blog_entry(entry_id) is not None
+
+        assert db.set_author_blog_broken("A456", blog_id, True) is True
+        broken = db.author_blogs("A123")[0]
+        assert broken["enabled"] == 0
+        assert broken["last_error"] == "Marked broken by user"
+        assert db.list_enabled_blogs() == []
+        assert db.set_author_blog_broken("A123", blog_id, False) is True
+        assert db.author_blogs("A456")[0]["enabled"] == 1
+
+        assert db.update_author_blog_url(
+            "A123", blog_id, "https://example.com/replacement"
+        ) is True
+        duplicate_id = db.add_author_blog("A123", "https://example.com/duplicate")
+        with pytest.raises(ValueError, match="already tracked"):
+            db.update_author_blog_url(
+                "A123", blog_id, "https://example.com/duplicate"
+            )
+        assert duplicate_id != blog_id
+        assert db.update_author_blog_url(
+            "A404", blog_id, "https://example.com/missing"
+        ) is False
+        assert db.set_author_blog_broken("A404", blog_id, True) is False
+        with pytest.raises(ValueError, match="required"):
+            db.update_author_blog_url("A123", blog_id, " ")
+
+
 def test_rss_items_are_baselined_then_added_to_blog_feed(app_config, author_candidate):
     page = """<html><head><link rel="alternate" type="application/rss+xml" href="/feed.xml"></head><body><main>Page</main></body></html>"""
 

@@ -904,3 +904,31 @@ def test_query_controller_tracks_numeric_progress_and_ignores_invalid(config_pat
     assert snapshot.message == "Model one"
     assert snapshot.live_output == "partial"
     assert (snapshot.progress_current, snapshot.progress_total) == (3, 8)
+
+
+def test_collection_query_accepts_outputs_longer_than_paper_summary_limit():
+    from paperwatch.query_jobs import _generate
+
+    long_output = "word " * 350
+
+    class LongCollectionOutput:
+        def generate_json(self, *args, **kwargs):
+            payload = {
+                "title": "Detailed collection result",
+                "summary": long_output,
+                "items": [
+                    {
+                        "paper_id": 1,
+                        "blog_entry_id": None,
+                        "content_type": "paper",
+                        "title": "Detailed paper",
+                        "output": long_output,
+                    }
+                ],
+            }
+            return StructuredJSONResponse(data=payload, usage={}, raw=payload)
+
+    result, usage = _generate(LongCollectionOutput(), "prompt")
+    assert len(result.summary.split()) == 350
+    assert len(result.items[0].output.split()) == 350
+    assert usage == {}

@@ -953,7 +953,15 @@ def test_fetch_title_records_missing_match_and_pdf_errors(
         assert stats.status == "failed" and paper_id is None
         assert db.get_run_errors(stats.run_id)[0]["stage"] == "paper_search_download"
 
-        no_pdf = replace(paper_record, openalex_id="WNOFILE", pdf_url=None)
+        no_pdf = replace(
+            paper_record,
+            openalex_id="WNOFILE",
+            doi=None,
+            arxiv_id=None,
+            title="Paper without any PDF source",
+            publication_url="https://publisher.test/no-file",
+            pdf_url=None,
+        )
         app.openalex = SearchOpenAlex([no_pdf])
         stats, paper_id = app.fetch_title(no_pdf.title)
         assert stats.status == "failed" and paper_id is not None
@@ -1038,8 +1046,25 @@ def test_fetch_work_downloads_exact_result_and_keeps_failed_record(
         with pytest.raises(ValueError, match="cannot be empty"):
             app.fetch_work(" ")
 
-        no_pdf = replace(paper_record, openalex_id="WNOFILE", pdf_url=None)
+        no_pdf = replace(
+            paper_record,
+            openalex_id="WNOFILE",
+            doi=None,
+            arxiv_id=None,
+            title="Paper without any PDF source",
+            publication_url="https://publisher.test/no-file",
+            pdf_url=None,
+        )
         app.openalex = WorkOpenAlex(no_pdf)
+        app.pdf_client = httpx.Client(
+            transport=httpx.MockTransport(
+                lambda request: httpx.Response(
+                    200,
+                    content=b"<html><body>No PDF</body></html>",
+                    headers={"content-type": "text/html"},
+                )
+            )
+        )
         failed, failed_paper_id = app.fetch_work("WNOFILE")
         assert failed.status == "failed" and failed_paper_id is not None
         assert db.get_run_errors(failed.run_id)[0]["stage"] == "paper_download"
@@ -1509,3 +1534,119 @@ def test_pdf_retry_uses_stored_url_when_refresh_fails_and_records_bad_pdf(
         assert Path(db.get_paper(first_id)["local_pdf_path"]).is_file()
         errors = db.get_run_errors(stats.run_id)
         assert any(row["stage"] == "pdf_retry" and "Retry invalid PDF" in row["message"] for row in errors)
+
+
+def test_missing_pdf_is_resolved_from_publication_page_and_stored(
+    app_config, author_candidate, paper_record
+):
+    paper = deepcopy(paper_record)
+    paper.pdf_url = None
+    paper.pdf_source = None
+    paper.arxiv_id = None
+    paper.publication_url = "https://dl.acm.org/doi/10.1145/example"
+    paper.metadata = {}
+
+    class NoLLM:
+        provider = "none"
+        model = ""
+
+        def close(self):
+            pass
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/doi/pdf/10.1145/example":
+            return httpx.Response(200, content=PDF_BYTES)
+        return httpx.Response(200, text="<html>No PDF</html>", headers={"content-type": "text/html"})
+
+    config = replace(app_config, llm=replace(app_config.llm, provider="none", model=""))
+    with Database(config.paths.database) as db:
+        db.add_author(author_candidate)
+        app = PaperWatch(
+            config,
+            db=db,
+            openalex=FakeOpenAlex([paper]),
+            arxiv=None,
+            llm=NoLLM(),
+            pdf_client=httpx.Client(
+                transport=httpx.MockTransport(handler), follow_redirects=True
+            ),
+        )
+        stats = app.run(today=date(2026, 7, 24))
+        stored = db.list_papers()[0]
+        assert stats.status == "success"
+        assert stats.pdfs_downloaded == 1
+        assert stored["pdf_url"] == "https://dl.acm.org/doi/pdf/10.1145/example"
+        assert stored["pdf_source"] == "source_page"
+        assert Path(stored["local_pdf_path"]).is_file()
+
+
+def test_invalid_source_pdf_landing_page_falls_back_to_embedded_pdf(
+    app_config, author_candidate, paper_record
+):
+    paper = deepcopy(paper_record)
+    paper.pdf_url = "https://publisher.test/source"
+    paper.publication_url = "https://publisher.test/article"
+
+    class NoLLM:
+        provider = "none"
+        model = ""
+
+        def close(self):
+            pass
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/source":
+            return httpx.Response(
+                200,
+                text='<a href="/download/paper">Source PDF</a>',
+                headers={"content-type": "text/html"},
+            )
+        if request.url.path == "/download/paper":
+            return httpx.Response(200, content=PDF_BYTES)
+        return httpx.Response(200, text="<html>No PDF</html>", headers={"content-type": "text/html"})
+
+    config = replace(app_config, llm=replace(app_config.llm, provider="none", model=""))
+    with Database(config.paths.database) as db:
+        db.add_author(author_candidate)
+        app = PaperWatch(
+            config,
+            db=db,
+            openalex=FakeOpenAlex([paper]),
+            arxiv=None,
+            llm=NoLLM(),
+            pdf_client=httpx.Client(
+                transport=httpx.MockTransport(handler), follow_redirects=True
+            ),
+        )
+        stats = app.run(today=date(2026, 7, 24))
+        stored = db.list_papers()[0]
+        assert stats.status == "success"
+        assert stored["pdf_url"] == "https://publisher.test/download/paper"
+        assert stored["pdf_source"] == "publisher_page"
+        assert Path(stored["local_pdf_path"]).is_file()
+
+
+def test_pdf_candidate_collection_includes_openalex_locations(paper_record):
+    paper = deepcopy(paper_record)
+    paper.pdf_url = "https://repo.test/direct.pdf"
+    paper.publication_url = "https://publisher.test/article"
+    paper.metadata = {
+        "best_oa_location": "malformed",
+        "primary_location": {
+            "pdf_url": "https://repo.test/direct.pdf",
+            "landing_page_url": "https://primary.test/article",
+        },
+        "locations": [
+            None,
+            {
+                "pdf_url": "https://other.test/file.pdf",
+                "landing_page_url": "not-a-url",
+            },
+        ],
+    }
+    assert PaperWatch._paper_pdf_candidates(paper) == [
+        "https://repo.test/direct.pdf",
+        "https://publisher.test/article",
+        "https://primary.test/article",
+        "https://other.test/file.pdf",
+    ]

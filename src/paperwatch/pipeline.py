@@ -24,7 +24,15 @@ from .llm import (
 from .locking import run_lock
 from .job_runtime import JobCancelled, ProgressCallback, check_cancelled, publish
 from .models import AnalysisResult, PaperRecord, normalize_title
-from .pdfs import PDFError, download_pdf, extract_pdf_text, is_complete_pdf, safe_pdf_name
+from .pdfs import (
+    PDFError,
+    ResolvedPDF,
+    download_pdf,
+    extract_pdf_text,
+    is_complete_pdf,
+    resolve_pdf_url,
+    safe_pdf_name,
+)
 from .sources.arxiv import ArxivClient
 from .sources.openalex import OpenAlexClient
 
@@ -416,6 +424,53 @@ class PaperWatch:
             stats.papers_analyzed += 1
         return outcome.result
 
+    @staticmethod
+    def _paper_pdf_candidates(paper: PaperRecord) -> list[str]:
+        candidates: list[str] = []
+
+        def add(value: Any) -> None:
+            url = str(value or "").strip()
+            if url.startswith(("http://", "https://")) and url not in candidates:
+                candidates.append(url)
+
+        add(paper.pdf_url)
+        add(paper.publication_url)
+        metadata = paper.metadata if isinstance(paper.metadata, dict) else {}
+        for key in ("best_oa_location", "primary_location"):
+            location = metadata.get(key)
+            if not isinstance(location, dict):
+                continue
+            add(location.get("pdf_url"))
+            add(location.get("landing_page_url"))
+        locations = metadata.get("locations")
+        if isinstance(locations, list):
+            for location in locations:
+                if not isinstance(location, dict):
+                    continue
+                add(location.get("pdf_url"))
+                add(location.get("landing_page_url"))
+        return candidates
+
+    def _resolve_paper_pdf(self, paper: PaperRecord) -> ResolvedPDF | None:
+        return resolve_pdf_url(
+            title=paper.title,
+            doi=paper.doi,
+            candidates=self._paper_pdf_candidates(paper),
+            client=self.pdf_client,
+            cancel_event=self._cancel_event,
+        )
+
+    def _store_resolved_pdf(
+        self,
+        *,
+        paper_id: int,
+        paper: PaperRecord,
+        resolved: ResolvedPDF,
+    ) -> None:
+        paper.pdf_url = resolved.url
+        paper.pdf_source = resolved.source
+        self.db.set_paper_pdf_source(paper_id, resolved.url, resolved.source)
+
     def _process_pdf(
         self,
         stats: RunStats,
@@ -425,20 +480,40 @@ class PaperWatch:
         analyze: bool,
         analyze_new_downloads: bool,
     ) -> None:
-        # Fetches are archival: once a paper exposes a PDF URL, keep a local copy.
-        # The legacy download_pdfs setting is still parsed for config compatibility,
-        # but no fetch path silently skips an available PDF.
+        # Fetches are archival: once a paper exposes a valid PDF, keep a local copy.
+        # Landing pages and Scholar result links are resolved only when the direct
+        # OpenAlex/arXiv URL is absent or fails PDF validation.
+        resolution_attempted = False
         if not paper.pdf_url:
-            return
+            resolved = self._resolve_paper_pdf(paper)
+            resolution_attempted = True
+            if resolved is None:
+                return
+            self._store_resolved_pdf(paper_id=paper_id, paper=paper, resolved=resolved)
 
         destination = self.config.paths.pdf_dir / safe_pdf_name(paper.identity_key)
-        downloaded = download_pdf(
-            paper.pdf_url,
-            destination,
-            max_bytes=self.config.fetch.max_pdf_bytes,
-            client=self.pdf_client,
-            cancel_event=self._cancel_event,
-        )
+        try:
+            downloaded = download_pdf(
+                paper.pdf_url,
+                destination,
+                max_bytes=self.config.fetch.max_pdf_bytes,
+                client=self.pdf_client,
+                cancel_event=self._cancel_event,
+            )
+        except PDFError as direct_error:
+            if resolution_attempted:
+                raise
+            resolved = self._resolve_paper_pdf(paper)
+            if resolved is None or resolved.url == paper.pdf_url:
+                raise direct_error
+            self._store_resolved_pdf(paper_id=paper_id, paper=paper, resolved=resolved)
+            downloaded = download_pdf(
+                paper.pdf_url,
+                destination,
+                max_bytes=self.config.fetch.max_pdf_bytes,
+                client=self.pdf_client,
+                cancel_event=self._cancel_event,
+            )
         if downloaded:
             stats.pdfs_downloaded += 1
         self.db.set_local_pdf(paper_id, str(destination))
@@ -686,19 +761,17 @@ class PaperWatch:
                 stats.new_paper_ids.append(paper_id)
             paper_error: _SelectedPaperDownloadError | None = None
             try:
-                if not paper.pdf_url:
-                    raise PDFError("The selected paper has no downloadable PDF")
-                destination = self.config.paths.pdf_dir / safe_pdf_name(paper.identity_key)
-                downloaded = download_pdf(
-                    paper.pdf_url,
-                    destination,
-                    max_bytes=self.config.fetch.max_pdf_bytes,
-                    client=self.pdf_client,
-                    cancel_event=self._cancel_event,
+                self._process_pdf(
+                    stats,
+                    paper_id=paper_id,
+                    paper=paper,
+                    analyze=False,
+                    analyze_new_downloads=False,
                 )
-                if downloaded:
-                    stats.pdfs_downloaded = 1
-                self.db.set_local_pdf(paper_id, str(destination))
+                stored = self.db.get_paper(paper_id)
+                local_path = Path(str(stored["local_pdf_path"] or "")) if stored else None
+                if local_path is None or not is_complete_pdf(local_path):
+                    raise PDFError("The selected paper has no downloadable PDF")
             except JobCancelled:
                 raise
             except Exception as exc:

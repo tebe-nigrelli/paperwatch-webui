@@ -21,6 +21,7 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from starlette.datastructures import UploadFile
 
+from . import __version__
 from .analysis_jobs import AnalysisController
 from .blog_import import import_blog_links
 from .blogs import normalize_blog_url
@@ -959,6 +960,7 @@ def create_app(
         base = {
             "request": request,
             "config": config,
+            "asset_version": __version__,
             "run_state": controller.snapshot(),
             "analysis_state": model_controller.snapshot(),
             "query_state": collection_controller.snapshot(),
@@ -1180,6 +1182,52 @@ def create_app(
             status_code=303,
         )
 
+    @app.post("/authors/{openalex_id}/blogs/{blog_id}/edit")
+    async def edit_author_blog(
+        request: Request, openalex_id: str, blog_id: int
+    ) -> RedirectResponse:
+        form = await request.form()
+        try:
+            url = normalize_blog_url(str(form.get("url", "")))
+            with Database(config.paths.database) as db:
+                if not db.update_author_blog_url(openalex_id, blog_id, url):
+                    raise HTTPException(404, "Blog link not found")
+        except ValueError as exc:
+            return RedirectResponse(
+                _notice_url(
+                    f"/authors/{quote_plus(openalex_id)}/blogs",
+                    str(exc),
+                    level="error",
+                ),
+                status_code=303,
+            )
+        return RedirectResponse(
+            _notice_url(
+                f"/authors/{quote_plus(openalex_id)}/blogs",
+                "Blog URL updated.",
+            ),
+            status_code=303,
+        )
+
+    @app.post("/authors/{openalex_id}/blogs/{blog_id}/availability")
+    async def set_author_blog_availability(
+        request: Request, openalex_id: str, blog_id: int
+    ) -> RedirectResponse:
+        form = await request.form()
+        broken = str(form.get("broken", "")) in {"1", "true", "on"}
+        with Database(config.paths.database) as db:
+            if not db.set_author_blog_broken(openalex_id, blog_id, broken):
+                raise HTTPException(404, "Blog link not found")
+        message = (
+            "Blog marked broken; future checks are paused."
+            if broken
+            else "Blog restored."
+        )
+        return RedirectResponse(
+            _notice_url(f"/authors/{quote_plus(openalex_id)}/blogs", message),
+            status_code=303,
+        )
+
     @app.get("/blogs", response_class=HTMLResponse)
     def blog_feed(request: Request) -> HTMLResponse:
         selected_query_id = _int_or_none(request.query_params.get("query_id"))
@@ -1282,6 +1330,29 @@ def create_app(
             db.add_author(candidate)
         return RedirectResponse(
             _notice_url("/authors", f"Added {candidate.name}."), status_code=303
+        )
+
+    @app.post("/authors/{openalex_id}/openalex-id")
+    async def update_author_openalex_id(
+        request: Request, openalex_id: str
+    ) -> RedirectResponse:
+        form = await request.form()
+        try:
+            replacement = _manual_openalex_author_id(
+                str(form.get("openalex_id", ""))
+            )
+            if replacement is None:
+                raise ValueError("OpenAlex author ID is required")
+            with Database(config.paths.database) as db:
+                if not db.update_author_openalex_id(openalex_id, replacement):
+                    raise HTTPException(404, "Author not found")
+        except ValueError as exc:
+            return RedirectResponse(
+                _notice_url("/authors", str(exc), level="error"), status_code=303
+            )
+        return RedirectResponse(
+            _notice_url("/authors", f"OpenAlex ID updated to {replacement}."),
+            status_code=303,
         )
 
     @app.post("/authors/{openalex_id}/enable")

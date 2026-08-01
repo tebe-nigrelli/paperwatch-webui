@@ -5,8 +5,8 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="color-scheme" content="light dark">
   <title>{% block title %}paperwatch{% endblock %}</title>
-  <link rel="stylesheet" href="{{ url_for('static', path='app.css') }}">
-  <script defer src="{{ url_for('static', path='app.js') }}"></script>
+  <link rel="stylesheet" href="{{ url_for('static', path='app.css') }}?v={{ asset_version }}">
+  <script defer src="{{ url_for('static', path='app.js') }}?v={{ asset_version }}"></script>
 </head>
 <body data-run-running="{{ 'true' if run_state.running else 'false' }}" data-analysis-running="{{ 'true' if analysis_state.running else 'false' }}" data-query-running="{{ 'true' if query_state.running else 'false' }}">
 <header class="site-header">
@@ -14,8 +14,8 @@
     <a class="brand" href="/">paperwatch</a>
     <nav aria-label="Primary navigation">
       <a href="/">Recent</a>
-      <a href="/authors">Authors</a>
       <a href="/blogs">Blogs</a>
+      <a href="/authors">Authors</a>
       <a href="/discover">Discover</a>
       <a href="/queries">Queries</a>
       <a href="/runs">Runs</a>

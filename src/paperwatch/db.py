@@ -759,6 +759,61 @@ class Database:
             )
         return cur.rowcount > 0
 
+    def update_author_openalex_id(self, current_id: str, new_id: str) -> bool:
+        current = self._author_id(current_id)
+        replacement = self._author_id(new_id)
+        if not replacement.startswith("A") or not replacement[1:].isdigit():
+            raise ValueError("OpenAlex author ID must look like A123456789")
+        with self.transaction() as conn:
+            row = conn.execute(
+                "SELECT id, metadata_json FROM authors WHERE openalex_id=?",
+                (current,),
+            ).fetchone()
+            if row is None:
+                return False
+            author_id = int(row["id"])
+            if replacement == current:
+                return True
+            duplicate = conn.execute(
+                "SELECT id FROM authors WHERE openalex_id=? AND id<>?",
+                (replacement, author_id),
+            ).fetchone()
+            if duplicate is not None:
+                raise ValueError("OpenAlex author ID is already assigned to another author")
+            try:
+                metadata = json.loads(row["metadata_json"] or "{}")
+            except (TypeError, json.JSONDecodeError):
+                metadata = {}
+            if not isinstance(metadata, dict):
+                metadata = {}
+            metadata["papers_enabled"] = True
+            conn.execute(
+                """
+                UPDATE authors
+                SET openalex_id=?, enabled=1, tracked=1, last_checked_at=NULL,
+                    metadata_json=?
+                WHERE id=?
+                """,
+                (replacement, json_dumps(metadata), author_id),
+            )
+            conn.execute(
+                """
+                UPDATE paper_authors
+                SET tracked_author_id=?, openalex_author_id=?
+                WHERE tracked_author_id=? OR openalex_author_id=?
+                """,
+                (author_id, replacement, author_id, current),
+            )
+            conn.execute(
+                "UPDATE paper_authors SET tracked_author_id=? WHERE openalex_author_id=?",
+                (author_id, replacement),
+            )
+            conn.execute(
+                "UPDATE run_errors SET author_openalex_id=? WHERE author_openalex_id=?",
+                (replacement, current),
+            )
+        return True
+
     def remove_author(self, openalex_id: str) -> bool:
         """Archive an author without deleting identity or paper relationships."""
         identifier = self._author_id(openalex_id)
@@ -833,6 +888,103 @@ class Database:
             )
         return cur.rowcount > 0
 
+    def update_author_blog_url(
+        self,
+        openalex_id: str,
+        blog_id: int,
+        url: str,
+    ) -> bool:
+        """Update a linked source URL and reset URL-specific fetch state.
+
+        Blog sources are shared across authors, so changing the URL updates the
+        source for every linked author while preserving its entries and ID.
+        """
+        identifier = self._author_id(openalex_id)
+        cleaned_url = url.strip()
+        if not cleaned_url:
+            raise ValueError("Blog URL is required")
+        with self.transaction() as conn:
+            linked = conn.execute(
+                """
+                SELECT b.url
+                FROM authors a
+                JOIN author_blogs ab ON ab.author_id=a.id
+                JOIN blogs b ON b.id=ab.blog_id
+                WHERE a.openalex_id=? AND a.tracked=1 AND b.id=?
+                """,
+                (identifier, blog_id),
+            ).fetchone()
+            if linked is None:
+                return False
+            current_url = str(linked["url"])
+            if current_url == cleaned_url:
+                conn.execute(
+                    """
+                    UPDATE blogs
+                    SET enabled=1, last_status=NULL, last_error=NULL
+                    WHERE id=?
+                    """,
+                    (blog_id,),
+                )
+                return True
+            duplicate = conn.execute(
+                "SELECT id FROM blogs WHERE url=? AND id<>?",
+                (cleaned_url, blog_id),
+            ).fetchone()
+            if duplicate is not None:
+                raise ValueError("That blog URL is already tracked")
+            conn.execute(
+                """
+                UPDATE blogs SET
+                    url=?, title=NULL, enabled=1,
+                    etag=NULL, last_modified=NULL,
+                    feed_url=NULL, feed_etag=NULL, feed_last_modified=NULL,
+                    feed_initialized=0, feed_discovery_checked=0,
+                    last_fetch_method=NULL, last_checked_at=NULL,
+                    last_status=NULL, last_error=NULL
+                WHERE id=?
+                """,
+                (cleaned_url, blog_id),
+            )
+        return True
+
+    def set_author_blog_broken(
+        self,
+        openalex_id: str,
+        blog_id: int,
+        broken: bool,
+    ) -> bool:
+        """Mark a linked source broken, pausing or restoring future fetches."""
+        identifier = self._author_id(openalex_id)
+        with self.transaction() as conn:
+            linked = conn.execute(
+                """
+                SELECT 1
+                FROM authors a
+                JOIN author_blogs ab ON ab.author_id=a.id
+                WHERE a.openalex_id=? AND a.tracked=1 AND ab.blog_id=?
+                """,
+                (identifier, blog_id),
+            ).fetchone()
+            if linked is None:
+                return False
+            conn.execute(
+                """
+                UPDATE blogs
+                SET enabled=?,
+                    last_status=CASE WHEN ? THEN last_status ELSE NULL END,
+                    last_error=CASE WHEN ? THEN 'Marked broken by user' ELSE NULL END
+                WHERE id=?
+                """,
+                (
+                    0 if broken else 1,
+                    1 if broken else 0,
+                    1 if broken else 0,
+                    blog_id,
+                ),
+            )
+        return True
+
     def author_blogs(self, openalex_id: str) -> list[sqlite3.Row]:
         identifier = self._author_id(openalex_id)
         return list(
@@ -840,7 +992,9 @@ class Database:
                 """
                 SELECT b.*, ab.label, ab.relationship,
                     (SELECT count(*) FROM blog_entries be
-                     WHERE be.blog_id=b.id AND be.change_kind != 'baseline') AS entry_count
+                     WHERE be.blog_id=b.id AND be.change_kind != 'baseline') AS entry_count,
+                    (SELECT count(*) FROM author_blogs linked
+                     WHERE linked.blog_id=b.id) AS linked_author_count
                 FROM authors a
                 JOIN author_blogs ab ON ab.author_id=a.id
                 JOIN blogs b ON b.id=ab.blog_id
@@ -1217,6 +1371,13 @@ class Database:
     def set_local_pdf(self, paper_id: int, path: str) -> None:
         with self.transaction() as conn:
             conn.execute("UPDATE papers SET local_pdf_path = ? WHERE id = ?", (path, paper_id))
+
+    def set_paper_pdf_source(self, paper_id: int, url: str, source: str) -> None:
+        with self.transaction() as conn:
+            conn.execute(
+                "UPDATE papers SET pdf_url = ?, pdf_source = ?, fetched_at = ? WHERE id = ?",
+                (url, source, utcnow(), paper_id),
+            )
 
     def get_paper(self, paper_id: int) -> sqlite3.Row | None:
         return self._conn.execute("SELECT * FROM papers WHERE id = ?", (paper_id,)).fetchone()

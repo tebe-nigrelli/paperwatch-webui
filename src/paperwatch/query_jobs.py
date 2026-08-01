@@ -274,7 +274,9 @@ def _query_prompt(user_prompt: str, documents: list[dict[str, Any]], *, merge: b
         )
     return f"""You are analyzing a filtered collection of research papers and/or blog entries.
 Return exactly one JSON object matching the supplied schema. {instruction}
-The top-level summary should synthesize the collection. The items list should contain concrete, useful outputs rather than restating titles. Do not invent facts.
+The top-level summary should synthesize the collection.
+The items list should contain concrete, useful outputs rather than restating titles.
+Keep each text field below 100,000 characters. Do not invent facts.
 
 USER PROMPT:
 {user_prompt}

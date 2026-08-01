@@ -2,7 +2,7 @@
 
 Paperwatch is a local, daily research-paper tracker for a curated set of authors. It discovers papers through OpenAlex, fills missing abstract and open-PDF metadata from arXiv, stores everything in SQLite, and produces strict structured summaries with Ollama, OpenAI, OpenAI Codex, or Claude Code models.
 
-Version 0.8.4 fetches linked blogs concurrently with paper discovery and PDF archival. It also removes the Diagnostics page and transient fetch banners, and keeps collection prompt controls folded beneath More filters by default. The Queries table remains the sole source of truth for fetch-time model execution; with both automatic columns clear, Fetch now downloads and indexes content without contacting a model.
+Version 0.8.8 keeps OpenAlex IDs visible and editable in the Authors table. Missing PDFs now fall back to verified links exposed by publisher/repository pages and, when necessary, direct PDF links in Google Scholar results. Resolved URLs are stored and retried by the existing recent-paper PDF recovery cycle.
 
 ## Main flow
 
@@ -11,6 +11,7 @@ tracked OpenAlex authors
   -> daily recent-work query with rolling overlap
   -> identifier-aware deduplication
   -> conditional arXiv abstract/PDF enrichment
+  -> publisher/repository and Google Scholar direct-PDF fallback
   -> SQLite metadata, ordered authorship, and ranked OpenAlex topics
   -> local archival of every exposed paper PDF
   -> optional saved-query processing selected in the Web UI
@@ -113,7 +114,7 @@ There is no multi-page author drill-down required to perform these actions.
 
 ### Authors and tags
 
-The Authors page shows tracked authors in a searchable table. The table includes each tracked author’s name, institution, local paper count, tags, external links, and compact icon controls for pausing, resuming, or non-destructively removing tracking. OpenAlex author discovery is on the separate **Discover** page.
+The Authors page shows tracked authors in a searchable table. The table includes each tracked author’s name, editable OpenAlex ID, institution, local paper count, tags, external links, and compact icon controls for pausing, resuming, or non-destructively removing tracking. Edit an OpenAlex ID in place and press Enter to save it. OpenAlex author discovery is on the separate **Discover** page.
 
 - Search matches name, institution/employment, ORCID, OpenAlex ID, and tags.
 - The small **Add tag** field submits on Enter and clears after the redirect.
@@ -305,8 +306,9 @@ year PDFs**. Local files are linked as **Downloaded PDF** and remote origins as
 - OpenAlex is the primary metadata/discovery source.
 - arXiv is queried only when the abstract or direct PDF is missing.
 - arXiv title matches are verified with author evidence.
-- PDFs are restricted to known open locations; paywalls are never bypassed.
-- Downloads are size-limited, signature-checked, and atomically written.
+- When OpenAlex exposes no working PDF, publisher and repository pages are inspected for standard PDF metadata and visible PDF/download links. Common arXiv, Google Drive, ACM, Wiley, and IEEE URL forms are normalized to direct download candidates.
+- If those sources fail, Google Scholar is checked for an explicitly exposed direct PDF link. Scholar blocking or a page without a direct link is treated as no result.
+- Paywalls and authentication are never bypassed. Every fallback candidate must begin with a PDF signature before it is stored, then the complete download is size-limited, EOF-checked, and atomically written.
 - Extracted text and model outputs are cached where their content identity matches.
 
 `max_pdf_chars` is a safety ceiling, not a chunk size. It must be high enough to extract the complete paper before chunking. The default is two million characters.

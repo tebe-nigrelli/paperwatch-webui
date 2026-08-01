@@ -12,17 +12,26 @@
   </form>
 </section>
 <section class="panel">
-  <div class="panel-heading"><h2>Linked blogs</h2><span>{{ blogs|length }}</span></div>
-  <div class="table-wrap"><table><thead><tr><th>Source</th><th>Relationship</th><th>Method</th><th>Last checked</th><th>Updates</th><th>Status</th><th>Remove</th></tr></thead><tbody>
-  {% for blog in blogs %}<tr>
-    <td><a href="{{ blog.url }}" target="_blank" rel="noreferrer">{{ blog.label or blog.title or blog.url }}</a><small class="block muted">{{ blog.url }}</small>{% if blog.feed_url and blog.feed_url != blog.url %}<small class="block muted">Feed: {{ blog.feed_url }}</small>{% endif %}</td>
+  <div class="panel-heading"><div><h2>Linked blogs</h2><p>Edit a URL in place and press Enter. Marking a source broken pauses future checks without deleting its history.</p></div><span>{{ blogs|length }}</span></div>
+  <div class="table-wrap"><table class="author-blog-table"><thead><tr><th>Source</th><th>Relationship</th><th>Method</th><th>Last checked</th><th>Updates</th><th>Status</th><th>Availability</th><th>Remove</th></tr></thead><tbody>
+  {% for blog in blogs %}<tr class="{% if not blog.enabled %}blog-source-broken{% endif %}">
+    <td class="blog-source-cell">
+      <div class="blog-source-heading"><strong>{{ blog.label or blog.title or 'Blog source' }}</strong><a href="{{ blog.url }}" target="_blank" rel="noreferrer" aria-label="Open {{ blog.url }}">Open ↗</a></div>
+      <form method="post" action="/authors/{{ author.openalex_id }}/blogs/{{ blog.id }}/edit" class="blog-url-edit-form">
+        <input type="url" name="url" value="{{ blog.url }}" maxlength="2000" required aria-label="Blog URL for {{ blog.label or blog.title or blog.url }}" title="Edit the URL and press Enter" autocomplete="off">
+        <button class="sr-only" type="submit">Save blog URL</button>
+      </form>
+      {% if blog.feed_url and blog.feed_url != blog.url %}<small class="block muted">Feed: {{ blog.feed_url }}</small>{% endif %}
+      {% if blog.linked_author_count > 1 %}<small class="block muted">Shared by {{ blog.linked_author_count }} authors; URL edits affect all links.</small>{% endif %}
+    </td>
     <td>{{ blog.relationship or '—' }}</td>
     <td>{% if blog.last_fetch_method == 'rss' %}<span class="status status-success">RSS</span>{% elif blog.last_fetch_method == 'snapshot' %}<span class="status">snapshot</span>{% else %}<span class="muted">auto</span>{% endif %}</td>
     <td>{{ blog.last_checked_at or 'Not fetched yet' }}</td>
     <td>{{ blog.entry_count }}</td>
-    <td>{% if blog.last_error %}<span class="status status-failed" title="{{ blog.last_error }}">error</span>{% elif blog.last_status %}<span class="status status-success">{{ blog.last_status }}</span>{% else %}<span class="muted">pending</span>{% endif %}</td>
+    <td>{% if not blog.enabled %}<span class="status status-failed">broken</span>{% elif blog.last_error %}<span class="status status-failed" title="{{ blog.last_error }}">error</span>{% elif blog.last_status %}<span class="status status-success">{{ blog.last_status }}</span>{% else %}<span class="muted">pending</span>{% endif %}</td>
+    <td class="blog-availability-cell"><form method="post" action="/authors/{{ author.openalex_id }}/blogs/{{ blog.id }}/availability"><input type="hidden" name="broken" value="{{ 0 if not blog.enabled else 1 }}"><button class="button button-small{% if blog.enabled %} button-danger{% endif %}" type="submit">{{ 'Restore' if not blog.enabled else 'Mark broken' }}</button></form></td>
     <td class="icon-action-cell"><form method="post" action="/authors/{{ author.openalex_id }}/blogs/{{ blog.id }}/remove" data-confirm="Unlink this blog from {{ author.name }}?"><button class="icon-button icon-danger" type="submit" aria-label="Unlink {{ blog.url }}">×</button></form></td>
-  </tr>{% else %}<tr><td colspan="7" class="empty">No blogs linked to this author.</td></tr>{% endfor %}
+  </tr>{% else %}<tr><td colspan="8" class="empty">No blogs linked to this author.</td></tr>{% endfor %}
   </tbody></table></div>
 </section>
 {% endblock %}

@@ -610,3 +610,75 @@ def test_version_seven_database_gains_query_selection_column(tmp_path):
         assert row["selection_json"] == "{}"
         assert db._conn.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION
         assert db._conn.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
+
+
+def test_author_openalex_id_update_preserves_relationships(
+    tmp_path, author_candidate, paper_record
+):
+    from dataclasses import replace
+
+    from paperwatch.models import PaperAuthor
+
+    with Database(tmp_path / "author-id.sqlite") as db:
+        db.add_author(author_candidate)
+        manual_id = db.add_manual_author("Manual Researcher", "Local Lab")
+        manual = db.find_authors_by_name("Manual Researcher")[0]
+        local_openalex_id = str(manual["openalex_id"])
+        blog_id = db.add_author_blog(local_openalex_id, "https://example.test/manual")
+        db.add_author_tag(local_openalex_id, "systems")
+        manual_paper = replace(
+            paper_record,
+            openalex_id="W-MANUAL",
+            doi="10.1000/manual",
+            arxiv_id=None,
+            title="Manual author paper",
+            authors=[PaperAuthor(local_openalex_id, "Manual Researcher", "first", True)],
+        )
+        paper_id, _ = db.upsert_paper(manual_paper)
+        run_id = db.start_run()
+        db.record_error(
+            run_id,
+            stage="author",
+            message="temporary",
+            author_openalex_id=local_openalex_id,
+        )
+
+        assert db.update_author_openalex_id(local_openalex_id, "a999") is True
+        assert db.get_author(local_openalex_id) is None
+        updated = db.get_author("A999")
+        assert updated is not None
+        assert updated["id"] == manual_id
+        assert updated["enabled"] == 1
+        assert updated["last_checked_at"] is None
+        assert db.author_blogs("A999")[0]["id"] == blog_id
+        listed = next(
+            row for row in db.list_authors_with_tags() if row["openalex_id"] == "A999"
+        )
+        assert listed["tags"] == "systems"
+        paper_author = db._conn.execute(
+            "SELECT * FROM paper_authors WHERE paper_id=?", (paper_id,)
+        ).fetchone()
+        assert paper_author["tracked_author_id"] == manual_id
+        assert paper_author["openalex_author_id"] == "A999"
+        error = db._conn.execute(
+            "SELECT author_openalex_id FROM run_errors WHERE run_id=?", (run_id,)
+        ).fetchone()
+        assert error["author_openalex_id"] == "A999"
+
+        assert db.update_author_openalex_id("A999", "A999") is True
+        with pytest.raises(ValueError, match="already assigned"):
+            db.update_author_openalex_id("A999", "A123")
+        with pytest.raises(ValueError, match="must look like"):
+            db.update_author_openalex_id("A999", "invalid")
+        assert db.update_author_openalex_id("A404", "A888") is False
+
+        db._conn.execute(
+            "UPDATE authors SET metadata_json='not-json' WHERE openalex_id='A999'"
+        )
+        db._conn.commit()
+        assert db.update_author_openalex_id("A999", "A998") is True
+        db._conn.execute(
+            "UPDATE authors SET metadata_json='[]' WHERE openalex_id='A998'"
+        )
+        db._conn.commit()
+        assert db.update_author_openalex_id("A998", "A997") is True

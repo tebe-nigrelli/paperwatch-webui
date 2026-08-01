@@ -231,6 +231,7 @@ def _chunk_narrative_limit(value: str) -> str:
 
 Narrative = Annotated[str, AfterValidator(_narrative_limit)]
 ChunkNarrative = Annotated[str, AfterValidator(_chunk_narrative_limit)]
+CollectionNarrative = Annotated[str, Field(max_length=100_000)]
 OneSentence = Annotated[Narrative, Field(max_length=500)]
 PaperKind = Literal[
     "mathematics",
@@ -370,12 +371,12 @@ class BatchQueryItem(StrictModel):
     blog_entry_id: int | None = None
     content_type: Literal["paper", "blog"] = "paper"
     title: str = Field(min_length=1)
-    output: Narrative
+    output: CollectionNarrative
 
 
 class BatchQueryResult(StrictModel):
     title: str = Field(min_length=1)
-    summary: Narrative
+    summary: CollectionNarrative
     items: list[BatchQueryItem]
 
 
