@@ -2,7 +2,7 @@
 
 Paperwatch is a local, daily research-paper tracker for a curated set of authors. It discovers papers through OpenAlex, fills missing abstract and open-PDF metadata from arXiv, stores everything in SQLite, and produces strict structured summaries with Ollama, OpenAI, OpenAI Codex, or Claude Code models.
 
-Version 0.8.8 keeps OpenAlex IDs visible and editable in the Authors table. Missing PDFs now fall back to verified links exposed by publisher/repository pages and, when necessary, direct PDF links in Google Scholar results. Resolved URLs are stored and retried by the existing recent-paper PDF recovery cycle.
+Version 0.9.7 completes the unified paper/blog workflow with source-aware RSS pages, reliable arXiv-to-paper imports and in-app links, parallel blog fetching, compact source labels, and clickable query-result origins. Small dropdowns cycle and apply immediately; larger dropdowns support type-to-filter, keyboard selection, Enter-to-apply, and clearing the current choice. The Content page no longer duplicates fetch-error diagnostics, and destructive controls are grouped by tracked sources, downloaded content, generated data, and operational history.
 
 ## Main flow
 
@@ -20,9 +20,13 @@ tracked OpenAlex authors
 
 tracked author blog links
   -> fetched in parallel with papers by the same daily run
-  -> RSS/Atom auto-discovery and individual post ingestion
-  -> normalized HTML snapshot and hash comparison when no feed works
-  -> new feed posts and changed snapshots stored in one blog-update feed
+  -> source-aware RSS/Atom discovery with author/category scope validation
+  -> RSS records enriched with the fetched primary article page and clickable media/links
+  -> primary arXiv RSS targets imported into the shared paper library
+  -> article-index discovery and bounded child-page monitoring
+  -> documentation, publication, GitHub, and video source modes
+  -> semantic text and meaningful-link comparison
+  -> new items and substantial edits stored in one blog-update feed
 ```
 
 Failures are isolated per author, paper, PDF, model, or saved query. Cross-process locks prevent the timer, manual fetch, and on-demand analysis jobs from modifying the same database concurrently.
@@ -78,18 +82,24 @@ The server binds to localhost by default and has no login system. Do not expose 
 
 ## UI structure
 
-### Recent papers
+### Downloaded content
 
-The home page is a newest-first table with these columns:
+The home page is a newest-first unified table for papers and blog entries. Paper rows and blog rows use different backgrounds while sharing search, author filters, date filters, tags, saved queries, and pagination. The table includes:
 
 - publication date and journal;
 - wrapping paper title with direct source links;
 - tracked authors, plus the number of other authors;
 - the leading OpenAlex topic;
 - local/source PDF state, with missing PDFs highlighted;
-- the latest structured summary.
+- the latest structured summary or blog change;
+- shared paper/blog tags;
+- direct links to local PDFs or original blog pages.
 
-Tracked author names link directly to the same table filtered to that author. Search, exact author, searchable multi-select author tags, topic, year, PDF, and summary filters stay on this page. Existing tags can be filtered in a dropdown, added with Enter, and removed from the active chip list; selecting several tags matches papers associated with any of those tagged tracked authors. Checkboxes select an exact paper subset for a saved prompt; selections persist in the browser across filter/search changes and selected rows remain at the top whenever they are visible. The table supports page sizes up to 1000 records. Local PDF links ask the desktop through `xdg-open`, so on Arch Linux/KDE they use the configured system PDF application.
+Tracked author names link directly to the same table filtered to that author. Every native select is enhanced with a text field: typing filters option labels and values, and Enter inserts the highlighted choice. Search, exact author, searchable multi-select author tags, shared content tags, topic, date, PDF, and analysis filters stay on this page. Checkboxes select exact paper or blog subsets for saved prompts. The table supports page sizes up to 1000 records. Local PDF links ask the desktop through `xdg-open`, so on Arch Linux/KDE they use the configured system PDF application.
+
+Blog detail pages preserve sanitized article structure and show remote HTTP(S) images or GIFs only while the page is open. Paperwatch stores their URLs in article text but never downloads the media into its data directory. Back, original-source, and icon-only copy controls stay on one line.
+
+The Runs page contains guarded data-management actions for deleting authors, downloaded papers/PDFs, or downloaded blog entries; exporting/importing the author-plus-blog catalog as JSON; and exporting/importing the complete SQLite database and PDF store as a ZIP archive.
 
 ### Paper detail
 
@@ -127,7 +137,7 @@ Authors can also be created manually. Supplying an OpenAlex author ID enables pa
 
 ### Blog updates
 
-Blogs are fetched during every normal paper run, so the systemd timer and manual `paperwatch run` command use one shared interval. Paperwatch automatically discovers RSS or Atom feeds advertised by a linked page, stores each later feed item as an individual update, and uses conditional feed requests on subsequent runs. The first feed synchronization is a hidden baseline. If no usable feed exists—or a known feed temporarily fails—the linked HTML page is normalized and compared as a snapshot instead. Snapshot changes retain unified diffs. Shared URLs are fetched once even when linked to several authors.
+Blogs are fetched during every normal paper run, so the systemd timer and manual `paperwatch run` command use one shared interval. Each source can use `auto`, `feed`, `article_index`, `article`, `docs`, `publications`, `github`, or `video` mode. Auto-discovered feeds are scored against the configured author/category URL to avoid silently selecting a company-wide feed. Duplicate or homepage-only feed IDs are replaced with stable article identities. Article indexes retain discovered child pages and recheck older pages after they leave the front page. CSS selectors and article-URL patterns can narrow dynamic sites. RSS entries and their fetched website pages are stored separately. Fetched pages retain a sanitized HTML representation for readable headings, paragraphs, lists, tables, code, and inline links, while normalized text remains available for searching and model input. The detail page can copy the complete normalized text to the clipboard. A manual import form creates the complete tracked-author → source → entry relationship. The first synchronization remains a hidden baseline; later meaningful item, body, or outbound-link changes become updates, while counters, avatars, navigation, social links, and tracking parameters are suppressed. Shared URLs are fetched once even when linked to several authors.
 
 ### Discover and import
 
@@ -140,7 +150,7 @@ The Discover page contains the network/import operations that are separate from 
 
 ### Saved collection queries
 
-Saved queries work on both research papers and blog entries. **Summarize** is created automatically, remains first, and cannot be deleted. Query creation has its own page, and each query stores the complete execution policy: one or more configured model profiles, context-window size, paper input (`Auto`, `Abstract`, or `Full paper PDF`), and PDF strategy (`Auto`, `Direct`, or `Chunk + merge`). Blog runs use the stored feed item or normalized snapshot text and retain any version diff as additional context.
+Saved queries work on both research papers and blog entries. **Summarize** is created automatically, remains first, and cannot be deleted. Query creation has its own page, and each query stores the complete execution policy: one or more configured model profiles, context-window size, paper input (`Auto`, `Abstract`, or `Full paper PDF`), and PDF strategy (`Auto`, `Direct`, or `Chunk + merge`). An optional regexp is applied to each record’s complete selected text before model execution. Only matching records proceed, and the radius setting keeps the requested number of surrounding words around every match. The query can send those excerpts to the configured models or return the excerpts locally without invoking an LLM. Blog runs use the stored feed item or normalized snapshot text and retain any version diff as additional context.
 
 The Queries table has independent **New papers** and **New blog entries** columns. Saving those checkboxes selects the prompts that run after every normal timer or manual fetch. Each selected query runs only on records created by that fetch and uses its own stored models and settings. Initial blog baselines are excluded. When all boxes are clear, a fetch performs no model preflight and no model inference.
 
@@ -152,6 +162,14 @@ To run a saved prompt manually:
 4. Inspect persistent per-model output on Queries or the individual record page.
 
 The Runs page shows active saved prompts with links to explicitly selected papers or blog entries. Every completed query run records its runtime selection, models, context, output, and per-model errors.
+
+### Shared content tags
+
+Papers and blog entries use one content-tag namespace. Tags can be added from either detail page, searched as normal text, and selected as filters on Recent papers and Blog updates. Removing the final paper/blog association removes the unused tag while author tags remain a separate author-classification system.
+
+### Fetch history
+
+Each run records paper and blog outcomes separately. The history shows configured author/source links, links successfully read, records with downloadable data, and records actually downloaded. The detailed run page retains the existing error list alongside these counters.
 
 ## Light and dark themes
 
@@ -174,6 +192,8 @@ analyze_pdfs = false
 pdf_analysis_strategy = "chunked" # auto | direct | chunked
 prompt_version = "v2"
 ```
+
+Ollama normally receives the Pydantic JSON schema through its structured-output `format` field. Some Ollama/model combinations fail while compiling that schema with `failed to parse grammar`. Paperwatch detects that HTTP 400 response and retries in plain JSON mode, placing the schema in the prompt and validating the returned JSON locally.
 
 Additional profiles are optional:
 
@@ -416,6 +436,9 @@ Exports preserve structured nested analysis data through canonical JSON fields.
 - `query_runs`: per-model saved-query outputs and failures
 - `runs`: daily/manual fetch totals and status
 - `run_errors`: isolated pipeline failures with stage context
+- `blogs`: source configuration, selected feed state, diagnostics, and article scan cursor
+- `known_blog_articles`: durable child-article identities and last-fetch state
+- `blog_entries`: feed items, discovered articles, snapshots, diffs, and analysis state
 
 Schema migrations are automatic and preserve historical rows.
 
@@ -428,7 +451,7 @@ paperwatch --config config.toml author list
 paperwatch --config config.toml author disable A123456789
 paperwatch --config config.toml author enable A123456789
 paperwatch --config config.toml author remove A123456789
-paperwatch --config config.toml blog add A123456789 https://example.com/blog/ --label 'Personal blog'
+paperwatch --config config.toml blog add A123456789 https://example.com/blog/ --label 'Personal blog' --mode article_index --selector main --article-url-pattern '/blog/'
 paperwatch --config config.toml blog import researcher-blogs.csv --create-missing
 paperwatch --config config.toml blog list
 paperwatch --config config.toml run

@@ -7,6 +7,8 @@
   {% if topics %}<div class="topic-tags paper-topic-tags" aria-label="OpenAlex topics">{% for topic in topics %}<a class="tag topic-tag{% if topic.is_primary %} active{% endif %}" href="/?topic={{ topic.openalex_id }}" title="{% if topic.score is not none %}OpenAlex relevance {{ '%.3f'|format(topic.score) }}{% endif %}{% if topic.subfield_name %} · {{ topic.subfield_name }}{% endif %}">{{ topic.display_name }}</a>{% endfor %}</div>{% endif %}
 </section>
 
+<section class="panel content-tags-panel"><div class="panel-heading"><div><h2>Tags</h2><p>Tags are shared with blog entries and searchable from both lists.</p></div></div><div class="content-tag-editor"><div class="content-tag-row">{% for tag in paper_tags %}<form method="post" action="/papers/{{ paper.id }}/tags/remove"><input type="hidden" name="tag" value="{{ tag.name }}"><button class="tag removable-tag" type="submit" title="Remove tag">{{ tag.name }} ×</button></form>{% else %}<span class="muted">No tags</span>{% endfor %}</div><form method="post" action="/papers/{{ paper.id }}/tags/add" class="inline-tag-form"><label><span>Add tag</span><input name="tag" list="content-tag-options" maxlength="40" required></label><button class="button button-small" type="submit">Add</button></form><datalist id="content-tag-options">{% for tag in content_tags %}<option value="{{ tag.name }}">{% endfor %}</datalist></div></section>
+
 <section class="panel author-picker-panel">
   {% if authors %}
   {% set default_author = authors[default_author_index] %}
@@ -57,9 +59,9 @@
 {% set latest_analysis = analyses[0] %}
 <section class="panel analysis-summary">
   <div class="panel-heading"><div><h2>Prompt summary</h2><p>{{ latest_analysis.scope }} · {{ latest_analysis.model }} · {{ latest_analysis.created_at }}</p></div><a class="button button-small" href="/analyses/{{ latest_analysis.id }}">Open full analysis</a></div>
-  <p class="lead">{{ latest_analysis.result.one_sentence_summary }}</p>
-  <div class="analysis-grid"><section><h3>Summary</h3><p>{{ latest_analysis.result.abstract_summary }}</p></section><section><h3>Research problem</h3><p>{{ latest_analysis.result.research_problem }}</p></section><section><h3>Conclusion</h3><p>{{ latest_analysis.result.conclusion_summary }}</p></section></div>
-  {% if analyses|length > 1 %}<details><summary>Other prompt summaries</summary><div class="object-list">{% for analysis in analyses[1:] %}<article><a href="/analyses/{{ analysis.id }}"><strong>{{ analysis.scope }} · {{ analysis.model }}</strong></a><p>{{ analysis.result.one_sentence_summary }}</p><small>{{ analysis.created_at }}</small></article>{% endfor %}</div></details>{% endif %}
+  <div class="lead markdown-block">{{ latest_analysis.result.one_sentence_summary|markdown|safe }}</div>
+  <div class="analysis-grid"><section><h3>Summary</h3><div class="markdown-block">{{ latest_analysis.result.abstract_summary|markdown|safe }}</div></section><section><h3>Research problem</h3><div class="markdown-block">{{ latest_analysis.result.research_problem|markdown|safe }}</div></section><section><h3>Conclusion</h3><div class="markdown-block">{{ latest_analysis.result.conclusion_summary|markdown|safe }}</div></section></div>
+  {% if analyses|length > 1 %}<details><summary>Other prompt summaries</summary><div class="object-list">{% for analysis in analyses[1:] %}<article><a href="/analyses/{{ analysis.id }}"><strong>{{ analysis.scope }} · {{ analysis.model }}</strong></a><div class="markdown-block">{{ analysis.result.one_sentence_summary|markdown|safe }}</div><small>{{ analysis.created_at }}</small></article>{% endfor %}</div></details>{% endif %}
 </section>
 {% endif %}
 
@@ -87,7 +89,7 @@
 </section>
 
 <div id="paper-results">
-{% if prompt_runs %}<section class="panel prompt-results"><div class="panel-heading"><div><h2>Saved prompt results</h2><p>Completed prompts run on this paper.</p></div></div>{% for run in prompt_runs %}<article class="prompt-result"><div class="panel-heading"><div><h3>{{ run.query_name }} · {{ run.model }}</h3><p>{{ run.created_at }} · {{ run.matched_count }} matched record{{ '' if run.matched_count == 1 else 's' }}</p></div><a class="button button-small" href="/queries#query-{{ run.query_id }}">Saved query</a></div>{% if run.output %}<h4>{{ run.output.title }}</h4><p class="lead">{{ run.output.summary }}</p>{% if run.output["items"] %}<div class="object-list">{% for item in run.output["items"] %}<article>{% if item.paper_id %}<a href="/papers/{{ item.paper_id }}"><strong>{{ item.title }}</strong></a>{% else %}<strong>{{ item.title }}</strong>{% endif %}<p>{{ item.output }}</p></article>{% endfor %}</div>{% endif %}{% endif %}</article>{% endfor %}</section>{% endif %}
+{% if prompt_runs %}<section class="panel prompt-results"><div class="panel-heading"><div><h2>Saved prompt results</h2><p>Completed prompts run on this paper.</p></div></div>{% for run in prompt_runs %}<article class="prompt-result"><div class="panel-heading"><div><h3>{{ run.query_name }} · {{ run.model }}</h3><p>{{ run.created_at }} · {{ run.matched_count }} matched record{{ '' if run.matched_count == 1 else 's' }}</p></div><a class="button button-small" href="/queries#query-{{ run.query_id }}">Saved query</a></div>{% if run.output %}<h4>{{ run.output.title }}</h4><div class="lead markdown-block">{{ run.output.summary|markdown|safe }}</div>{% if run.output["items"] %}<div class="object-list">{% for item in run.output["items"] %}<article>{% if item.paper_id %}<a href="/papers/{{ item.paper_id }}"><strong>{{ item.title }}</strong></a>{% else %}<strong>{{ item.title }}</strong>{% endif %}<div class="markdown-block">{{ item.output|markdown|safe }}</div></article>{% endfor %}</div>{% endif %}{% endif %}</article>{% endfor %}</section>{% endif %}
 
 <details class="panel"><summary>Source metadata</summary><pre>{{ metadata|prettyjson }}</pre></details>
 

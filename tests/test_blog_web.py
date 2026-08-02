@@ -55,7 +55,7 @@ def test_manual_author_and_blog_management_ui(config_path):
     assert "Import blog links" in page.text
     assert "Manual blog import" in page.text
     assert "Fetch new papers, download available PDFs" in page.text
-    assert 'href="/blogs"' in page.text
+    assert 'href="/">Content</a>' in page.text
 
     response = client.post(
         "/authors/manual",
@@ -603,7 +603,7 @@ def test_author_openalex_id_is_editable_inline(config_path):
     assert 'data-author-openalex-column hidden' not in page.text
     assert 'id="toggle-author-ids"' not in page.text
     assert 'title="Edit the ID and press Enter"' in page.text
-    assert page.text.index('href="/blogs"') < page.text.index('href="/authors"')
+    assert page.text.index('href="/">Content</a>') < page.text.index('href="/authors"')
 
     blank = client.post(
         f"/authors/{local_id}/openalex-id",
@@ -652,8 +652,10 @@ def test_author_openalex_id_is_editable_inline(config_path):
     assert ".shell{width:min(1240px" in css.text
     assert ".author-blogs-column" in css.text
     assert ".author-blog-table" in css.text
+    assert "grid-template-columns: repeat(2, minmax(0, 1fr))" in css.text
+    assert '.blog-source-settings-form > input[type="url"] { grid-column: 1 / -1; }' in css.text
     javascript = client.get("/static/app.js")
     assert 'getElementById("toggle-author-ids")' not in javascript.text
     assert '.author-table.author-ids-visible' not in css.text
-    assert '/static/app.css?v=0.8.8' in page.text
-    assert '/static/app.js?v=0.8.8' in page.text
+    assert '/static/app.css?v=0.9.7' in page.text
+    assert '/static/app.js?v=0.9.7' in page.text

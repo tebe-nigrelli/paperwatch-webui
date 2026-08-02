@@ -11,10 +11,9 @@
 <body data-run-running="{{ 'true' if run_state.running else 'false' }}" data-analysis-running="{{ 'true' if analysis_state.running else 'false' }}" data-query-running="{{ 'true' if query_state.running else 'false' }}">
 <header class="site-header">
   <div class="shell header-inner">
-    <a class="brand" href="/">paperwatch</a>
+    <a class="brand" href="/"><span>paperwatch</span><small>v{{ asset_version }}</small></a>
     <nav aria-label="Primary navigation">
-      <a href="/">Recent</a>
-      <a href="/blogs">Blogs</a>
+      <a href="/">Content</a>
       <a href="/authors">Authors</a>
       <a href="/discover">Discover</a>
       <a href="/queries">Queries</a>

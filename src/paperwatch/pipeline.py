@@ -1,11 +1,13 @@
 from __future__ import annotations
 
-from concurrent.futures import Future, ThreadPoolExecutor
+from concurrent.futures import Future, ThreadPoolExecutor, as_completed
 from dataclasses import asdict, dataclass, field
 from difflib import SequenceMatcher
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
+import hashlib
 import json
+import re
 import threading
 from typing import Any
 
@@ -14,7 +16,7 @@ import httpx
 from . import USER_AGENT
 
 from .analysis import analyze_pdf_file, analyze_text
-from .blogs import BlogFetch, blog_diff, fetch_blog
+from .blogs import ArticleItem, BlogFetch, blog_diff, fetch_blog
 from .chunking import analyze_chunked_text, direct_prompt_fit
 from .config import AppConfig
 from .db import Database
@@ -23,7 +25,7 @@ from .llm import (
 )
 from .locking import run_lock
 from .job_runtime import JobCancelled, ProgressCallback, check_cancelled, publish
-from .models import AnalysisResult, PaperRecord, normalize_title
+from .models import AnalysisResult, PaperAuthor, PaperRecord, extract_arxiv_id, normalize_title
 from .pdfs import (
     PDFError,
     ResolvedPDF,
@@ -39,25 +41,41 @@ from .sources.openalex import OpenAlexClient
 
 @dataclass(slots=True)
 class RunStats:
+    authors_total: int = 0
     authors_checked: int = 0
     papers_found: int = 0
+    papers_downloadable: int = 0
+    papers_downloaded: int = 0
     papers_analyzed: int = 0
     pdfs_downloaded: int = 0
+    blogs_total: int = 0
     blogs_checked: int = 0
+    blogs_with_content: int = 0
+    blog_items_available: int = 0
+    blog_items_downloaded: int = 0
     blog_updates_found: int = 0
     errors_count: int = 0
     run_id: int | None = None
     status: str = "running"
     new_paper_ids: list[int] = field(default_factory=list)
     new_blog_entry_ids: list[int] = field(default_factory=list)
+    _downloadable_paper_ids: set[int] = field(default_factory=set, repr=False)
+    _downloaded_paper_ids: set[int] = field(default_factory=set, repr=False)
 
     def as_dict(self) -> dict[str, int]:
         return {
+            "authors_total": self.authors_total,
             "authors_checked": self.authors_checked,
             "papers_found": self.papers_found,
+            "papers_downloadable": self.papers_downloadable,
+            "papers_downloaded": self.papers_downloaded,
             "papers_analyzed": self.papers_analyzed,
             "pdfs_downloaded": self.pdfs_downloaded,
+            "blogs_total": self.blogs_total,
             "blogs_checked": self.blogs_checked,
+            "blogs_with_content": self.blogs_with_content,
+            "blog_items_available": self.blog_items_available,
+            "blog_items_downloaded": self.blog_items_downloaded,
             "blog_updates_found": self.blog_updates_found,
             "errors_count": self.errors_count,
         }
@@ -69,7 +87,38 @@ class _SelectedPaperDownloadError(RuntimeError):
         self.paper_id = paper_id
 
 
+RSS_WEBSITE_MARKER = "\n\nWebsite content:\n"
+RSS_WEBSITE_HTML = re.compile(
+    r'<hr><section class="rss-linked-page">.*</section>\s*$',
+    re.DOTALL,
+)
+
+
+def _rss_with_article(
+    feed_text: str,
+    feed_html: str | None,
+    article: ArticleItem,
+) -> tuple[str, str | None, str]:
+    """Combine one feed record with its primary webpage, replacing old enrichment."""
+    base_text = feed_text.split(RSS_WEBSITE_MARKER, 1)[0].rstrip()
+    combined_text = f"{base_text}{RSS_WEBSITE_MARKER}{article.text}"[:1_000_000]
+    base_html = RSS_WEBSITE_HTML.sub("", feed_html or "").rstrip()
+    article_html = article.rendered_html or ""
+    combined_html = (
+        f'{base_html}{"<hr>" if base_html else ""}<section class="rss-linked-page">'
+        f"<h2>Website content</h2>{article_html}</section>"
+        if article_html
+        else (base_html or None)
+    )
+    return (
+        combined_text,
+        combined_html,
+        hashlib.sha256(combined_text.encode("utf-8")).hexdigest(),
+    )
+
+
 class PaperWatch:
+
     def __init__(
         self,
         config: AppConfig,
@@ -164,16 +213,194 @@ class PaperWatch:
         downloads PDFs. Results are applied on the main thread so the existing
         SQLite connection remains single-threaded.
         """
-        results: list[tuple[Any, BlogFetch | None, Exception | None]] = []
-        for blog in blogs:
+        if not blogs:
+            return []
+        # Each configured source gets its own worker. Slow or broken websites
+        # therefore cannot serialize the rest of a large watchlist.
+        worker_count = len(blogs)
+        if worker_count == 1:
+            blog = blogs[0]
             check_cancelled(self._cancel_event)
             try:
-                results.append((blog, fetch_blog(self.pdf_client, blog), None))
+                return [(blog, fetch_blog(self.pdf_client, blog), None)]
             except JobCancelled:
                 raise
             except Exception as exc:
-                results.append((blog, None, exc))
-        return results
+                return [(blog, None, exc)]
+
+        results: list[tuple[Any, BlogFetch | None, Exception | None] | None] = [
+            None
+        ] * len(blogs)
+        with ThreadPoolExecutor(
+            max_workers=worker_count,
+            thread_name_prefix="paperwatch-blog-source",
+        ) as executor:
+            future_indexes = {
+                executor.submit(fetch_blog, self.pdf_client, blog): index
+                for index, blog in enumerate(blogs)
+            }
+            for future in as_completed(future_indexes):
+                check_cancelled(self._cancel_event)
+                index = future_indexes[future]
+                blog = blogs[index]
+                try:
+                    results[index] = (blog, future.result(), None)
+                except JobCancelled:
+                    raise
+                except Exception as exc:
+                    results[index] = (blog, None, exc)
+        return [result for result in results if result is not None]
+
+    def _prepare_blog_fetch_rows(self, blogs: list[Any]) -> list[dict[str, Any]]:
+        prepared: list[dict[str, Any]] = []
+        for blog in blogs:
+            row = dict(blog)
+            blog_id = row.get("id")
+            row["_known_article_urls"] = (
+                self.db.known_blog_article_urls(int(blog_id)) if blog_id is not None else ()
+            )
+            prepared.append(row)
+        return prepared
+
+    @staticmethod
+    def _arxiv_fallback_title(
+        arxiv_id: str,
+        feed_title: str | None,
+        article: ArticleItem | None,
+    ) -> str:
+        candidates = [article.title if article else None, feed_title]
+        for value in candidates:
+            title = str(value or "").strip()
+            if title and title.casefold() not in {"arxiv", "arxiv.org", "paper"}:
+                return title
+        return f"arXiv {arxiv_id}"
+
+    @staticmethod
+    def _arxiv_fallback_abstract(article: ArticleItem | None) -> str | None:
+        if article is None:
+            return None
+        lines = [
+            line
+            for line in article.text.splitlines()
+            if line.strip()
+            and not line.startswith(("Title:", "URL:", "Outbound links:", "- "))
+        ]
+        text = "\n".join(lines).strip()
+        return text[:100_000] or None
+
+    def _import_arxiv_feed_item(
+        self,
+        stats: RunStats,
+        url: str | None,
+        *,
+        feed_title: str | None = None,
+        published_at: str | None = None,
+        article: ArticleItem | None = None,
+    ) -> int | None:
+        """Import and return the paper linked by a primary arXiv RSS URL.
+
+        The arXiv API enriches the record when enabled. A minimal paper is still
+        created from the RSS/article data when the API is disabled or unavailable,
+        so the RSS entry can always link to an in-app paper page.
+        """
+        if not url:
+            return None
+        try:
+            parsed = httpx.URL(url)
+        except (TypeError, ValueError):
+            return None
+        if parsed.host not in {"arxiv.org", "www.arxiv.org", "export.arxiv.org"}:
+            return None
+        arxiv_id = extract_arxiv_id(url)
+        if not arxiv_id:
+            return None
+
+        entry = None
+        if self.arxiv is not None:
+            try:
+                entry = self.arxiv.by_id(arxiv_id)
+            except JobCancelled:
+                raise
+            except Exception as exc:
+                self._record_error(
+                    stats,
+                    stage="rss_arxiv_enrichment",
+                    exc=RuntimeError(f"{url}: {exc}"),
+                )
+
+        if entry is not None:
+            paper = PaperRecord(
+                openalex_id=None,
+                doi=entry.doi,
+                arxiv_id=entry.arxiv_id,
+                title=entry.title,
+                abstract=entry.abstract,
+                publication_date=entry.published,
+                updated_date=entry.updated,
+                venue="arXiv",
+                publication_url=entry.abstract_url,
+                pdf_url=entry.pdf_url,
+                abstract_source="arxiv",
+                pdf_source="arxiv" if entry.pdf_url else None,
+                authors=[PaperAuthor(openalex_id=None, name=name) for name in entry.authors],
+                metadata={"rss_arxiv_source": url},
+            )
+        else:
+            abstract = self._arxiv_fallback_abstract(article)
+            paper = PaperRecord(
+                openalex_id=None,
+                doi=None,
+                arxiv_id=arxiv_id,
+                title=self._arxiv_fallback_title(arxiv_id, feed_title, article),
+                abstract=abstract,
+                publication_date=(published_at or "")[:10] or None,
+                updated_date=None,
+                venue="arXiv",
+                publication_url=f"https://arxiv.org/abs/{arxiv_id}",
+                pdf_url=f"https://arxiv.org/pdf/{arxiv_id}",
+                abstract_source="rss-linked-page" if abstract else "rss",
+                pdf_source="arxiv",
+                authors=[],
+                metadata={"rss_arxiv_source": url, "rss_fallback": True},
+            )
+
+        try:
+            paper_id, is_new = self.db.upsert_paper(paper, auto_analyze=bool(paper.abstract))
+            if is_new:
+                stats.papers_found += 1
+                stats.new_paper_ids.append(paper_id)
+        except JobCancelled:
+            raise
+        except Exception as exc:
+            self._record_error(
+                stats,
+                stage="rss_arxiv_import",
+                exc=RuntimeError(f"{url}: {exc}"),
+            )
+            return None
+
+        # A fallback record has a canonical PDF link, but it should not turn a
+        # successful RSS import into an error merely because the optional arXiv
+        # API was disabled. API-enriched records keep the existing eager download.
+        if entry is not None and paper.pdf_url:
+            try:
+                self._process_pdf(
+                    stats,
+                    paper_id=paper_id,
+                    paper=paper,
+                    analyze=False,
+                    analyze_new_downloads=False,
+                )
+            except JobCancelled:
+                raise
+            except Exception as exc:
+                self._record_error(
+                    stats,
+                    stage="rss_arxiv_pdf",
+                    exc=RuntimeError(f"{url}: {exc}"),
+                    paper=paper,
+                )
+        return paper_id
 
     def _apply_blog_fetch(
         self,
@@ -183,11 +410,25 @@ class PaperWatch:
         error: Exception | None,
     ) -> None:
         blog_id = int(blog["id"])
-        stats.blogs_checked += 1
         try:
             if error is not None:
                 raise error
             assert fetched is not None
+            stats.blogs_checked += 1
+            available = (
+                len(fetched.feed_items)
+                + len(fetched.discovered_articles)
+                + (1 if fetched.snapshot_text else 0)
+            )
+            downloaded = (
+                len(fetched.feed_items)
+                + len(fetched.article_items)
+                + (1 if fetched.snapshot_text else 0)
+            )
+            if available or downloaded:
+                stats.blogs_with_content += 1
+            stats.blog_items_available += available
+            stats.blog_items_downloaded += downloaded
             if fetched.not_modified:
                 self.db.mark_blog_checked(
                     blog_id,
@@ -196,28 +437,63 @@ class PaperWatch:
                     fetch_method=fetched.method,
                     feed_url=fetched.feed_url,
                     feed_discovery_checked=fetched.discovery_checked,
+                    diagnostics=json.dumps(fetched.diagnostics),
+                    item_stream_mode=fetched.source_mode,
                 )
                 return
 
             if fetched.method == "rss":
                 initial_sync = not bool(blog["feed_initialized"])
+                article_by_url = {item.url: item for item in fetched.article_items}
+                paper_by_url: dict[str, int] = {}
                 for item in reversed(fetched.feed_items):
+                    article = article_by_url.get(item.url or "")
+                    item_text = item.text
+                    item_html = item.rendered_html
+                    item_sha256 = item.sha256
+                    if article is not None:
+                        item_text, item_html, item_sha256 = _rss_with_article(
+                            item.text,
+                            item.rendered_html,
+                            article,
+                        )
                     previous = self.db.latest_blog_entry(
                         blog_id,
                         entry_kind="rss",
                         external_id=item.external_id,
                     )
-                    if previous is not None and previous["content_sha256"] == item.sha256:
+                    # Import primary arXiv targets even when the RSS record is
+                    # unchanged, and retain an explicit in-app paper relationship.
+                    linked_paper_id = self._import_arxiv_feed_item(
+                        stats,
+                        item.url,
+                        feed_title=item.title,
+                        published_at=item.published_at,
+                        article=article,
+                    )
+                    if item.url and linked_paper_id is not None:
+                        paper_by_url[item.url] = linked_paper_id
+                    if previous is not None and previous["content_sha256"] == item_sha256:
+                        if linked_paper_id is not None:
+                            self.db.link_blog_entry_to_paper(int(previous["id"]), linked_paper_id)
                         continue
+                    initial_item = previous is None and initial_sync
                     if previous is None:
-                        kind, diff = ("baseline", "") if initial_sync else ("changed", "")
+                        kind, diff = "changed", ""
                     else:
-                        kind, diff = blog_diff(str(previous["normalized_text"]), item.text)
+                        kind, diff = blog_diff(
+                            str(previous["normalized_text"]),
+                            item_text,
+                            # Feed entries are already scoped records. Any semantic
+                            # body/title change is meaningful; webpage noise filtering
+                            # is only appropriate for snapshots.
+                            source_mode="feed",
+                        )
                     entry_id = self.db.save_blog_entry(
                         blog_id=blog_id,
                         title=item.title,
-                        content_sha256=item.sha256,
-                        normalized_text=item.text,
+                        content_sha256=item_sha256,
+                        normalized_text=item_text,
                         diff_text=diff,
                         change_kind=kind,
                         previous_entry_id=(
@@ -227,10 +503,99 @@ class PaperWatch:
                         external_id=item.external_id,
                         source_url=item.url,
                         published_at=item.published_at,
+                        rendered_html=item_html,
+                        linked_paper_id=linked_paper_id,
                     )
-                    if kind != "baseline":
+                    if kind != "baseline" and not initial_item:
                         stats.blog_updates_found += 1
                         stats.new_blog_entry_ids.append(entry_id)
+                feed_urls = {item.url for item in fetched.feed_items if item.url}
+                for article in fetched.article_items:
+                    # A 304 feed response has no item payload, but known article pages
+                    # are still rechecked. Enrich the latest RSS record in place so an
+                    # older teaser-only entry gains the webpage body without producing
+                    # a false new feed update.
+                    linked_paper_id = paper_by_url.get(article.url)
+                    if linked_paper_id is None:
+                        linked_paper_id = self._import_arxiv_feed_item(
+                            stats,
+                            article.url,
+                            feed_title=article.title,
+                            article=article,
+                        )
+                    rss_entry = self.db.latest_blog_entry_for_source(
+                        blog_id,
+                        entry_kind="rss",
+                        source_url=article.url,
+                    )
+                    if rss_entry is None:
+                        continue
+                    if linked_paper_id is not None:
+                        self.db.link_blog_entry_to_paper(int(rss_entry["id"]), linked_paper_id)
+                    combined_text, combined_html, combined_sha256 = _rss_with_article(
+                        str(rss_entry["normalized_text"] or ""),
+                        str(rss_entry["rendered_html"] or "") or None,
+                        article,
+                    )
+                    if str(rss_entry["content_sha256"]) != combined_sha256:
+                        self.db.update_blog_entry_content(
+                            int(rss_entry["id"]),
+                            content_sha256=combined_sha256,
+                            normalized_text=combined_text,
+                            rendered_html=combined_html,
+                        )
+                discovered = tuple(fetched.discovered_articles)
+                fetched_article_urls = {item.url for item in fetched.article_items}
+                if discovered or fetched.article_items:
+                    self.db.sync_known_blog_articles(
+                        blog_id,
+                        ((item.url, item.title) for item in discovered),
+                        fetched_urls=fetched_article_urls,
+                    )
+                for article in fetched.article_items:
+                    previous_article = self.db.latest_blog_entry(
+                        blog_id,
+                        entry_kind="snapshot",
+                        external_id=article.external_id,
+                    )
+                    if (
+                        previous_article is not None
+                        and previous_article["content_sha256"] == article.sha256
+                    ):
+                        continue
+                    first_page_fetch = previous_article is None
+                    if previous_article is None:
+                        article_kind, article_diff = "changed", ""
+                    else:
+                        article_kind, article_diff = blog_diff(
+                            str(previous_article["normalized_text"]),
+                            article.text,
+                            source_mode="article",
+                        )
+                    article_entry_id = self.db.save_blog_entry(
+                        blog_id=blog_id,
+                        title=article.title,
+                        content_sha256=article.sha256,
+                        normalized_text=article.text,
+                        diff_text=article_diff,
+                        change_kind=article_kind,
+                        previous_entry_id=(
+                            int(previous_article["id"])
+                            if previous_article is not None
+                            else None
+                        ),
+                        entry_kind="snapshot",
+                        external_id=article.external_id,
+                        source_url=article.url,
+                        rendered_html=article.rendered_html,
+                    )
+                    # The feed item itself is the new-content notification. The
+                    # first HTML fetch is a usable website snapshot, not a
+                    # second notification for the same post.
+                    if article_kind != "baseline" and not first_page_fetch:
+                        stats.blog_updates_found += 1
+                        stats.new_blog_entry_ids.append(article_entry_id)
+
                 self.db.mark_blog_checked(
                     blog_id,
                     status=fetched.status_code,
@@ -242,12 +607,156 @@ class PaperWatch:
                     feed_url=fetched.feed_url,
                     feed_initialized=True,
                     feed_discovery_checked=fetched.discovery_checked,
+                    article_initialized=(
+                        True
+                        if fetched.source_mode
+                        in {"auto", "feed", "article_index", "publications"}
+                        else None
+                    ),
+                    article_cursor=fetched.article_cursor_next,
+                    diagnostics=json.dumps(fetched.diagnostics),
+                    item_stream_mode=fetched.source_mode,
                 )
                 return
 
             assert fetched.snapshot_text is not None
             assert fetched.snapshot_sha256 is not None
-            previous = self.db.latest_blog_entry(blog_id, entry_kind="snapshot")
+            initial_article_sync = not bool(blog.get("article_initialized", 0))
+            existing_article_urls = {
+                str(value) for value in (blog.get("_known_article_urls", ()) or ())
+            }
+            discovered = tuple(fetched.discovered_articles)
+            discovered_urls = {item.url for item in discovered}
+            new_discoveries = [
+                item for item in discovered if item.url not in existing_article_urls
+            ]
+            fetched_article_urls = {item.url for item in fetched.article_items}
+            if discovered or fetched.article_items:
+                self.db.sync_known_blog_articles(
+                    blog_id,
+                    ((item.url, item.title) for item in discovered),
+                    fetched_urls=fetched_article_urls,
+                )
+            discovery_candidates = (
+                discovered
+                if fetched.source_mode == "publications"
+                else new_discoveries
+            )
+            for article in discovery_candidates:
+                # A successfully fetched child page is stored below as the
+                # actual entry; do not also create a teaser-only discovery row.
+                if article.url in fetched_article_urls:
+                    continue
+                normalized = "\n".join(
+                    part
+                    for part in (
+                        f"Title: {article.title}",
+                        f"URL: {article.url}",
+                        article.summary,
+                    )
+                    if part
+                )
+                external_id = hashlib.sha256(
+                    f"article-discovery\0{article.url}".encode("utf-8")
+                ).hexdigest()
+                previous_discovery = self.db.latest_blog_entry(
+                    blog_id,
+                    entry_kind="rss",
+                    external_id=external_id,
+                )
+                if previous_discovery is not None:
+                    continue
+                linked_paper_id = self._import_arxiv_feed_item(
+                    stats,
+                    article.url,
+                    feed_title=article.title,
+                )
+                entry_id = self.db.save_blog_entry(
+                    blog_id=blog_id,
+                    title=article.title,
+                    content_sha256=hashlib.sha256(normalized.encode("utf-8")).hexdigest(),
+                    normalized_text=normalized,
+                    diff_text="",
+                    change_kind="changed",
+                    previous_entry_id=None,
+                    entry_kind="rss",
+                    external_id=external_id,
+                    source_url=article.url,
+                    linked_paper_id=linked_paper_id,
+                )
+                if not initial_article_sync and article.url not in existing_article_urls:
+                    stats.blog_updates_found += 1
+                    stats.new_blog_entry_ids.append(entry_id)
+
+            for article in fetched.article_items:
+                linked_paper_id = self._import_arxiv_feed_item(
+                    stats,
+                    article.url,
+                    feed_title=article.title,
+                    article=article,
+                )
+                previous_article = self.db.latest_blog_entry(
+                    blog_id,
+                    entry_kind="rss",
+                    external_id=article.external_id,
+                )
+                reuse_source_entry = previous_article is None
+                if reuse_source_entry:
+                    previous_article = self.db.latest_blog_entry_for_source(
+                        blog_id,
+                        entry_kind="rss",
+                        source_url=article.url,
+                    )
+                if previous_article is not None and linked_paper_id is not None:
+                    self.db.link_blog_entry_to_paper(
+                        int(previous_article["id"]), linked_paper_id
+                    )
+                if previous_article is not None and previous_article["content_sha256"] == article.sha256:
+                    continue
+                if reuse_source_entry and previous_article is not None:
+                    self.db.update_blog_entry_content(
+                        int(previous_article["id"]),
+                        content_sha256=article.sha256,
+                        normalized_text=article.text,
+                        rendered_html=article.rendered_html,
+                    )
+                    continue
+                initial_article = previous_article is None and (
+                    initial_article_sync or article.url in existing_article_urls
+                )
+                if previous_article is None:
+                    article_kind, article_diff = "changed", ""
+                else:
+                    article_kind, article_diff = blog_diff(
+                        str(previous_article["normalized_text"]),
+                        article.text,
+                        source_mode="article",
+                    )
+                article_entry_id = self.db.save_blog_entry(
+                    blog_id=blog_id,
+                    title=article.title,
+                    content_sha256=article.sha256,
+                    normalized_text=article.text,
+                    diff_text=article_diff,
+                    change_kind=article_kind,
+                    previous_entry_id=(
+                        int(previous_article["id"])
+                        if previous_article is not None
+                        else None
+                    ),
+                    entry_kind="rss",
+                    external_id=article.external_id,
+                    source_url=article.url,
+                    rendered_html=article.rendered_html,
+                    linked_paper_id=linked_paper_id,
+                )
+                if article_kind != "baseline" and not initial_article:
+                    stats.blog_updates_found += 1
+                    stats.new_blog_entry_ids.append(article_entry_id)
+
+            previous = self.db.latest_blog_entry(
+                blog_id, entry_kind="snapshot", external_id="source-page"
+            )
             if (
                 previous is not None
                 and previous["content_sha256"] == fetched.snapshot_sha256
@@ -262,12 +771,23 @@ class PaperWatch:
                     fetch_method="snapshot",
                     feed_url=fetched.feed_url,
                     feed_discovery_checked=fetched.discovery_checked,
+                    article_initialized=(
+                        True
+                        if fetched.source_mode in {"article_index", "publications"}
+                        else None
+                    ),
+                    article_cursor=fetched.article_cursor_next,
+                    diagnostics=json.dumps(fetched.diagnostics),
+                    item_stream_mode=fetched.source_mode,
                 )
                 return
             kind, diff = blog_diff(
                 str(previous["normalized_text"]) if previous is not None else None,
                 fetched.snapshot_text,
+                source_mode=fetched.source_mode,
             )
+            if new_discoveries and fetched.source_mode in {"article_index", "publications"}:
+                kind, diff = "baseline", ""
             entry_id = self.db.save_blog_entry(
                 blog_id=blog_id,
                 title=fetched.title,
@@ -277,7 +797,9 @@ class PaperWatch:
                 change_kind=kind,
                 previous_entry_id=int(previous["id"]) if previous is not None else None,
                 entry_kind="snapshot",
+                external_id="source-page",
                 source_url=str(blog["url"]),
+                rendered_html=fetched.snapshot_rendered_html,
             )
             if kind != "baseline":
                 stats.blog_updates_found += 1
@@ -292,6 +814,14 @@ class PaperWatch:
                 fetch_method="snapshot",
                 feed_url=fetched.feed_url,
                 feed_discovery_checked=fetched.discovery_checked,
+                article_initialized=(
+                    True
+                    if fetched.source_mode in {"article_index", "publications"}
+                    else None
+                ),
+                article_cursor=fetched.article_cursor_next,
+                diagnostics=json.dumps(fetched.diagnostics),
+                item_stream_mode=fetched.source_mode,
             )
         except JobCancelled:
             raise
@@ -316,7 +846,8 @@ class PaperWatch:
 
     def _fetch_blogs(self, stats: RunStats, blogs: list[Any] | None = None) -> None:
         selected = blogs if blogs is not None else self.db.list_enabled_blogs()
-        self._apply_blog_batch(stats, self._fetch_blog_batch(selected))
+        prepared = self._prepare_blog_fetch_rows(selected)
+        self._apply_blog_batch(stats, self._fetch_blog_batch(prepared))
 
     def _start_blog_fetches(
         self, blogs: list[Any]
@@ -328,7 +859,7 @@ class PaperWatch:
             return None, None
         # sqlite3.Row instances belong to the main database connection. Copy the
         # values before handing work to a background thread.
-        safe_blogs = [dict(blog) for blog in blogs]
+        safe_blogs = self._prepare_blog_fetch_rows(blogs)
         executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="paperwatch-blogs")
         return executor, executor.submit(self._fetch_blog_batch, safe_blogs)
 
@@ -491,6 +1022,9 @@ class PaperWatch:
                 return
             self._store_resolved_pdf(paper_id=paper_id, paper=paper, resolved=resolved)
 
+        stats._downloadable_paper_ids.add(paper_id)
+        stats.papers_downloadable = len(stats._downloadable_paper_ids)
+
         destination = self.config.paths.pdf_dir / safe_pdf_name(paper.identity_key)
         try:
             downloaded = download_pdf(
@@ -517,6 +1051,8 @@ class PaperWatch:
         if downloaded:
             stats.pdfs_downloaded += 1
         self.db.set_local_pdf(paper_id, str(destination))
+        stats._downloaded_paper_ids.add(paper_id)
+        stats.papers_downloaded = len(stats._downloaded_paper_ids)
 
         should_analyze = analyze or (downloaded and analyze_new_downloads)
         if (
@@ -848,6 +1384,8 @@ class PaperWatch:
                 if self._local_pdf_missing(row)
             ]
             blogs = [] if historical else self.db.list_enabled_blogs()
+            stats.authors_total = len(authors)
+            stats.blogs_total = len(blogs)
             self._start_progress(
                 len(authors) + len(retry_rows) + len(blogs),
                 (

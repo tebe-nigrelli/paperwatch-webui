@@ -11,7 +11,12 @@ from typing import Sequence
 
 from .config import AppConfig, ConfigError, load_config
 from .blog_import import import_blog_links_path
-from .blogs import normalize_blog_url
+from .blogs import (
+    SOURCE_MODES,
+    normalize_blog_url,
+    validate_article_url_pattern,
+    validate_content_selector,
+)
 from .db import Database
 from .llm import LLMClient, create_llm
 from .pipeline import PaperWatch
@@ -102,6 +107,9 @@ def _parser() -> argparse.ArgumentParser:
     blog_add.add_argument("url")
     blog_add.add_argument("--label", default="")
     blog_add.add_argument("--relationship", default="")
+    blog_add.add_argument("--mode", choices=sorted(SOURCE_MODES), default="auto")
+    blog_add.add_argument("--selector", default="")
+    blog_add.add_argument("--article-url-pattern", default="")
     blog_import = blog_sub.add_parser("import", help="Import author blog links from CSV")
     blog_import.add_argument("csv_path")
     blog_import.add_argument(
@@ -285,6 +293,11 @@ def _blog_command(args: argparse.Namespace, services: Services) -> int:
             url,
             label=args.label,
             relationship=args.relationship,
+            source_mode=args.mode,
+            content_selector=validate_content_selector(args.selector),
+            article_url_pattern=validate_article_url_pattern(
+                args.article_url_pattern
+            ),
         )
         print(f"Linked {url} to {args.author_id}")
         return 0
@@ -305,7 +318,8 @@ def _blog_command(args: argparse.Namespace, services: Services) -> int:
             for blog in services.db.author_blogs(str(author["openalex_id"])):
                 print(
                     f"{author['openalex_id']} | {author['name']} | "
-                    f"{blog['label'] or blog['title'] or 'Blog'} | {blog['url']}"
+                    f"{blog['label'] or blog['title'] or 'Blog'} | "
+                    f"{blog['source_mode']} | {blog['url']}"
                 )
         return 0
     return 2

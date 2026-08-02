@@ -146,10 +146,16 @@ def test_rss_atom_parsing_discovery_and_fetch_fallback():
         requests.append(str(request.url))
         if request.url.path == "/blog":
             return httpx.Response(200, headers={"content-type": "text/html"}, text=html)
+        if request.url.path == "/feed.xml":
+            return httpx.Response(
+                200,
+                headers={"content-type": "application/rss+xml", "etag": "feed-v1"},
+                text=rss,
+            )
         return httpx.Response(
             200,
-            headers={"content-type": "application/rss+xml", "etag": "feed-v1"},
-            text=rss,
+            headers={"content-type": "text/html"},
+            text="<title>First post</title><main>Full website article</main>",
         )
 
     with httpx.Client(transport=httpx.MockTransport(discovered_handler)) as client:
@@ -160,7 +166,13 @@ def test_rss_atom_parsing_discovery_and_fetch_fallback():
     assert fetched.method == "rss"
     assert fetched.feed_url == "https://example.com/feed.xml"
     assert fetched.etag == "feed-v1"
-    assert requests == ["https://example.com/blog", "https://example.com/feed.xml"]
+    assert requests == [
+        "https://example.com/blog",
+        "https://example.com/feed.xml",
+        "https://example.com/posts/1",
+    ]
+    assert fetched.discovered_articles[0].url == "https://example.com/posts/1"
+    assert "Full website article" in fetched.article_items[0].text
 
     def discovery_failure_handler(request):
         if request.url.path == "/blog":
@@ -274,6 +286,18 @@ Bad URL,Elsewhere,Bad,ftp://example.com,Direct,,,
         missing_headers = io.StringIO("name,url\nAda,x\n")
         with pytest.raises(ValueError, match="CSV must contain"):
             import_blog_links(db, missing_headers)
+
+        with pytest.raises(ValueError, match="CSV must contain"):
+            import_blog_links(db, io.StringIO(""))
+
+        padded_headers = io.StringIO(
+            " Rank, Researcher / author, Primary source URL \n"
+            " 1, Padded Person, https://example.com/padded \n"
+        )
+        padded = import_blog_links(db, padded_headers, create_missing=True)
+        assert padded.rows == 1
+        assert padded.links == 1
+        assert padded.authors_created == 1
 
         path = tmp_path / "links.csv"
         path.write_text(csv_text, encoding="utf-8-sig")
@@ -396,7 +420,7 @@ def test_editing_and_marking_shared_blog_sources(tmp_path, author_candidate):
             db.update_author_blog_url("A123", blog_id, " ")
 
 
-def test_rss_items_are_baselined_then_added_to_blog_feed(app_config, author_candidate):
+def test_rss_items_are_imported_without_triggering_initial_updates(app_config, author_candidate):
     page = """<html><head><link rel="alternate" type="application/rss+xml" href="/feed.xml"></head><body><main>Page</main></body></html>"""
 
     def rss(*items):
@@ -423,15 +447,24 @@ def test_rss_items_are_baselined_then_added_to_blog_feed(app_config, author_cand
     ]
     page_fetched = False
 
+    article_titles = {"/one": "First", "/two": "Second", "/three": "Third"}
+
     def handler(request):
         nonlocal page_fetched
         if request.url.path == "/blog":
             page_fetched = True
             return httpx.Response(200, headers={"content-type": "text/html"}, text=page)
+        if request.url.path == "/feed.xml":
+            return httpx.Response(
+                200,
+                headers={"content-type": "application/rss+xml"},
+                text=feed_versions.pop(0),
+            )
+        title = article_titles[request.url.path]
         return httpx.Response(
             200,
-            headers={"content-type": "application/rss+xml"},
-            text=feed_versions.pop(0),
+            headers={"content-type": "text/html"},
+            text=f"<title>{title}</title><main>{title} website body</main>",
         )
 
     client = httpx.Client(transport=httpx.MockTransport(handler))
@@ -453,20 +486,28 @@ def test_rss_items_are_baselined_then_added_to_blog_feed(app_config, author_cand
         assert blog["feed_url"] == "https://example.com/feed.xml"
         assert blog["feed_initialized"] == 1
         assert blog["last_fetch_method"] == "rss"
-        assert db.list_blog_entries() == []
+        initial_entries = db.list_blog_entries()
+        assert len(initial_entries) == 4
+        assert {entry["title"] for entry in initial_entries} == {"First", "Second"}
+        assert {entry["entry_kind"] for entry in initial_entries} == {"rss", "snapshot"}
+        assert {entry["change_kind"] for entry in initial_entries} == {"changed"}
+        assert any("website body" in entry["normalized_text"] for entry in initial_entries)
 
         second = app.run(today=date(2026, 7, 31))
         assert second.blog_updates_found == 1
         new_entries = db.list_blog_entries()
-        assert len(new_entries) == 1
-        assert new_entries[0]["entry_kind"] == "rss"
-        assert new_entries[0]["title"] == "Third"
-        assert new_entries[0]["source_url"] == "https://example.com/three"
+        assert len(new_entries) == 6
+        third_entries = [entry for entry in new_entries if entry["title"] == "Third"]
+        assert {entry["entry_kind"] for entry in third_entries} == {"rss", "snapshot"}
+        assert {entry["source_url"] for entry in third_entries} == {
+            "https://example.com/three"
+        }
 
         third = app.run(today=date(2026, 7, 31))
         assert third.blog_updates_found == 1
         changed = db.list_blog_entries()[0]
         assert changed["title"] == "Second revised"
+        assert changed["entry_kind"] == "rss"
         assert changed["previous_entry_id"] is not None
         assert "Updated body" in changed["diff_text"]
     client.close()

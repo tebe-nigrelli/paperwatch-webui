@@ -1,0 +1,18 @@
+{% extends "base.html" %}
+{% block title %}Import blog entry · paperwatch{% endblock %}
+{% block content %}
+<section class="page-heading"><p class="eyebrow">Manual import</p><h1>Import blog entry</h1><p>Attach one stored entry to a tracked author and source. A later import with the same entry URL becomes a new version of that entry.</p></section>
+<section class="panel">
+  <form method="post" action="/blogs/import" class="query-editor">
+    <label><span>Tracked author</span><select name="author_id" required><option value="">Choose author</option>{% for author in authors %}<option value="{{ author.openalex_id }}">{{ author.name }}</option>{% endfor %}</select></label>
+    <label><span>Blog label</span><input name="blog_label" placeholder="Personal blog"></label>
+    <label class="wide"><span>Blog URL</span><input type="url" name="blog_url" required placeholder="https://example.com/blog/"></label>
+    <label><span>Relationship</span><input name="relationship" value="Direct import"></label>
+    <label><span>Published time</span><input name="published_at" placeholder="2026-08-02T08:00:00+02:00"></label>
+    <label class="full"><span>Entry title</span><input name="entry_title" required></label>
+    <label class="full"><span>Entry URL</span><input type="url" name="entry_url" required placeholder="https://example.com/blog/post"></label>
+    <label class="full"><span>Entry text</span><textarea name="content" rows="24" required placeholder="Paste the article text here."></textarea></label>
+    <div class="button-group full"><button class="button button-primary" type="submit">Import entry</button><a class="button" href="/blogs">Cancel</a></div>
+  </form>
+</section>
+{% endblock %}

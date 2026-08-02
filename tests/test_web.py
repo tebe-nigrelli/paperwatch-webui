@@ -212,7 +212,7 @@ def test_dashboard_assets_and_security_headers(config_path, seeded_web):
     assert "Backfill 1 year PDFs" not in response.text
     assert "Discover" in response.text
     assert "Diagnostics" not in response.text
-    assert "broken PDF" in response.text
+    assert "broken PDF" not in response.text
     assert response.text.index("More filters") < response.text.index("Run on these 2 papers")
     assert '<details class="advanced-filters collection-runner-details">' in response.text
     assert response.headers["x-frame-options"] == "DENY"
@@ -462,9 +462,13 @@ def test_run_pages_action_and_status_api(config_path, seeded_web):
     assert "broken PDF" in response.text
     assert client.get("/runs/999999").status_code == 404
 
-    response = client.post("/actions/run", follow_redirects=False)
+    response = client.post(
+        "/actions/run",
+        headers={"referer": "http://testserver/runs?page=2"},
+        follow_redirects=False,
+    )
     assert response.status_code == 303
-    assert response.headers["location"] == "/"
+    assert response.headers["location"] == "/runs?page=2"
     assert controller.modes == ["run"]
     response = client.post("/actions/backfill", follow_redirects=False)
     assert "already+running" in response.headers["location"]

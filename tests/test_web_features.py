@@ -276,7 +276,10 @@ def test_saved_query_create_edit_run_output_and_delete(
         )
     page = client.get("/queries")
     assert "Compare evidence" in page.text
-    assert "One paper matched" in page.text
+    assert "Open result" in page.text
+    assert "One paper matched" not in page.text
+    result = client.get(f"/queries/runs/{run_id}")
+    assert "One paper matched" in result.text
     assert "Search “Minimal”" in page.text
     assert "From 2026-01-01" in page.text
     assert "Select papers and run" in page.text

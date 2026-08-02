@@ -146,6 +146,8 @@
       syncExternalInputs();
       refreshOptions();
       input.focus();
+      const form = fieldset.closest("form");
+      if (form && (form.method || "get").toLocaleLowerCase() === "get") form.requestSubmit();
     };
     const removeTag = (value) => {
       const target = normalized(value);
@@ -156,6 +158,8 @@
       syncExternalInputs();
       refreshOptions();
       input.focus();
+      const form = fieldset.closest("form");
+      if (form && (form.method || "get").toLocaleLowerCase() === "get") form.requestSubmit();
     };
 
     input.addEventListener("focus", () => refreshOptions());
@@ -498,6 +502,297 @@
       window.setTimeout(pollRunning, 200);
     }
   }
+
+  document.querySelectorAll("[data-copy-source]").forEach((button) => {
+    button.addEventListener("click", async () => {
+      const source = document.getElementById(button.dataset.copySource || "");
+      if (!source) return;
+      const text = "value" in source ? source.value : source.textContent || "";
+      const originalHtml = button.innerHTML;
+      const originalLabel = button.getAttribute("aria-label") || "Copy text";
+      const showState = (label, failed = false) => {
+        button.classList.toggle("copy-failed", failed);
+        if (button.hasAttribute("data-copy-icon")) {
+          button.setAttribute("aria-label", label);
+          button.title = label;
+          button.dataset.copyState = label;
+        } else {
+          button.textContent = label;
+        }
+      };
+      try {
+        if (navigator.clipboard && window.isSecureContext) {
+          await navigator.clipboard.writeText(text);
+        } else {
+          const temporary = document.createElement("textarea");
+          temporary.value = text;
+          temporary.setAttribute("readonly", "");
+          temporary.style.position = "fixed";
+          temporary.style.opacity = "0";
+          document.body.appendChild(temporary);
+          temporary.select();
+          document.execCommand("copy");
+          temporary.remove();
+        }
+        showState("Copied");
+      } catch (_) {
+        showState("Copy failed", true);
+      }
+      window.setTimeout(() => {
+        button.innerHTML = originalHtml;
+        button.setAttribute("aria-label", originalLabel);
+        button.title = originalLabel;
+        delete button.dataset.copyState;
+        button.classList.remove("copy-failed");
+      }, 1600);
+    });
+  });
+
+  const enhanceSelect = (select, index) => {
+    if (select.dataset.searchSelectReady === "true") return;
+    select.dataset.searchSelectReady = "true";
+    const multiple = select.multiple;
+    const enabledOptions = Array.from(select.options).filter((option) => !option.disabled);
+    const cycle = !multiple && enabledOptions.length > 0 && enabledOptions.length <= 5;
+    const form = select.closest("form");
+    const autoApply = () => {
+      if (form && (form.method || "get").toLocaleLowerCase() === "get") form.requestSubmit();
+    };
+    const wrapper = document.createElement("div");
+    wrapper.className = `search-select${multiple ? " search-select-multiple" : ""}${cycle ? " search-select-cycle" : ""}`;
+    const input = document.createElement("input");
+    input.type = "search";
+    input.className = "search-select-input";
+    input.autocomplete = "off";
+    input.setAttribute("role", "combobox");
+    input.setAttribute("aria-autocomplete", "list");
+    input.setAttribute("aria-expanded", "false");
+    if (cycle) input.readOnly = true;
+    const list = document.createElement("div");
+    list.className = "search-select-options";
+    list.id = `search-select-options-${index}`;
+    list.setAttribute("role", "listbox");
+    if (multiple) list.setAttribute("aria-multiselectable", "true");
+    list.hidden = true;
+    input.setAttribute("aria-controls", list.id);
+    const chips = document.createElement("div");
+    chips.className = "search-select-chips";
+    if (!multiple) chips.hidden = true;
+    wrapper.append(chips, input, list);
+    select.before(wrapper);
+    select.classList.add("search-select-native");
+    select.setAttribute("aria-hidden", "true");
+    select.tabIndex = -1;
+
+    let active = -1;
+    const normalized = (value) => String(value || "").trim().toLocaleLowerCase();
+    const optionRows = Array.from(select.options).map((option, optionIndex) => {
+      const button = document.createElement("button");
+      button.type = "button";
+      button.className = "search-select-option";
+      button.dataset.optionIndex = String(optionIndex);
+      button.setAttribute("role", "option");
+      button.textContent = option.textContent || option.value;
+      list.appendChild(button);
+      return button;
+    });
+    const visibleRows = () => optionRows.filter((row) => !row.hidden);
+    const setActive = (rowIndex) => {
+      const visible = visibleRows();
+      optionRows.forEach((row) => row.classList.remove("active"));
+      if (!visible.length) {
+        active = -1;
+        input.removeAttribute("aria-activedescendant");
+        return;
+      }
+      active = Math.max(0, Math.min(rowIndex, visible.length - 1));
+      const row = visible[active];
+      if (!row.id) row.id = `${list.id}-option-${row.dataset.optionIndex}`;
+      row.classList.add("active");
+      input.setAttribute("aria-activedescendant", row.id);
+      row.scrollIntoView({ block: "nearest" });
+    };
+    const selectedOptions = () => Array.from(select.selectedOptions);
+    const syncInput = () => {
+      if (!multiple && document.activeElement !== input) {
+        input.value = select.selectedIndex >= 0 ? select.options[select.selectedIndex].textContent || "" : "";
+      }
+      chips.replaceChildren();
+      if (multiple) {
+        selectedOptions().forEach((option) => {
+          const chip = document.createElement("button");
+          chip.type = "button";
+          chip.className = "search-select-chip";
+          chip.textContent = `${option.textContent || option.value} ×`;
+          chip.setAttribute("aria-label", `Remove ${option.textContent || option.value}`);
+          chip.addEventListener("click", () => {
+            option.selected = false;
+            select.dispatchEvent(new Event("change", { bubbles: true }));
+            syncInput();
+            refresh(true);
+          });
+          chips.appendChild(chip);
+        });
+      }
+      optionRows.forEach((row, rowIndex) => {
+        const selected = select.options[rowIndex]?.selected || false;
+        row.classList.toggle("selected", selected);
+        row.setAttribute("aria-selected", String(selected));
+      });
+      input.disabled = select.disabled;
+      wrapper.classList.toggle("control-disabled", select.disabled);
+    };
+    const refresh = (open = true) => {
+      const term = normalized(input.value);
+      optionRows.forEach((row, rowIndex) => {
+        const option = select.options[rowIndex];
+        const matches = !term || normalized(option?.textContent).includes(term) || normalized(option?.value).includes(term);
+        row.hidden = !matches;
+      });
+      if (open && !select.disabled) {
+        list.hidden = false;
+        input.setAttribute("aria-expanded", "true");
+      }
+      setActive(0);
+    };
+    const close = () => {
+      list.hidden = true;
+      input.setAttribute("aria-expanded", "false");
+      active = -1;
+      optionRows.forEach((row) => row.classList.remove("active"));
+      if (!multiple) syncInput();
+      else input.value = "";
+    };
+    const choose = (row) => {
+      const optionIndex = Number(row.dataset.optionIndex);
+      const option = select.options[optionIndex];
+      if (!option || option.disabled) return;
+      if (multiple) {
+        option.selected = !option.selected;
+      } else if (option.selected) {
+        const emptyOption = Array.from(select.options).find((candidate) => candidate.value === "");
+        if (emptyOption) emptyOption.selected = true;
+        else select.selectedIndex = -1;
+        input.value = "";
+      } else {
+        select.selectedIndex = optionIndex;
+        input.value = option.textContent || option.value;
+      }
+      select.dispatchEvent(new Event("change", { bubbles: true }));
+      syncInput();
+      if (multiple) {
+        input.value = "";
+        refresh(true);
+        input.focus();
+      } else {
+        close();
+        input.focus();
+      }
+      autoApply();
+    };
+    input.addEventListener("focus", () => {
+      if (cycle) return;
+      if (!multiple) input.select();
+      refresh(true);
+    });
+    input.addEventListener("click", (event) => {
+      if (cycle) {
+        event.preventDefault();
+        const current = enabledOptions.indexOf(select.options[select.selectedIndex]);
+        const next = enabledOptions[(current + 1 + enabledOptions.length) % enabledOptions.length];
+        if (!next) return;
+        select.value = next.value;
+        select.dispatchEvent(new Event("change", { bubbles: true }));
+        syncInput();
+        autoApply();
+        return;
+      }
+      if (!multiple && select.selectedIndex >= 0) {
+        const selectedText = select.options[select.selectedIndex].textContent || "";
+        if (input.value === selectedText) {
+          input.value = "";
+          refresh(true);
+        }
+      }
+    });
+    input.addEventListener("input", () => refresh(true));
+    input.addEventListener("keydown", (event) => {
+      const visible = visibleRows();
+      if (cycle && ["ArrowDown", "ArrowUp", "Enter", " "].includes(event.key)) {
+        event.preventDefault();
+        const current = enabledOptions.indexOf(select.options[select.selectedIndex]);
+        const direction = event.key === "ArrowUp" ? -1 : 1;
+        const next = enabledOptions[(current + direction + enabledOptions.length) % enabledOptions.length];
+        if (next) {
+          select.value = next.value;
+          select.dispatchEvent(new Event("change", { bubbles: true }));
+          syncInput();
+          autoApply();
+        }
+        return;
+      }
+      if (event.key === "ArrowDown") {
+        event.preventDefault();
+        if (list.hidden) refresh(true);
+        else setActive((active + 1) % Math.max(visible.length, 1));
+      } else if (event.key === "ArrowUp") {
+        event.preventDefault();
+        if (list.hidden) refresh(true);
+        else setActive(active <= 0 ? visible.length - 1 : active - 1);
+      } else if (event.key === "Enter") {
+        event.preventDefault();
+        if (list.hidden) refresh(true);
+        const row = visibleRows()[active >= 0 ? active : 0];
+        if (row) {
+          const option = select.options[Number(row.dataset.optionIndex)];
+          if (option && !multiple && !option.selected) input.value = option.textContent || option.value;
+          choose(row);
+        }
+      } else if (event.key === "Escape") {
+        event.preventDefault();
+        close();
+      }
+    });
+    optionRows.forEach((row) => {
+      row.addEventListener("mousedown", (event) => event.preventDefault());
+      row.addEventListener("mousemove", () => setActive(visibleRows().indexOf(row)));
+      row.addEventListener("click", () => choose(row));
+    });
+    document.addEventListener("click", (event) => {
+      if (!wrapper.contains(event.target)) close();
+    });
+    const observer = new MutationObserver(syncInput);
+    observer.observe(select, { attributes: true, attributeFilter: ["disabled"] });
+    select.addEventListener("change", syncInput);
+    syncInput();
+  };
+
+  document.querySelectorAll("select").forEach((select, index) => enhanceSelect(select, index));
+
+  document.querySelectorAll("[data-cycle-toggle]").forEach((button) => {
+    const input = button.parentElement?.querySelector("[data-cycle-value]");
+    if (!input) return;
+    let options = [];
+    try {
+      options = JSON.parse(button.dataset.cycleOptions || "[]");
+    } catch (_error) {
+      options = [];
+    }
+    if (!Array.isArray(options) || options.length === 0) return;
+    const render = () => {
+      const option = options.find((candidate) => candidate.value === input.value) || options[0];
+      input.value = option.value;
+      button.textContent = option.label;
+      button.setAttribute("aria-label", `Supported content: ${option.label}. Click to change.`);
+    };
+    button.addEventListener("click", () => {
+      const current = Math.max(0, options.findIndex((candidate) => candidate.value === input.value));
+      const next = options[(current + 1) % options.length];
+      input.value = next.value;
+      render();
+    });
+    render();
+  });
 
   const picker = document.getElementById("author-picker");
   if (picker) {

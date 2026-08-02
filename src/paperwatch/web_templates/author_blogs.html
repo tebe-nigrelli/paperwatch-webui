@@ -3,34 +3,42 @@
 {% block content %}
 <section class="page-heading split"><div><p class="eyebrow">Author blogs</p><h1>{{ author.name }}</h1><p>{{ author.institution or 'Institution unavailable' }}</p></div><a class="button" href="/authors">Back to authors</a></section>
 <section class="panel">
-  <div class="panel-heading"><div><h2>Add blog</h2><p>The URL is checked whenever papers are checked. RSS or Atom is discovered automatically; HTML snapshots are the fallback. Shared URLs are fetched once.</p></div></div>
+  <div class="panel-heading"><div><h2>Add source</h2><p>Choose automatic detection or a source-specific mode. CSS selectors and URL patterns are optional guardrails for noisy sites.</p></div></div>
   <form method="post" action="/authors/{{ author.openalex_id }}/blogs" class="filter-grid blog-link-form">
-    <label class="wide"><span>Blog URL</span><input type="url" name="url" maxlength="2000" required placeholder="https://example.com/blog/"></label>
+    <label class="wide"><span>Source URL</span><input type="url" name="url" maxlength="2000" required placeholder="https://example.com/blog/"></label>
     <label><span>Label</span><input name="label" maxlength="300" placeholder="Personal blog"></label>
     <label><span>Relationship</span><input name="relationship" maxlength="300" placeholder="Direct author, lab, company"></label>
-    <button class="button button-primary" type="submit">Link blog</button>
+    <label><span>Mode</span><select name="source_mode">{% for mode in source_modes %}<option value="{{ mode }}"{% if mode == 'auto' %} selected{% endif %}>{{ mode }}</option>{% endfor %}</select></label>
+    <label><span>Content selector</span><input name="content_selector" maxlength="500" placeholder="main, article, .post-list"></label>
+    <label class="wide"><span>Article URL pattern</span><input name="article_url_pattern" maxlength="500" placeholder="/blog/|/posts/"></label>
+    <button class="button button-primary" type="submit">Link source</button>
   </form>
 </section>
 <section class="panel">
-  <div class="panel-heading"><div><h2>Linked blogs</h2><p>Edit a URL in place and press Enter. Marking a source broken pauses future checks without deleting its history.</p></div><span>{{ blogs|length }}</span></div>
-  <div class="table-wrap"><table class="author-blog-table"><thead><tr><th>Source</th><th>Relationship</th><th>Method</th><th>Last checked</th><th>Updates</th><th>Status</th><th>Availability</th><th>Remove</th></tr></thead><tbody>
+  <div class="panel-heading"><div><h2>Linked sources</h2><p>Settings are shared when the same URL is linked to multiple authors. Marking a source broken pauses checks without deleting history.</p></div><span>{{ blogs|length }}</span></div>
+  <div class="table-wrap"><table class="author-blog-table"><thead><tr><th>Source and extraction</th><th>Relationship</th><th>Method</th><th>Last checked</th><th>Updates</th><th>Status</th><th>Availability</th><th>Remove</th></tr></thead><tbody>
   {% for blog in blogs %}<tr class="{% if not blog.enabled %}blog-source-broken{% endif %}">
     <td class="blog-source-cell">
       <div class="blog-source-heading"><strong>{{ blog.label or blog.title or 'Blog source' }}</strong><a href="{{ blog.url }}" target="_blank" rel="noreferrer" aria-label="Open {{ blog.url }}">Open ↗</a></div>
-      <form method="post" action="/authors/{{ author.openalex_id }}/blogs/{{ blog.id }}/edit" class="blog-url-edit-form">
+      <form method="post" action="/authors/{{ author.openalex_id }}/blogs/{{ blog.id }}/edit" class="blog-source-settings-form">
         <input type="url" name="url" value="{{ blog.url }}" maxlength="2000" required aria-label="Blog URL for {{ blog.label or blog.title or blog.url }}" title="Edit the URL and press Enter" autocomplete="off">
-        <button class="sr-only" type="submit">Save blog URL</button>
+        <select name="source_mode" aria-label="Source mode">{% for mode in source_modes %}<option value="{{ mode }}"{% if blog.source_mode == mode %} selected{% endif %}>{{ mode }}</option>{% endfor %}</select>
+        <input name="content_selector" value="{{ blog.content_selector or '' }}" maxlength="500" placeholder="CSS content selector" aria-label="Content selector">
+        <input name="article_url_pattern" value="{{ blog.article_url_pattern or '' }}" maxlength="500" placeholder="Article URL regex" aria-label="Article URL pattern">
+        <button class="button button-small" type="submit">Save</button>
       </form>
       {% if blog.feed_url and blog.feed_url != blog.url %}<small class="block muted">Feed: {{ blog.feed_url }}</small>{% endif %}
-      {% if blog.linked_author_count > 1 %}<small class="block muted">Shared by {{ blog.linked_author_count }} authors; URL edits affect all links.</small>{% endif %}
+      {% if blog.item_stream_mode %}<small class="block muted">Effective mode: {{ blog.item_stream_mode }}</small>{% endif %}
+      {% if blog.feed_diagnostics %}<details class="source-diagnostics"><summary>Diagnostics</summary><code>{{ blog.feed_diagnostics }}</code></details>{% endif %}
+      {% if blog.linked_author_count > 1 %}<small class="block muted">Shared by {{ blog.linked_author_count }} authors; edits affect all links.</small>{% endif %}
     </td>
     <td>{{ blog.relationship or '—' }}</td>
-    <td>{% if blog.last_fetch_method == 'rss' %}<span class="status status-success">RSS</span>{% elif blog.last_fetch_method == 'snapshot' %}<span class="status">snapshot</span>{% else %}<span class="muted">auto</span>{% endif %}</td>
+    <td>{% if blog.last_fetch_method == 'rss' %}<span class="status status-success">items</span>{% elif blog.last_fetch_method == 'snapshot' %}<span class="status">snapshot</span>{% else %}<span class="muted">pending</span>{% endif %}</td>
     <td>{{ blog.last_checked_at or 'Not fetched yet' }}</td>
     <td>{{ blog.entry_count }}</td>
     <td>{% if not blog.enabled %}<span class="status status-failed">broken</span>{% elif blog.last_error %}<span class="status status-failed" title="{{ blog.last_error }}">error</span>{% elif blog.last_status %}<span class="status status-success">{{ blog.last_status }}</span>{% else %}<span class="muted">pending</span>{% endif %}</td>
     <td class="blog-availability-cell"><form method="post" action="/authors/{{ author.openalex_id }}/blogs/{{ blog.id }}/availability"><input type="hidden" name="broken" value="{{ 0 if not blog.enabled else 1 }}"><button class="button button-small{% if blog.enabled %} button-danger{% endif %}" type="submit">{{ 'Restore' if not blog.enabled else 'Mark broken' }}</button></form></td>
-    <td class="icon-action-cell"><form method="post" action="/authors/{{ author.openalex_id }}/blogs/{{ blog.id }}/remove" data-confirm="Unlink this blog from {{ author.name }}?"><button class="icon-button icon-danger" type="submit" aria-label="Unlink {{ blog.url }}">×</button></form></td>
+    <td class="icon-action-cell"><form method="post" action="/authors/{{ author.openalex_id }}/blogs/{{ blog.id }}/remove" data-confirm="Unlink this source from {{ author.name }}?"><button class="icon-button icon-danger" type="submit" aria-label="Unlink {{ blog.url }}">×</button></form></td>
   </tr>{% else %}<tr><td colspan="8" class="empty">No blogs linked to this author.</td></tr>{% endfor %}
   </tbody></table></div>
 </section>

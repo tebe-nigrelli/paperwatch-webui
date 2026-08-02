@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import inspect
 import json
+import bisect
+import re
 
 import httpx
 import secrets
@@ -85,6 +87,96 @@ def _blog_document(row: Any) -> dict[str, Any]:
     }
 
 
+def _regexp_excerpts(text: str, pattern: str, radius: int) -> tuple[str, int]:
+    expression = re.compile(pattern, re.MULTILINE)
+    matches = list(expression.finditer(text))[:500]
+    if not matches:
+        return "", 0
+    words = list(re.finditer(r"\S+", text))
+    starts = [item.start() for item in words]
+    ends = [item.end() for item in words]
+    ranges: list[tuple[int, int]] = []
+    for match in matches:
+        if not words:
+            ranges.append((match.start(), match.end()))
+            continue
+        first = bisect.bisect_right(ends, match.start())
+        last = max(first, bisect.bisect_left(starts, max(match.end(), match.start() + 1)))
+        left = max(0, first - radius)
+        right = min(len(words), max(first + 1, last) + radius)
+        start = words[left].start() if left < len(words) else match.start()
+        end = words[right - 1].end() if right else match.end()
+        ranges.append((start, end))
+    merged: list[tuple[int, int]] = []
+    for start, end in ranges:
+        if merged and start <= merged[-1][1] + 1:
+            merged[-1] = (merged[-1][0], max(merged[-1][1], end))
+        else:
+            merged.append((start, end))
+    excerpts = [text[start:end].strip() for start, end in merged if text[start:end].strip()]
+    return "\n\n[…]\n\n".join(excerpts), len(matches)
+
+
+def preprocess_regexp_documents(
+    documents: list[dict[str, Any]], pattern: str, radius: int
+) -> tuple[list[dict[str, Any]], int]:
+    if not pattern:
+        return documents, 0
+    prepared: list[dict[str, Any]] = []
+    total_matches = 0
+    for document in documents:
+        content_key = next(
+            (
+                key
+                for key in ("fulltext", "abstract", "content", "content_excerpt")
+                if isinstance(document.get(key), str)
+            ),
+            None,
+        )
+        if content_key is None:
+            continue
+        excerpt, matches = _regexp_excerpts(str(document[content_key]), pattern, radius)
+        if not matches:
+            continue
+        item = dict(document)
+        item[content_key] = excerpt
+        item["regexp_match_count"] = matches
+        prepared.append(item)
+        total_matches += matches
+    return prepared, total_matches
+
+
+def regexp_result(
+    documents: list[dict[str, Any]], pattern: str, match_count: int
+) -> BatchQueryResult:
+    items = []
+    for document in documents:
+        content = next(
+            (
+                str(document[key])
+                for key in ("fulltext", "abstract", "content", "content_excerpt")
+                if document.get(key) not in (None, "")
+            ),
+            "",
+        )
+        items.append(
+            {
+                "paper_id": document.get("paper_id"),
+                "blog_entry_id": document.get("blog_entry_id"),
+                "content_type": document.get("content_type", "paper"),
+                "title": str(document.get("title") or "Untitled record"),
+                "output": content,
+            }
+        )
+    return BatchQueryResult.model_validate(
+        {
+            "title": f"Regexp matches: {pattern}",
+            "summary": f"{match_count} match(es) across {len(documents)} record(s).",
+            "items": items,
+        }
+    )
+
+
 def _selection_search_args(selection: dict[str, Any] | None) -> dict[str, Any]:
     selection = selection or {}
     return {
@@ -95,6 +187,11 @@ def _selection_search_args(selection: dict[str, Any] | None) -> dict[str, Any]:
             for tag in selection.get("author_tags", ())
             if str(tag).strip()
         ) if isinstance(selection.get("author_tags"), (list, tuple)) else (),
+        "content_tags": tuple(
+            str(tag)
+            for tag in selection.get("content_tags", ())
+            if str(tag).strip()
+        ) if isinstance(selection.get("content_tags"), (list, tuple)) else (),
         "topic_id": str(selection.get("topic_id") or ""),
         "paper_kind": str(selection.get("paper_kind") or ""),
         "scope": str(selection.get("scope") or ""),
@@ -534,14 +631,29 @@ def run_query_batch(
                 selection=selection,
                 config=config,
             )
-            publish(progress, "message", f"Matched {len(documents)} record(s)")
+            regexp_pattern = str(query["regexp_pattern"] or "")
+            regexp_radius = int(query["regexp_radius"] or 0)
+            regexp_mode = str(query["regexp_mode"] or "query")
+            regexp_matches = 0
+            if regexp_pattern:
+                documents, regexp_matches = preprocess_regexp_documents(
+                    documents, regexp_pattern, regexp_radius
+                )
+                publish(
+                    progress,
+                    "message",
+                    f"Regexp matched {regexp_matches} time(s) in {len(documents)} record(s)",
+                )
+            else:
+                publish(progress, "message", f"Matched {len(documents)} record(s)")
             for profile_name in profile_names:
                 row = runs.get(profile_name)
                 if row is None:
                     continue
                 run_id = int(row["id"])
                 profile = profiles.get(profile_name)
-                if profile is None:
+                local_print = regexp_mode == "print" and bool(regexp_pattern)
+                if profile is None and not local_print:
                     db.finish_query_run(
                         run_id, matched_count=len(documents), input_chars=0,
                         error=f"Configured LLM profile {profile_name!r} is no longer available",
@@ -564,6 +676,23 @@ def run_query_batch(
                 llm: LLMClient | None = None
                 try:
                     publish(progress, "reset_output", "")
+                    if local_print:
+                        result = regexp_result(documents, regexp_pattern, regexp_matches)
+                        db.finish_query_run(
+                            run_id,
+                            matched_count=len(documents),
+                            input_chars=sum(
+                                len(str(item.get("content") or item.get("abstract") or item.get("fulltext") or ""))
+                                for item in documents
+                            ),
+                            output=result.model_dump(),
+                        )
+                        completed += 1
+                        progress_done += 1
+                        publish(progress, "message", "Printed regexp matches")
+                        publish(progress, "progress", f"{progress_done}/{len(runs)}")
+                        continue
+                    assert profile is not None
                     publish(progress, "stage", f"Running saved prompt with {profile.model}")
                     llm = create_llm(profile)
                     configure_job_runtime(llm, progress, cancel_event)
@@ -605,7 +734,8 @@ def run_query_batch(
                         run_id, matched_count=len(documents), input_chars=0, error=str(exc)
                     )
                     failed += 1
-                    publish(progress, "message", f"{profile.model} failed: {exc}")
+                    model_name = profile.model if profile is not None else "regexp"
+                    publish(progress, "message", f"{model_name} failed: {exc}")
                     progress_done += 1
                     publish(progress, "progress", f"{progress_done}/{len(runs)}")
                 finally:
@@ -665,16 +795,31 @@ class QueryController:
             selection["pdf_strategy"] = pdf_strategy
             config = load_config(self.config_path)
             available = {item.profile: item for item in config.available_llms}
-            selected = tuple(dict.fromkeys(profiles))
-            if not selected:
-                raise ValueError("Select at least one configured model")
-            unknown = [name for name in selected if name not in available]
-            if unknown:
-                raise ValueError(f"Unknown configured model profile(s): {', '.join(unknown)}")
             batch_id = secrets.token_hex(10)
             with Database(config.paths.database) as db:
-                if db.get_saved_query(query_id) is None:
+                query = db.get_saved_query(query_id)
+                if query is None:
                     raise ValueError("Saved query not found")
+                supported = str(query["content_scope"] or "both")
+                if supported not in {"both", content_type}:
+                    label = "papers" if supported == "papers" else "blogs"
+                    raise ValueError(f"This query is configured for {label} only")
+                local_print = (
+                    str(query["regexp_mode"] or "query") == "print"
+                    and bool(str(query["regexp_pattern"] or "").strip())
+                )
+                selected = (
+                    ("regexp",)
+                    if local_print
+                    else tuple(dict.fromkeys(profiles))
+                )
+                if not selected:
+                    raise ValueError("Select at least one configured model")
+                unknown = [name for name in selected if name not in available and name != "regexp"]
+                if unknown:
+                    raise ValueError(
+                        f"Unknown configured model profile(s): {', '.join(unknown)}"
+                    )
                 validate_query_sources(
                     db,
                     selection=selection,
@@ -683,7 +828,12 @@ class QueryController:
                 )
                 db.create_query_runs(
                     batch_id=batch_id, query_id=query_id,
-                    profiles=[(name, available[name].provider, available[name].model) for name in selected],
+                    profiles=[
+                        (name, "local", "regexp")
+                        if name == "regexp"
+                        else (name, available[name].provider, available[name].model)
+                        for name in selected
+                    ],
                     context_window_tokens=context_window_tokens, selection=selection,
                 )
             paper_id = None

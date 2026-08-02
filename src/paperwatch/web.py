@@ -1,8 +1,14 @@
 from __future__ import annotations
 
 import csv
+import hashlib
+import html
 import inspect
 import io
+import os
+import sqlite3
+import tempfile
+import zipfile
 import json
 import re
 import shutil
@@ -19,12 +25,20 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, RedirectResponse, Response
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
+from starlette.background import BackgroundTask
 from starlette.datastructures import UploadFile
 
 from . import __version__
 from .analysis_jobs import AnalysisController
 from .blog_import import import_blog_links
-from .blogs import normalize_blog_url
+from .blogs import (
+    SOURCE_MODES,
+    blog_diff,
+    normalize_blog_url,
+    normalize_source_mode,
+    validate_article_url_pattern,
+    validate_content_selector,
+)
 from .config import AppConfig, load_config
 from .db import Database
 from .job_runtime import ProgressCallback
@@ -61,6 +75,7 @@ class PaperFilters:
     query: str = ""
     author_id: str = ""
     author_tags: tuple[str, ...] = ()
+    content_tags: tuple[str, ...] = ()
     topic_id: str = ""
     paper_kind: str = ""
     scope: str = ""
@@ -77,6 +92,7 @@ class PaperFilters:
             "query": self.query,
             "author_id": self.author_id,
             "author_tags": list(self.author_tags),
+            "content_tags": list(self.content_tags),
             "topic_id": self.topic_id,
             "paper_kind": self.paper_kind,
             "scope": self.scope,
@@ -92,6 +108,7 @@ class PaperFilters:
             ("q", self.query),
             ("author", self.author_id),
             *(("author_tag", tag) for tag in self.author_tags),
+            *(("tag", tag) for tag in self.content_tags),
             ("topic", self.topic_id),
             ("kind", self.paper_kind),
             ("scope", self.scope),
@@ -108,6 +125,7 @@ class PaperFilters:
             ("q", self.query),
             ("author", self.author_id),
             *(("author_tag", tag) for tag in self.author_tags),
+            *(("tag", tag) for tag in self.content_tags),
             ("topic", self.topic_id),
             ("kind", self.paper_kind),
             ("scope", self.scope),
@@ -517,10 +535,28 @@ def _parse_filter_values(params: Any) -> PaperFilters:
             seen_tags.add(normalized)
         if len(author_tags) >= 50:
             break
+    raw_content_tags = (
+        params.getlist("tag")
+        if hasattr(params, "getlist")
+        else params.get("tag", ())
+    )
+    if isinstance(raw_content_tags, str):
+        raw_content_tags = (raw_content_tags,)
+    content_tags: list[str] = []
+    seen_content_tags: set[str] = set()
+    for value in raw_content_tags or ():
+        tag = " ".join(str(value).strip().split())[:40]
+        normalized = tag.casefold()
+        if tag and normalized not in seen_content_tags:
+            content_tags.append(tag)
+            seen_content_tags.add(normalized)
+        if len(content_tags) >= 50:
+            break
     return PaperFilters(
         query=params.get("q", "").strip()[:200],
         author_id=params.get("author", "").strip()[:64],
         author_tags=tuple(author_tags),
+        content_tags=tuple(content_tags),
         topic_id=topic_id,
         paper_kind=paper_kind,
         scope=scope,
@@ -536,6 +572,21 @@ def _parse_filter_values(params: Any) -> PaperFilters:
 
 def _parse_filters(request: Request) -> PaperFilters:
     return _parse_filter_values(request.query_params)
+
+
+def _content_tag_values(params: Any) -> tuple[str, ...]:
+    raw = params.getlist("tag") if hasattr(params, "getlist") else params.get("tag", ())
+    if isinstance(raw, str):
+        raw = (raw,)
+    values: list[str] = []
+    seen: set[str] = set()
+    for value in raw or ():
+        cleaned = " ".join(str(value).strip().split())[:40]
+        key = cleaned.casefold()
+        if cleaned and key not in seen:
+            values.append(cleaned)
+            seen.add(key)
+    return tuple(values[:50])
 
 
 def _json_value(value: Any, fallback: Any) -> Any:
@@ -580,6 +631,13 @@ def _query_view(row: Any, config: AppConfig) -> dict[str, Any]:
     )
     query["paper_source_scope"] = str(query.get("paper_source_scope") or "auto")
     query["pdf_strategy"] = str(query.get("pdf_strategy") or "chunked")
+    query["regexp_pattern"] = str(query.get("regexp_pattern") or "")
+    query["regexp_radius"] = int(query.get("regexp_radius") or 0)
+    query["regexp_mode"] = str(query.get("regexp_mode") or "query")
+    query["content_scope"] = str(query.get("content_scope") or "both")
+    query["local_regexp"] = bool(
+        query["regexp_pattern"] and query["regexp_mode"] == "print"
+    )
     return query
 
 
@@ -600,12 +658,24 @@ def _query_execution_form(form: Any, config: AppConfig) -> dict[str, Any]:
     pdf_strategy = str(form.get("pdf_strategy", "chunked"))
     if source_scope == "abstract":
         pdf_strategy = "auto"
+    regexp_radius = _int_or_none(form.get("regexp_radius"))
+    if regexp_radius is None:
+        regexp_radius = 0
     return {
         "model_profiles": profiles,
         "context_window_tokens": context,
         "paper_source_scope": source_scope,
         "pdf_strategy": pdf_strategy,
+        "regexp_pattern": str(form.get("regexp_pattern", "")),
+        "regexp_radius": regexp_radius,
+        "regexp_mode": str(form.get("regexp_mode", "query")),
+        "content_scope": str(form.get("content_scope", "both")),
     }
+
+
+def _query_supports(query: Any, content_type: str) -> bool:
+    scope = str(query.get("content_scope", "both") if isinstance(query, dict) else query["content_scope"] or "both")
+    return scope == "both" or scope == content_type
 
 
 def _analysis_view(row: Any) -> dict[str, Any]:
@@ -672,6 +742,7 @@ def _all_filtered(db: Database, filters: PaperFilters) -> list[Any]:
         query=filters.query,
         author_id=filters.author_id,
         author_tags=filters.author_tags,
+        content_tags=filters.content_tags,
         topic_id=filters.topic_id,
         paper_kind=filters.paper_kind,
         scope=filters.scope,
@@ -684,6 +755,177 @@ def _all_filtered(db: Database, filters: PaperFilters) -> list[Any]:
         offset=0,
     )
     return rows
+
+
+def _content_kind(value: str | None, default: str = "all") -> str:
+    normalized = str(value or default).strip().lower()
+    return normalized if normalized in {"all", "papers", "blogs"} else default
+
+
+def _website_view(value: str) -> tuple[str, str]:
+    parsed = urlparse(str(value or ""))
+    host = (parsed.hostname or "").lower()
+    display = host.removeprefix("www.") or str(value or "")
+    if parsed.scheme.lower() in {"http", "https"} and parsed.netloc:
+        return display, f"{parsed.scheme.lower()}://{parsed.netloc}/"
+    return display, str(value or "")
+
+
+def _record_sort_key(record: dict[str, Any], sort: str) -> tuple[Any, ...]:
+    if sort == "title":
+        return (str(record.get("title") or "").casefold(), int(record.get("id") or 0))
+    date_value = str(record.get("record_date") or "")
+    if sort == "oldest":
+        return (date_value or "9999-12-31", int(record.get("id") or 0))
+    if sort == "discovered":
+        return (str(record.get("record_fetched") or ""), int(record.get("id") or 0))
+    return (date_value, int(record.get("id") or 0))
+
+
+def _safe_markdown_url(value: str) -> str | None:
+    parsed = urlparse(html.unescape(value).strip())
+    if parsed.scheme.lower() not in {"http", "https"} or not parsed.netloc:
+        return None
+    return parsed.geturl()
+
+
+def _render_stored_markdown(value: str) -> str:
+    """Render stored summaries and extracted blog markdown without raw HTML.
+
+    Remote images remain URLs. Browsers fetch them only while the detail page is open;
+    Paperwatch never stores the image bytes.
+    """
+    image_pattern = re.compile(r"!\[([^\]]*)\]\((https?://[^\s\)]+)\)")
+    link_pattern = re.compile(r"(?<!!)\[([^\]]+)\]\((https?://[^\s\)]+)\)")
+
+    def image(match: re.Match[str]) -> str:
+        url = _safe_markdown_url(match.group(2))
+        if url is None:
+            return match.group(0)
+        alt = html.escape(html.unescape(match.group(1)) or "Image")
+        safe_url = html.escape(url, quote=True)
+        return (
+            '<figure class="remote-blog-image"><a href="' + safe_url + '" '
+            'target="_blank" rel="noreferrer noopener"><img src="' + safe_url + '" '
+            'alt="' + alt + '" loading="lazy" decoding="async" '
+            'referrerpolicy="no-referrer"></a><figcaption><a href="' + safe_url + '" '
+            'target="_blank" rel="noreferrer noopener">Open image</a></figcaption></figure>'
+        )
+
+    def link(match: re.Match[str]) -> str:
+        url = _safe_markdown_url(match.group(2))
+        if url is None:
+            return match.group(0)
+        label = html.escape(html.unescape(match.group(1)))
+        return (
+            '<a href="' + html.escape(url, quote=True) + '" target="_blank" '
+            'rel="noreferrer noopener">' + label + '</a>'
+        )
+
+    def inline(raw: str) -> str:
+        escaped = html.escape(raw)
+        code_values: list[str] = []
+
+        def code(match: re.Match[str]) -> str:
+            code_values.append(f"<code>{match.group(1)}</code>")
+            return f"\x00CODE{len(code_values) - 1}\x00"
+
+        escaped = re.sub(r"`([^`\n]+)`", code, escaped)
+        escaped = image_pattern.sub(image, escaped)
+        escaped = link_pattern.sub(link, escaped)
+        escaped = re.sub(
+            r"!?\[([^\]]*)\]\((?!https?://)[^\)]*\)",
+            lambda match: html.escape(html.unescape(match.group(1))),
+            escaped,
+            flags=re.IGNORECASE,
+        )
+        escaped = re.sub(r"\*\*(.+?)\*\*", r"<strong>\1</strong>", escaped)
+        escaped = re.sub(r"(?<!\*)\*([^*\n]+)\*(?!\*)", r"<em>\1</em>", escaped)
+        for index, rendered in enumerate(code_values):
+            escaped = escaped.replace(f"\x00CODE{index}\x00", rendered)
+        return escaped
+
+    lines = (value or "").replace("\r\n", "\n").replace("\r", "\n").split("\n")
+    blocks: list[str] = []
+    paragraph: list[str] = []
+    list_items: list[str] = []
+    list_kind = "ul"
+    quote_lines: list[str] = []
+    code_lines: list[str] = []
+    in_code = False
+
+    def flush_paragraph() -> None:
+        if paragraph:
+            rendered = "<br>".join(inline(line) for line in paragraph)
+            if rendered.startswith("<figure") and rendered.endswith("</figure>"):
+                blocks.append(rendered)
+            else:
+                blocks.append(f"<p>{rendered}</p>")
+            paragraph.clear()
+
+    def flush_list() -> None:
+        if list_items:
+            blocks.append(
+                f"<{list_kind}>" + "".join(f"<li>{inline(item)}</li>" for item in list_items) + f"</{list_kind}>"
+            )
+            list_items.clear()
+
+    def flush_quote() -> None:
+        if quote_lines:
+            blocks.append(f"<blockquote>{'<br>'.join(inline(line) for line in quote_lines)}</blockquote>")
+            quote_lines.clear()
+
+    for line in lines:
+        if line.strip().startswith("```"):
+            flush_paragraph()
+            flush_list()
+            flush_quote()
+            if in_code:
+                blocks.append(f"<pre><code>{html.escape(chr(10).join(code_lines))}</code></pre>")
+                code_lines.clear()
+            in_code = not in_code
+            continue
+        if in_code:
+            code_lines.append(line)
+            continue
+        if not line.strip():
+            flush_paragraph()
+            flush_list()
+            flush_quote()
+            continue
+        heading = re.match(r"^(#{1,6})\s+(.+)$", line)
+        if heading:
+            flush_paragraph()
+            flush_list()
+            flush_quote()
+            level = len(heading.group(1))
+            blocks.append(f"<h{level}>{inline(heading.group(2))}</h{level}>")
+            continue
+        unordered = re.match(r"^\s*[-*+]\s+(.+)$", line)
+        ordered = re.match(r"^\s*\d+[.)]\s+(.+)$", line)
+        if unordered or ordered:
+            flush_paragraph()
+            flush_quote()
+            kind = "ol" if ordered else "ul"
+            if list_items and kind != list_kind:
+                flush_list()
+            list_kind = kind
+            list_items.append((ordered or unordered).group(1))
+            continue
+        if line.lstrip().startswith(">"):
+            flush_paragraph()
+            flush_list()
+            quote_lines.append(line.lstrip()[1:].lstrip())
+            continue
+        flush_list()
+        flush_quote()
+        paragraph.append(line)
+    if in_code and code_lines:
+        blocks.append(f"<pre><code>{html.escape(chr(10).join(code_lines))}</code></pre>")
+    flush_paragraph()
+    flush_list()
+    flush_quote()
+    return "".join(blocks)
 
 
 def _notice_url(path: str, message: str, *, level: str = "success") -> str:
@@ -713,6 +955,7 @@ def _author_view(row: Any) -> dict[str, Any]:
                 if author_id
                 else f"/?q={encoded_name}"
             ),
+            "author_url": f"/authors/{quote_plus(author_id)}/blogs" if author_id else "/authors",
             "google_scholar_url": f"https://scholar.google.com/scholar?q={scholar_query}",
             "openalex_url": (f"https://openalex.org/authors/{author_id.lower()}" if author_id else None),
             "arxiv_url": f"https://arxiv.org/search/?query={encoded_name}&searchtype=author",
@@ -947,6 +1190,7 @@ def create_app(
         value, ensure_ascii=False, indent=2, sort_keys=True
     )
     templates.env.filters["querystring"] = lambda items: urlencode(items)
+    templates.env.filters["markdown"] = _render_stored_markdown
 
     app = FastAPI(title="paperwatch", docs_url=None, redoc_url=None, openapi_url=None)
     app.state.config = config
@@ -979,53 +1223,136 @@ def create_app(
         response.headers["X-Frame-Options"] = "DENY"
         response.headers["Referrer-Policy"] = "same-origin"
         response.headers["Content-Security-Policy"] = (
-            "default-src 'self'; style-src 'self'; img-src 'self' data:; "
+            "default-src 'self'; style-src 'self'; img-src 'self' data: https: http:; "
             "script-src 'self'; base-uri 'self'; form-action 'self'; frame-ancestors 'none'"
         )
         return response
 
-    @app.get("/", response_class=HTMLResponse)
-    def recent_papers(request: Request) -> HTMLResponse:
+    def _render_content_page(
+        request: Request,
+        *,
+        default_content: str = "all",
+        is_home: bool = False,
+    ) -> HTMLResponse:
         filters = _parse_filters(request)
-        offset = (filters.page - 1) * filters.page_size
+        content_filter = _content_kind(request.query_params.get("content"), default_content)
+        selected_query_id = _int_or_none(request.query_params.get("query_id"))
         with Database(config.paths.database) as db:
-            rows, total = db.search_papers(
-                query=filters.query,
-                author_id=filters.author_id,
-                author_tags=filters.author_tags,
-                topic_id=filters.topic_id,
-                paper_kind=filters.paper_kind,
-                scope=filters.scope,
-                has_pdf=filters.has_pdf,
-                analyzed=filters.analyzed,
-                date_from=filters.date_from,
-                date_to=filters.date_to,
-                sort=filters.sort,
-                limit=filters.page_size,
-                offset=offset,
-            )
+            paper_rows: list[Any] = []
+            blog_rows: list[Any] = []
+            if content_filter != "blogs":
+                paper_rows, _paper_total = db.search_papers(
+                    query=filters.query,
+                    author_id=filters.author_id,
+                    author_tags=filters.author_tags,
+                    content_tags=filters.content_tags,
+                    topic_id=filters.topic_id,
+                    paper_kind=filters.paper_kind,
+                    scope=filters.scope,
+                    has_pdf=filters.has_pdf,
+                    analyzed=filters.analyzed,
+                    date_from=filters.date_from,
+                    date_to=filters.date_to,
+                    sort=filters.sort,
+                    limit=None,
+                    offset=0,
+                )
+            if content_filter != "papers":
+                blog_rows = db.list_blog_entries(
+                    limit=None,
+                    query=filters.query,
+                    tags=filters.content_tags,
+                    author_id=filters.author_id,
+                    author_tags=filters.author_tags,
+                    date_from=filters.date_from,
+                    date_to=filters.date_to,
+                    sort=filters.sort,
+                )
             author_rows = db.list_authors_with_tags(tracked_only=True)
             tag_rows = db.list_tags()
+            content_tag_rows = db.list_content_tags()
             topic_rows = db.list_topics()
-            saved_queries = [dict(row) for row in db.list_saved_queries()]
-            recent_errors = db.recent_errors(3)
-            paper_views = [_paper_table_view(db, row) for row in rows]
+            saved_queries = [_query_view(row, config) for row in db.list_saved_queries()]
+            paper_views = [_paper_table_view(db, row) for row in paper_rows]
+            blog_views = []
+            for row in blog_rows:
+                entry = dict(row)
+                entry["tracked_authors"] = [
+                    {
+                        "name": str(author["name"]),
+                        "url": f"/authors/{quote_plus(str(author['openalex_id']))}/blogs",
+                    }
+                    for author in db.blog_authors(int(entry["blog_id"]))
+                ]
+                entry["source_site"], entry["source_site_url"] = _website_view(
+                    str(entry.get("source_url") or entry.get("url") or "")
+                )
+                blog_views.append(entry)
+
+        records: list[dict[str, Any]] = []
+        for paper in paper_views:
+            paper["content_type"] = "paper"
+            paper["record_date"] = paper.get("publication_date") or paper.get("discovered_at") or ""
+            paper["record_fetched"] = paper.get("fetched_at") or paper.get("discovered_at") or ""
+            records.append(paper)
+        for entry in blog_views:
+            entry["content_type"] = "blog"
+            entry["record_date"] = entry.get("published_at") or entry.get("fetched_at") or ""
+            entry["record_fetched"] = entry.get("fetched_at") or ""
+            records.append(entry)
+
+        reverse = filters.sort not in {"oldest", "title"}
+        records.sort(key=lambda item: _record_sort_key(item, filters.sort), reverse=reverse)
+        total = len(records)
         pages = max(1, (total + filters.page_size - 1) // filters.page_size)
+        if filters.page > pages and total:
+            items = filters.query_items(page=pages)
+            if content_filter != "all":
+                items.append(("content", content_filter))
+            return RedirectResponse(f"/?{urlencode(items)}", status_code=303)
+        offset = (filters.page - 1) * filters.page_size
+        records = records[offset : offset + filters.page_size]
+        visible_papers = [item for item in records if item["content_type"] == "paper"]
+        visible_blogs = [item for item in records if item["content_type"] == "blog"]
+        previous_items = filters.query_items(page=filters.page - 1)
+        next_items = filters.query_items(page=filters.page + 1)
+        page_jump_items = filters.selection_items()
+        if filters.page_size != DEFAULT_PAGE_SIZE:
+            page_jump_items.append(("page_size", str(filters.page_size)))
+        if content_filter != "all":
+            previous_items.append(("content", content_filter))
+            next_items.append(("content", content_filter))
+            page_jump_items.append(("content", content_filter))
         return render(
             request,
-            "papers.html",
-            papers=paper_views,
+            "content.html",
+            records=records,
+            papers=visible_papers,
+            blog_entries=visible_blogs,
             filters=filters,
+            content_filter=content_filter,
             authors=author_rows,
             author_tags=tag_rows,
+            content_tags=content_tag_rows,
             topics=topic_rows,
             saved_queries=saved_queries,
+            paper_queries=[query for query in saved_queries if _query_supports(query, "papers")],
+            blog_queries=[query for query in saved_queries if _query_supports(query, "blogs")],
+            selected_query_id=selected_query_id,
             model_profiles=config.available_llms,
             total=total,
+            paper_total=len(paper_views),
+            blog_total=len(blog_rows),
             pages=pages,
-            is_home=True,
-            recent_errors=recent_errors,
+            is_home=is_home,
+            previous_query=urlencode(previous_items),
+            next_query=urlencode(next_items),
+            page_jump_items=page_jump_items,
         )
+
+    @app.get("/", response_class=HTMLResponse)
+    def recent_papers(request: Request) -> HTMLResponse:
+        return _render_content_page(request, default_content="all", is_home=True)
 
     @app.get("/authors", response_class=HTMLResponse)
     def authors(request: Request) -> HTMLResponse:
@@ -1142,6 +1469,7 @@ def create_app(
             "author_blogs.html",
             author=author,
             blogs=blogs,
+            source_modes=sorted(SOURCE_MODES),
         )
 
     @app.post("/authors/{openalex_id}/blogs")
@@ -1151,12 +1479,20 @@ def create_app(
             url = normalize_blog_url(str(form.get("url", "")))
             label = str(form.get("label", ""))
             relationship = str(form.get("relationship", ""))
+            source_mode = normalize_source_mode(form.get("source_mode", "auto"))
+            content_selector = validate_content_selector(form.get("content_selector"))
+            article_url_pattern = validate_article_url_pattern(
+                form.get("article_url_pattern")
+            )
             with Database(config.paths.database) as db:
                 db.add_author_blog(
                     openalex_id,
                     url,
                     label=label,
                     relationship=relationship,
+                    source_mode=source_mode,
+                    content_selector=content_selector,
+                    article_url_pattern=article_url_pattern,
                 )
         except ValueError as exc:
             return RedirectResponse(
@@ -1189,8 +1525,20 @@ def create_app(
         form = await request.form()
         try:
             url = normalize_blog_url(str(form.get("url", "")))
+            source_mode = normalize_source_mode(form.get("source_mode", "auto"))
+            content_selector = validate_content_selector(form.get("content_selector"))
+            article_url_pattern = validate_article_url_pattern(
+                form.get("article_url_pattern")
+            )
             with Database(config.paths.database) as db:
-                if not db.update_author_blog_url(openalex_id, blog_id, url):
+                if not db.update_author_blog_url(
+                    openalex_id,
+                    blog_id,
+                    url,
+                    source_mode=source_mode,
+                    content_selector=content_selector,
+                    article_url_pattern=article_url_pattern,
+                ):
                     raise HTTPException(404, "Blog link not found")
         except ValueError as exc:
             return RedirectResponse(
@@ -1230,36 +1578,121 @@ def create_app(
 
     @app.get("/blogs", response_class=HTMLResponse)
     def blog_feed(request: Request) -> HTMLResponse:
-        selected_query_id = _int_or_none(request.query_params.get("query_id"))
+        return _render_content_page(request, default_content="blogs")
+
+    @app.get("/blogs/import", response_class=HTMLResponse)
+    def import_blog_entry_page(request: Request) -> HTMLResponse:
         with Database(config.paths.database) as db:
-            entries = db.list_blog_entries(250)
-            saved_queries = [dict(row) for row in db.list_saved_queries()]
-        return render(
-            request,
-            "blogs.html",
-            entries=entries,
-            saved_queries=saved_queries,
-            selected_query_id=selected_query_id,
-            model_profiles=config.available_llms,
+            authors = db.list_authors(tracked_only=True)
+        return render(request, "import_blog_entry.html", authors=authors)
+
+    @app.post("/blogs/import")
+    async def import_blog_entry(request: Request) -> RedirectResponse:
+        form = await request.form()
+        author_id = str(form.get("author_id", "")).strip()
+        title = clean_text(str(form.get("entry_title", "")))
+        content = str(form.get("content", "")).strip()
+        published_at = str(form.get("published_at", "")).strip()
+        try:
+            if not author_id:
+                raise ValueError("Choose a tracked author")
+            if not title:
+                raise ValueError("Entry title is required")
+            if not content:
+                raise ValueError("Entry text is required")
+            if len(title) > 1000:
+                raise ValueError("Entry title is too long")
+            if len(content) > 5_000_000:
+                raise ValueError("Entry text is too long")
+            blog_url = normalize_blog_url(str(form.get("blog_url", "")))
+            entry_url = normalize_blog_url(str(form.get("entry_url", "")))
+            if published_at:
+                try:
+                    datetime.fromisoformat(published_at.replace("Z", "+00:00"))
+                except ValueError as exc:
+                    raise ValueError("Published time must be ISO 8601") from exc
+            normalized = f"Title: {title}\nURL: {entry_url}\n\n{content}"
+            digest = hashlib.sha256(normalized.encode("utf-8")).hexdigest()
+            external_id = hashlib.sha256(
+                f"manual\0{entry_url}".encode("utf-8")
+            ).hexdigest()
+            with Database(config.paths.database) as db:
+                if db.get_author(author_id) is None:
+                    raise ValueError("Tracked author was not found")
+                blog_id = db.add_author_blog(
+                    author_id,
+                    blog_url,
+                    label=str(form.get("blog_label", "")),
+                    relationship=str(form.get("relationship", "Direct import")),
+                    source_mode="article",
+                )
+                previous = db.latest_blog_entry(
+                    blog_id, entry_kind="snapshot", external_id=external_id
+                )
+                if previous is not None and previous["content_sha256"] == digest:
+                    entry_id = int(previous["id"])
+                else:
+                    kind, diff = blog_diff(
+                        str(previous["normalized_text"]) if previous is not None else None,
+                        normalized,
+                    )
+                    entry_id = db.save_blog_entry(
+                        blog_id=blog_id,
+                        title=title,
+                        content_sha256=digest,
+                        normalized_text=normalized,
+                        diff_text=diff,
+                        change_kind="changed" if previous is None else kind,
+                        previous_entry_id=int(previous["id"]) if previous is not None else None,
+                        entry_kind="snapshot",
+                        external_id=external_id,
+                        source_url=entry_url,
+                        published_at=published_at or None,
+                    )
+        except ValueError as exc:
+            return RedirectResponse(
+                _notice_url("/blogs/import", str(exc), level="error"), status_code=303
+            )
+        return RedirectResponse(
+            _notice_url(f"/blogs/{entry_id}", "Blog entry imported."), status_code=303
         )
 
     @app.get("/blogs/{entry_id}", response_class=HTMLResponse)
     def blog_entry(request: Request, entry_id: int) -> HTMLResponse:
         with Database(config.paths.database) as db:
             entry = db.get_blog_entry(entry_id)
-            saved_queries = [dict(row) for row in db.list_saved_queries()]
+            saved_queries = [
+                query for row in db.list_saved_queries()
+                if _query_supports(query := _query_view(row, config), "blogs")
+            ]
             prompt_runs = [
                 _query_output(row) for row in db.query_runs_for_blog_entry(entry_id)
             ]
+            entry_tags = db.blog_entry_tags(entry_id)
+            content_tags = db.list_content_tags()
+            tracked_authors = db.blog_authors(int(entry["blog_id"])) if entry else []
         if entry is None:
             raise HTTPException(404, "Blog update not found")
+        entry_view = dict(entry)
+        entry_view["tracked_authors"] = [
+            {
+                "name": str(author["name"]),
+                "url": f"/authors/{quote_plus(str(author['openalex_id']))}/blogs",
+            }
+            for author in tracked_authors
+        ]
+        entry_view["display_html"] = str(entry["rendered_html"] or "") or _render_stored_markdown(
+            str(entry["normalized_text"] or "")
+        )
         return render(
             request,
             "blog_detail.html",
-            entry=entry,
+            entry=entry_view,
             saved_queries=saved_queries,
             prompt_runs=prompt_runs,
             model_profiles=config.available_llms,
+            entry_tags=entry_tags,
+            content_tags=content_tags,
         )
 
     @app.post("/blogs/{entry_id}/prompt")
@@ -1306,6 +1739,33 @@ def create_app(
         if async_request:
             return JSONResponse({"ok": True, "batch_id": batch_id, "message": message})
         return RedirectResponse(_notice_url(f"/blogs/{entry_id}", message), status_code=303)
+
+    @app.post("/blogs/{entry_id}/tags/add")
+    async def add_blog_content_tag(request: Request, entry_id: int) -> RedirectResponse:
+        form = await request.form()
+        try:
+            with Database(config.paths.database) as db:
+                if not db.add_blog_entry_tag(entry_id, str(form.get("tag", ""))):
+                    raise HTTPException(404, "Blog entry not found")
+        except ValueError as exc:
+            return RedirectResponse(
+                _notice_url(f"/blogs/{entry_id}", str(exc), level="error"), status_code=303
+            )
+        return RedirectResponse(
+            _notice_url(f"/blogs/{entry_id}", "Tag added."), status_code=303
+        )
+
+    @app.post("/blogs/{entry_id}/tags/remove")
+    async def remove_blog_content_tag(request: Request, entry_id: int) -> RedirectResponse:
+        form = await request.form()
+        try:
+            with Database(config.paths.database) as db:
+                db.remove_blog_entry_tag(entry_id, str(form.get("tag", "")))
+        except ValueError as exc:
+            return RedirectResponse(
+                _notice_url(f"/blogs/{entry_id}", str(exc), level="error"), status_code=303
+            )
+        return RedirectResponse(f"/blogs/{entry_id}", status_code=303)
 
     @app.post("/authors/search")
     async def search_authors(request: Request) -> RedirectResponse:
@@ -1547,12 +2007,16 @@ def create_app(
         return RedirectResponse(target, status_code=303)
 
     @app.post("/actions/run")
-    def start_run() -> RedirectResponse:
+    def start_run(request: Request) -> RedirectResponse:
         if controller.snapshot().running:
             controller.cancel()
         else:
             controller.start("run")
-        return RedirectResponse("/", status_code=303)
+        referer = urlparse(request.headers.get("referer", ""))
+        target = referer.path or "/"
+        if referer.query:
+            target = f"{target}?{referer.query}"
+        return RedirectResponse(target, status_code=303)
 
     @app.post("/actions/download")
     async def download_paper(request: Request) -> RedirectResponse:
@@ -1607,48 +2071,7 @@ def create_app(
 
     @app.get("/papers", response_class=HTMLResponse)
     def papers(request: Request) -> HTMLResponse:
-        filters = _parse_filters(request)
-        selected_query_id = _int_or_none(request.query_params.get("query_id"))
-        offset = (filters.page - 1) * filters.page_size
-        with Database(config.paths.database) as db:
-            rows, total = db.search_papers(
-                query=filters.query,
-                author_id=filters.author_id,
-                author_tags=filters.author_tags,
-                topic_id=filters.topic_id,
-                paper_kind=filters.paper_kind,
-                scope=filters.scope,
-                has_pdf=filters.has_pdf,
-                analyzed=filters.analyzed,
-                date_from=filters.date_from,
-                date_to=filters.date_to,
-                sort=filters.sort,
-                limit=filters.page_size,
-                offset=offset,
-            )
-            author_rows = db.list_authors_with_tags(tracked_only=True)
-            tag_rows = db.list_tags()
-            topic_rows = db.list_topics()
-            saved_queries = [dict(row) for row in db.list_saved_queries()]
-            paper_views = [_paper_table_view(db, row) for row in rows]
-        pages = max(1, (total + filters.page_size - 1) // filters.page_size)
-        if filters.page > pages and total:
-            target = urlencode(filters.query_items(page=pages))
-            return RedirectResponse(f"/papers?{target}", status_code=303)
-        return render(
-            request,
-            "papers.html",
-            papers=paper_views,
-            filters=filters,
-            authors=author_rows,
-            author_tags=tag_rows,
-            topics=topic_rows,
-            saved_queries=saved_queries,
-            selected_query_id=selected_query_id,
-            model_profiles=config.available_llms,
-            total=total,
-            pages=pages,
-        )
+        return _render_content_page(request, default_content="papers")
 
     @app.get("/papers/{paper_id}", response_class=HTMLResponse)
     def paper_detail(request: Request, paper_id: int) -> HTMLResponse:
@@ -1667,10 +2090,15 @@ def create_app(
                 dict(row) for row in db.visible_analysis_tasks_for_paper(paper_id)
             ]
             analyses = [_analysis_view(row) for row in db.paper_analyses(paper_id)]
-            saved_queries = [dict(row) for row in db.list_saved_queries()]
+            saved_queries = [
+                query for row in db.list_saved_queries()
+                if _query_supports(query := _query_view(row, config), "papers")
+            ]
             prompt_runs = [
                 _query_output(row) for row in db.query_runs_for_paper(paper_id)
             ]
+            paper_tags = db.paper_tags(paper_id)
+            content_tags = db.list_content_tags()
         return render(
             request,
             "paper_detail.html",
@@ -1684,6 +2112,8 @@ def create_app(
             prompt_runs=prompt_runs,
             model_profiles=config.available_llms,
             metadata=_json_value(paper["metadata_json"], {}),
+            paper_tags=paper_tags,
+            content_tags=content_tags,
         )
 
     @app.post("/papers/{paper_id}/authors/{openalex_id}/add")
@@ -1717,6 +2147,33 @@ def create_app(
             _notice_url(f"/papers/{paper_id}", f"Added {name} to tracking."),
             status_code=303,
         )
+
+    @app.post("/papers/{paper_id}/tags/add")
+    async def add_paper_content_tag(request: Request, paper_id: int) -> RedirectResponse:
+        form = await request.form()
+        try:
+            with Database(config.paths.database) as db:
+                if not db.add_paper_tag(paper_id, str(form.get("tag", ""))):
+                    raise HTTPException(404, "Paper not found")
+        except ValueError as exc:
+            return RedirectResponse(
+                _notice_url(f"/papers/{paper_id}", str(exc), level="error"), status_code=303
+            )
+        return RedirectResponse(
+            _notice_url(f"/papers/{paper_id}", "Tag added."), status_code=303
+        )
+
+    @app.post("/papers/{paper_id}/tags/remove")
+    async def remove_paper_content_tag(request: Request, paper_id: int) -> RedirectResponse:
+        form = await request.form()
+        try:
+            with Database(config.paths.database) as db:
+                db.remove_paper_tag(paper_id, str(form.get("tag", "")))
+        except ValueError as exc:
+            return RedirectResponse(
+                _notice_url(f"/papers/{paper_id}", str(exc), level="error"), status_code=303
+            )
+        return RedirectResponse(f"/papers/{paper_id}", status_code=303)
 
     @app.post("/papers/{paper_id}/analyze")
     async def analyze_paper(request: Request, paper_id: int) -> Response:
@@ -1954,6 +2411,43 @@ def create_app(
             model_profiles=config.available_llms,
         )
 
+    @app.get("/queries/runs/{run_id}", response_class=HTMLResponse)
+    def query_run_detail(request: Request, run_id: int) -> HTMLResponse:
+        with Database(config.paths.database) as db:
+            row = db.get_query_run(run_id)
+            if row is None:
+                raise HTTPException(404, "Query output not found")
+            run = _query_output(row)
+            selection = run.get("selection") if isinstance(run.get("selection"), dict) else {}
+            links: list[dict[str, str]] = []
+            blog_ids = selection.get("blog_entry_ids")
+            if isinstance(blog_ids, list):
+                for entry in db.blog_entries_by_ids(blog_ids):
+                    links.append(
+                        {
+                            "label": f"Blog entry: {entry['title']}",
+                            "url": f"/blogs/{int(entry['id'])}",
+                        }
+                    )
+            paper_ids = selection.get("paper_ids")
+            if isinstance(paper_ids, list):
+                for raw_id in paper_ids:
+                    paper_id = _int_or_none(raw_id)
+                    paper = db.get_paper(paper_id) if paper_id is not None else None
+                    if paper is not None:
+                        links.append(
+                            {
+                                "label": f"Paper: {paper['title']}",
+                                "url": f"/papers/{paper_id}",
+                            }
+                        )
+            run["selection_links"] = links
+            run["selection_source"] = str(
+                selection.get("source_scope")
+                or ("blog" if selection.get("content_type") == "blogs" else "abstract")
+            )
+        return render(request, "query_run_detail.html", run=run)
+
     @app.get("/queries/new", response_class=HTMLResponse)
     def query_new_page(request: Request) -> HTMLResponse:
         selected = [config.available_llms[0].profile] if config.available_llms else []
@@ -1965,6 +2459,11 @@ def create_app(
             "context_window_tokens": config.llm.context_window_tokens,
             "paper_source_scope": "auto",
             "pdf_strategy": "chunked",
+            "regexp_pattern": "",
+            "regexp_radius": 0,
+            "regexp_mode": "query",
+            "content_scope": "both",
+            "local_regexp": False,
         }
         return render(
             request,
@@ -2020,7 +2519,8 @@ def create_app(
             legacy_target_form = not any(
                 key in form
                 for key in (
-                    "model", "context_window_tokens", "paper_source_scope", "pdf_strategy"
+                    "model", "context_window_tokens", "paper_source_scope", "pdf_strategy",
+                    "content_scope",
                 )
             )
             with Database(config.paths.database) as db:
@@ -2135,15 +2635,23 @@ def create_app(
             return RedirectResponse(
                 _notice_url("/", "Select a saved query.", level="error"), status_code=303
             )
+        filters = _parse_filter_values(form)
+        with Database(config.paths.database) as db:
+            stored_query = db.get_saved_query(query_id)
+            local_regexp = bool(
+                stored_query
+                and str(stored_query["regexp_pattern"] or "").strip()
+                and str(stored_query["regexp_mode"] or "query") == "print"
+            )
+            authors_for_labels = db.list_authors_with_tags(tracked_only=True)
+            topics_for_labels = db.list_topics()
         available_profiles = {item.profile for item in config.available_llms}
-        if not profiles or any(name not in available_profiles for name in profiles):
+        if not local_regexp and (
+            not profiles or any(name not in available_profiles for name in profiles)
+        ):
             return RedirectResponse(
                 _notice_url("/", "Select a configured model.", level="error"), status_code=303
             )
-        filters = _parse_filter_values(form)
-        with Database(config.paths.database) as db:
-            authors_for_labels = db.list_authors_with_tags(tracked_only=True)
-            topics_for_labels = db.list_topics()
         selection = _selection_with_labels(
             filters, authors=authors_for_labels, topics=topics_for_labels
         )
@@ -2209,7 +2717,7 @@ def create_app(
             str(value) for value in form.getlist("model") if str(value).strip()
         )
         profiles = requested_profiles or tuple(query["model_profiles"])
-        if not profiles:
+        if not profiles and not query["local_regexp"]:
             return RedirectResponse(
                 _notice_url(
                     f"/queries/{query_id}/edit",
@@ -2329,6 +2837,328 @@ def create_app(
                 "analysis": asdict(model_controller.snapshot()),
                 "query": asdict(collection_controller.snapshot()),
             }
+        )
+
+    def _data_actions_available() -> bool:
+        return not (
+            controller.snapshot().running
+            or model_controller.snapshot().running
+            or collection_controller.snapshot().running
+        )
+
+    @app.post("/data/delete/authors")
+    def delete_all_authors() -> RedirectResponse:
+        if not _data_actions_available():
+            return RedirectResponse(
+                _notice_url("/runs", "Stop active jobs before deleting data.", level="warning"),
+                status_code=303,
+            )
+        with Database(config.paths.database) as db:
+            count = db.delete_all_authors()
+        return RedirectResponse(
+            _notice_url("/runs", f"Deleted {count} author record(s)."), status_code=303
+        )
+
+    @app.post("/data/delete/papers")
+    def delete_all_papers() -> RedirectResponse:
+        if not _data_actions_available():
+            return RedirectResponse(
+                _notice_url("/runs", "Stop active jobs before deleting data.", level="warning"),
+                status_code=303,
+            )
+        with Database(config.paths.database) as db:
+            count, paths = db.delete_all_papers()
+        root = config.paths.pdf_dir.resolve()
+        removed = 0
+        for value in paths:
+            path = Path(value).expanduser().resolve()
+            if path.is_file() and (path == root or root in path.parents):
+                path.unlink(missing_ok=True)
+                removed += 1
+        return RedirectResponse(
+            _notice_url(
+                "/runs", f"Deleted {count} paper record(s) and {removed} stored PDF(s)."
+            ),
+            status_code=303,
+        )
+
+    @app.post("/data/delete/blogs")
+    def delete_all_downloaded_blogs() -> RedirectResponse:
+        if not _data_actions_available():
+            return RedirectResponse(
+                _notice_url("/runs", "Stop active jobs before deleting data.", level="warning"),
+                status_code=303,
+            )
+        with Database(config.paths.database) as db:
+            count = db.delete_all_blog_entries()
+        return RedirectResponse(
+            _notice_url(
+                "/runs",
+                f"Deleted {count} downloaded blog entr{'y' if count == 1 else 'ies'}; source links were kept.",
+            ),
+            status_code=303,
+        )
+
+    @app.post("/data/delete/summaries")
+    def delete_all_summaries() -> RedirectResponse:
+        if not _data_actions_available():
+            return RedirectResponse(
+                _notice_url("/runs", "Stop active jobs before deleting data.", level="warning"),
+                status_code=303,
+            )
+        with Database(config.paths.database) as db:
+            count = db.delete_all_summaries()
+        return RedirectResponse(
+            _notice_url(
+                "/runs",
+                f"Deleted {count} generated summar{'y' if count == 1 else 'ies'} and their task history.",
+            ),
+            status_code=303,
+        )
+
+    @app.post("/data/delete/fetch-history")
+    def delete_fetch_history() -> RedirectResponse:
+        if not _data_actions_available():
+            return RedirectResponse(
+                _notice_url("/runs", "Stop active jobs before deleting data.", level="warning"),
+                status_code=303,
+            )
+        with Database(config.paths.database) as db:
+            count = db.delete_fetch_history()
+        return RedirectResponse(
+            _notice_url(
+                "/runs",
+                f"Deleted {count} fetch-history record{'s' if count != 1 else ''}.",
+            ),
+            status_code=303,
+        )
+
+    @app.post("/data/delete/queries")
+    def delete_all_queries() -> RedirectResponse:
+        if not _data_actions_available():
+            return RedirectResponse(
+                _notice_url("/runs", "Stop active jobs before deleting data.", level="warning"),
+                status_code=303,
+            )
+        with Database(config.paths.database) as db:
+            count = db.delete_all_queries()
+        return RedirectResponse(
+            _notice_url(
+                "/runs",
+                f"Deleted {count} saved quer{'y' if count == 1 else 'ies'}; the built-in query was restored.",
+            ),
+            status_code=303,
+        )
+
+    @app.post("/data/delete/query-history")
+    def delete_query_history() -> RedirectResponse:
+        if not _data_actions_available():
+            return RedirectResponse(
+                _notice_url("/runs", "Stop active jobs before deleting data.", level="warning"),
+                status_code=303,
+            )
+        with Database(config.paths.database) as db:
+            count = db.delete_query_history()
+        return RedirectResponse(
+            _notice_url(
+                "/runs",
+                f"Deleted {count} saved-query output record{'s' if count != 1 else ''}.",
+            ),
+            status_code=303,
+        )
+
+    @app.get("/data/export/authors-blogs")
+    def export_authors_blogs() -> JSONResponse:
+        with Database(config.paths.database) as db:
+            payload = db.export_author_blog_catalog()
+        return JSONResponse(
+            payload,
+            headers={
+                "Content-Disposition": 'attachment; filename="paperwatch-authors-blogs.json"'
+            },
+        )
+
+    @app.post("/data/import/authors-blogs")
+    async def import_authors_blogs(request: Request) -> RedirectResponse:
+        if not _data_actions_available():
+            return RedirectResponse(
+                _notice_url("/runs", "Stop active jobs before importing data.", level="warning"),
+                status_code=303,
+            )
+        form = await request.form()
+        upload = form.get("file")
+        if not isinstance(upload, UploadFile):
+            return RedirectResponse(
+                _notice_url("/runs", "Choose an authors and blogs JSON file.", level="error"),
+                status_code=303,
+            )
+        try:
+            raw = await upload.read(20_000_001)
+            if len(raw) > 20_000_000:
+                raise ValueError("Authors and blogs import exceeds 20 MB")
+            payload = json.loads(raw.decode("utf-8-sig"))
+            if not isinstance(payload, dict):
+                raise ValueError("Authors and blogs import must be a JSON object")
+            with Database(config.paths.database) as db:
+                authors_count, links_count = db.import_author_blog_catalog(payload)
+        except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
+            return RedirectResponse(
+                _notice_url("/runs", str(exc), level="error"), status_code=303
+            )
+        finally:
+            await upload.close()
+        return RedirectResponse(
+            _notice_url(
+                "/runs",
+                f"Imported {authors_count} author(s) and {links_count} author-blog link(s).",
+            ),
+            status_code=303,
+        )
+
+    @app.get("/data/export/all")
+    def export_all_data() -> FileResponse:
+        handle, archive_name = tempfile.mkstemp(prefix="paperwatch-export-", suffix=".zip")
+        os.close(handle)
+        archive = Path(archive_name)
+        with tempfile.TemporaryDirectory(prefix="paperwatch-export-db-") as temporary:
+            database_copy = Path(temporary) / "database.sqlite3"
+            with Database(config.paths.database) as db:
+                db.backup_to(database_copy)
+            pdf_root = config.paths.pdf_dir.resolve()
+            pdf_paths: dict[str, str] = {}
+            with zipfile.ZipFile(archive, "w", compression=zipfile.ZIP_DEFLATED) as bundle:
+                bundle.write(database_copy, "database.sqlite3")
+                if pdf_root.is_dir():
+                    for file in sorted(pdf_root.rglob("*")):
+                        if not file.is_file() or file.is_symlink():
+                            continue
+                        relative = file.relative_to(pdf_root).as_posix()
+                        bundle.write(file, f"pdfs/{relative}")
+                        pdf_paths[str(file.resolve())] = relative
+                bundle.writestr(
+                    "manifest.json",
+                    json.dumps(
+                        {
+                            "format": "paperwatch-full-data",
+                            "version": 1,
+                            "created_at": _utcnow(),
+                            "pdf_paths": pdf_paths,
+                        },
+                        ensure_ascii=False,
+                        indent=2,
+                    ),
+                )
+        return FileResponse(
+            archive,
+            media_type="application/zip",
+            filename="paperwatch-full-data.zip",
+            background=BackgroundTask(archive.unlink, missing_ok=True),
+        )
+
+    @app.post("/data/import/all")
+    async def import_all_data(request: Request) -> RedirectResponse:
+        if not _data_actions_available():
+            return RedirectResponse(
+                _notice_url("/runs", "Stop active jobs before importing data.", level="warning"),
+                status_code=303,
+            )
+        form = await request.form()
+        upload = form.get("file")
+        if not isinstance(upload, UploadFile):
+            return RedirectResponse(
+                _notice_url("/runs", "Choose a Paperwatch full-data ZIP file.", level="error"),
+                status_code=303,
+            )
+        staging_root = Path(tempfile.mkdtemp(prefix="paperwatch-import-"))
+        uploaded = staging_root / "upload.zip"
+        try:
+            total = 0
+            with uploaded.open("wb") as handle:
+                while chunk := await upload.read(1024 * 1024):
+                    total += len(chunk)
+                    if total > 5_000_000_000:
+                        raise ValueError("Full-data import exceeds 5 GB")
+                    handle.write(chunk)
+            if not zipfile.is_zipfile(uploaded):
+                raise ValueError("Full-data import is not a ZIP archive")
+            database_copy = staging_root / "database.sqlite3"
+            pdf_stage = staging_root / "pdfs"
+            pdf_stage.mkdir()
+            with zipfile.ZipFile(uploaded) as bundle:
+                names = set(bundle.namelist())
+                if "database.sqlite3" not in names or "manifest.json" not in names:
+                    raise ValueError("Full-data archive is missing its database or manifest")
+                manifest = json.loads(bundle.read("manifest.json").decode("utf-8"))
+                if not isinstance(manifest, dict) or manifest.get("format") != "paperwatch-full-data":
+                    raise ValueError("Unsupported full-data archive")
+                database_copy.write_bytes(bundle.read("database.sqlite3"))
+                for name in names:
+                    if not name.startswith("pdfs/") or name.endswith("/"):
+                        continue
+                    relative = Path(name.removeprefix("pdfs/"))
+                    if relative.is_absolute() or ".." in relative.parts:
+                        raise ValueError("Full-data archive contains an unsafe path")
+                    destination = pdf_stage / relative
+                    destination.parent.mkdir(parents=True, exist_ok=True)
+                    with bundle.open(name) as source, destination.open("wb") as target:
+                        shutil.copyfileobj(source, target)
+            check = sqlite3.connect(str(database_copy))
+            try:
+                result = check.execute("PRAGMA quick_check").fetchone()
+                tables = {
+                    str(row[0])
+                    for row in check.execute(
+                        "SELECT name FROM sqlite_master WHERE type='table'"
+                    ).fetchall()
+                }
+            finally:
+                check.close()
+            if not result or result[0] != "ok" or not {"authors", "papers", "blogs", "blog_entries"} <= tables:
+                raise ValueError("Full-data database is invalid")
+            with Database(database_copy):
+                pass
+            pdf_mapping = manifest.get("pdf_paths") if isinstance(manifest.get("pdf_paths"), dict) else {}
+            if pdf_mapping:
+                conn = sqlite3.connect(str(database_copy))
+                try:
+                    for old_path, relative in pdf_mapping.items():
+                        relative_path = Path(str(relative))
+                        if relative_path.is_absolute() or ".." in relative_path.parts:
+                            continue
+                        destination = config.paths.pdf_dir.resolve() / relative_path
+                        conn.execute(
+                            "UPDATE papers SET local_pdf_path=? WHERE local_pdf_path=?",
+                            (str(destination), str(old_path)),
+                        )
+                    conn.commit()
+                finally:
+                    conn.close()
+            stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+            database_target = config.paths.database.resolve()
+            database_target.parent.mkdir(parents=True, exist_ok=True)
+            if database_target.exists():
+                backup = database_target.with_name(f"{database_target.name}.before-import-{stamp}")
+                shutil.copy2(database_target, backup)
+            for suffix in ("-wal", "-shm"):
+                Path(str(database_target) + suffix).unlink(missing_ok=True)
+            os.replace(database_copy, database_target)
+            pdf_target = config.paths.pdf_dir.resolve()
+            if pdf_target.exists():
+                pdf_backup = pdf_target.with_name(f"{pdf_target.name}.before-import-{stamp}")
+                if pdf_backup.exists():
+                    shutil.rmtree(pdf_backup)
+                os.replace(pdf_target, pdf_backup)
+            os.replace(pdf_stage, pdf_target)
+        except (OSError, sqlite3.Error, zipfile.BadZipFile, json.JSONDecodeError, ValueError) as exc:
+            return RedirectResponse(
+                _notice_url("/runs", f"Import failed: {exc}", level="error"), status_code=303
+            )
+        finally:
+            await upload.close()
+            shutil.rmtree(staging_root, ignore_errors=True)
+        return RedirectResponse(
+            _notice_url("/runs", "Imported the full Paperwatch database and PDF store."),
+            status_code=303,
         )
 
     @app.get("/runs", response_class=HTMLResponse)

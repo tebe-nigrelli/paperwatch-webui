@@ -5,7 +5,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import TextIO
 
-from .blogs import normalize_blog_url
+from .blogs import infer_source_mode, normalize_blog_url
 from .db import Database
 
 
@@ -25,7 +25,12 @@ def import_blog_links(
     *,
     create_missing: bool = False,
 ) -> BlogImportStats:
-    reader = csv.DictReader(stream)
+    reader = csv.DictReader(stream, skipinitialspace=True)
+    if reader.fieldnames:
+        reader.fieldnames = [
+            (name or "").lstrip("\ufeff").strip()
+            for name in reader.fieldnames
+        ]
     required = {"Researcher / author", "Primary source URL"}
     if not reader.fieldnames or not required.issubset(reader.fieldnames):
         raise ValueError("CSV must contain Researcher / author and Primary source URL columns")
@@ -53,14 +58,30 @@ def import_blog_links(
                 row.get("Primary source URL") or "",
                 row.get("Primary applied-ML source") or "",
                 row.get("Relationship to author") or "",
+                row.get("Primary source type") or "",
+                row.get("Primary source mode") or "",
+                row.get("Primary content selector") or "",
+                row.get("Primary article URL pattern") or "",
             ),
             (
                 row.get("Secondary source URL") or "",
                 row.get("Secondary nearby source") or "",
                 row.get("Secondary relationship") or "",
+                row.get("Secondary source type") or row.get("Secondary focus") or "",
+                row.get("Secondary source mode") or "",
+                row.get("Secondary content selector") or "",
+                row.get("Secondary article URL pattern") or "",
             ),
         )
-        for raw_url, label, relationship in sources:
+        for (
+            raw_url,
+            label,
+            relationship,
+            source_type,
+            explicit_mode,
+            content_selector,
+            article_url_pattern,
+        ) in sources:
             if not raw_url.strip():
                 continue
             try:
@@ -73,6 +94,12 @@ def import_blog_links(
                 url,
                 label=label,
                 relationship=relationship,
+                source_mode=(
+                    explicit_mode.strip()
+                    or infer_source_mode(url, source_type, label)
+                ),
+                content_selector=content_selector,
+                article_url_pattern=article_url_pattern,
             )
             stats.links += 1
     return stats

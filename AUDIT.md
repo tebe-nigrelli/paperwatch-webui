@@ -1,8 +1,8 @@
-# Release audit — paperwatch 0.6.4
+# Release audit — paperwatch 0.9.7
 
 ## Result
 
-This revision consolidates discovery/import operations, makes saved prompts runtime-configurable and source-safe, adds persistent paper subset selection, restores a three-state system-aware theme toggle, opens local PDFs through the desktop, fixes exact OpenAlex work downloads, and adds Claude Code as an LLM provider.
+This revision makes RSS-originated arXiv papers reliable and directly navigable, gives every configured blog its own fetch worker, links query outputs back to their stored source, shortens blog source labels to the site root, removes duplicate fetch-error diagnostics from Content, and restructures destructive controls. Dropdowns with at most five choices cycle and apply immediately; larger dropdowns support typed filtering, keyboard selection, Enter-to-apply, and clearing the current text.
 
 ## Verified behavior
 
@@ -48,7 +48,7 @@ This revision consolidates discovery/import operations, makes saved prompts runt
 
 ## Compatibility review
 
-- Existing SQLite data migrates incrementally through schema version 9.
+- Existing SQLite data migrates incrementally through schema version 20. Hidden initial RSS, GitHub, video, and child-article records from schema 16 are promoted to usable entries.
 - Legacy saved-query arguments and `/papers/{id}/pdf` remain accepted for API/backward compatibility.
 - Daily fetch, backfill, manual import, summaries, saved prompts, multi-model runs, exports, author tracking, tags, active-run links, PDF validation/redownload, Ollama recovery, OpenAI, and Codex paths remain covered.
 - New templates and static assets are included by the existing package-data rules.
@@ -57,8 +57,8 @@ This revision consolidates discovery/import operations, makes saved prompts runt
 
 | Check | Result |
 |---|---|
-| Deterministic tests | 253 passed |
-| Branch-aware coverage | 95.18% |
+| Deterministic tests | 374 passed |
+| Branch-aware coverage | 95.03% |
 | Enforced minimum | 95% |
 | Python compilation | Passed |
 | Wheel build | Passed |

@@ -24,6 +24,10 @@ class _OllamaOutputError(LLMError):
     """A successful Ollama HTTP response with unusable model output."""
 
 
+class _OllamaGrammarError(LLMError):
+    """The server cannot compile Ollama's JSON-schema grammar."""
+
+
 TModel = TypeVar("TModel", bound=BaseModel)
 
 
@@ -193,6 +197,10 @@ class OllamaClient:
                 value = payload.get(key)
                 if isinstance(value, str) and value.strip():
                     return value.strip()
+                if isinstance(value, dict):
+                    nested = value.get("message") or value.get("detail")
+                    if isinstance(nested, str) and nested.strip():
+                        return nested.strip()
         text = response.text.strip()
         return text[:500] if text else f"HTTP {response.status_code}"
 
@@ -206,6 +214,12 @@ class OllamaClient:
                 f"Ollama analysis failed: model {self.model!r} is not installed. "
                 f"Run `ollama pull {self.model}` and retry. Server response: {detail}"
             )
+        if response.status_code == 400 and (
+            "failed to parse grammar" in lowered
+            or "failed to initialize samplers" in lowered
+            or ("grammar" in lowered and "parse" in lowered)
+        ):
+            return _OllamaGrammarError(detail)
         return LLMError(
             f"Ollama analysis failed: request to {endpoint} returned "
             f"HTTP {response.status_code}: {detail}"
@@ -253,17 +267,26 @@ class OllamaClient:
         schema: dict[str, Any],
         force_stream: bool | None = None,
         output_tokens: int | None = None,
+        json_mode_only: bool = False,
     ) -> StructuredJSONResponse | None:
         endpoint = f"{self.base_url}/api/chat"
+        effective_prompt = prompt
+        if json_mode_only:
+            effective_prompt = (
+                prompt
+                + "\n\nThe server cannot enforce the schema as a grammar. Return exactly one "
+                "JSON object matching this JSON Schema, with no markdown or commentary:\n"
+                + json.dumps(schema, ensure_ascii=False, separators=(",", ":"))
+            )
         request_json = {
             "model": self.model,
-            "messages": [{"role": "user", "content": prompt}],
+            "messages": [{"role": "user", "content": effective_prompt}],
             "stream": (
                 self._progress is not None or self._cancel_event is not None
                 if force_stream is None
                 else force_stream
             ),
-            "format": schema,
+            "format": "json" if json_mode_only else schema,
             "think": False,
             "options": {
                 "temperature": 0,
@@ -307,8 +330,6 @@ class OllamaClient:
             return StructuredJSONResponse(
                 data=self._decode_json_content(content), usage=usage, raw=payload
             )
-
-        import json
 
         content_parts: list[str] = []
         final_payload: dict[str, Any] = {}
@@ -383,6 +404,7 @@ class OllamaClient:
             max(2_048, min(8_192, context // 3)),
             max(3_072, min(12_288, context // 2)),
         )
+        json_mode_only = False
         for attempt in range(3):
             retry_prompt = prompt
             if attempt:
@@ -398,7 +420,29 @@ class OllamaClient:
                     schema=schema,
                     force_stream=False if attempt else None,
                     output_tokens=output_limits[attempt],
+                    json_mode_only=json_mode_only,
                 )
+            except _OllamaGrammarError:
+                if json_mode_only:
+                    raise
+                json_mode_only = True
+                if self._progress is not None:
+                    self._progress(
+                        "message",
+                        "Ollama could not compile the JSON schema; retrying in JSON mode",
+                    )
+                try:
+                    return self._native_generate_once(
+                        retry_prompt,
+                        schema=schema,
+                        force_stream=False,
+                        output_tokens=output_limits[attempt],
+                        json_mode_only=True,
+                    )
+                except _OllamaOutputError as exc:
+                    last_error = exc
+                    if first_error is None:
+                        first_error = exc
             except _OllamaOutputError as exc:
                 last_error = exc
                 if attempt == 0:

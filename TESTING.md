@@ -1,4 +1,4 @@
-# Automated testing strategy — paperwatch 0.6.4
+# Automated testing strategy — paperwatch 0.9.7
 
 The default suite is deterministic and requires no live OpenAlex index, arXiv service, Ollama server, OpenAI account, PDF host, or external browser assets.
 
@@ -10,8 +10,8 @@ pytest
 
 Release result:
 
-- 253 tests passed
-- 95.18% branch-aware coverage
+- 374 tests passed
+- 95.03% branch-aware coverage
 - Python 3.13.5 release environment
 
 ## Feature coverage
@@ -30,15 +30,16 @@ Release result:
 | Structured summaries | Exact keys/enums, narrative limits, `Setting: ` requirement, trusted metadata normalization, named-column and JSON round trips |
 | Chunked analysis | Paragraph splitting, overlap, chunk-size budgets, direct-fit checks, chunk-note cache, recursive reduction, final strict schema, context failures |
 | Multi-model analysis | Direct/auto/chunked modes, same-source runs, partial failures, cache reuse, context overrides, source validation |
-| Saved queries | Protected built-in Summarize prompt, name/prompt-only CRUD, runtime abstract/full-PDF source, all-paper source compatibility preflight, PDF-only strategy validation, exact paper selection, map/reduce grouping, oversized record splitting/compaction, multi-model success/failure, status recovery |
+| Saved queries | Protected built-in Summarize prompt, paper/blog/both support scope, optional no-op regexp preprocessing, bounded match radius, local print mode, direct result pages, runtime abstract/full-PDF/blog source, exact mixed-content selection, map/reduce grouping, oversized record splitting/compaction, multi-model success/failure, status recovery |
 | Pipeline | Cursor-independent one-year download-only backfill, historical-analysis suppression, late-PDF analysis, normal initial/overlap windows, model preflight, automatic PDF chunking, cache behavior, error isolation, counters |
 | Concurrency | Separate cross-process fetch, paper-analysis, and saved-query locks; clean release behavior |
 | SQLite | Transactions, WAL, foreign keys, schema guards, migrations through schema v9, historical paper flags, tag/query/chunk persistence, integrity |
-| Recent-paper UI | Newest-first table, wrapping titles, tracked-author links, one leading topic, missing-PDF state, summary column, persistent row selection and selected-first sorting, full-filter JSON/CSV export, filter-preserving runtime prompt controls, 25–1000 pagination, system/light/dark theme control |
+| Unified download UI | Color-coded paper/blog rows, author-page links, explicit all/papers/blogs content-type filtering, shared text/author/date/tag filters, blog-tag column, remote image rendering without persistent media downloads, searchable selects with keyboard insertion and clear-on-reselect, persistent row selection, direct page-number jumps, exports, 25–1000 pagination, system/light/dark theme control, visible running version |
 | Paper UI | Consolidated identifier/external/action metadata panel, author picker state, model reruns, saved prompts, 16384-token default context input, no-reload fragment refresh, scroll preservation, live output, cancellation, stale-attempt recovery, analysis rendering, exports |
 | Discovery/author/query UI | Mutually exclusive Paper/Author OpenAlex discovery modes, review-before-download, manual PDF import/backfill, table-based author filtering, Enter-to-tag, icon pause/resume/archive controls, protected Summarize prompt, prompt-only query CRUD, runtime source/strategy/context/model controls, persisted selections/outputs/errors |
 | Static resilience | System/light/dark preference cycle, hidden-state CSS precedence, no CDN dependency, responsive templates |
-| Web security | CSP, frame denial, MIME-sniff prevention, same-origin referrer policy, protected local-PDF paths, safe `xdg-open` invocation without a shell, localhost default |
+| Web security | CSP with explicit remote image allowance, sanitized stored HTML/markdown, rejection of non-HTTP media links, frame denial, MIME-sniff prevention, same-origin referrer policy, protected local-PDF paths, safe `xdg-open` invocation without a shell, guarded destructive/import actions, localhost default |
+| Data management | Delete authors/papers/blog entries/generated summaries/query definitions/query history/fetch history, constrained PDF cleanup, author/blog JSON round trip, full SQLite/PDF ZIP round trip, archive validation, unsafe-path rejection, active-job blocking |
 | CLI/systemd | CLI commands, web invocation, daily timer, web service files, archive wording |
 | Packaging | Prompt/config/templates/assets/new modules included in wheel; installed command/server smoke tests |
 
