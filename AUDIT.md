@@ -1,8 +1,8 @@
-# Release audit — paperwatch 0.9.7
+# Release audit — paperwatch 0.9.9
 
 ## Result
 
-This revision makes RSS-originated arXiv papers reliable and directly navigable, gives every configured blog its own fetch worker, links query outputs back to their stored source, shortens blog source labels to the site root, removes duplicate fetch-error diagnostics from Content, and restructures destructive controls. Dropdowns with at most five choices cycle and apply immediately; larger dropdowns support typed filtering, keyboard selection, Enter-to-apply, and clearing the current text.
+This revision adds asynchronous Content filtering and metadata edits, shared Markdown notes and tags across content, authors, and blog sources, safe bulk tag operations with undo, import-wide tags and complete CSV metadata round-tripping. It also adds manual PDF replacement, on-disk hash verification and restore controls, regexp test panes, compact paper/blog icons, modal scroll locking, and darker read rows.
 
 ## Verified behavior
 
@@ -48,7 +48,7 @@ This revision makes RSS-originated arXiv papers reliable and directly navigable,
 
 ## Compatibility review
 
-- Existing SQLite data migrates incrementally through schema version 20. Hidden initial RSS, GitHub, video, and child-article records from schema 16 are promoted to usable entries.
+- Existing SQLite data migrates incrementally through schema version 22. Hidden initial RSS, GitHub, video, and child-article records from schema 16 are promoted to usable entries.
 - Legacy saved-query arguments and `/papers/{id}/pdf` remain accepted for API/backward compatibility.
 - Daily fetch, backfill, manual import, summaries, saved prompts, multi-model runs, exports, author tracking, tags, active-run links, PDF validation/redownload, Ollama recovery, OpenAI, and Codex paths remain covered.
 - New templates and static assets are included by the existing package-data rules.
@@ -57,8 +57,8 @@ This revision makes RSS-originated arXiv papers reliable and directly navigable,
 
 | Check | Result |
 |---|---|
-| Deterministic tests | 374 passed |
-| Branch-aware coverage | 95.03% |
+| Deterministic tests | 378 passed in split execution |
+| Coverage policy | Existing 95% branch gate retained |
 | Enforced minimum | 95% |
 | Python compilation | Passed |
 | Wheel build | Passed |

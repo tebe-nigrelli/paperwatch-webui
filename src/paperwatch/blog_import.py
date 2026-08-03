@@ -24,6 +24,7 @@ def import_blog_links(
     stream: TextIO,
     *,
     create_missing: bool = False,
+    import_tags: tuple[str, ...] = (),
 ) -> BlogImportStats:
     reader = csv.DictReader(stream, skipinitialspace=True)
     if reader.fieldnames:
@@ -53,6 +54,14 @@ def import_blog_links(
             stats.authors_ambiguous += 1
             continue
         author_id = str(matches[0]["openalex_id"])
+        author_tags = (
+            row.get("Author tags")
+            or row.get("Tags")
+            or ""
+        )
+        for raw_tag in (*import_tags, *str(author_tags).replace(";", ",").split(",")):
+            if str(raw_tag).strip():
+                db.add_author_tag(author_id, str(raw_tag))
         sources = (
             (
                 row.get("Primary source URL") or "",
@@ -73,7 +82,7 @@ def import_blog_links(
                 row.get("Secondary article URL pattern") or "",
             ),
         )
-        for (
+        for source_index, (
             raw_url,
             label,
             relationship,
@@ -81,7 +90,7 @@ def import_blog_links(
             explicit_mode,
             content_selector,
             article_url_pattern,
-        ) in sources:
+        ) in enumerate(sources):
             if not raw_url.strip():
                 continue
             try:
@@ -89,7 +98,7 @@ def import_blog_links(
             except ValueError:
                 stats.invalid_urls += 1
                 continue
-            db.add_author_blog(
+            blog_id = db.add_author_blog(
                 author_id,
                 url,
                 label=label,
@@ -101,6 +110,19 @@ def import_blog_links(
                 content_selector=content_selector,
                 article_url_pattern=article_url_pattern,
             )
+            tag_value = (
+                row.get("Primary tags") if source_index == 0
+                else row.get("Secondary tags")
+            ) or row.get("Blog tags") or row.get("Tags") or ""
+            for raw_tag in (*import_tags, *str(tag_value).replace(";", ",").split(",")):
+                if str(raw_tag).strip():
+                    db.add_blog_source_tag(blog_id, str(raw_tag))
+            notes = row.get("Primary notes") or row.get("Notes") or ""
+            if str(notes).strip():
+                db.set_object_notes("blog_source", blog_id, str(notes))
+            enabled = str(row.get("Enabled") or "yes").strip().casefold()
+            if enabled in {"0", "false", "no", "off", "disabled"}:
+                db.set_author_blog_broken(author_id, blog_id, True)
             stats.links += 1
     return stats
 
@@ -110,6 +132,9 @@ def import_blog_links_path(
     path: str | Path,
     *,
     create_missing: bool = False,
+    import_tags: tuple[str, ...] = (),
 ) -> BlogImportStats:
     with Path(path).expanduser().open("r", encoding="utf-8-sig", newline="") as handle:
-        return import_blog_links(db, handle, create_missing=create_missing)
+        return import_blog_links(
+            db, handle, create_missing=create_missing, import_tags=import_tags
+        )

@@ -20,7 +20,7 @@ from .models import (
 )
 
 
-SCHEMA_VERSION = 21
+SCHEMA_VERSION = 23
 BLOG_SOURCE_MODES = {
     "auto",
     "feed",
@@ -55,6 +55,8 @@ CREATE TABLE IF NOT EXISTS authors (
     cited_by_count INTEGER NOT NULL DEFAULT 0,
     enabled INTEGER NOT NULL DEFAULT 1,
     tracked INTEGER NOT NULL DEFAULT 1,
+    starred INTEGER NOT NULL DEFAULT 0,
+    notes TEXT NOT NULL DEFAULT '',
     added_at TEXT NOT NULL,
     last_checked_at TEXT,
     metadata_json TEXT NOT NULL DEFAULT '{}'
@@ -75,7 +77,12 @@ CREATE TABLE IF NOT EXISTS papers (
     publication_url TEXT,
     pdf_url TEXT,
     local_pdf_path TEXT,
+    pdf_sha256 TEXT,
     auto_analyze INTEGER NOT NULL DEFAULT 1,
+    starred INTEGER NOT NULL DEFAULT 0,
+    read_at TEXT,
+    selected INTEGER NOT NULL DEFAULT 0,
+    notes TEXT NOT NULL DEFAULT '',
     abstract_source TEXT,
     pdf_source TEXT,
     discovered_at TEXT NOT NULL,
@@ -134,6 +141,7 @@ CREATE TABLE IF NOT EXISTS blogs (
     id INTEGER PRIMARY KEY,
     url TEXT NOT NULL UNIQUE,
     title TEXT,
+    notes TEXT NOT NULL DEFAULT '',
     enabled INTEGER NOT NULL DEFAULT 1,
     etag TEXT,
     last_modified TEXT,
@@ -172,6 +180,10 @@ CREATE TABLE IF NOT EXISTS blog_entries (
     normalized_text TEXT NOT NULL,
     rendered_html TEXT,
     linked_paper_id INTEGER REFERENCES papers(id) ON DELETE SET NULL,
+    starred INTEGER NOT NULL DEFAULT 0,
+    read_at TEXT,
+    selected INTEGER NOT NULL DEFAULT 0,
+    notes TEXT NOT NULL DEFAULT '',
     diff_text TEXT NOT NULL DEFAULT '',
     change_kind TEXT NOT NULL CHECK (change_kind IN ('baseline', 'changed', 'reset')),
     entry_kind TEXT NOT NULL DEFAULT 'snapshot' CHECK (entry_kind IN ('rss', 'snapshot')),
@@ -213,6 +225,21 @@ CREATE TABLE IF NOT EXISTS blog_entry_tag_links (
 );
 CREATE INDEX IF NOT EXISTS idx_blog_entry_tag_links_tag
 ON blog_entry_tag_links(tag_id, blog_entry_id);
+CREATE TABLE IF NOT EXISTS blog_source_tag_links (
+    blog_id INTEGER NOT NULL REFERENCES blogs(id) ON DELETE CASCADE,
+    tag_id INTEGER NOT NULL REFERENCES content_tags(id) ON DELETE CASCADE,
+    PRIMARY KEY (blog_id, tag_id)
+);
+CREATE INDEX IF NOT EXISTS idx_blog_source_tag_links_tag
+ON blog_source_tag_links(tag_id, blog_id);
+
+CREATE TABLE IF NOT EXISTS tag_action_history (
+    id INTEGER PRIMARY KEY,
+    action TEXT NOT NULL,
+    payload_json TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    undone_at TEXT
+);
 """
 
 
@@ -339,6 +366,10 @@ CREATE TABLE IF NOT EXISTS saved_queries (
         CHECK (regexp_mode IN ('query', 'print')),
     content_scope TEXT NOT NULL DEFAULT 'both'
         CHECK (content_scope IN ('both', 'papers', 'blogs')),
+    query_kind TEXT NOT NULL DEFAULT 'summary'
+        CHECK (query_kind IN ('summary', 'classification')),
+    label_class TEXT NOT NULL DEFAULT '',
+    label_values_json TEXT NOT NULL DEFAULT '[]',
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL,
     last_run_at TEXT
@@ -364,6 +395,33 @@ CREATE TABLE IF NOT EXISTS query_runs (
 );
 CREATE INDEX IF NOT EXISTS idx_query_runs_query ON query_runs(query_id, id DESC);
 CREATE INDEX IF NOT EXISTS idx_query_runs_batch ON query_runs(batch_id, id);
+
+CREATE TABLE IF NOT EXISTS query_classification_results (
+    id INTEGER PRIMARY KEY,
+    query_id INTEGER NOT NULL REFERENCES saved_queries(id) ON DELETE CASCADE,
+    query_run_id INTEGER REFERENCES query_runs(id) ON DELETE SET NULL,
+    content_type TEXT NOT NULL CHECK (content_type IN ('paper', 'blog')),
+    paper_id INTEGER REFERENCES papers(id) ON DELETE CASCADE,
+    blog_entry_id INTEGER REFERENCES blog_entries(id) ON DELETE CASCADE,
+    value TEXT NOT NULL,
+    tag_name TEXT NOT NULL,
+    raw_output TEXT NOT NULL DEFAULT '',
+    manually_modified INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    CHECK (
+        (content_type='paper' AND paper_id IS NOT NULL AND blog_entry_id IS NULL)
+        OR (content_type='blog' AND blog_entry_id IS NOT NULL AND paper_id IS NULL)
+    )
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_query_classification_paper
+ON query_classification_results(query_id, paper_id)
+WHERE paper_id IS NOT NULL;
+CREATE UNIQUE INDEX IF NOT EXISTS idx_query_classification_blog
+ON query_classification_results(query_id, blog_entry_id)
+WHERE blog_entry_id IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_query_classification_tag
+ON query_classification_results(tag_name COLLATE NOCASE);
 """
 
 TOPICS_SCHEMA = """
@@ -423,6 +481,7 @@ class Database:
         self._conn.executescript(COMMON_SCHEMA)
         self._ensure_author_tracking_column()
         self._ensure_paper_columns()
+        self._ensure_extended_metadata_columns()
         if version == 1:
             self._migrate_v1_analyses()
         elif version == 0 and self._is_legacy_analyses_table():
@@ -437,6 +496,7 @@ class Database:
         self._conn.executescript(TOPICS_SCHEMA)
         self._conn.executescript(BLOGS_SCHEMA)
         self._ensure_blog_columns()
+        self._ensure_extended_metadata_columns()
         if version < 17:
             self._promote_initial_blog_items()
         if version < 18:
@@ -448,6 +508,50 @@ class Database:
             self._backfill_paper_topics()
         self._conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
         self._conn.commit()
+
+    def _ensure_extended_metadata_columns(self) -> None:
+        additions = {
+            "authors": {"notes": "TEXT NOT NULL DEFAULT ''"},
+            "papers": {
+                "pdf_sha256": "TEXT",
+                "notes": "TEXT NOT NULL DEFAULT ''",
+            },
+            "blogs": {"notes": "TEXT NOT NULL DEFAULT ''"},
+            "blog_entries": {"notes": "TEXT NOT NULL DEFAULT ''"},
+        }
+        for table, definitions in additions.items():
+            exists = self._conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (table,)
+            ).fetchone()
+            if exists is None:
+                continue
+            columns = {
+                row["name"]
+                for row in self._conn.execute(f"PRAGMA table_info({table})").fetchall()
+            }
+            for name, definition in definitions.items():
+                if name not in columns:
+                    self._conn.execute(
+                        f"ALTER TABLE {table} ADD COLUMN {name} {definition}"
+                    )
+        self._conn.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS blog_source_tag_links (
+                blog_id INTEGER NOT NULL REFERENCES blogs(id) ON DELETE CASCADE,
+                tag_id INTEGER NOT NULL REFERENCES content_tags(id) ON DELETE CASCADE,
+                PRIMARY KEY (blog_id, tag_id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_blog_source_tag_links_tag
+            ON blog_source_tag_links(tag_id, blog_id);
+            CREATE TABLE IF NOT EXISTS tag_action_history (
+                id INTEGER PRIMARY KEY,
+                action TEXT NOT NULL,
+                payload_json TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                undone_at TEXT
+            );
+            """
+        )
 
     def _ensure_run_blog_columns(self) -> None:
         columns = {
@@ -502,6 +606,9 @@ class Database:
             "published_at": "TEXT",
             "rendered_html": "TEXT",
             "linked_paper_id": "INTEGER REFERENCES papers(id) ON DELETE SET NULL",
+            "starred": "INTEGER NOT NULL DEFAULT 0",
+            "read_at": "TEXT",
+            "selected": "INTEGER NOT NULL DEFAULT 0",
         }
         for name, definition in entry_definitions.items():
             if name not in entry_columns:
@@ -587,6 +694,10 @@ class Database:
             self._conn.execute(
                 "ALTER TABLE authors ADD COLUMN tracked INTEGER NOT NULL DEFAULT 1"
             )
+        if "starred" not in columns:
+            self._conn.execute(
+                "ALTER TABLE authors ADD COLUMN starred INTEGER NOT NULL DEFAULT 0"
+            )
 
     def _ensure_paper_columns(self) -> None:
         columns = {
@@ -596,6 +707,14 @@ class Database:
             self._conn.execute(
                 "ALTER TABLE papers ADD COLUMN auto_analyze INTEGER NOT NULL DEFAULT 1"
             )
+        additions = {
+            "starred": "INTEGER NOT NULL DEFAULT 0",
+            "read_at": "TEXT",
+            "selected": "INTEGER NOT NULL DEFAULT 0",
+        }
+        for name, definition in additions.items():
+            if name not in columns:
+                self._conn.execute(f"ALTER TABLE papers ADD COLUMN {name} {definition}")
 
     def _ensure_analysis_columns(self) -> None:
         additions = {
@@ -646,6 +765,9 @@ class Database:
             "regexp_radius": "INTEGER NOT NULL DEFAULT 0",
             "regexp_mode": "TEXT NOT NULL DEFAULT 'query'",
             "content_scope": "TEXT NOT NULL DEFAULT 'both'",
+            "query_kind": "TEXT NOT NULL DEFAULT 'summary'",
+            "label_class": "TEXT NOT NULL DEFAULT ''",
+            "label_values_json": "TEXT NOT NULL DEFAULT '[]'",
         }
         for name, definition in query_additions.items():
             if name not in query_columns:
@@ -913,6 +1035,15 @@ class Database:
             cur = conn.execute(
                 "UPDATE authors SET enabled = ?, tracked = 1 WHERE openalex_id = ?",
                 (1 if enabled else 0, identifier),
+            )
+        return cur.rowcount > 0
+
+    def set_author_starred(self, openalex_id: str, starred: bool) -> bool:
+        identifier = self._author_id(openalex_id)
+        with self.transaction() as conn:
+            cur = conn.execute(
+                "UPDATE authors SET starred=? WHERE openalex_id=?",
+                (1 if starred else 0, identifier),
             )
         return cur.rowcount > 0
 
@@ -1230,8 +1361,18 @@ class Database:
             )
         return True
 
-    def author_blogs(self, openalex_id: str) -> list[sqlite3.Row]:
+    def author_blogs(self, openalex_id: str, *, tag: str = "") -> list[sqlite3.Row]:
         identifier = self._author_id(openalex_id)
+        where = "a.openalex_id=?"
+        params: list[Any] = [identifier]
+        cleaned_tag = " ".join(tag.strip().split())
+        if cleaned_tag:
+            where += (
+                " AND EXISTS (SELECT 1 FROM blog_source_tag_links bstlf "
+                "JOIN content_tags ctf ON ctf.id=bstlf.tag_id "
+                "WHERE bstlf.blog_id=b.id AND ctf.name=? COLLATE NOCASE)"
+            )
+            params.append(cleaned_tag)
         return list(
             self._conn.execute(
                 """
@@ -1239,14 +1380,21 @@ class Database:
                     (SELECT count(*) FROM blog_entries be
                      WHERE be.blog_id=b.id AND be.change_kind != 'baseline') AS entry_count,
                     (SELECT count(*) FROM author_blogs linked
-                     WHERE linked.blog_id=b.id) AS linked_author_count
+                     WHERE linked.blog_id=b.id) AS linked_author_count,
+                    COALESCE((SELECT group_concat(name, ', ') FROM (
+                        SELECT ct.name AS name
+                        FROM blog_source_tag_links bstl
+                        JOIN content_tags ct ON ct.id=bstl.tag_id
+                        WHERE bstl.blog_id=b.id
+                        ORDER BY ct.name COLLATE NOCASE
+                    )), '') AS source_tags
                 FROM authors a
                 JOIN author_blogs ab ON ab.author_id=a.id
                 JOIN blogs b ON b.id=ab.blog_id
-                WHERE a.openalex_id=?
+                WHERE """ + where + """
                 ORDER BY COALESCE(ab.label, b.title, b.url) COLLATE NOCASE
                 """,
-                (identifier,),
+                tuple(params),
             ).fetchall()
         )
 
@@ -1548,12 +1696,18 @@ class Database:
         limit: int | None = 100,
         *,
         query: str = "",
+        title_query: str = "",
         tags: Iterable[str] = (),
         author_id: str = "",
+        author_ids: Iterable[str] = (),
         author_tags: Iterable[str] = (),
         date_from: str = "",
         date_to: str = "",
         sort: str = "newest",
+        starred: bool | None = None,
+        read: bool | None = None,
+        selected: bool | None = None,
+        analyzed: bool | None = None,
     ) -> list[sqlite3.Row]:
         where = ["be.change_kind != 'baseline'"]
         params: list[Any] = []
@@ -1567,9 +1721,16 @@ class Database:
                 "OR EXISTS (SELECT 1 FROM blog_entry_tag_links betlq "
                 "JOIN content_tags ctq ON ctq.id=betlq.tag_id "
                 "WHERE betlq.blog_entry_id=be.id "
-                "AND ctq.name LIKE ? ESCAPE '\\' COLLATE NOCASE))"
+                "AND ctq.name LIKE ? ESCAPE '\\' COLLATE NOCASE) "
+                "OR EXISTS (SELECT 1 FROM query_classification_results qcrq "
+                "WHERE qcrq.blog_entry_id=be.id "
+                "AND qcrq.tag_name LIKE ? ESCAPE '\\' COLLATE NOCASE))"
             )
-            params.extend([term, term, term, term])
+            params.extend([term, term, term, term, term])
+        if title_query.strip():
+            escaped = title_query.strip().replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+            where.append("be.title LIKE ? ESCAPE '\\' COLLATE NOCASE")
+            params.append(f"%{escaped}%")
         clean_tags = tuple(
             dict.fromkeys(
                 " ".join(str(tag).strip().split())
@@ -1580,18 +1741,28 @@ class Database:
         if clean_tags:
             placeholders = ",".join("?" for _ in clean_tags)
             where.append(
-                "EXISTS (SELECT 1 FROM blog_entry_tag_links betl "
+                "(EXISTS (SELECT 1 FROM blog_entry_tag_links betl "
                 "JOIN content_tags ct ON ct.id=betl.tag_id "
                 "WHERE betl.blog_entry_id=be.id "
-                f"AND ct.name COLLATE NOCASE IN ({placeholders}))"
+                f"AND ct.name COLLATE NOCASE IN ({placeholders})) "
+                "OR EXISTS (SELECT 1 FROM query_classification_results qcr "
+                "WHERE qcr.blog_entry_id=be.id "
+                f"AND qcr.tag_name COLLATE NOCASE IN ({placeholders})))"
             )
             params.extend(clean_tags)
-        if author_id.strip():
+            params.extend(clean_tags)
+        clean_author_ids = tuple(dict.fromkeys(
+            self._author_id(str(value)) for value in author_ids if str(value).strip()
+        ))
+        if not clean_author_ids and author_id.strip():
+            clean_author_ids = (self._author_id(author_id),)
+        if clean_author_ids:
+            placeholders = ",".join("?" for _ in clean_author_ids)
             where.append(
                 "EXISTS (SELECT 1 FROM author_blogs abf JOIN authors af ON af.id=abf.author_id "
-                "WHERE abf.blog_id=b.id AND af.openalex_id=?)"
+                f"WHERE abf.blog_id=b.id AND af.openalex_id IN ({placeholders}))"
             )
-            params.append(self._author_id(author_id))
+            params.extend(clean_author_ids)
         clean_author_tags = tuple(
             dict.fromkeys(
                 " ".join(str(tag).strip().split())
@@ -1615,6 +1786,22 @@ class Database:
         if date_to:
             where.append("substr(COALESCE(be.published_at, be.fetched_at), 1, 10) <= ?")
             params.append(date_to)
+        if starred is not None:
+            where.append("be.starred=?")
+            params.append(1 if starred else 0)
+        if read is not None:
+            where.append("be.read_at IS NOT NULL" if read else "be.read_at IS NULL")
+        if selected is not None:
+            where.append("be.selected=?")
+            params.append(1 if selected else 0)
+        if analyzed is not None:
+            clause = "EXISTS" if analyzed else "NOT EXISTS"
+            where.append(
+                f"{clause} ("
+                "SELECT 1 FROM query_runs qr, json_each(qr.selection_json, '$.blog_entry_ids') selected_entry "
+                "WHERE qr.status='success' AND CAST(selected_entry.value AS INTEGER)=be.id"
+                ")"
+            )
         order_sql = {
             "newest": "COALESCE(be.published_at, be.fetched_at) DESC, be.id DESC",
             "oldest": "COALESCE(be.published_at, be.fetched_at) ASC, be.id ASC",
@@ -1628,12 +1815,20 @@ class Database:
                     FROM author_blogs ab JOIN authors a ON a.id=ab.author_id
                     WHERE ab.blog_id=b.id ORDER BY a.name COLLATE NOCASE
                 )) AS author_names,
+                EXISTS (
+                    SELECT 1 FROM query_runs qrs, json_each(qrs.selection_json, '$.blog_entry_ids') selected_entry
+                    WHERE qrs.status='success' AND CAST(selected_entry.value AS INTEGER)=be.id
+                ) AS has_summary,
                 COALESCE((SELECT group_concat(name, ', ') FROM (
                     SELECT ct.name AS name
                     FROM blog_entry_tag_links betl
                     JOIN content_tags ct ON ct.id=betl.tag_id
                     WHERE betl.blog_entry_id=be.id
-                    ORDER BY ct.name COLLATE NOCASE
+                    UNION
+                    SELECT qcr.tag_name AS name
+                    FROM query_classification_results qcr
+                    WHERE qcr.blog_entry_id=be.id
+                    ORDER BY name COLLATE NOCASE
                 )), '') AS content_tags
             FROM blog_entries be JOIN blogs b ON b.id=be.blog_id
             WHERE {' AND '.join(where)}
@@ -1668,7 +1863,11 @@ class Database:
                     FROM blog_entry_tag_links betl
                     JOIN content_tags ct ON ct.id=betl.tag_id
                     WHERE betl.blog_entry_id=be.id
-                    ORDER BY ct.name COLLATE NOCASE
+                    UNION
+                    SELECT qcr.tag_name AS name
+                    FROM query_classification_results qcr
+                    WHERE qcr.blog_entry_id=be.id
+                    ORDER BY name COLLATE NOCASE
                 )), '') AS content_tags
             FROM blog_entries be JOIN blogs b ON b.id=be.blog_id
             WHERE be.id IN ({placeholders}) AND be.change_kind != 'baseline'
@@ -1692,7 +1891,11 @@ class Database:
                     FROM blog_entry_tag_links betl
                     JOIN content_tags ct ON ct.id=betl.tag_id
                     WHERE betl.blog_entry_id=be.id
-                    ORDER BY ct.name COLLATE NOCASE
+                    UNION
+                    SELECT qcr.tag_name AS name
+                    FROM query_classification_results qcr
+                    WHERE qcr.blog_entry_id=be.id
+                    ORDER BY name COLLATE NOCASE
                 )), '') AS content_tags
             FROM blog_entries be JOIN blogs b ON b.id=be.blog_id
             WHERE be.id=?
@@ -1711,6 +1914,62 @@ class Database:
                 (blog_id,),
             ).fetchall()
         )
+
+    @staticmethod
+    def _content_table(content_type: str) -> tuple[str, str]:
+        normalized = content_type.strip().lower()
+        if normalized in {"paper", "papers"}:
+            return "papers", "paper"
+        if normalized in {"blog", "blogs", "blog_entry"}:
+            return "blog_entries", "blog"
+        raise ValueError("Content type must be paper or blog")
+
+    def set_content_starred(self, content_type: str, record_id: int, starred: bool) -> bool:
+        table, _ = self._content_table(content_type)
+        with self.transaction() as conn:
+            cur = conn.execute(
+                f"UPDATE {table} SET starred=? WHERE id=?",
+                (1 if starred else 0, int(record_id)),
+            )
+        return cur.rowcount > 0
+
+    def set_content_read(self, content_type: str, record_id: int, read: bool) -> bool:
+        table, _ = self._content_table(content_type)
+        with self.transaction() as conn:
+            cur = conn.execute(
+                f"UPDATE {table} SET read_at=? WHERE id=?",
+                (utcnow() if read else None, int(record_id)),
+            )
+        return cur.rowcount > 0
+
+    def set_content_selected(self, content_type: str, record_id: int, selected: bool) -> bool:
+        table, _ = self._content_table(content_type)
+        with self.transaction() as conn:
+            cur = conn.execute(
+                f"UPDATE {table} SET selected=? WHERE id=?",
+                (1 if selected else 0, int(record_id)),
+            )
+        return cur.rowcount > 0
+
+    def bulk_update_selected_content(self, action: str) -> int:
+        if action not in {"star", "unstar", "read", "unread", "unselect"}:
+            raise ValueError("Unknown selected-content action")
+        updates = {
+            "star": ("starred", 1),
+            "unstar": ("starred", 0),
+            "read": ("read_at", utcnow()),
+            "unread": ("read_at", None),
+            "unselect": ("selected", 0),
+        }
+        column, value = updates[action]
+        with self.transaction() as conn:
+            papers = conn.execute(
+                f"UPDATE papers SET {column}=? WHERE selected=1", (value,)
+            ).rowcount
+            blogs = conn.execute(
+                f"UPDATE blog_entries SET {column}=? WHERE selected=1", (value,)
+            ).rowcount
+        return int(papers + blogs)
 
     def _find_existing_paper(self, paper: PaperRecord) -> sqlite3.Row | None:
         row = self._conn.execute(
@@ -1860,9 +2119,41 @@ class Database:
             self._sync_paper_topics(conn, paper_id, paper.topics)
         return paper_id, is_new
 
-    def set_local_pdf(self, paper_id: int, path: str) -> None:
+    def set_local_pdf(
+        self, paper_id: int, path: str, pdf_sha256: str | None = None
+    ) -> None:
         with self.transaction() as conn:
-            conn.execute("UPDATE papers SET local_pdf_path = ? WHERE id = ?", (path, paper_id))
+            conn.execute(
+                "UPDATE papers SET local_pdf_path=?, pdf_sha256=? WHERE id=?",
+                (path, pdf_sha256, paper_id),
+            )
+
+    def set_paper_pdf_hash(self, paper_id: int, pdf_sha256: str | None) -> bool:
+        with self.transaction() as conn:
+            cur = conn.execute(
+                "UPDATE papers SET pdf_sha256=? WHERE id=?", (pdf_sha256, paper_id)
+            )
+        return cur.rowcount > 0
+
+    def set_object_notes(self, object_type: str, object_id: int, notes: str) -> bool:
+        normalized = object_type.strip().lower()
+        table = {
+            "paper": "papers",
+            "blog": "blog_entries",
+            "blog_entry": "blog_entries",
+            "author": "authors",
+            "blog_source": "blogs",
+        }.get(normalized)
+        if table is None:
+            raise ValueError("Unknown notes object type")
+        cleaned = notes.strip()
+        if len(cleaned) > 200_000:
+            raise ValueError("Notes are too long")
+        with self.transaction() as conn:
+            cur = conn.execute(
+                f"UPDATE {table} SET notes=? WHERE id=?", (cleaned, int(object_id))
+            )
+        return cur.rowcount > 0
 
     def set_paper_pdf_source(self, paper_id: int, url: str, source: str) -> None:
         with self.transaction() as conn:
@@ -1936,14 +2227,20 @@ class Database:
         self,
         *,
         query: str = "",
+        title_query: str = "",
         author_id: str = "",
+        author_ids: Iterable[str] = (),
         author_tags: Iterable[str] = (),
         content_tags: Iterable[str] = (),
         topic_id: str = "",
+        topic_ids: Iterable[str] = (),
         paper_kind: str = "",
         scope: str = "",
         has_pdf: bool | None = None,
         analyzed: bool | None = None,
+        starred: bool | None = None,
+        read: bool | None = None,
+        selected: bool | None = None,
         date_from: str = "",
         date_to: str = "",
         sort: str = "newest",
@@ -1961,17 +2258,30 @@ class Database:
                 "OR EXISTS (SELECT 1 FROM paper_tag_links ptlq "
                 "JOIN content_tags ctq ON ctq.id=ptlq.tag_id "
                 "WHERE ptlq.paper_id=p.id "
-                "AND ctq.name LIKE ? ESCAPE '\\' COLLATE NOCASE))"
+                "AND ctq.name LIKE ? ESCAPE '\\' COLLATE NOCASE) "
+                "OR EXISTS (SELECT 1 FROM query_classification_results qcrq "
+                "WHERE qcrq.paper_id=p.id "
+                "AND qcrq.tag_name LIKE ? ESCAPE '\\' COLLATE NOCASE))"
             )
             escaped = query.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
             term = f"%{escaped}%"
-            params.extend([term, term, term, term])
-        if author_id:
+            params.extend([term, term, term, term, term])
+        if title_query:
+            escaped = title_query.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+            where.append("p.title LIKE ? ESCAPE '\\' COLLATE NOCASE")
+            params.append(f"%{escaped}%")
+        clean_author_ids = tuple(dict.fromkeys(
+            self._author_id(str(value)) for value in author_ids if str(value).strip()
+        ))
+        if not clean_author_ids and author_id:
+            clean_author_ids = (self._author_id(author_id),)
+        if clean_author_ids:
+            placeholders = ",".join("?" for _ in clean_author_ids)
             where.append(
                 "EXISTS (SELECT 1 FROM paper_authors paa WHERE paa.paper_id=p.id "
-                "AND paa.openalex_author_id=?)"
+                f"AND paa.openalex_author_id IN ({placeholders}))"
             )
-            params.append(self._author_id(author_id))
+            params.extend(clean_author_ids)
         clean_author_tags = tuple(
             dict.fromkeys(
                 " ".join(str(tag).strip().split())
@@ -2021,18 +2331,28 @@ class Database:
         if clean_content_tags:
             placeholders = ",".join("?" for _ in clean_content_tags)
             where.append(
-                "EXISTS (SELECT 1 FROM paper_tag_links ptl "
+                "(EXISTS (SELECT 1 FROM paper_tag_links ptl "
                 "JOIN content_tags ct ON ct.id=ptl.tag_id "
                 "WHERE ptl.paper_id=p.id "
-                f"AND ct.name COLLATE NOCASE IN ({placeholders}))"
+                f"AND ct.name COLLATE NOCASE IN ({placeholders})) "
+                "OR EXISTS (SELECT 1 FROM query_classification_results qcr "
+                "WHERE qcr.paper_id=p.id "
+                f"AND qcr.tag_name COLLATE NOCASE IN ({placeholders})))"
             )
             params.extend(clean_content_tags)
-        if topic_id:
+            params.extend(clean_content_tags)
+        clean_topic_ids = tuple(dict.fromkeys(
+            self._topic_id(str(value)) for value in topic_ids if str(value).strip()
+        ))
+        if not clean_topic_ids and topic_id:
+            clean_topic_ids = (self._topic_id(topic_id),)
+        if clean_topic_ids:
+            placeholders = ",".join("?" for _ in clean_topic_ids)
             where.append(
                 "EXISTS (SELECT 1 FROM paper_topics ptt WHERE ptt.paper_id=p.id "
-                "AND ptt.topic_id=?)"
+                f"AND ptt.topic_id IN ({placeholders}))"
             )
-            params.append(self._topic_id(topic_id))
+            params.extend(clean_topic_ids)
         if paper_kind:
             where.append(
                 "EXISTS (SELECT 1 FROM analyses ak WHERE ak.paper_id=p.id AND ak.paper_kind=?)"
@@ -2052,6 +2372,14 @@ class Database:
         if analyzed is not None:
             clause = "EXISTS" if analyzed else "NOT EXISTS"
             where.append(f"{clause} (SELECT 1 FROM analyses aa WHERE aa.paper_id=p.id)")
+        if starred is not None:
+            where.append("p.starred=?")
+            params.append(1 if starred else 0)
+        if read is not None:
+            where.append("p.read_at IS NOT NULL" if read else "p.read_at IS NULL")
+        if selected is not None:
+            where.append("p.selected=?")
+            params.append(1 if selected else 0)
         if date_from:
             where.append("p.publication_date >= ?")
             params.append(date_from)
@@ -2114,7 +2442,11 @@ class Database:
                     FROM paper_tag_links ptl
                     JOIN content_tags ct ON ct.id=ptl.tag_id
                     WHERE ptl.paper_id=p.id
-                    ORDER BY ct.name COLLATE NOCASE
+                    UNION
+                    SELECT qcr.tag_name AS name
+                    FROM query_classification_results qcr
+                    WHERE qcr.paper_id=p.id
+                    ORDER BY name COLLATE NOCASE
                 )), '') AS content_tags
             FROM papers p
             {where_sql}
@@ -2469,7 +2801,12 @@ class Database:
         )
 
     def list_authors_with_tags(
-        self, *, tracked_only: bool = True, tag: str = "", query: str = ""
+        self,
+        *,
+        tracked_only: bool = True,
+        tag: str = "",
+        query: str = "",
+        starred: bool | None = None,
     ) -> list[sqlite3.Row]:
         where = ["a.tracked=1"] if tracked_only else []
         params: list[Any] = []
@@ -2494,6 +2831,9 @@ class Database:
                 "AND at3.name LIKE ? ESCAPE '\\' COLLATE NOCASE))"
             )
             params.extend([term, term, term, term, term])
+        if starred is not None:
+            where.append("a.starred=?")
+            params.append(1 if starred else 0)
         where_sql = " WHERE " + " AND ".join(where) if where else ""
         return list(
             self._conn.execute(
@@ -2586,13 +2926,34 @@ class Database:
         return list(
             self._conn.execute(
                 """
-                SELECT ct.id, ct.name,
-                    (SELECT count(*) FROM paper_tag_links ptl WHERE ptl.tag_id=ct.id) AS paper_count,
-                    (SELECT count(*) FROM blog_entry_tag_links betl WHERE betl.tag_id=ct.id) AS blog_count
-                FROM content_tags ct
-                WHERE EXISTS (SELECT 1 FROM paper_tag_links ptl WHERE ptl.tag_id=ct.id)
-                   OR EXISTS (SELECT 1 FROM blog_entry_tag_links betl WHERE betl.tag_id=ct.id)
-                ORDER BY ct.name COLLATE NOCASE
+                WITH names(name) AS (
+                    SELECT name FROM content_tags
+                    UNION
+                    SELECT tag_name FROM query_classification_results
+                    UNION
+                    SELECT name FROM author_tags
+                )
+                SELECT NULL AS id, names.name,
+                    (SELECT count(*) FROM paper_tag_links ptl
+                     JOIN content_tags ct ON ct.id=ptl.tag_id
+                     WHERE ct.name=names.name COLLATE NOCASE)
+                    + (SELECT count(*) FROM query_classification_results qcr
+                       WHERE qcr.paper_id IS NOT NULL
+                         AND qcr.tag_name=names.name COLLATE NOCASE) AS paper_count,
+                    (SELECT count(*) FROM blog_entry_tag_links betl
+                     JOIN content_tags ct ON ct.id=betl.tag_id
+                     WHERE ct.name=names.name COLLATE NOCASE)
+                    + (SELECT count(*) FROM query_classification_results qcr
+                       WHERE qcr.blog_entry_id IS NOT NULL
+                         AND qcr.tag_name=names.name COLLATE NOCASE) AS blog_count,
+                    (SELECT count(*) FROM author_tag_links atl
+                     JOIN author_tags at ON at.id=atl.tag_id
+                     WHERE at.name=names.name COLLATE NOCASE) AS author_count,
+                    (SELECT count(*) FROM blog_source_tag_links bstl
+                     JOIN content_tags ct ON ct.id=bstl.tag_id
+                     WHERE ct.name=names.name COLLATE NOCASE) AS blog_source_count
+                FROM names
+                ORDER BY names.name COLLATE NOCASE
                 """
             ).fetchall()
         )
@@ -2601,11 +2962,15 @@ class Database:
         return list(
             self._conn.execute(
                 """
-                SELECT ct.* FROM content_tags ct
+                SELECT id, name, 0 AS generated FROM content_tags ct
                 JOIN paper_tag_links ptl ON ptl.tag_id=ct.id
-                WHERE ptl.paper_id=? ORDER BY ct.name COLLATE NOCASE
+                WHERE ptl.paper_id=?
+                UNION
+                SELECT NULL AS id, tag_name AS name, 1 AS generated
+                FROM query_classification_results WHERE paper_id=?
+                ORDER BY name COLLATE NOCASE
                 """,
-                (paper_id,),
+                (paper_id, paper_id),
             ).fetchall()
         )
 
@@ -2613,17 +2978,41 @@ class Database:
         return list(
             self._conn.execute(
                 """
-                SELECT ct.* FROM content_tags ct
+                SELECT id, name, 0 AS generated FROM content_tags ct
                 JOIN blog_entry_tag_links betl ON betl.tag_id=ct.id
-                WHERE betl.blog_entry_id=? ORDER BY ct.name COLLATE NOCASE
+                WHERE betl.blog_entry_id=?
+                UNION
+                SELECT NULL AS id, tag_name AS name, 1 AS generated
+                FROM query_classification_results WHERE blog_entry_id=?
+                ORDER BY name COLLATE NOCASE
                 """,
-                (entry_id,),
+                (entry_id, entry_id),
+            ).fetchall()
+        )
+
+    def blog_source_tags(self, blog_id: int) -> list[sqlite3.Row]:
+        return list(
+            self._conn.execute(
+                """
+                SELECT ct.id, ct.name, 0 AS generated
+                FROM content_tags ct
+                JOIN blog_source_tag_links bstl ON bstl.tag_id=ct.id
+                WHERE bstl.blog_id=?
+                ORDER BY ct.name COLLATE NOCASE
+                """,
+                (blog_id,),
             ).fetchall()
         )
 
     def _add_content_tag(self, table: str, column: str, record_id: int, tag: str) -> bool:
         cleaned = self._clean_tag(tag)
-        parent_table = "papers" if table == "paper_tag_links" else "blog_entries"
+        parent_table = {
+            "paper_tag_links": "papers",
+            "blog_entry_tag_links": "blog_entries",
+            "blog_source_tag_links": "blogs",
+        }.get(table)
+        if parent_table is None:
+            raise ValueError("Unknown content tag table")
         with self.transaction() as conn:
             if conn.execute(
                 f"SELECT 1 FROM {parent_table} WHERE id=?", (record_id,)
@@ -2656,6 +3045,7 @@ class Database:
                 DELETE FROM content_tags
                 WHERE id NOT IN (SELECT tag_id FROM paper_tag_links)
                   AND id NOT IN (SELECT tag_id FROM blog_entry_tag_links)
+                  AND id NOT IN (SELECT tag_id FROM blog_source_tag_links)
                 """
             )
         return cur.rowcount > 0
@@ -2675,6 +3065,188 @@ class Database:
         return self._remove_content_tag(
             "blog_entry_tag_links", "blog_entry_id", entry_id, tag
         )
+
+    def add_blog_source_tag(self, blog_id: int, tag: str) -> bool:
+        return self._add_content_tag("blog_source_tag_links", "blog_id", blog_id, tag)
+
+    def remove_blog_source_tag(self, blog_id: int, tag: str) -> bool:
+        return self._remove_content_tag("blog_source_tag_links", "blog_id", blog_id, tag)
+
+    @staticmethod
+    def _tag_spec(object_type: str) -> tuple[str, str, str, str]:
+        normalized = object_type.strip().lower()
+        specs = {
+            "paper": ("papers", "paper_tag_links", "paper_id", "content_tags"),
+            "blog": ("blog_entries", "blog_entry_tag_links", "blog_entry_id", "content_tags"),
+            "blog_entry": ("blog_entries", "blog_entry_tag_links", "blog_entry_id", "content_tags"),
+            "author": ("authors", "author_tag_links", "author_id", "author_tags"),
+            "blog_source": ("blogs", "blog_source_tag_links", "blog_id", "content_tags"),
+        }
+        if normalized not in specs:
+            raise ValueError("Unknown tag object type")
+        return specs[normalized]
+
+    def _record_tag_action(
+        self, conn: sqlite3.Connection, action: str, changes: list[dict[str, Any]]
+    ) -> int | None:
+        if not changes:
+            return None
+        cur = conn.execute(
+            "INSERT INTO tag_action_history(action, payload_json, created_at) VALUES (?, ?, ?)",
+            (action, json_dumps(changes), utcnow()),
+        )
+        return int(cur.lastrowid)
+
+    def bulk_update_selected_tags(self, action: str, tag: str = "") -> tuple[int, int | None]:
+        normalized = action.strip().lower()
+        if normalized not in {"add", "remove", "clear"}:
+            raise ValueError("Tag action must be add, remove, or clear")
+        cleaned = self._clean_tag(tag) if normalized != "clear" else ""
+        selected: list[tuple[str, int]] = [
+            ("paper", int(row["id"]))
+            for row in self._conn.execute("SELECT id FROM papers WHERE selected=1")
+        ] + [
+            ("blog", int(row["id"]))
+            for row in self._conn.execute("SELECT id FROM blog_entries WHERE selected=1")
+        ]
+        changes: list[dict[str, Any]] = []
+        with self.transaction() as conn:
+            for object_type, object_id in selected:
+                _parent, link_table, object_column, tag_table = self._tag_spec(object_type)
+                if normalized == "clear":
+                    rows = conn.execute(
+                        f"SELECT t.name FROM {link_table} l JOIN {tag_table} t ON t.id=l.tag_id "
+                        f"WHERE l.{object_column}=?",
+                        (object_id,),
+                    ).fetchall()
+                    for row in rows:
+                        changes.append({"object_type": object_type, "id": object_id, "tag": str(row["name"]), "change": "removed"})
+                    conn.execute(f"DELETE FROM {link_table} WHERE {object_column}=?", (object_id,))
+                    continue
+                tag_row = conn.execute(
+                    f"SELECT id FROM {tag_table} WHERE name=? COLLATE NOCASE", (cleaned,)
+                ).fetchone()
+                if normalized == "add":
+                    if tag_row is None:
+                        cur = conn.execute(
+                            f"INSERT INTO {tag_table}(name, created_at) VALUES (?, ?)",
+                            (cleaned, utcnow()),
+                        )
+                        tag_id = int(cur.lastrowid)
+                    else:
+                        tag_id = int(tag_row["id"])
+                    cur = conn.execute(
+                        f"INSERT OR IGNORE INTO {link_table}({object_column}, tag_id) VALUES (?, ?)",
+                        (object_id, tag_id),
+                    )
+                    if cur.rowcount:
+                        changes.append({"object_type": object_type, "id": object_id, "tag": cleaned, "change": "added"})
+                elif tag_row is not None:
+                    cur = conn.execute(
+                        f"DELETE FROM {link_table} WHERE {object_column}=? AND tag_id=?",
+                        (object_id, int(tag_row["id"])),
+                    )
+                    if cur.rowcount:
+                        changes.append({"object_type": object_type, "id": object_id, "tag": cleaned, "change": "removed"})
+            action_id = self._record_tag_action(conn, f"selected:{normalized}", changes)
+            self._cleanup_orphan_tags(conn)
+        return len(changes), action_id
+
+    def remove_tag_globally(self, tag: str, scope: str = "all") -> tuple[int, int | None]:
+        cleaned = self._clean_tag(tag)
+        normalized_scope = scope.strip().lower()
+        allowed = {"all", "content", "authors", "blogs"}
+        if normalized_scope not in allowed:
+            raise ValueError("Tag scope must be all, content, authors, or blogs")
+        targets: list[str] = []
+        if normalized_scope in {"all", "content"}:
+            targets.extend(("paper", "blog"))
+        if normalized_scope in {"all", "authors"}:
+            targets.append("author")
+        if normalized_scope in {"all", "blogs"}:
+            targets.append("blog_source")
+        changes: list[dict[str, Any]] = []
+        with self.transaction() as conn:
+            for object_type in targets:
+                _parent, link_table, object_column, tag_table = self._tag_spec(object_type)
+                rows = conn.execute(
+                    f"SELECT l.{object_column} AS object_id FROM {link_table} l "
+                    f"JOIN {tag_table} t ON t.id=l.tag_id WHERE t.name=? COLLATE NOCASE",
+                    (cleaned,),
+                ).fetchall()
+                for row in rows:
+                    changes.append({"object_type": object_type, "id": int(row["object_id"]), "tag": cleaned, "change": "removed"})
+                conn.execute(
+                    f"DELETE FROM {link_table} WHERE tag_id IN "
+                    f"(SELECT id FROM {tag_table} WHERE name=? COLLATE NOCASE)",
+                    (cleaned,),
+                )
+            action_id = self._record_tag_action(conn, f"global-remove:{normalized_scope}", changes)
+            self._cleanup_orphan_tags(conn)
+        return len(changes), action_id
+
+    def _cleanup_orphan_tags(self, conn: sqlite3.Connection) -> None:
+        conn.execute(
+            """
+            DELETE FROM content_tags
+            WHERE id NOT IN (SELECT tag_id FROM paper_tag_links)
+              AND id NOT IN (SELECT tag_id FROM blog_entry_tag_links)
+              AND id NOT IN (SELECT tag_id FROM blog_source_tag_links)
+            """
+        )
+        conn.execute(
+            "DELETE FROM author_tags WHERE id NOT IN (SELECT tag_id FROM author_tag_links)"
+        )
+
+    def undo_last_tag_action(self) -> int:
+        row = self._conn.execute(
+            "SELECT * FROM tag_action_history WHERE undone_at IS NULL ORDER BY id DESC LIMIT 1"
+        ).fetchone()
+        if row is None:
+            return 0
+        try:
+            changes = json.loads(str(row["payload_json"] or "[]"))
+        except json.JSONDecodeError as exc:
+            raise DatabaseError("Stored tag action is invalid") from exc
+        restored = 0
+        with self.transaction() as conn:
+            for item in reversed(changes if isinstance(changes, list) else []):
+                if not isinstance(item, dict):
+                    continue
+                object_type = str(item.get("object_type") or "")
+                object_id = int(item.get("id") or 0)
+                tag = self._clean_tag(str(item.get("tag") or ""))
+                _parent, link_table, object_column, tag_table = self._tag_spec(object_type)
+                tag_row = conn.execute(
+                    f"SELECT id FROM {tag_table} WHERE name=? COLLATE NOCASE", (tag,)
+                ).fetchone()
+                if str(item.get("change")) == "added":
+                    if tag_row is not None:
+                        cur = conn.execute(
+                            f"DELETE FROM {link_table} WHERE {object_column}=? AND tag_id=?",
+                            (object_id, int(tag_row["id"])),
+                        )
+                        restored += cur.rowcount
+                else:
+                    if tag_row is None:
+                        cur = conn.execute(
+                            f"INSERT INTO {tag_table}(name, created_at) VALUES (?, ?)",
+                            (tag, utcnow()),
+                        )
+                        tag_id = int(cur.lastrowid)
+                    else:
+                        tag_id = int(tag_row["id"])
+                    cur = conn.execute(
+                        f"INSERT OR IGNORE INTO {link_table}({object_column}, tag_id) VALUES (?, ?)",
+                        (object_id, tag_id),
+                    )
+                    restored += cur.rowcount
+            conn.execute(
+                "UPDATE tag_action_history SET undone_at=? WHERE id=?",
+                (utcnow(), int(row["id"])),
+            )
+            self._cleanup_orphan_tags(conn)
+        return restored
 
     def delete_all_authors(self) -> int:
         """Delete author records while preserving downloaded papers and blog sources."""
@@ -2758,10 +3330,13 @@ class Database:
                 dict(item)
                 for item in self._conn.execute(
                     """
-                    SELECT b.url, COALESCE(ab.label, b.title, '') AS label,
+                    SELECT b.id, b.url, COALESCE(ab.label, b.title, '') AS label,
                            COALESCE(ab.relationship, '') AS relationship,
                            b.source_mode, b.content_selector, b.article_url_pattern,
-                           b.enabled
+                           b.enabled, b.notes,
+                           COALESCE((SELECT group_concat(ct.name, ', ') FROM blog_source_tag_links bstl
+                               JOIN content_tags ct ON ct.id=bstl.tag_id
+                               WHERE bstl.blog_id=b.id), '') AS tags
                     FROM author_blogs ab JOIN blogs b ON b.id=ab.blog_id
                     WHERE ab.author_id=? ORDER BY b.url
                     """,
@@ -2813,8 +3388,12 @@ class Database:
                 )
             if not bool(raw.get("enabled", 1)):
                 self.set_author_enabled(identifier, False)
+            self.set_author_starred(identifier, bool(raw.get("starred", 0)))
             for tag in raw.get("tags", ()) if isinstance(raw.get("tags"), list) else ():
                 self.add_author_tag(identifier, str(tag))
+            author_row = self.get_author(identifier)
+            if author_row is not None:
+                self.set_object_notes("author", int(author_row["id"]), str(raw.get("notes") or ""))
             imported_authors += 1
             blogs = raw.get("blogs")
             if not isinstance(blogs, list):
@@ -2822,7 +3401,7 @@ class Database:
             for blog in blogs:
                 if not isinstance(blog, dict):
                     continue
-                self.add_author_blog(
+                blog_id = self.add_author_blog(
                     identifier,
                     str(blog.get("url") or ""),
                     label=str(blog.get("label") or ""),
@@ -2831,6 +3410,14 @@ class Database:
                     content_selector=str(blog.get("content_selector") or "") or None,
                     article_url_pattern=str(blog.get("article_url_pattern") or "") or None,
                 )
+                self.set_object_notes("blog_source", blog_id, str(blog.get("notes") or ""))
+                raw_tags = blog.get("tags")
+                tags = raw_tags if isinstance(raw_tags, list) else str(raw_tags or "").split(",")
+                for tag in tags:
+                    if str(tag).strip():
+                        self.add_blog_source_tag(blog_id, str(tag))
+                if not bool(blog.get("enabled", 1)):
+                    self.set_author_blog_broken(identifier, blog_id, True)
                 imported_links += 1
         return imported_authors, imported_links
 
@@ -2958,6 +3545,42 @@ class Database:
             raise ValueError("Print regexp matches requires a regexp")
         return cleaned, radius, mode
 
+    @staticmethod
+    def _classification_values(
+        query_kind: str,
+        label_class: str,
+        label_values: Iterable[dict[str, str]],
+    ) -> tuple[str, str, str]:
+        kind = query_kind.strip().lower() or "summary"
+        if kind not in {"summary", "classification"}:
+            raise ValueError("Query type must be summary or classification")
+        cleaned_class = " ".join(label_class.strip().split())[:40]
+        values: list[dict[str, str]] = []
+        seen: set[str] = set()
+        for item in label_values:
+            value = " ".join(str(item.get("value", "")).strip().split())[:40]
+            pattern = str(item.get("pattern", "")).strip()[:2000]
+            key = value.casefold()
+            if not value or key in seen:
+                continue
+            if not pattern:
+                raise ValueError(f"Classification value {value!r} needs a regexp")
+            try:
+                re.compile(pattern, re.MULTILINE)
+            except re.error as exc:
+                raise ValueError(f"Invalid classification regexp for {value}: {exc}") from exc
+            seen.add(key)
+            values.append({"value": value, "pattern": pattern})
+        if kind == "classification":
+            if not cleaned_class:
+                raise ValueError("Classification queries need a tag class")
+            if len(values) < 2:
+                raise ValueError("Classification queries need at least two label values")
+        else:
+            cleaned_class = ""
+            values = []
+        return kind, cleaned_class, json_dumps(values)
+
     def create_saved_query(
         self,
         *,
@@ -2975,6 +3598,9 @@ class Database:
         regexp_radius: int = 0,
         regexp_mode: str = "query",
         content_scope: str = "both",
+        query_kind: str = "summary",
+        label_class: str = "",
+        label_values: Iterable[dict[str, str]] = (),
     ) -> int:
         name = name.strip()
         prompt = prompt.strip()
@@ -2987,6 +3613,11 @@ class Database:
         regexp, radius, regexp_action = self._regexp_values(
             regexp_pattern, regexp_radius, regexp_mode
         )
+        kind, classification_class, classification_values = self._classification_values(
+            query_kind, label_class, label_values
+        )
+        if kind == "classification" and regexp_action == "print":
+            raise ValueError("Classification queries must run their prompt")
         if content_scope not in {"both", "papers", "blogs"}:
             raise ValueError("Query content scope must be both, papers, or blogs")
         if content_scope == "papers":
@@ -3010,8 +3641,9 @@ class Database:
                     auto_run_papers, auto_run_blogs, model_profiles_json,
                     context_window_tokens, paper_source_scope, pdf_strategy,
                     regexp_pattern, regexp_radius, regexp_mode, content_scope,
+                    query_kind, label_class, label_values_json,
                     created_at, updated_at
-                ) VALUES (?, 'papers', '', ?, 0, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, 'papers', '', ?, 0, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     name[:120],
@@ -3026,6 +3658,9 @@ class Database:
                     radius,
                     regexp_action,
                     content_scope,
+                    kind,
+                    classification_class,
+                    classification_values,
                     now,
                     now,
                 ),
@@ -3050,6 +3685,9 @@ class Database:
         regexp_radius: int = 0,
         regexp_mode: str = "query",
         content_scope: str = "both",
+        query_kind: str = "summary",
+        label_class: str = "",
+        label_values: Iterable[dict[str, str]] = (),
     ) -> bool:
         name = name.strip()
         prompt = prompt.strip()
@@ -3062,6 +3700,11 @@ class Database:
         regexp, radius, regexp_action = self._regexp_values(
             regexp_pattern, regexp_radius, regexp_mode
         )
+        kind, classification_class, classification_values = self._classification_values(
+            query_kind, label_class, label_values
+        )
+        if kind == "classification" and regexp_action == "print":
+            raise ValueError("Classification queries must run their prompt")
         if content_scope not in {"both", "papers", "blogs"}:
             raise ValueError("Query content scope must be both, papers, or blogs")
         if not name and not prompt and regexp_action != "print":
@@ -3082,7 +3725,8 @@ class Database:
                     auto_run_blogs=CASE WHEN ? IS NULL THEN auto_run_blogs ELSE ? END,
                     model_profiles_json=?, context_window_tokens=?,
                     paper_source_scope=?, pdf_strategy=?, regexp_pattern=?,
-                    regexp_radius=?, regexp_mode=?, content_scope=?, updated_at=?
+                    regexp_radius=?, regexp_mode=?, content_scope=?, query_kind=?,
+                    label_class=?, label_values_json=?, updated_at=?
                 WHERE id=?
                 """,
                 (
@@ -3101,6 +3745,9 @@ class Database:
                     radius,
                     regexp_action,
                     content_scope,
+                    kind,
+                    classification_class,
+                    classification_values,
                     utcnow(),
                     query_id,
                 ),
@@ -3150,6 +3797,203 @@ class Database:
                 "DELETE FROM saved_queries WHERE id=? AND is_builtin=0", (query_id,)
             )
         return cur.rowcount > 0
+
+    @staticmethod
+    def _decoded_label_values(value: Any) -> list[dict[str, str]]:
+        try:
+            decoded = json.loads(value or "[]")
+        except (TypeError, json.JSONDecodeError):
+            return []
+        if not isinstance(decoded, list):
+            return []
+        values: list[dict[str, str]] = []
+        for item in decoded:
+            if not isinstance(item, dict):
+                continue
+            label = str(item.get("value") or "").strip()
+            pattern = str(item.get("pattern") or "").strip()
+            if label and pattern:
+                values.append({"value": label, "pattern": pattern})
+        return values
+
+    def apply_query_classifications(
+        self,
+        query_id: int,
+        query_run_id: int,
+        output: dict[str, Any],
+    ) -> int:
+        query = self.get_saved_query(query_id)
+        if query is None or str(query["query_kind"] or "summary") != "classification":
+            return 0
+        label_class = " ".join(str(query["label_class"] or "").split())
+        values = self._decoded_label_values(query["label_values_json"])
+        items = output.get("items") if isinstance(output, dict) else None
+        if not label_class or not values or not isinstance(items, list):
+            return 0
+        now = utcnow()
+        changed = 0
+        with self.transaction() as conn:
+            for item in items:
+                if not isinstance(item, dict):
+                    continue
+                raw_output = str(item.get("output") or "")
+                selected_value = next(
+                    (
+                        value["value"]
+                        for value in values
+                        if re.search(value["pattern"], raw_output, re.MULTILINE)
+                    ),
+                    None,
+                )
+                if selected_value is None:
+                    continue
+                paper_id = item.get("paper_id")
+                blog_entry_id = item.get("blog_entry_id")
+                if paper_id is not None:
+                    content_type = "paper"
+                    record_id = int(paper_id)
+                    existing = conn.execute(
+                        "SELECT id, manually_modified FROM query_classification_results "
+                        "WHERE query_id=? AND paper_id=?",
+                        (query_id, record_id),
+                    ).fetchone()
+                    columns = (record_id, None)
+                elif blog_entry_id is not None:
+                    content_type = "blog"
+                    record_id = int(blog_entry_id)
+                    existing = conn.execute(
+                        "SELECT id, manually_modified FROM query_classification_results "
+                        "WHERE query_id=? AND blog_entry_id=?",
+                        (query_id, record_id),
+                    ).fetchone()
+                    columns = (None, record_id)
+                else:
+                    continue
+                if existing is not None and bool(existing["manually_modified"]):
+                    continue
+                tag_name = f"{label_class}: {selected_value}"[:80]
+                if existing is None:
+                    conn.execute(
+                        """
+                        INSERT INTO query_classification_results(
+                            query_id, query_run_id, content_type, paper_id,
+                            blog_entry_id, value, tag_name, raw_output,
+                            manually_modified, created_at, updated_at
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?)
+                        """,
+                        (
+                            query_id,
+                            query_run_id,
+                            content_type,
+                            columns[0],
+                            columns[1],
+                            selected_value,
+                            tag_name,
+                            raw_output,
+                            now,
+                            now,
+                        ),
+                    )
+                else:
+                    conn.execute(
+                        """
+                        UPDATE query_classification_results
+                        SET query_run_id=?, value=?, tag_name=?, raw_output=?,
+                            manually_modified=0, updated_at=?
+                        WHERE id=?
+                        """,
+                        (
+                            query_run_id,
+                            selected_value,
+                            tag_name,
+                            raw_output,
+                            now,
+                            int(existing["id"]),
+                        ),
+                    )
+                changed += 1
+        return changed
+
+    def classification_results_for_content(
+        self, content_type: str, record_id: int
+    ) -> list[dict[str, Any]]:
+        _table, normalized = self._content_table(content_type)
+        column = "paper_id" if normalized == "paper" else "blog_entry_id"
+        rows = self._conn.execute(
+            f"""
+            SELECT qcr.*, q.name AS query_name, q.label_class, q.label_values_json
+            FROM query_classification_results qcr
+            JOIN saved_queries q ON q.id=qcr.query_id
+            WHERE qcr.{column}=?
+            ORDER BY q.name COLLATE NOCASE, qcr.id
+            """,
+            (int(record_id),),
+        ).fetchall()
+        result: list[dict[str, Any]] = []
+        for row in rows:
+            item = dict(row)
+            item["choices"] = [value["value"] for value in self._decoded_label_values(row["label_values_json"])]
+            result.append(item)
+        return result
+
+    def set_content_classification(
+        self,
+        query_id: int,
+        content_type: str,
+        record_id: int,
+        value: str,
+    ) -> bool:
+        query = self.get_saved_query(query_id)
+        if query is None or str(query["query_kind"] or "summary") != "classification":
+            return False
+        choices = [item["value"] for item in self._decoded_label_values(query["label_values_json"])]
+        selected = next((item for item in choices if item.casefold() == value.strip().casefold()), None)
+        if selected is None:
+            raise ValueError("Classification value is not allowed by this query")
+        _table, normalized = self._content_table(content_type)
+        column = "paper_id" if normalized == "paper" else "blog_entry_id"
+        other_column = "blog_entry_id" if normalized == "paper" else "paper_id"
+        now = utcnow()
+        tag_name = f"{' '.join(str(query['label_class'] or '').split())}: {selected}"[:80]
+        with self.transaction() as conn:
+            existing = conn.execute(
+                f"SELECT id FROM query_classification_results WHERE query_id=? AND {column}=?",
+                (query_id, int(record_id)),
+            ).fetchone()
+            if existing is None:
+                parent = conn.execute(
+                    f"SELECT 1 FROM {'papers' if normalized == 'paper' else 'blog_entries'} WHERE id=?",
+                    (int(record_id),),
+                ).fetchone()
+                if parent is None:
+                    return False
+                conn.execute(
+                    f"""
+                    INSERT INTO query_classification_results(
+                        query_id, content_type, {column}, {other_column}, value,
+                        tag_name, raw_output, manually_modified, created_at, updated_at
+                    ) VALUES (?, ?, ?, NULL, ?, ?, '', 1, ?, ?)
+                    """,
+                    (query_id, normalized, int(record_id), selected, tag_name, now, now),
+                )
+            else:
+                conn.execute(
+                    """
+                    UPDATE query_classification_results
+                    SET value=?, tag_name=?, manually_modified=1, updated_at=?
+                    WHERE id=?
+                    """,
+                    (selected, tag_name, now, int(existing["id"])),
+                )
+        return True
+
+    def clear_query_classifications(self, query_id: int) -> int:
+        with self.transaction() as conn:
+            cur = conn.execute(
+                "DELETE FROM query_classification_results WHERE query_id=?",
+                (int(query_id),),
+            )
+        return cur.rowcount
 
     def delete_all_queries(self) -> int:
         """Delete every saved query and output, then restore the built-in query."""

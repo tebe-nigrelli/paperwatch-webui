@@ -52,7 +52,7 @@ from .models import (
     short_openalex_id,
     strip_doi,
 )
-from .pdfs import PDFError, safe_pdf_name, validate_pdf_file
+from .pdfs import PDFError, download_pdf, pdf_sha256, safe_pdf_name, validate_pdf_file
 from .query_jobs import QueryController
 from .sources.openalex import OpenAlexClient
 
@@ -73,14 +73,19 @@ DEFAULT_CONTEXT_WINDOW_TOKENS = 16384
 @dataclass(frozen=True, slots=True)
 class PaperFilters:
     query: str = ""
+    title_query: str = ""
     author_id: str = ""
+    author_ids: tuple[str, ...] = ()
     author_tags: tuple[str, ...] = ()
     content_tags: tuple[str, ...] = ()
     topic_id: str = ""
+    topic_ids: tuple[str, ...] = ()
     paper_kind: str = ""
     scope: str = ""
     has_pdf: bool | None = None
     analyzed: bool | None = None
+    starred: bool | None = None
+    read: bool | None = None
     date_from: str = ""
     date_to: str = ""
     sort: str = "newest"
@@ -90,14 +95,19 @@ class PaperFilters:
     def selection(self) -> dict[str, Any]:
         return {
             "query": self.query,
+            "title_query": self.title_query,
             "author_id": self.author_id,
+            "author_ids": list(self.author_ids),
             "author_tags": list(self.author_tags),
             "content_tags": list(self.content_tags),
             "topic_id": self.topic_id,
+            "topic_ids": list(self.topic_ids),
             "paper_kind": self.paper_kind,
             "scope": self.scope,
             "has_pdf": self.has_pdf,
             "analyzed": self.analyzed,
+            "starred": self.starred,
+            "read": self.read,
             "date_from": self.date_from,
             "date_to": self.date_to,
             "sort": self.sort,
@@ -106,14 +116,17 @@ class PaperFilters:
     def selection_items(self) -> list[tuple[str, str]]:
         items = [
             ("q", self.query),
-            ("author", self.author_id),
+            ("title", self.title_query),
+            *(("author", value) for value in (self.author_ids or ((self.author_id,) if self.author_id else ()))),
             *(("author_tag", tag) for tag in self.author_tags),
             *(("tag", tag) for tag in self.content_tags),
-            ("topic", self.topic_id),
+            *(("topic", value) for value in (self.topic_ids or ((self.topic_id,) if self.topic_id else ()))),
             ("kind", self.paper_kind),
             ("scope", self.scope),
             ("has_pdf", _bool_query(self.has_pdf)),
             ("analyzed", _bool_query(self.analyzed)),
+            ("starred", _bool_query(self.starred)),
+            ("read", _bool_query(self.read)),
             ("date_from", self.date_from),
             ("date_to", self.date_to),
             ("sort", self.sort if self.sort != "newest" else ""),
@@ -123,14 +136,17 @@ class PaperFilters:
     def query_items(self, *, page: int | None = None) -> list[tuple[str, str]]:
         items = [
             ("q", self.query),
-            ("author", self.author_id),
+            ("title", self.title_query),
+            *(("author", value) for value in (self.author_ids or ((self.author_id,) if self.author_id else ()))),
             *(("author_tag", tag) for tag in self.author_tags),
             *(("tag", tag) for tag in self.content_tags),
-            ("topic", self.topic_id),
+            *(("topic", value) for value in (self.topic_ids or ((self.topic_id,) if self.topic_id else ()))),
             ("kind", self.paper_kind),
             ("scope", self.scope),
             ("has_pdf", _bool_query(self.has_pdf)),
             ("analyzed", _bool_query(self.analyzed)),
+            ("starred", _bool_query(self.starred)),
+            ("read", _bool_query(self.read)),
             ("date_from", self.date_from),
             ("date_to", self.date_to),
             ("sort", self.sort if self.sort != "newest" else ""),
@@ -515,9 +531,22 @@ def _parse_filter_values(params: Any) -> PaperFilters:
     sort = params.get("sort", "newest")
     if sort not in SORTS:
         sort = "newest"
-    topic_id = short_openalex_id(params.get("topic", "").strip()[:64]) or ""
-    if topic_id and not topic_id.startswith("T"):
-        topic_id = ""
+    raw_topics = params.getlist("topic") if hasattr(params, "getlist") else params.get("topic", ())
+    if isinstance(raw_topics, str):
+        raw_topics = (raw_topics,)
+    topic_ids = tuple(dict.fromkeys(
+        candidate for value in (raw_topics or ())
+        if (candidate := short_openalex_id(str(value).strip()[:64]) or "").startswith("T")
+    ))[:50]
+    topic_id = topic_ids[0] if topic_ids else ""
+    raw_authors = params.getlist("author") if hasattr(params, "getlist") else params.get("author", ())
+    if isinstance(raw_authors, str):
+        raw_authors = (raw_authors,)
+    author_ids = tuple(dict.fromkeys(
+        candidate for value in (raw_authors or ())
+        if (candidate := short_openalex_id(str(value).strip()[:64]) or str(value).strip()[:64])
+    ))[:50]
+    author_id = author_ids[0] if author_ids else ""
     raw_author_tags = (
         params.getlist("author_tag")
         if hasattr(params, "getlist")
@@ -545,7 +574,7 @@ def _parse_filter_values(params: Any) -> PaperFilters:
     content_tags: list[str] = []
     seen_content_tags: set[str] = set()
     for value in raw_content_tags or ():
-        tag = " ".join(str(value).strip().split())[:40]
+        tag = " ".join(str(value).strip().split())[:80]
         normalized = tag.casefold()
         if tag and normalized not in seen_content_tags:
             content_tags.append(tag)
@@ -554,14 +583,19 @@ def _parse_filter_values(params: Any) -> PaperFilters:
             break
     return PaperFilters(
         query=params.get("q", "").strip()[:200],
-        author_id=params.get("author", "").strip()[:64],
+        title_query=params.get("title", "").strip()[:300],
+        author_id=author_id,
+        author_ids=author_ids,
         author_tags=tuple(author_tags),
         content_tags=tuple(content_tags),
         topic_id=topic_id,
+        topic_ids=topic_ids,
         paper_kind=paper_kind,
         scope=scope,
         has_pdf=_parse_tristate(params.get("has_pdf")),
         analyzed=_parse_tristate(params.get("analyzed")),
+        starred=_parse_tristate(params.get("starred")),
+        read=_parse_tristate(params.get("read")),
         date_from=_valid_date(params.get("date_from")),
         date_to=_valid_date(params.get("date_to")),
         sort=sort,
@@ -581,12 +615,37 @@ def _content_tag_values(params: Any) -> tuple[str, ...]:
     values: list[str] = []
     seen: set[str] = set()
     for value in raw or ():
-        cleaned = " ".join(str(value).strip().split())[:40]
+        cleaned = " ".join(str(value).strip().split())[:80]
         key = cleaned.casefold()
         if cleaned and key not in seen:
             values.append(cleaned)
             seen.add(key)
     return tuple(values[:50])
+
+
+def _split_tags(value: str) -> tuple[str, ...]:
+    values: list[str] = []
+    seen: set[str] = set()
+    for raw in re.split(r"[,;\n]", value):
+        cleaned = " ".join(raw.strip().split())[:80]
+        key = cleaned.casefold()
+        if cleaned and key not in seen:
+            values.append(cleaned)
+            seen.add(key)
+        if len(values) >= 100:
+            break
+    return tuple(values)
+
+
+def _request_return_path(request: Request, fallback: str = "/") -> str:
+    referer = urlparse(request.headers.get("referer", ""))
+    if referer.path.startswith("/") and not referer.path.startswith("//"):
+        return f"{referer.path}?{referer.query}" if referer.query else referer.path
+    return fallback
+
+
+def _async_request(request: Request) -> bool:
+    return request.headers.get("X-Paperwatch-Async") == "1"
 
 
 def _json_value(value: Any, fallback: Any) -> Any:
@@ -635,10 +694,39 @@ def _query_view(row: Any, config: AppConfig) -> dict[str, Any]:
     query["regexp_radius"] = int(query.get("regexp_radius") or 0)
     query["regexp_mode"] = str(query.get("regexp_mode") or "query")
     query["content_scope"] = str(query.get("content_scope") or "both")
+    query["query_kind"] = str(query.get("query_kind") or "summary")
+    query["label_class"] = str(query.get("label_class") or "")
+    label_values = _json_value(query.get("label_values_json"), [])
+    if not isinstance(label_values, list):
+        label_values = []
+    query["label_values"] = [
+        {
+            "value": str(item.get("value") or ""),
+            "pattern": str(item.get("pattern") or ""),
+        }
+        for item in label_values
+        if isinstance(item, dict) and item.get("value") and item.get("pattern")
+    ]
+    query["label_values_text"] = "\n".join(
+        f"{item['value']} = {item['pattern']}" for item in query["label_values"]
+    )
     query["local_regexp"] = bool(
         query["regexp_pattern"] and query["regexp_mode"] == "print"
     )
     return query
+
+
+def _classification_form_values(value: str) -> list[dict[str, str]]:
+    values: list[dict[str, str]] = []
+    for raw_line in value.splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if "=" not in line:
+            raise ValueError("Each classification value must use: Label = regexp")
+        label, pattern = line.split("=", 1)
+        values.append({"value": label.strip(), "pattern": pattern.strip()})
+    return values
 
 
 def _query_execution_form(form: Any, config: AppConfig) -> dict[str, Any]:
@@ -661,6 +749,7 @@ def _query_execution_form(form: Any, config: AppConfig) -> dict[str, Any]:
     regexp_radius = _int_or_none(form.get("regexp_radius"))
     if regexp_radius is None:
         regexp_radius = 0
+    query_kind = str(form.get("query_kind", "summary"))
     return {
         "model_profiles": profiles,
         "context_window_tokens": context,
@@ -670,6 +759,13 @@ def _query_execution_form(form: Any, config: AppConfig) -> dict[str, Any]:
         "regexp_radius": regexp_radius,
         "regexp_mode": str(form.get("regexp_mode", "query")),
         "content_scope": str(form.get("content_scope", "both")),
+        "query_kind": query_kind,
+        "label_class": str(form.get("label_class", "")),
+        "label_values": (
+            _classification_form_values(str(form.get("label_values", "")))
+            if query_kind == "classification"
+            else []
+        ),
     }
 
 
@@ -740,10 +836,13 @@ def _paper_export(db: Database, row: Any) -> dict[str, Any]:
 def _all_filtered(db: Database, filters: PaperFilters) -> list[Any]:
     rows, _ = db.search_papers(
         query=filters.query,
+        title_query=filters.title_query,
         author_id=filters.author_id,
+        author_ids=filters.author_ids,
         author_tags=filters.author_tags,
         content_tags=filters.content_tags,
         topic_id=filters.topic_id,
+        topic_ids=filters.topic_ids,
         paper_kind=filters.paper_kind,
         scope=filters.scope,
         has_pdf=filters.has_pdf,
@@ -982,8 +1081,34 @@ def _paper_view(row: Any) -> dict[str, Any]:
     return data
 
 
+def _paper_pdf_state(db: Database, data: dict[str, Any]) -> dict[str, Any]:
+    value = str(data.get("local_pdf_path") or "").strip()
+    data["pdf_modified"] = False
+    data["pdf_missing_on_disk"] = False
+    if not value:
+        return data
+    path = Path(value).expanduser()
+    if not path.is_file():
+        data["pdf_modified"] = True
+        data["pdf_missing_on_disk"] = True
+        return data
+    try:
+        current = pdf_sha256(path)
+    except PDFError:
+        data["pdf_modified"] = True
+        return data
+    stored = str(data.get("pdf_sha256") or "")
+    if not stored:
+        db.set_paper_pdf_hash(int(data["id"]), current)
+        data["pdf_sha256"] = current
+    else:
+        data["pdf_modified"] = stored != current
+    data["current_pdf_sha256"] = current
+    return data
+
+
 def _paper_table_view(db: Database, row: Any) -> dict[str, Any]:
-    data = _paper_view(row)
+    data = _paper_pdf_state(db, _paper_view(row))
     paper_authors = [_author_view(item) for item in db.paper_authors(int(data["id"]))]
     tracked_authors = [item for item in paper_authors if bool(item.get("is_tracked"))]
     data["tracked_authors"] = tracked_authors
@@ -1243,37 +1368,63 @@ def create_app(
             if content_filter != "blogs":
                 paper_rows, _paper_total = db.search_papers(
                     query=filters.query,
+                    title_query=filters.title_query,
                     author_id=filters.author_id,
+                    author_ids=filters.author_ids,
                     author_tags=filters.author_tags,
                     content_tags=filters.content_tags,
                     topic_id=filters.topic_id,
+                    topic_ids=filters.topic_ids,
                     paper_kind=filters.paper_kind,
                     scope=filters.scope,
                     has_pdf=filters.has_pdf,
                     analyzed=filters.analyzed,
+                    starred=filters.starred,
+                    read=filters.read,
+                    selected=False,
                     date_from=filters.date_from,
                     date_to=filters.date_to,
                     sort=filters.sort,
                     limit=None,
                     offset=0,
                 )
-            if content_filter != "papers":
+            blog_compatible_filters = not (
+                filters.topic_id
+                or filters.topic_ids
+                or filters.paper_kind
+                or filters.scope
+                or filters.has_pdf is True
+            )
+            if content_filter != "papers" and blog_compatible_filters:
                 blog_rows = db.list_blog_entries(
                     limit=None,
                     query=filters.query,
+                    title_query=filters.title_query,
                     tags=filters.content_tags,
                     author_id=filters.author_id,
+                    author_ids=filters.author_ids,
                     author_tags=filters.author_tags,
                     date_from=filters.date_from,
                     date_to=filters.date_to,
                     sort=filters.sort,
+                    starred=filters.starred,
+                    read=filters.read,
+                    selected=False,
+                    analyzed=filters.analyzed,
                 )
+            selected_paper_rows, _ = db.search_papers(
+                selected=True, limit=None, offset=0, sort="discovered"
+            )
+            selected_blog_rows = db.list_blog_entries(
+                limit=None, selected=True, sort="discovered"
+            )
             author_rows = db.list_authors_with_tags(tracked_only=True)
             tag_rows = db.list_tags()
             content_tag_rows = db.list_content_tags()
             topic_rows = db.list_topics()
             saved_queries = [_query_view(row, config) for row in db.list_saved_queries()]
             paper_views = [_paper_table_view(db, row) for row in paper_rows]
+            selected_paper_views = [_paper_table_view(db, row) for row in selected_paper_rows]
             blog_views = []
             for row in blog_rows:
                 entry = dict(row)
@@ -1288,6 +1439,20 @@ def create_app(
                     str(entry.get("source_url") or entry.get("url") or "")
                 )
                 blog_views.append(entry)
+            selected_blog_views = []
+            for row in selected_blog_rows:
+                entry = dict(row)
+                entry["tracked_authors"] = [
+                    {
+                        "name": str(author["name"]),
+                        "url": f"/authors/{quote_plus(str(author['openalex_id']))}/blogs",
+                    }
+                    for author in db.blog_authors(int(entry["blog_id"]))
+                ]
+                entry["source_site"], entry["source_site_url"] = _website_view(
+                    str(entry.get("source_url") or entry.get("url") or "")
+                )
+                selected_blog_views.append(entry)
 
         records: list[dict[str, Any]] = []
         for paper in paper_views:
@@ -1300,6 +1465,21 @@ def create_app(
             entry["record_date"] = entry.get("published_at") or entry.get("fetched_at") or ""
             entry["record_fetched"] = entry.get("fetched_at") or ""
             records.append(entry)
+
+        selected_records: list[dict[str, Any]] = []
+        for paper in selected_paper_views:
+            paper["content_type"] = "paper"
+            paper["record_date"] = paper.get("publication_date") or paper.get("discovered_at") or ""
+            paper["record_fetched"] = paper.get("fetched_at") or paper.get("discovered_at") or ""
+            selected_records.append(paper)
+        for entry in selected_blog_views:
+            entry["content_type"] = "blog"
+            entry["record_date"] = entry.get("published_at") or entry.get("fetched_at") or ""
+            entry["record_fetched"] = entry.get("fetched_at") or ""
+            selected_records.append(entry)
+        selected_records.sort(
+            key=lambda item: _record_sort_key(item, "discovered"), reverse=True
+        )
 
         reverse = filters.sort not in {"oldest", "title"}
         records.sort(key=lambda item: _record_sort_key(item, filters.sort), reverse=reverse)
@@ -1327,6 +1507,8 @@ def create_app(
             request,
             "content.html",
             records=records,
+            selected_records=selected_records,
+            selected_count=len(selected_records),
             papers=visible_papers,
             blog_entries=visible_blogs,
             filters=filters,
@@ -1354,14 +1536,192 @@ def create_app(
     def recent_papers(request: Request) -> HTMLResponse:
         return _render_content_page(request, default_content="all", is_home=True)
 
+    @app.post("/content/{content_type}/{record_id}/star")
+    async def star_content(
+        request: Request, content_type: str, record_id: int
+    ) -> Response:
+        form = await request.form()
+        starred = str(form.get("starred", "")) in {"1", "true", "on"}
+        with Database(config.paths.database) as db:
+            if not db.set_content_starred(content_type, record_id, starred):
+                raise HTTPException(404, "Content not found")
+        if request.headers.get("X-Paperwatch-Async") == "1":
+            return JSONResponse({"ok": True, "starred": starred})
+        return RedirectResponse(_request_return_path(request), status_code=303)
+
+    @app.post("/content/{content_type}/{record_id}/read")
+    async def read_content(
+        request: Request, content_type: str, record_id: int
+    ) -> Response:
+        form = await request.form()
+        read = str(form.get("read", "1")) in {"1", "true", "on"}
+        with Database(config.paths.database) as db:
+            if not db.set_content_read(content_type, record_id, read):
+                raise HTTPException(404, "Content not found")
+        if request.headers.get("X-Paperwatch-Async") == "1":
+            return JSONResponse({"ok": True, "read": read})
+        return RedirectResponse(_request_return_path(request), status_code=303)
+
+    @app.post("/content/{content_type}/{record_id}/select")
+    async def select_content(
+        request: Request, content_type: str, record_id: int
+    ) -> Response:
+        form = await request.form()
+        selected = str(form.get("selected", "")) in {"1", "true", "on"}
+        with Database(config.paths.database) as db:
+            if not db.set_content_selected(content_type, record_id, selected):
+                raise HTTPException(404, "Content not found")
+        if request.headers.get("X-Paperwatch-Async") == "1":
+            return JSONResponse({"ok": True, "selected": selected})
+        return RedirectResponse(_request_return_path(request), status_code=303)
+
+    @app.post("/content/selected/{action}")
+    def update_selected_content(request: Request, action: str) -> Response:
+        try:
+            with Database(config.paths.database) as db:
+                changed = db.bulk_update_selected_content(action)
+        except ValueError as exc:
+            if _async_request(request):
+                return JSONResponse({"ok": False, "message": str(exc)}, status_code=400)
+            raise HTTPException(400, str(exc)) from exc
+        if _async_request(request):
+            return JSONResponse({"ok": True, "changed": changed})
+        return RedirectResponse(_request_return_path(request), status_code=303)
+
+    @app.post("/content/selected/tags/{action}")
+    async def update_selected_tags(request: Request, action: str) -> Response:
+        form = await request.form()
+        try:
+            with Database(config.paths.database) as db:
+                changed, action_id = db.bulk_update_selected_tags(
+                    action, str(form.get("tag", ""))
+                )
+        except ValueError as exc:
+            if request.headers.get("X-Paperwatch-Async") == "1":
+                return JSONResponse({"ok": False, "message": str(exc)}, status_code=400)
+            return RedirectResponse(
+                _notice_url(_request_return_path(request), str(exc), level="error"),
+                status_code=303,
+            )
+        payload = {"ok": True, "changed": changed, "action_id": action_id}
+        if request.headers.get("X-Paperwatch-Async") == "1":
+            return JSONResponse(payload)
+        return RedirectResponse(
+            _notice_url(_request_return_path(request), f"Updated {changed} tag link(s)."),
+            status_code=303,
+        )
+
+    @app.post("/tags/remove-global")
+    async def remove_global_tag(request: Request) -> Response:
+        form = await request.form()
+        try:
+            with Database(config.paths.database) as db:
+                changed, action_id = db.remove_tag_globally(
+                    str(form.get("tag", "")), str(form.get("scope", "all"))
+                )
+        except ValueError as exc:
+            if request.headers.get("X-Paperwatch-Async") == "1":
+                return JSONResponse({"ok": False, "message": str(exc)}, status_code=400)
+            return RedirectResponse(
+                _notice_url(_request_return_path(request), str(exc), level="error"),
+                status_code=303,
+            )
+        if request.headers.get("X-Paperwatch-Async") == "1":
+            return JSONResponse({"ok": True, "changed": changed, "action_id": action_id})
+        return RedirectResponse(
+            _notice_url(_request_return_path(request), f"Removed {changed} tag link(s)."),
+            status_code=303,
+        )
+
+    @app.post("/tags/undo")
+    async def undo_tag_action(request: Request) -> Response:
+        with Database(config.paths.database) as db:
+            changed = db.undo_last_tag_action()
+        if request.headers.get("X-Paperwatch-Async") == "1":
+            return JSONResponse({"ok": True, "changed": changed})
+        return RedirectResponse(
+            _notice_url(_request_return_path(request), f"Restored {changed} tag link(s)."),
+            status_code=303,
+        )
+
+    @app.post("/notes/{object_type}/{object_id}")
+    async def save_object_notes(
+        request: Request, object_type: str, object_id: int
+    ) -> Response:
+        form = await request.form()
+        try:
+            with Database(config.paths.database) as db:
+                if not db.set_object_notes(object_type, object_id, str(form.get("notes", ""))):
+                    raise HTTPException(404, "Object not found")
+        except ValueError as exc:
+            if request.headers.get("X-Paperwatch-Async") == "1":
+                return JSONResponse({"ok": False, "message": str(exc)}, status_code=400)
+            return RedirectResponse(
+                _notice_url(_request_return_path(request), str(exc), level="error"),
+                status_code=303,
+            )
+        if request.headers.get("X-Paperwatch-Async") == "1":
+            return JSONResponse({"ok": True})
+        return RedirectResponse(_request_return_path(request), status_code=303)
+
+    @app.get("/exports/authors.csv")
+    def export_authors_csv() -> Response:
+        output = io.StringIO(newline="")
+        fields = ["Author Name", "Institution", "OpenAlex ID", "Starred", "Enabled", "Tags", "Notes"]
+        writer = csv.DictWriter(output, fieldnames=fields)
+        writer.writeheader()
+        with Database(config.paths.database) as db:
+            for row in db.list_authors_with_tags(tracked_only=True):
+                writer.writerow({
+                    "Author Name": row["name"],
+                    "Institution": row["institution"] or "",
+                    "OpenAlex ID": "" if str(row["openalex_id"]).startswith("LOCAL-") else row["openalex_id"],
+                    "Starred": "yes" if row["starred"] else "no",
+                    "Enabled": "yes" if row["enabled"] else "no",
+                    "Tags": row["tags"] or "",
+                    "Notes": row["notes"] or "",
+                })
+        return Response(output.getvalue(), media_type="text/csv; charset=utf-8", headers={"Content-Disposition": 'attachment; filename="paperwatch-authors.csv"'})
+
+    @app.get("/exports/blogs.csv")
+    def export_blogs_csv() -> Response:
+        output = io.StringIO(newline="")
+        fields = [
+            "Researcher / author", "Current lab / organization",
+            "Primary applied-ML source", "Primary source URL", "Relationship to author",
+            "Primary source type", "Primary source mode", "Primary content selector",
+            "Primary article URL pattern", "Primary tags", "Notes", "Enabled",
+        ]
+        writer = csv.DictWriter(output, fieldnames=fields)
+        writer.writeheader()
+        with Database(config.paths.database) as db:
+            for author in db.list_authors(tracked_only=True):
+                for blog in db.author_blogs(str(author["openalex_id"])):
+                    writer.writerow({
+                        "Researcher / author": author["name"],
+                        "Current lab / organization": author["institution"] or "",
+                        "Primary applied-ML source": blog["label"] or blog["title"] or "",
+                        "Primary source URL": blog["url"],
+                        "Relationship to author": blog["relationship"] or "",
+                        "Primary source type": blog["item_stream_mode"] or "",
+                        "Primary source mode": blog["source_mode"] or "auto",
+                        "Primary content selector": blog["content_selector"] or "",
+                        "Primary article URL pattern": blog["article_url_pattern"] or "",
+                        "Primary tags": blog["source_tags"] or "",
+                        "Notes": blog["notes"] or "",
+                        "Enabled": "yes" if blog["enabled"] else "no",
+                    })
+        return Response(output.getvalue(), media_type="text/csv; charset=utf-8", headers={"Content-Disposition": 'attachment; filename="paperwatch-blogs.csv"'})
+
     @app.get("/authors", response_class=HTMLResponse)
     def authors(request: Request) -> HTMLResponse:
         tag = request.query_params.get("tag", "").strip()[:40]
         name = request.query_params.get("name", "").strip()[:200]
         query = request.query_params.get("q", "").strip()[:200]
+        starred = _parse_tristate(request.query_params.get("starred"))
         with Database(config.paths.database) as db:
             rows = [dict(row) for row in db.list_authors_with_tags(
-                tracked_only=True, tag=tag, query=query
+                tracked_only=True, tag=tag, query=query, starred=starred
             )]
             for row in rows:
                 row["is_local"] = str(row["openalex_id"]).startswith("LOCAL-")
@@ -1373,6 +1733,7 @@ def create_app(
             tags=tags,
             active_tag=tag,
             author_query=query,
+            author_starred=starred,
         )
 
     @app.post("/authors/manual")
@@ -1386,7 +1747,7 @@ def create_app(
             openalex_id = _manual_openalex_author_id(str(form.get("openalex_id", "")))
             with Database(config.paths.database) as db:
                 if openalex_id:
-                    db.add_author(
+                    author_db_id = db.add_author(
                         AuthorCandidate(
                             openalex_id=openalex_id,
                             name=name,
@@ -1394,8 +1755,14 @@ def create_app(
                             metadata={"manual": True},
                         )
                     )
+                    identifier = openalex_id
                 else:
-                    db.add_manual_author(name, institution)
+                    author_db_id = db.add_manual_author(name, institution)
+                    author_row = db.find_authors_by_name(name)[0]
+                    identifier = str(author_row["openalex_id"])
+                for tag in _split_tags(str(form.get("tags", ""))):
+                    db.add_author_tag(identifier, tag)
+                db.set_object_notes("author", author_db_id, str(form.get("notes", "")))
         except ValueError as exc:
             return RedirectResponse(
                 _notice_url("/authors", str(exc), level="error"), status_code=303
@@ -1414,7 +1781,9 @@ def create_app(
                 raise ValueError("Choose an author")
             url = normalize_blog_url(str(form.get("url", "")))
             with Database(config.paths.database) as db:
-                db.add_author_blog(openalex_id, url)
+                blog_id = db.add_author_blog(openalex_id, url)
+                for tag in _split_tags(str(form.get("tags", ""))):
+                    db.add_blog_source_tag(blog_id, tag)
         except ValueError as exc:
             return RedirectResponse(
                 _notice_url("/authors", str(exc), level="error"), status_code=303
@@ -1428,6 +1797,7 @@ def create_app(
         form = await request.form()
         upload = form.get("csv_file")
         create_missing = str(form.get("create_missing", "")) in {"1", "true", "on"}
+        import_tags = _split_tags(str(form.get("import_tags", "")))
         if not isinstance(upload, UploadFile) or not upload.filename:
             return RedirectResponse(
                 _notice_url("/authors", "Choose a CSV file.", level="error"),
@@ -1443,6 +1813,7 @@ def create_app(
                     db,
                     io.StringIO(text, newline=""),
                     create_missing=create_missing,
+                    import_tags=import_tags,
                 )
         except (UnicodeDecodeError, ValueError) as exc:
             return RedirectResponse(
@@ -1457,18 +1828,120 @@ def create_app(
         )
         return RedirectResponse(_notice_url("/authors", message), status_code=303)
 
+    @app.post("/authors/import")
+    async def import_authors_csv(request: Request) -> RedirectResponse:
+        form = await request.form()
+        upload = form.get("csv_file")
+        if not isinstance(upload, UploadFile) or not upload.filename:
+            return RedirectResponse(
+                _notice_url("/authors", "Choose an author CSV file.", level="error"),
+                status_code=303,
+            )
+        imported = 0
+        import_tags = _split_tags(str(form.get("import_tags", "")))
+        try:
+            raw = await upload.read(5_000_001)
+            if len(raw) > 5_000_000:
+                raise ValueError("CSV file exceeds 5 MB")
+            stream = io.StringIO(raw.decode("utf-8-sig"), newline="")
+            reader = csv.DictReader(stream, skipinitialspace=True)
+            if reader.fieldnames:
+                reader.fieldnames = [(name or "").strip() for name in reader.fieldnames]
+            fields = {str(name).casefold(): str(name) for name in (reader.fieldnames or ())}
+            name_column = next(
+                (
+                    fields[key]
+                    for key in ("author name", "name", "researcher / author")
+                    if key in fields
+                ),
+                None,
+            )
+            if name_column is None:
+                raise ValueError("CSV must contain an Author Name column")
+            institution_column = next(
+                (fields[key] for key in ("institution", "current lab / organization") if key in fields),
+                None,
+            )
+            openalex_column = next(
+                (fields[key] for key in ("openalex id", "openalex author id") if key in fields),
+                None,
+            )
+            starred_column = fields.get("starred")
+            enabled_column = fields.get("enabled")
+            tags_column = fields.get("tags")
+            notes_column = next((fields[key] for key in ("notes", "comments") if key in fields), None)
+            with Database(config.paths.database) as db:
+                for raw_row in reader:
+                    row = {str(key).strip(): str(value or "").strip() for key, value in raw_row.items()}
+                    name = clean_text(row.get(name_column)) or ""
+                    if not name:
+                        continue
+                    institution = clean_text(row.get(institution_column)) if institution_column else None
+                    openalex_id = _manual_openalex_author_id(
+                        row.get(openalex_column, "") if openalex_column else ""
+                    )
+                    if openalex_id:
+                        db.add_author(
+                            AuthorCandidate(
+                                openalex_id=openalex_id,
+                                name=name,
+                                institution=institution,
+                                metadata={"csv_import": True},
+                            )
+                        )
+                        identifier = openalex_id
+                    else:
+                        db.add_manual_author(name, institution)
+                        matches = db.find_authors_by_name(name)
+                        identifier = str(matches[0]["openalex_id"]) if matches else ""
+                    if identifier and starred_column:
+                        db.set_author_starred(
+                            identifier,
+                            row.get(starred_column, "").casefold() in {"1", "true", "yes", "on", "starred"},
+                        )
+                    if identifier and enabled_column:
+                        db.set_author_enabled(
+                            identifier,
+                            row.get(enabled_column, "yes").casefold() not in {"0", "false", "no", "off", "disabled"},
+                        )
+                    if identifier:
+                        for tag in (*import_tags, *_split_tags(row.get(tags_column, "") if tags_column else "")):
+                            db.add_author_tag(identifier, tag)
+                    if identifier and notes_column:
+                        stored_author = db.get_author(identifier)
+                        if stored_author is not None:
+                            db.set_object_notes(
+                                "author", int(stored_author["id"]), row.get(notes_column, "")
+                            )
+                    imported += 1
+        except (UnicodeDecodeError, ValueError) as exc:
+            return RedirectResponse(
+                _notice_url("/authors", f"Could not import authors: {exc}", level="error"),
+                status_code=303,
+            )
+        finally:
+            await upload.close()
+        return RedirectResponse(
+            _notice_url("/authors", f"Imported {imported} author row{'s' if imported != 1 else ''}."),
+            status_code=303,
+        )
+
     @app.get("/authors/{openalex_id}/blogs", response_class=HTMLResponse)
     def author_blogs(request: Request, openalex_id: str) -> HTMLResponse:
+        tag = request.query_params.get("tag", "").strip()[:80]
         with Database(config.paths.database) as db:
             author = db.get_author(openalex_id)
             if author is None or not author["tracked"]:
                 raise HTTPException(404, "Author not found")
-            blogs = db.author_blogs(openalex_id)
+            blogs = db.author_blogs(openalex_id, tag=tag)
+            content_tags = db.list_content_tags()
         return render(
             request,
             "author_blogs.html",
             author=author,
             blogs=blogs,
+            active_tag=tag,
+            content_tags=content_tags,
             source_modes=sorted(SOURCE_MODES),
         )
 
@@ -1485,7 +1958,7 @@ def create_app(
                 form.get("article_url_pattern")
             )
             with Database(config.paths.database) as db:
-                db.add_author_blog(
+                blog_id = db.add_author_blog(
                     openalex_id,
                     url,
                     label=label,
@@ -1494,6 +1967,8 @@ def create_app(
                     content_selector=content_selector,
                     article_url_pattern=article_url_pattern,
                 )
+                for tag in _split_tags(str(form.get("tags", ""))):
+                    db.add_blog_source_tag(blog_id, tag)
         except ValueError as exc:
             return RedirectResponse(
                 _notice_url(
@@ -1507,6 +1982,37 @@ def create_app(
             _notice_url(f"/authors/{quote_plus(openalex_id)}/blogs", "Blog linked."),
             status_code=303,
         )
+
+    @app.post("/authors/{openalex_id}/blogs/{blog_id}/tags/add")
+    async def add_blog_source_tag(
+        request: Request, openalex_id: str, blog_id: int
+    ) -> Response:
+        form = await request.form()
+        try:
+            with Database(config.paths.database) as db:
+                if not db.add_blog_source_tag(blog_id, str(form.get("tag", ""))):
+                    raise HTTPException(404, "Blog source not found")
+        except ValueError as exc:
+            if request.headers.get("X-Paperwatch-Async") == "1":
+                return JSONResponse({"ok": False, "message": str(exc)}, status_code=400)
+            return RedirectResponse(
+                _notice_url(f"/authors/{quote_plus(openalex_id)}/blogs", str(exc), level="error"),
+                status_code=303,
+            )
+        if request.headers.get("X-Paperwatch-Async") == "1":
+            return JSONResponse({"ok": True})
+        return RedirectResponse(f"/authors/{quote_plus(openalex_id)}/blogs", status_code=303)
+
+    @app.post("/authors/{openalex_id}/blogs/{blog_id}/tags/remove")
+    async def remove_blog_source_tag(
+        request: Request, openalex_id: str, blog_id: int
+    ) -> Response:
+        form = await request.form()
+        with Database(config.paths.database) as db:
+            db.remove_blog_source_tag(blog_id, str(form.get("tag", "")))
+        if request.headers.get("X-Paperwatch-Async") == "1":
+            return JSONResponse({"ok": True})
+        return RedirectResponse(f"/authors/{quote_plus(openalex_id)}/blogs", status_code=303)
 
     @app.post("/authors/{openalex_id}/blogs/{blog_id}/remove")
     def remove_author_blog(openalex_id: str, blog_id: int) -> RedirectResponse:
@@ -1649,6 +2155,10 @@ def create_app(
                         source_url=entry_url,
                         published_at=published_at or None,
                     )
+                for tag in _split_tags(str(form.get("tags", ""))):
+                    db.add_blog_entry_tag(entry_id, tag)
+                if str(form.get("notes", "")).strip():
+                    db.set_object_notes("blog", entry_id, str(form.get("notes", "")))
         except ValueError as exc:
             return RedirectResponse(
                 _notice_url("/blogs/import", str(exc), level="error"), status_code=303
@@ -1671,6 +2181,7 @@ def create_app(
             entry_tags = db.blog_entry_tags(entry_id)
             content_tags = db.list_content_tags()
             tracked_authors = db.blog_authors(int(entry["blog_id"])) if entry else []
+            classifications = db.classification_results_for_content("blog", entry_id)
         if entry is None:
             raise HTTPException(404, "Blog update not found")
         entry_view = dict(entry)
@@ -1678,6 +2189,7 @@ def create_app(
             {
                 "name": str(author["name"]),
                 "url": f"/authors/{quote_plus(str(author['openalex_id']))}/blogs",
+                "entries_url": f"/?content=blogs&author={quote_plus(str(author['openalex_id']))}",
             }
             for author in tracked_authors
         ]
@@ -1693,6 +2205,7 @@ def create_app(
             model_profiles=config.available_llms,
             entry_tags=entry_tags,
             content_tags=content_tags,
+            classifications=classifications,
         )
 
     @app.post("/blogs/{entry_id}/prompt")
@@ -1741,31 +2254,56 @@ def create_app(
         return RedirectResponse(_notice_url(f"/blogs/{entry_id}", message), status_code=303)
 
     @app.post("/blogs/{entry_id}/tags/add")
-    async def add_blog_content_tag(request: Request, entry_id: int) -> RedirectResponse:
+    async def add_blog_content_tag(request: Request, entry_id: int) -> Response:
         form = await request.form()
+        tag = str(form.get("tag", ""))
         try:
             with Database(config.paths.database) as db:
-                if not db.add_blog_entry_tag(entry_id, str(form.get("tag", ""))):
+                if not db.add_blog_entry_tag(entry_id, tag):
                     raise HTTPException(404, "Blog entry not found")
         except ValueError as exc:
-            return RedirectResponse(
-                _notice_url(f"/blogs/{entry_id}", str(exc), level="error"), status_code=303
-            )
-        return RedirectResponse(
-            _notice_url(f"/blogs/{entry_id}", "Tag added."), status_code=303
-        )
+            if _async_request(request):
+                return JSONResponse({"ok": False, "message": str(exc)}, status_code=400)
+            return RedirectResponse(_notice_url(f"/blogs/{entry_id}", str(exc), level="error"), status_code=303)
+        if _async_request(request):
+            return JSONResponse({"ok": True, "tag": tag})
+        return RedirectResponse(_notice_url(f"/blogs/{entry_id}", "Tag added."), status_code=303)
 
     @app.post("/blogs/{entry_id}/tags/remove")
-    async def remove_blog_content_tag(request: Request, entry_id: int) -> RedirectResponse:
+    async def remove_blog_content_tag(request: Request, entry_id: int) -> Response:
         form = await request.form()
+        tag = str(form.get("tag", ""))
         try:
             with Database(config.paths.database) as db:
-                db.remove_blog_entry_tag(entry_id, str(form.get("tag", "")))
+                db.remove_blog_entry_tag(entry_id, tag)
         except ValueError as exc:
-            return RedirectResponse(
-                _notice_url(f"/blogs/{entry_id}", str(exc), level="error"), status_code=303
-            )
+            if _async_request(request):
+                return JSONResponse({"ok": False, "message": str(exc)}, status_code=400)
+            return RedirectResponse(_notice_url(f"/blogs/{entry_id}", str(exc), level="error"), status_code=303)
+        if _async_request(request):
+            return JSONResponse({"ok": True, "tag": tag})
         return RedirectResponse(f"/blogs/{entry_id}", status_code=303)
+
+    @app.post("/content/{content_type}/{record_id}/classifications/{query_id}")
+    async def update_content_classification(
+        request: Request,
+        content_type: str,
+        record_id: int,
+        query_id: int,
+    ) -> Response:
+        form = await request.form()
+        value = str(form.get("value", ""))
+        try:
+            with Database(config.paths.database) as db:
+                if not db.set_content_classification(query_id, content_type, record_id, value):
+                    raise HTTPException(404, "Classification or content not found")
+        except ValueError as exc:
+            if _async_request(request):
+                return JSONResponse({"ok": False, "message": str(exc)}, status_code=400)
+            return RedirectResponse(_notice_url(_request_return_path(request), str(exc), level="error"), status_code=303)
+        if _async_request(request):
+            return JSONResponse({"ok": True, "value": value})
+        return RedirectResponse(_request_return_path(request), status_code=303)
 
     @app.post("/authors/search")
     async def search_authors(request: Request) -> RedirectResponse:
@@ -1822,6 +2360,17 @@ def create_app(
                 raise HTTPException(404, "Author not found")
         return RedirectResponse(_notice_url("/authors", "Author enabled."), status_code=303)
 
+    @app.post("/authors/{openalex_id}/star")
+    async def star_author(request: Request, openalex_id: str) -> Response:
+        form = await request.form()
+        starred = str(form.get("starred", "")) in {"1", "true", "on"}
+        with Database(config.paths.database) as db:
+            if not db.set_author_starred(openalex_id, starred):
+                raise HTTPException(404, "Author not found")
+        if request.headers.get("X-Paperwatch-Async") == "1":
+            return JSONResponse({"ok": True, "starred": starred})
+        return RedirectResponse(_request_return_path(request, "/authors"), status_code=303)
+
     @app.post("/authors/{openalex_id}/disable")
     def disable_author(openalex_id: str) -> RedirectResponse:
         with Database(config.paths.database) as db:
@@ -1837,7 +2386,7 @@ def create_app(
         return RedirectResponse(_notice_url("/authors", "Author removed from tracking; its database record was retained."), status_code=303)
 
     @app.post("/authors/{openalex_id}/tags")
-    async def add_author_tag(request: Request, openalex_id: str) -> RedirectResponse:
+    async def add_author_tag(request: Request, openalex_id: str) -> Response:
         form = await request.form()
         tag = str(form.get("tag", "")).strip()
         try:
@@ -1845,17 +2394,21 @@ def create_app(
                 if not db.add_author_tag(openalex_id, tag):
                     raise HTTPException(404, "Author not found")
         except ValueError as exc:
-            return RedirectResponse(
-                _notice_url("/authors", str(exc), level="error"), status_code=303
-            )
+            if _async_request(request):
+                return JSONResponse({"ok": False, "message": str(exc)}, status_code=400)
+            return RedirectResponse(_notice_url("/authors", str(exc), level="error"), status_code=303)
+        if _async_request(request):
+            return JSONResponse({"ok": True, "tag": tag})
         return RedirectResponse(_notice_url("/authors", f"Added tag {tag}."), status_code=303)
 
     @app.post("/authors/{openalex_id}/tags/remove")
-    async def remove_author_tag(request: Request, openalex_id: str) -> RedirectResponse:
+    async def remove_author_tag(request: Request, openalex_id: str) -> Response:
         form = await request.form()
         tag = str(form.get("tag", "")).strip()
         with Database(config.paths.database) as db:
             db.remove_author_tag(openalex_id, tag)
+        if _async_request(request):
+            return JSONResponse({"ok": True, "tag": tag})
         return RedirectResponse(_notice_url("/authors", f"Removed tag {tag}."), status_code=303)
 
     @app.get("/papers/import", response_class=HTMLResponse)
@@ -1891,6 +2444,8 @@ def create_app(
                     "venue",
                     "doi",
                     "arxiv_id",
+                    "tags",
+                    "notes",
                 )
             }
             form_upload = form.get("pdf")
@@ -1919,7 +2474,11 @@ def create_app(
             staged.replace(destination)
             staged = None
             with Database(config.paths.database) as db:
-                db.set_local_pdf(paper_id, str(destination))
+                db.set_local_pdf(paper_id, str(destination), pdf_sha256(destination))
+                for tag in _split_tags(values.get("tags", "")):
+                    db.add_paper_tag(paper_id, tag)
+                if values.get("notes", "").strip():
+                    db.set_object_notes("paper", paper_id, values["notes"])
             if backup is not None:
                 backup.unlink(missing_ok=True)
             return RedirectResponse(
@@ -2079,7 +2638,7 @@ def create_app(
             paper_row = db.get_paper(paper_id)
             if paper_row is None:
                 raise HTTPException(404, "Paper not found")
-            paper = _paper_view(paper_row)
+            paper = _paper_pdf_state(db, _paper_view(paper_row))
             author_rows = [_author_view(row) for row in db.paper_authors(paper_id)]
             default_author_index = next(
                 (index for index, author in enumerate(author_rows) if bool(author.get("is_tracked"))),
@@ -2099,6 +2658,7 @@ def create_app(
             ]
             paper_tags = db.paper_tags(paper_id)
             content_tags = db.list_content_tags()
+            classifications = db.classification_results_for_content("paper", paper_id)
         return render(
             request,
             "paper_detail.html",
@@ -2114,6 +2674,7 @@ def create_app(
             metadata=_json_value(paper["metadata_json"], {}),
             paper_tags=paper_tags,
             content_tags=content_tags,
+            classifications=classifications,
         )
 
     @app.post("/papers/{paper_id}/authors/{openalex_id}/add")
@@ -2149,30 +2710,34 @@ def create_app(
         )
 
     @app.post("/papers/{paper_id}/tags/add")
-    async def add_paper_content_tag(request: Request, paper_id: int) -> RedirectResponse:
+    async def add_paper_content_tag(request: Request, paper_id: int) -> Response:
         form = await request.form()
+        tag = str(form.get("tag", ""))
         try:
             with Database(config.paths.database) as db:
-                if not db.add_paper_tag(paper_id, str(form.get("tag", ""))):
+                if not db.add_paper_tag(paper_id, tag):
                     raise HTTPException(404, "Paper not found")
         except ValueError as exc:
-            return RedirectResponse(
-                _notice_url(f"/papers/{paper_id}", str(exc), level="error"), status_code=303
-            )
-        return RedirectResponse(
-            _notice_url(f"/papers/{paper_id}", "Tag added."), status_code=303
-        )
+            if _async_request(request):
+                return JSONResponse({"ok": False, "message": str(exc)}, status_code=400)
+            return RedirectResponse(_notice_url(f"/papers/{paper_id}", str(exc), level="error"), status_code=303)
+        if _async_request(request):
+            return JSONResponse({"ok": True, "tag": tag})
+        return RedirectResponse(_notice_url(f"/papers/{paper_id}", "Tag added."), status_code=303)
 
     @app.post("/papers/{paper_id}/tags/remove")
-    async def remove_paper_content_tag(request: Request, paper_id: int) -> RedirectResponse:
+    async def remove_paper_content_tag(request: Request, paper_id: int) -> Response:
         form = await request.form()
+        tag = str(form.get("tag", ""))
         try:
             with Database(config.paths.database) as db:
-                db.remove_paper_tag(paper_id, str(form.get("tag", "")))
+                db.remove_paper_tag(paper_id, tag)
         except ValueError as exc:
-            return RedirectResponse(
-                _notice_url(f"/papers/{paper_id}", str(exc), level="error"), status_code=303
-            )
+            if _async_request(request):
+                return JSONResponse({"ok": False, "message": str(exc)}, status_code=400)
+            return RedirectResponse(_notice_url(f"/papers/{paper_id}", str(exc), level="error"), status_code=303)
+        if _async_request(request):
+            return JSONResponse({"ok": True, "tag": tag})
         return RedirectResponse(f"/papers/{paper_id}", status_code=303)
 
     @app.post("/papers/{paper_id}/analyze")
@@ -2319,6 +2884,104 @@ def create_app(
             raise HTTPException(500, f"Could not open PDF: {exc}") from exc
         return Response(status_code=204)
 
+    @app.post("/papers/{paper_id}/pdf/upload")
+    async def replace_local_pdf(request: Request, paper_id: int) -> RedirectResponse:
+        upload: UploadFile | None = None
+        staged: Path | None = None
+        backup: Path | None = None
+        destination: Path | None = None
+        try:
+            form = await request.form(
+                max_files=1,
+                max_fields=5,
+                max_part_size=config.fetch.max_pdf_bytes,
+            )
+            candidate = form.get("pdf")
+            if not isinstance(candidate, UploadFile) or not candidate.filename:
+                raise ValueError("Choose a PDF file")
+            upload = candidate
+            staged = await _stage_uploaded_pdf(
+                upload,
+                directory=config.paths.pdf_dir,
+                max_bytes=config.fetch.max_pdf_bytes,
+            )
+            with Database(config.paths.database) as db:
+                paper = db.get_paper(paper_id)
+                if paper is None:
+                    raise HTTPException(404, "Paper not found")
+                destination = config.paths.pdf_dir / safe_pdf_name(str(paper["identity_key"]))
+            if destination.exists():
+                backup = destination.with_suffix(destination.suffix + f".backup-{uuid.uuid4().hex}")
+                destination.replace(backup)
+            staged.replace(destination)
+            staged = None
+            with Database(config.paths.database) as db:
+                db.set_local_pdf(paper_id, str(destination), pdf_sha256(destination))
+            if backup is not None:
+                backup.unlink(missing_ok=True)
+            return RedirectResponse(
+                _notice_url(f"/papers/{paper_id}", "Local PDF replaced."),
+                status_code=303,
+            )
+        except (ValueError, PDFError, OSError) as exc:
+            if destination is not None and backup is not None and backup.exists():
+                destination.unlink(missing_ok=True)
+                backup.replace(destination)
+            return RedirectResponse(
+                _notice_url(f"/papers/{paper_id}", str(exc), level="error"),
+                status_code=303,
+            )
+        finally:
+            if upload is not None:
+                await upload.close()
+            if staged is not None:
+                staged.unlink(missing_ok=True)
+            if backup is not None:
+                backup.unlink(missing_ok=True)
+
+    @app.post("/papers/{paper_id}/pdf/restore")
+    def restore_local_pdf(paper_id: int) -> RedirectResponse:
+        with Database(config.paths.database) as db:
+            paper = db.get_paper(paper_id)
+            if paper is None:
+                raise HTTPException(404, "Paper not found")
+            pdf_url = str(paper["pdf_url"] or "").strip()
+            if not pdf_url:
+                return RedirectResponse(
+                    _notice_url(
+                        f"/papers/{paper_id}",
+                        "No remote PDF URL is stored for this paper.",
+                        level="error",
+                    ),
+                    status_code=303,
+                )
+            destination = config.paths.pdf_dir / safe_pdf_name(str(paper["identity_key"]))
+        backup = destination.with_suffix(destination.suffix + f".backup-{uuid.uuid4().hex}")
+        try:
+            if destination.exists():
+                destination.replace(backup)
+            download_pdf(
+                pdf_url,
+                destination,
+                max_bytes=config.fetch.max_pdf_bytes,
+            )
+            validate_pdf_file(destination)
+            with Database(config.paths.database) as db:
+                db.set_local_pdf(paper_id, str(destination), pdf_sha256(destination))
+            backup.unlink(missing_ok=True)
+        except (PDFError, OSError) as exc:
+            destination.unlink(missing_ok=True)
+            if backup.exists():
+                backup.replace(destination)
+            return RedirectResponse(
+                _notice_url(f"/papers/{paper_id}", str(exc), level="error"),
+                status_code=303,
+            )
+        return RedirectResponse(
+            _notice_url(f"/papers/{paper_id}", "PDF restored from the remote source."),
+            status_code=303,
+        )
+
     @app.get("/papers/{paper_id}/pdf")
     def local_pdf(paper_id: int) -> FileResponse:
         path = local_pdf_path(paper_id)
@@ -2463,6 +3126,10 @@ def create_app(
             "regexp_radius": 0,
             "regexp_mode": "query",
             "content_scope": "both",
+            "query_kind": "summary",
+            "label_class": "",
+            "label_values": [],
+            "label_values_text": "",
             "local_regexp": False,
         }
         return render(
@@ -2593,6 +3260,21 @@ def create_app(
                 )
             db.delete_saved_query(query_id)
         return RedirectResponse(_notice_url("/queries", "Saved query deleted."), status_code=303)
+
+    @app.post("/queries/{query_id}/classifications/delete")
+    def delete_query_classifications(query_id: int) -> RedirectResponse:
+        with Database(config.paths.database) as db:
+            query = db.get_saved_query(query_id)
+            if query is None:
+                raise HTTPException(404, "Saved query not found")
+            removed = db.clear_query_classifications(query_id)
+        return RedirectResponse(
+            _notice_url(
+                f"/queries#query-{query_id}",
+                f"Removed {removed} classification result{'s' if removed != 1 else ''}.",
+            ),
+            status_code=303,
+        )
 
     @app.post("/queries/{query_id}/run")
     async def run_query(request: Request, query_id: int) -> RedirectResponse:

@@ -11,7 +11,9 @@
     <label><span>Published time</span><input name="published_at" placeholder="2026-08-02T08:00:00+02:00"></label>
     <label class="full"><span>Entry title</span><input name="entry_title" required></label>
     <label class="full"><span>Entry URL</span><input type="url" name="entry_url" required placeholder="https://example.com/blog/post"></label>
+    <label class="full"><span>Tags</span><input name="tags" placeholder="evaluation, agents"><small>Separate tags with commas, semicolons, or new lines.</small></label>
     <label class="full"><span>Entry text</span><textarea name="content" rows="24" required placeholder="Paste the article text here."></textarea></label>
+    <label class="full"><span>Notes (optional, Markdown)</span><textarea name="notes" rows="6"></textarea></label>
     <div class="button-group full"><button class="button button-primary" type="submit">Import entry</button><a class="button" href="/blogs">Cancel</a></div>
   </form>
 </section>

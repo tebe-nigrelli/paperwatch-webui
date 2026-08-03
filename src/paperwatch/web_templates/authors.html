@@ -6,11 +6,22 @@
   <article class="panel">
     <div class="panel-heading"><div><h2>Add author manually</h2><p>OpenAlex IDs enable paper fetching. Authors without one remain blog-only.</p></div></div>
     <form method="post" action="/authors/manual" class="compact-form author-manual-form">
-      <label><span>Name</span><input name="name" maxlength="300" required placeholder="Author name"></label>
+      <label><span>Author Name</span><input name="name" maxlength="300" required placeholder="Author name"></label>
       <label><span>Institution</span><input name="institution" maxlength="300" placeholder="Optional"></label>
       <label><span>OpenAlex author ID</span><input name="openalex_id" maxlength="40" placeholder="Optional, for example A123456789"></label>
+      <label><span>Tags</span><input name="tags" maxlength="500" placeholder="comma-separated"></label>
+      <label class="grow"><span>Notes</span><input name="notes" maxlength="200000" placeholder="Optional Markdown notes"></label>
       <button class="button button-primary" type="submit">Add author</button>
     </form>
+    <div class="author-csv-import-row">
+      <form method="post" action="/authors/import" enctype="multipart/form-data" class="inline-blog-csv-form">
+        <label class="grow"><span>Author CSV import</span><input type="file" name="csv_file" accept=".csv,text/csv" required></label>
+        <label><span>Tags for every imported author</span><input name="import_tags" placeholder="optional, comma-separated"></label>
+        <button class="button button-primary" type="submit">Import authors</button>
+      </form>
+      <button class="icon-button info-button" type="button" data-dialog-open="author-csv-info" aria-label="Author CSV schema" title="Author CSV schema">ⓘ</button>
+      <a class="button button-small" href="/exports/authors.csv">Export authors CSV</a>
+    </div>
   </article>
   <article class="panel">
     <div class="panel-heading"><div><h2>Import blog links</h2><p>Link one source directly, or match a CSV by exact author name.</p></div></div>
@@ -18,12 +29,16 @@
       <form method="post" action="/authors/blogs/manual" class="inline-blog-import-form">
         <label><span>Manual blog import</span><select name="openalex_id" required><option value="">Choose author</option>{% for author in authors %}<option value="{{ author.openalex_id }}">{{ author.name }}</option>{% endfor %}</select></label>
         <label class="grow"><span>Blog URL</span><input type="url" name="url" maxlength="2000" required placeholder="https://example.com/blog/"></label>
+        <label><span>Tags</span><input name="tags" placeholder="optional, comma-separated"></label>
         <button class="button button-primary" type="submit">Link blog</button>
       </form>
       <form method="post" action="/authors/blogs/import" enctype="multipart/form-data" class="inline-blog-csv-form">
         <label class="grow"><span>CSV import</span><input type="file" name="csv_file" accept=".csv,text/csv" required></label>
         <label class="check-row compact-check"><input type="checkbox" name="create_missing" value="1"><span>Create missing authors</span></label>
+        <label><span>Tags for every imported object</span><input name="import_tags" placeholder="optional, comma-separated"></label>
         <button class="button button-primary" type="submit">Import CSV</button>
+        <button class="icon-button info-button" type="button" data-dialog-open="blog-csv-info" aria-label="Blogs CSV schema" title="Blogs CSV schema">ⓘ</button>
+        <a class="button button-small" href="/exports/blogs.csv">Export blogs CSV</a>
       </form>
     </div>
   </article>
@@ -35,20 +50,24 @@
   </div>
   <form method="get" action="/authors" class="author-filter-form">
     <label class="grow"><span>Filter tracked authors</span><input id="author-filter" name="q" value="{{ author_query or '' }}" placeholder="Name, tag, university, ORCID, or OpenAlex ID" autocomplete="off"></label>
+    <label><span>Star</span><select name="starred"><option value="">Any</option><option value="yes" {% if author_starred is sameas true %}selected{% endif %}>Starred</option><option value="no" {% if author_starred is sameas false %}selected{% endif %}>Not starred</option></select></label>
+    <label><span>Tag</span><select name="tag"><option value="">All tags</option>{% for tag in tags %}<option value="{{ tag.name }}" {% if active_tag == tag.name %}selected{% endif %}>{{ tag.name }}</option>{% endfor %}</select></label>
     <button class="button button-primary" type="submit">Filter</button>
-    {% if author_query or active_tag %}<a class="button" href="/authors">Clear</a>{% endif %}
+    {% if author_query or active_tag or author_starred is not none %}<a class="button" href="/authors">Clear</a>{% endif %}
   </form>
   <div class="table-wrap">
     <table class="author-table" id="tracked-authors-table">
-      <thead><tr><th class="author-name-column">Name<br>University</th><th class="author-openalex-column">OpenAlex ID</th><th class="author-papers-column">Papers</th><th class="author-blogs-column">Blogs</th><th class="author-sources-column">Sources</th><th class="author-tags-column">Add tag</th><th class="author-state-column">Pause / resume</th><th class="author-remove-column">Remove</th></tr></thead>
+      <thead><tr><th class="author-name-column">Name<br>University</th><th class="author-star-column">Star</th><th class="author-openalex-column">OpenAlex ID</th><th class="author-papers-column">Papers</th><th class="author-blogs-column">Blogs</th><th class="author-sources-column">Sources</th><th class="author-tags-column">Add tag</th><th class="author-state-column">Pause / resume</th><th class="author-remove-column">Remove</th></tr></thead>
       <tbody id="tracked-author-rows">
       {% for author in authors %}
-      <tr data-author-search="{{ author.name }} {{ author.institution or '' }} {{ author.tags }} {{ author.orcid or '' }} {{ author.openalex_id }}">
+      <tr{% if author.notes %} class="object-row-mark"{% endif %} data-author-search="{{ author.name }} {{ author.institution or '' }} {{ author.tags }} {{ author.orcid or '' }} {{ author.openalex_id }}">
         <td class="author-identity-cell">
           <a class="author-name" href="/?author={{ author.openalex_id }}">{{ author.name }}</a>
           <small>{{ author.institution or ('Blog-only author' if author.is_local else 'University unavailable') }}</small>
-          {% if author.tags %}<div class="tag-list compact-tags">{% for tag in author.tags.split(', ') if tag %}<form method="post" action="/authors/{{ author.openalex_id }}/tags/remove"><input type="hidden" name="tag" value="{{ tag }}"><button class="tag tag-removable" title="Remove tag {{ tag }}">{{ tag }} ×</button></form>{% endfor %}</div>{% endif %}
+          {% if author.tags %}<div class="tag-list compact-tags">{% for tag in author.tags.split(', ') if tag %}<form method="post" action="/authors/{{ author.openalex_id }}/tags/remove" data-async-action data-refresh-selector="tr[data-author-search]"><input type="hidden" name="tag" value="{{ tag }}"><button class="tag tag-removable" title="Remove tag {{ tag }}">{{ tag }} ×</button></form>{% endfor %}</div>{% endif %}
+          <details class="row-notes-editor"><summary>Notes{% if author.notes %} · saved{% endif %}</summary>{% if author.notes %}<article class="notes-rendered">{{ author.notes|markdown|safe }}</article>{% endif %}<form method="post" action="/notes/author/{{ author.id }}" data-async-action><textarea name="notes" rows="4" maxlength="200000">{{ author.notes or '' }}</textarea><button class="button button-small" type="submit">Save</button></form></details>
         </td>
+        <td class="author-star-cell"><form method="post" action="/authors/{{ author.openalex_id }}/star" data-content-state><input type="hidden" name="starred" value="{{ 0 if author.starred else 1 }}"><button class="icon-button star-button{% if author.starred %} is-starred{% endif %}" type="submit" aria-label="{{ 'Unstar' if author.starred else 'Star' }} {{ author.name }}" title="{{ 'Unstar' if author.starred else 'Star' }} {{ author.name }}">{{ '★' if author.starred else '☆' }}</button></form></td>
         <td class="author-openalex-cell">
           <form method="post" action="/authors/{{ author.openalex_id }}/openalex-id" class="author-openalex-form">
             <input name="openalex_id" value="{{ '' if author.is_local else author.openalex_id }}" maxlength="40" placeholder="A123456789" aria-label="OpenAlex ID for {{ author.name }}" title="Edit the ID and press Enter" autocomplete="off" required>
@@ -58,14 +77,16 @@
         <td>{% if author.is_local %}<span class="muted">—</span>{% else %}<a href="/?author={{ author.openalex_id }}">{{ author.paper_count }}</a>{% endif %}</td>
         <td class="author-blogs-cell"><a href="/authors/{{ author.openalex_id }}/blogs">{{ author.blog_count }} · Manage</a></td>
         <td><div class="external-links"><a href="https://scholar.google.com/scholar?q=author%3A%22{{ author.name|urlencode }}%22" target="_blank" rel="noreferrer">Scholar</a>{% if not author.is_local %}<a href="https://openalex.org/authors/{{ author.openalex_id|lower }}" target="_blank" rel="noreferrer">OpenAlex</a><a href="https://arxiv.org/search/?query={{ author.name|urlencode }}&searchtype=author" target="_blank" rel="noreferrer">arXiv</a>{% endif %}</div></td>
-        <td class="tag-entry-cell"><form method="post" action="/authors/{{ author.openalex_id }}/tags" class="tag-entry-form"><input name="tag" list="tag-suggestions" placeholder="Add tag" aria-label="Add tag to {{ author.name }}" maxlength="40" autocomplete="off" required></form></td>
+        <td class="tag-entry-cell"><form method="post" action="/authors/{{ author.openalex_id }}/tags" class="tag-entry-form" data-async-action><input name="tag" list="tag-suggestions" placeholder="Add tag" aria-label="Add tag to {{ author.name }}" maxlength="40" autocomplete="off" required></form></td>
         <td class="icon-action-cell">{% if author.is_local %}<span class="muted" title="Add an OpenAlex ID to enable paper fetching">Blog-only</span>{% elif author.enabled %}<form method="post" action="/authors/{{ author.openalex_id }}/disable"><button class="icon-button" type="submit" title="Pause fetching {{ author.name }}" aria-label="Pause fetching {{ author.name }}">⏸</button></form>{% else %}<form method="post" action="/authors/{{ author.openalex_id }}/enable"><button class="icon-button" type="submit" title="Resume fetching {{ author.name }}" aria-label="Resume fetching {{ author.name }}">▶</button></form>{% endif %}</td>
         <td class="icon-action-cell"><form method="post" action="/authors/{{ author.openalex_id }}/remove" data-confirm="Remove this author from the tracking list? Stored papers, blogs, and history remain."><button class="icon-button icon-danger" type="submit" title="Remove {{ author.name }} from tracking" aria-label="Remove {{ author.name }} from tracking">×</button></form></td>
       </tr>
-      {% else %}<tr><td colspan="8" class="empty">No tracked authors match this filter.</td></tr>{% endfor %}
+      {% else %}<tr><td colspan="9" class="empty">No tracked authors match this filter.</td></tr>{% endfor %}
       </tbody>
     </table>
   </div>
   <datalist id="tag-suggestions">{% for tag in tags %}<option value="{{ tag.name }}">{% endfor %}</datalist>
 </section>
+<dialog id="author-csv-info" class="info-dialog"><div class="panel-heading"><div><h2>Author CSV schema</h2><p>Headers are trimmed and matched case-insensitively.</p></div><button class="icon-button dialog-close-button" type="button" data-dialog-close aria-label="Close">×</button></div><table><thead><tr><th>Column</th><th>Required</th><th>Meaning</th></tr></thead><tbody><tr><td>Author Name</td><td>Yes</td><td>Also accepts Name or Researcher / author.</td></tr><tr><td>Institution</td><td>No</td><td>Also accepts Current lab / organization.</td></tr><tr><td>OpenAlex ID</td><td>No</td><td>For example A123456789. Without it, the author is blog-only.</td></tr><tr><td>Starred</td><td>No</td><td>yes, true, 1, on, or starred.</td></tr><tr><td>Enabled</td><td>No</td><td>yes/no fetch state.</td></tr><tr><td>Tags</td><td>No</td><td>Comma-separated tags.</td></tr><tr><td>Notes</td><td>No</td><td>Markdown comments.</td></tr></tbody></table><p><code>Author Name,Institution,OpenAlex ID,Starred,Enabled,Tags,Notes</code></p></dialog>
+<dialog id="blog-csv-info" class="info-dialog"><div class="panel-heading"><div><h2>Blogs CSV schema</h2><p>Headers are trimmed. The watchlist schema and compact exports are both accepted.</p></div><button class="icon-button dialog-close-button" type="button" data-dialog-close aria-label="Close">×</button></div><table><thead><tr><th>Column</th><th>Required</th><th>Meaning</th></tr></thead><tbody><tr><td>Researcher / author</td><td>Yes</td><td>Exact tracked author name.</td></tr><tr><td>Primary source URL</td><td>Yes</td><td>First blog/source URL.</td></tr><tr><td>Primary applied-ML source</td><td>No</td><td>Display label.</td></tr><tr><td>Primary source type/mode</td><td>No</td><td>Extraction hints.</td></tr><tr><td>Primary tags / Blog tags</td><td>No</td><td>Comma-separated source tags.</td></tr><tr><td>Notes</td><td>No</td><td>Markdown source notes in exports.</td></tr></tbody></table></dialog>
 {% endblock %}

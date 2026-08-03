@@ -265,11 +265,27 @@
 
   const paperTableBody = document.getElementById("paper-table-body");
   if (paperTableBody) {
-    const selectionKey = "paperwatch-selected-papers";
     const hiddenInput = document.getElementById("selected-paper-ids");
     const status = document.getElementById("paper-selection-status");
     const runLabel = document.getElementById("collection-run-label");
     const clear = document.getElementById("clear-paper-selection");
+    const persistentDock = document.querySelector(".selected-content-dock");
+    if (persistentDock) {
+      const selectedIds = Array.from(
+        persistentDock.querySelectorAll(".paper-select-toggle:checked")
+      ).map((checkbox) => String(checkbox.value));
+      if (hiddenInput) hiddenInput.value = selectedIds.join(",");
+      if (clear) clear.hidden = true;
+      if (runLabel && selectedIds.length) {
+        runLabel.textContent = `Run on ${selectedIds.length} selected paper${selectedIds.length === 1 ? "" : "s"}`;
+      }
+      if (status) {
+        status.textContent = selectedIds.length
+          ? "The persistent selection is used. Change it with the first column or the selected-content panel."
+          : "No papers are persistently selected; the run uses the visible paper results.";
+      }
+    } else {
+    const selectionKey = "paperwatch-selected-papers";
     let selected = new Set();
     try {
       const saved = JSON.parse(storageGet(selectionKey) || "[]");
@@ -307,6 +323,7 @@
     });
     if (clear) clear.addEventListener("click", () => { selected.clear(); updateSelection(); });
     updateSelection();
+    }
   }
 
   const paperJobs = document.getElementById("paper-jobs");
@@ -554,7 +571,7 @@
     const multiple = select.multiple;
     const enabledOptions = Array.from(select.options).filter((option) => !option.disabled);
     const cycle = !multiple && enabledOptions.length > 0 && enabledOptions.length <= 5;
-    const form = select.closest("form");
+    const form = select.form || select.closest("form");
     const autoApply = () => {
       if (form && (form.method || "get").toLocaleLowerCase() === "get") form.requestSubmit();
     };
@@ -790,8 +807,57 @@
       const next = options[(current + 1) % options.length];
       input.value = next.value;
       render();
+      input.dispatchEvent(new Event("change", { bubbles: true }));
     });
     render();
+  });
+
+  const queryKindInput = document.querySelector('input[name="query_kind"][data-cycle-value]');
+  const classificationSettings = document.querySelector("[data-classification-settings]");
+  if (queryKindInput && classificationSettings) {
+    const updateClassificationSettings = () => {
+      classificationSettings.hidden = queryKindInput.value !== "classification";
+    };
+    queryKindInput.addEventListener("change", updateClassificationSettings);
+    updateClassificationSettings();
+  }
+
+  document.querySelectorAll("[data-dialog-open]").forEach((button) => {
+    button.addEventListener("click", () => {
+      const dialog = document.getElementById(button.dataset.dialogOpen || "");
+      if (dialog?.showModal) dialog.showModal();
+    });
+  });
+  document.querySelectorAll("dialog [data-dialog-close]").forEach((button) => {
+    button.addEventListener("click", () => button.closest("dialog")?.close());
+  });
+  document.querySelectorAll("dialog").forEach((dialog) => {
+    dialog.addEventListener("click", (event) => {
+      if (event.target === dialog) dialog.close();
+    });
+  });
+
+  document.querySelectorAll("[data-auto-read]").forEach((element) => {
+    const contentType = element.dataset.contentType;
+    const contentId = element.dataset.contentId;
+    if (!contentType || !contentId) return;
+    let timer = window.setTimeout(async () => {
+      timer = null;
+      const body = new FormData();
+      body.set("read", "1");
+      try {
+        await fetch(`/content/${encodeURIComponent(contentType)}/${encodeURIComponent(contentId)}/read`, {
+          method: "POST",
+          body,
+          headers: { "X-Paperwatch-Async": "1", "Accept": "application/json" },
+        });
+      } catch (_) {
+        // Reading state is a convenience signal; a later visit can retry it.
+      }
+    }, 5000);
+    window.addEventListener("pagehide", () => {
+      if (timer !== null) window.clearTimeout(timer);
+    }, { once: true });
   });
 
   const picker = document.getElementById("author-picker");
@@ -831,4 +897,175 @@
     });
     update();
   }
+
+
+  let dynamicSelectIndex = 10000;
+  const initializeDynamicSelects = (root = document) => {
+    root.querySelectorAll("select").forEach((select) => enhanceSelect(select, dynamicSelectIndex++));
+  };
+
+  const parseHtml = (text) => new DOMParser().parseFromString(text, "text/html");
+  const replaceFromResponse = async (response, selector) => {
+    if (!response.ok) throw new Error(`Request failed with HTTP ${response.status}`);
+    const doc = parseHtml(await response.text());
+    const incoming = doc.querySelector(selector);
+    const current = document.querySelector(selector);
+    if (!incoming || !current) return false;
+    current.replaceWith(incoming);
+    initializeDynamicSelects(incoming);
+    return true;
+  };
+  const refreshContentPage = async (url = window.location.href, push = false) => {
+    const response = await fetch(url, { headers: { "X-Paperwatch-Partial": "1" } });
+    const replaced = await replaceFromResponse(response, "#content-page-root");
+    if (replaced && push) window.history.pushState({}, "", url);
+    return replaced;
+  };
+  const refreshSelector = async (selector) => {
+    const response = await fetch(window.location.href, { headers: { "X-Paperwatch-Partial": "1" } });
+    return replaceFromResponse(response, selector);
+  };
+  const postAsync = async (form) => {
+    const response = await fetch(form.action, {
+      method: (form.method || "post").toUpperCase(),
+      body: new FormData(form),
+      headers: { "X-Paperwatch-Async": "1", "Accept": "application/json" },
+    });
+    let payload = {};
+    try { payload = await response.json(); } catch (_) { payload = {}; }
+    if (!response.ok || payload.ok === false) throw new Error(payload.message || `Request failed with HTTP ${response.status}`);
+    return payload;
+  };
+
+  document.addEventListener("submit", async (event) => {
+    const form = event.target.closest("form");
+    if (!form) return;
+    if (form.matches("[data-content-filter]")) {
+      event.preventDefault();
+      const url = new URL(form.action || window.location.href, window.location.href);
+      const params = new URLSearchParams(new FormData(form));
+      params.delete("page");
+      for (const [key, value] of Array.from(params.entries())) if (!String(value).trim()) params.delete(key);
+      url.search = params.toString();
+      try { await refreshContentPage(url.toString(), true); } catch (error) { console.error(error); }
+      return;
+    }
+    if (form.matches("[data-content-state]")) {
+      event.preventDefault();
+      try {
+        const payload = await postAsync(form);
+        if ("starred" in payload) {
+          const input = form.querySelector('input[name="starred"]');
+          const button = form.querySelector(".star-button");
+          if (input) input.value = payload.starred ? "0" : "1";
+          if (button) {
+            button.classList.toggle("is-starred", Boolean(payload.starred));
+            button.textContent = payload.starred ? "★" : "☆";
+          }
+        } else if ("read" in payload) {
+          const input = form.querySelector('input[name="read"]');
+          const button = form.querySelector(".read-state-button");
+          const row = form.closest(".content-row");
+          if (input) input.value = payload.read ? "0" : "1";
+          if (button) button.textContent = payload.read ? "Read" : "Unread";
+          if (row) row.dataset.read = payload.read ? "true" : "false";
+        } else if ("selected" in payload) {
+          await refreshContentPage(window.location.href, false);
+        }
+      } catch (error) { console.error(error); }
+      return;
+    }
+    if (form.matches("[data-async-action]")) {
+      event.preventDefault();
+      try {
+        await postAsync(form);
+        const selector = form.dataset.refreshSelector;
+        if (document.querySelector("#content-page-root")) await refreshContentPage(window.location.href, false);
+        else if (selector) await refreshSelector(selector);
+        else {
+          const panel = form.closest(".content-tags-panel, .classification-panel, .object-notes-panel");
+          if (panel && panel.classList.length) {
+            const className = Array.from(panel.classList).find((name) => name.endsWith("-panel"));
+            if (className) await refreshSelector(`.${className}`);
+          }
+        }
+      } catch (error) { console.error(error); }
+    }
+  });
+
+  document.addEventListener("click", async (event) => {
+    const link = event.target.closest("a[data-content-page]");
+    if (!link) return;
+    event.preventDefault();
+    try { await refreshContentPage(link.href, true); } catch (error) { console.error(error); }
+  });
+  window.addEventListener("popstate", () => {
+    if (document.querySelector("#content-page-root")) refreshContentPage(window.location.href, false).catch(console.error);
+  });
+
+  const escapeHtml = (value) => value.replace(/[&<>"']/g, (char) => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[char]));
+  const compileDebugRegexp = (pattern) => {
+    let flags = "g";
+    let source = pattern.trim();
+    if (source.startsWith("(?i)")) { flags += "i"; source = source.slice(4); }
+    return new RegExp(source, flags);
+  };
+  const highlightMatches = (text, patterns) => {
+    const ranges = [];
+    patterns.forEach((pattern) => {
+      if (!pattern.trim()) return;
+      const regexp = compileDebugRegexp(pattern);
+      let match;
+      let guard = 0;
+      while ((match = regexp.exec(text)) && guard++ < 1000) {
+        if (!match[0]) { regexp.lastIndex += 1; continue; }
+        ranges.push([match.index, match.index + match[0].length]);
+      }
+    });
+    ranges.sort((a, b) => a[0] - b[0]);
+    const merged = [];
+    ranges.forEach((range) => {
+      const previous = merged[merged.length - 1];
+      if (previous && range[0] <= previous[1]) previous[1] = Math.max(previous[1], range[1]);
+      else merged.push([...range]);
+    });
+    let cursor = 0;
+    return merged.map(([start, end]) => {
+      const before = escapeHtml(text.slice(cursor, start));
+      const match = `<mark>${escapeHtml(text.slice(start, end))}</mark>`;
+      cursor = end;
+      return before + match;
+    }).join("") + escapeHtml(text.slice(cursor));
+  };
+  document.querySelectorAll("[data-regexp-debug]").forEach((panel) => {
+    const mode = panel.dataset.regexpDebug;
+    const source = document.querySelector(`[data-regexp-source="${mode}"]`);
+    const input = panel.querySelector("[data-regexp-test-input]");
+    const output = panel.querySelector("[data-regexp-test-output]");
+    if (!source || !input || !output) return;
+    let timer;
+    const render = () => {
+      const raw = source.value || "";
+      const patterns = mode === "classification"
+        ? raw.split(/\r?\n/).map((line) => line.includes("=") ? line.slice(line.indexOf("=") + 1).trim() : "").filter(Boolean)
+        : [raw];
+      if (!patterns.length || !input.value) { output.textContent = "No matches to test."; return; }
+      try { output.innerHTML = highlightMatches(input.value, patterns) || escapeHtml(input.value); }
+      catch (error) { output.textContent = `Invalid regexp: ${error.message}`; }
+    };
+    const schedule = () => { window.clearTimeout(timer); timer = window.setTimeout(render, 120); };
+    source.addEventListener("input", schedule);
+    input.addEventListener("input", schedule);
+    render();
+  });
+
+  const syncDialogScroll = () => document.body.classList.toggle("dialog-open", Boolean(document.querySelector("dialog[open]")));
+  document.querySelectorAll("dialog").forEach((dialog) => {
+    dialog.addEventListener("close", syncDialogScroll);
+    dialog.addEventListener("cancel", syncDialogScroll);
+  });
+  document.addEventListener("click", (event) => {
+    if (event.target.closest("[data-dialog-open]")) window.setTimeout(syncDialogScroll, 0);
+  });
+
 })();

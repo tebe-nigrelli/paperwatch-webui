@@ -34,6 +34,7 @@ from .pdfs import (
     is_complete_pdf,
     resolve_pdf_url,
     safe_pdf_name,
+    pdf_sha256,
 )
 from .sources.arxiv import ArxivClient
 from .sources.openalex import OpenAlexClient
@@ -1050,7 +1051,7 @@ class PaperWatch:
             )
         if downloaded:
             stats.pdfs_downloaded += 1
-        self.db.set_local_pdf(paper_id, str(destination))
+        self.db.set_local_pdf(paper_id, str(destination), pdf_sha256(destination))
         stats._downloaded_paper_ids.add(paper_id)
         stats.papers_downloaded = len(stats._downloaded_paper_ids)
 

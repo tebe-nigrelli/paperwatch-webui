@@ -1,13 +1,15 @@
 {% extends "base.html" %}
 {% block title %}{{ paper.title }} · paperwatch{% endblock %}
 {% block content %}
-<section class="page-heading paper-heading">
+<section class="page-heading paper-heading"{% if not paper.read_at %} data-auto-read data-content-type="paper" data-content-id="{{ paper.id }}"{% endif %}>
   <div class="paper-meta"><span>{{ paper.publication_date or 'Unknown date' }}</span><span>{{ paper.venue or 'Venue unavailable' }}</span></div>
-  <h1>{{ paper.title }}</h1>
+  <h1{% if paper.notes or paper.pdf_modified %} class="object-name-noted"{% endif %}>{{ paper.title }}</h1>
   {% if topics %}<div class="topic-tags paper-topic-tags" aria-label="OpenAlex topics">{% for topic in topics %}<a class="tag topic-tag{% if topic.is_primary %} active{% endif %}" href="/?topic={{ topic.openalex_id }}" title="{% if topic.score is not none %}OpenAlex relevance {{ '%.3f'|format(topic.score) }}{% endif %}{% if topic.subfield_name %} · {{ topic.subfield_name }}{% endif %}">{{ topic.display_name }}</a>{% endfor %}</div>{% endif %}
 </section>
 
-<section class="panel content-tags-panel"><div class="panel-heading"><div><h2>Tags</h2><p>Tags are shared with blog entries and searchable from both lists.</p></div></div><div class="content-tag-editor"><div class="content-tag-row">{% for tag in paper_tags %}<form method="post" action="/papers/{{ paper.id }}/tags/remove"><input type="hidden" name="tag" value="{{ tag.name }}"><button class="tag removable-tag" type="submit" title="Remove tag">{{ tag.name }} ×</button></form>{% else %}<span class="muted">No tags</span>{% endfor %}</div><form method="post" action="/papers/{{ paper.id }}/tags/add" class="inline-tag-form"><label><span>Add tag</span><input name="tag" list="content-tag-options" maxlength="40" required></label><button class="button button-small" type="submit">Add</button></form><datalist id="content-tag-options">{% for tag in content_tags %}<option value="{{ tag.name }}">{% endfor %}</datalist></div></section>
+<section class="panel content-tags-panel"><div class="panel-heading"><div><h2>Tags</h2><p>Tags are shared with blog entries and searchable from both lists.</p></div></div><div class="content-tag-editor"><div class="content-tag-row">{% for tag in paper_tags %}{% if tag.generated %}<span class="tag generated-tag" title="Managed by a classifier query">{{ tag.name }}</span>{% else %}<form method="post" action="/papers/{{ paper.id }}/tags/remove" data-async-action data-refresh-selector=".content-tags-panel"><input type="hidden" name="tag" value="{{ tag.name }}"><button class="tag removable-tag" type="submit" title="Remove tag">{{ tag.name }} ×</button></form>{% endif %}{% else %}<span class="muted">No tags</span>{% endfor %}</div><form method="post" action="/papers/{{ paper.id }}/tags/add" class="inline-tag-form" data-async-action data-refresh-selector=".content-tags-panel"><label><span>Add tag</span><input name="tag" list="content-tag-options" maxlength="40" required></label><button class="button button-small" type="submit">Add</button></form><datalist id="content-tag-options">{% for tag in content_tags %}<option value="{{ tag.name }}">{% endfor %}</datalist></div></section>
+
+{% if classifications %}<section class="panel classification-panel"><div class="panel-heading"><div><h2>Classifier labels</h2><p>Values are constrained by their saved query. Manual changes remain fixed on later runs.</p></div></div><div class="classification-grid">{% for item in classifications %}<form method="post" action="/content/paper/{{ paper.id }}/classifications/{{ item.query_id }}" class="classification-row" data-async-action data-refresh-selector=".classification-panel"><label><span>{{ item.label_class }}</span><select name="value">{% for choice in item.choices %}<option value="{{ choice }}" {% if choice == item.value %}selected{% endif %}>{{ choice }}</option>{% endfor %}</select></label><button class="button button-small" type="submit">Set</button><a href="/queries#query-{{ item.query_id }}">{{ item.query_name }}</a></form>{% endfor %}</div></section>{% endif %}
 
 <section class="panel author-picker-panel">
   {% if authors %}
@@ -47,23 +49,17 @@
         <div class="button-group">
           {% if paper.local_pdf_path %}<a class="button button-primary" href="/papers/{{ paper.id }}/pdf/open">Open PDF</a>{% endif %}
           {% if paper.pdf_url %}<a class="button" href="{{ paper.pdf_url }}" target="_blank" rel="noreferrer">Source PDF</a>{% endif %}
+          {% if paper.pdf_modified and paper.pdf_url %}<form method="post" action="/papers/{{ paper.id }}/pdf/restore" data-confirm="Replace the local PDF with a fresh download from the stored source?"><button class="button button-warning" type="submit">Restore PDF</button></form>{% endif %}
           <a class="button" href="/papers/{{ paper.id }}/export.json">Export JSON</a>
         </div>
       </div>
     </div>
   </div>
 </section>
-{% if paper.abstract %}<section class="panel prose"><div class="panel-heading"><h2>Source abstract</h2></div><p>{{ paper.abstract }}</p></section>{% endif %}
 
-{% if analyses %}
-{% set latest_analysis = analyses[0] %}
-<section class="panel analysis-summary">
-  <div class="panel-heading"><div><h2>Prompt summary</h2><p>{{ latest_analysis.scope }} · {{ latest_analysis.model }} · {{ latest_analysis.created_at }}</p></div><a class="button button-small" href="/analyses/{{ latest_analysis.id }}">Open full analysis</a></div>
-  <div class="lead markdown-block">{{ latest_analysis.result.one_sentence_summary|markdown|safe }}</div>
-  <div class="analysis-grid"><section><h3>Summary</h3><div class="markdown-block">{{ latest_analysis.result.abstract_summary|markdown|safe }}</div></section><section><h3>Research problem</h3><div class="markdown-block">{{ latest_analysis.result.research_problem|markdown|safe }}</div></section><section><h3>Conclusion</h3><div class="markdown-block">{{ latest_analysis.result.conclusion_summary|markdown|safe }}</div></section></div>
-  {% if analyses|length > 1 %}<details><summary>Other prompt summaries</summary><div class="object-list">{% for analysis in analyses[1:] %}<article><a href="/analyses/{{ analysis.id }}"><strong>{{ analysis.scope }} · {{ analysis.model }}</strong></a><div class="markdown-block">{{ analysis.result.one_sentence_summary|markdown|safe }}</div><small>{{ analysis.created_at }}</small></article>{% endfor %}</div></details>{% endif %}
-</section>
-{% endif %}
+<section class="panel pdf-management-panel"><div class="panel-heading"><div><h2>Local PDF</h2><p>Upload or overwrite a PDF manually. Paperwatch stores a hash and warns when the file changes on disk.</p></div>{% if paper.pdf_modified %}<span class="status status-warning">{{ 'Missing on disk' if paper.pdf_missing_on_disk else 'Modified on disk' }}</span>{% endif %}</div><form method="post" action="/papers/{{ paper.id }}/pdf/upload" enctype="multipart/form-data" class="inline-upload-form"><label class="grow"><span>PDF file</span><input type="file" name="pdf" accept="application/pdf,.pdf" required></label><button class="button button-primary" type="submit">{{ 'Replace local PDF' if paper.local_pdf_path else 'Import PDF' }}</button></form>{% if paper.pdf_sha256 %}<small class="muted">Stored hash: <code>{{ paper.pdf_sha256 }}</code></small>{% endif %}</section>
+<section class="panel object-notes-panel"><div class="panel-heading"><div><h2>Notes</h2><p>Private Markdown notes for this paper.</p></div></div>{% if paper.notes %}<article class="prose notes-rendered">{{ paper.notes|markdown|safe }}</article>{% else %}<p class="muted">No notes.</p>{% endif %}<details><summary>Edit notes</summary><form method="post" action="/notes/paper/{{ paper.id }}" data-async-action data-refresh-selector=".object-notes-panel"><textarea name="notes" rows="8" maxlength="200000" placeholder="Markdown notes">{{ paper.notes or '' }}</textarea><button class="button button-primary" type="submit">Save notes</button></form></details></section>
+{% if paper.abstract %}<section class="panel prose"><div class="panel-heading"><h2>Source abstract</h2></div><p>{{ paper.abstract }}</p></section>{% endif %}
 
 <section class="panel model-runner">
   <div class="panel-heading"><div><h2>Run saved prompt</h2><p>Choose the prompt, models, source, PDF handling, and context for this run.</p></div>{% if query_state.running and query_state.paper_id == paper.id %}<span class="status status-running">running</span>{% endif %}</div>
@@ -89,13 +85,15 @@
 </section>
 
 <div id="paper-results">
-{% if prompt_runs %}<section class="panel prompt-results"><div class="panel-heading"><div><h2>Saved prompt results</h2><p>Completed prompts run on this paper.</p></div></div>{% for run in prompt_runs %}<article class="prompt-result"><div class="panel-heading"><div><h3>{{ run.query_name }} · {{ run.model }}</h3><p>{{ run.created_at }} · {{ run.matched_count }} matched record{{ '' if run.matched_count == 1 else 's' }}</p></div><a class="button button-small" href="/queries#query-{{ run.query_id }}">Saved query</a></div>{% if run.output %}<h4>{{ run.output.title }}</h4><div class="lead markdown-block">{{ run.output.summary|markdown|safe }}</div>{% if run.output["items"] %}<div class="object-list">{% for item in run.output["items"] %}<article>{% if item.paper_id %}<a href="/papers/{{ item.paper_id }}"><strong>{{ item.title }}</strong></a>{% else %}<strong>{{ item.title }}</strong>{% endif %}<div class="markdown-block">{{ item.output|markdown|safe }}</div></article>{% endfor %}</div>{% endif %}{% endif %}</article>{% endfor %}</section>{% endif %}
-
 <details class="panel"><summary>Source metadata</summary><pre>{{ metadata|prettyjson }}</pre></details>
 
 <section class="panel model-task-history">
   <h3 class="subheading">Recent tasks</h3>
   {% if analysis_tasks %}<div class="table-wrap"><table><thead><tr><th>Model</th><th>Source</th><th>Strategy</th><th>Status</th><th>Result</th></tr></thead><tbody>{% for task in analysis_tasks %}<tr><td><strong>{{ task.profile }}</strong><small>{{ task.model }}</small></td><td>{{ task.scope }}</td><td>{{ task.analysis_strategy }}{% if task.context_window_tokens %}<small>{{ task.context_window_tokens }} tokens · {{ task.chunk_count }} chunks</small>{% endif %}</td><td><span class="status status-{{ task.status }}">{{ task.status }}</span>{% if task.error_text %}<small class="task-error">{{ task.error_text }}</small>{% endif %}</td><td>{% if task.analysis_id %}<a href="/analyses/{{ task.analysis_id }}">Open</a>{% else %}—{% endif %}</td></tr>{% endfor %}</tbody></table></div>{% else %}<p class="muted">No analysis tasks yet.</p>{% endif %}
 </section>
+
+{% if analyses %}<section class="panel"><div class="panel-heading"><div><h2>Paper summaries</h2><p>Open a summary without embedding its full output on this page.</p></div><span>{{ analyses|length }}</span></div><div class="table-wrap"><table><thead><tr><th>Source</th><th>Model</th><th>Created</th><th>Result</th></tr></thead><tbody>{% for analysis in analyses %}<tr><td>{{ analysis.scope }}</td><td>{{ analysis.model }}</td><td>{{ analysis.created_at }}</td><td><a href="/analyses/{{ analysis.id }}">Summary</a></td></tr>{% endfor %}</tbody></table></div></section>{% endif %}
+
+{% if prompt_runs %}<section class="panel prompt-results"><div class="panel-heading"><div><h2>Query results</h2><p>Completed saved queries run on this paper.</p></div><span>{{ prompt_runs|length }}</span></div><div class="table-wrap"><table><thead><tr><th>Query</th><th>Model</th><th>Status</th><th>Records</th><th>Created</th><th>Result</th></tr></thead><tbody>{% for run in prompt_runs %}<tr><td><a href="/queries#query-{{ run.query_id }}">{{ run.query_name }}</a></td><td>{{ run.model }}</td><td><span class="status status-{{ run.status }}">{{ run.status }}</span></td><td>{{ run.matched_count }}</td><td>{{ run.created_at }}</td><td><a href="/queries/runs/{{ run.id }}">Summary</a></td></tr>{% endfor %}</tbody></table></div></section>{% endif %}
 </div>
 {% endblock %}

@@ -134,7 +134,7 @@ def test_manual_author_and_blog_management_ui(config_path):
     assert 'class="author-openalex-column"' in authors.text
     assert 'data-author-openalex-column hidden' not in authors.text
     assert 'title="Edit the ID and press Enter"' in authors.text
-    assert ">Save</button>" not in authors.text
+    assert '<button class="sr-only" type="submit">Save OpenAlex ID</button>' in authors.text
 
     invalid_blog = client.post(
         f"/authors/{manual_id}/blogs",
@@ -253,7 +253,7 @@ def test_blog_csv_import_and_feed_ui(config_path):
     feed = client.get("/blogs")
     assert feed.status_code == 200
     assert "Blog updates" in feed.text
-    assert 'class="panel paper-table-panel blog-updates-panel"' in feed.text
+    assert 'class="panel paper-table-panel unified-content-panel"' in feed.text
     assert "New Person" in feed.text
     assert str(changed) in feed.text
     detail = client.get(f"/blogs/{changed}")
@@ -657,5 +657,5 @@ def test_author_openalex_id_is_editable_inline(config_path):
     javascript = client.get("/static/app.js")
     assert 'getElementById("toggle-author-ids")' not in javascript.text
     assert '.author-table.author-ids-visible' not in css.text
-    assert '/static/app.css?v=0.9.7' in page.text
-    assert '/static/app.js?v=0.9.7' in page.text
+    assert '/static/app.css?v=0.9.9' in page.text
+    assert '/static/app.js?v=0.9.9' in page.text

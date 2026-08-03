@@ -23,7 +23,7 @@ from .llm import (
     create_llm,
 )
 from .locking import analysis_lock
-from .pdfs import PDFError, download_pdf, extract_pdf_text, is_complete_pdf, safe_pdf_name
+from .pdfs import PDFError, download_pdf, extract_pdf_text, is_complete_pdf, pdf_sha256, safe_pdf_name
 
 
 @dataclass(slots=True)
@@ -79,7 +79,7 @@ def _paper_pdf_path(
             max_bytes=config.fetch.max_pdf_bytes,
             client=pdf_client,
         )
-        db.set_local_pdf(paper_id, str(path))
+        db.set_local_pdf(paper_id, str(path), pdf_sha256(path))
     return paper, path
 
 
@@ -112,7 +112,7 @@ def _paper_text(
             max_bytes=config.fetch.max_pdf_bytes,
             client=pdf_client,
         )
-        db.set_local_pdf(paper_id, str(path))
+        db.set_local_pdf(paper_id, str(path), pdf_sha256(path))
         text = extract_pdf_text(path, max_chars=config.fetch.max_pdf_chars)
     return paper, text
 

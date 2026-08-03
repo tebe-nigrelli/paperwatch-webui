@@ -197,6 +197,8 @@ def _selection_search_args(selection: dict[str, Any] | None) -> dict[str, Any]:
         "scope": str(selection.get("scope") or ""),
         "has_pdf": selection.get("has_pdf") if isinstance(selection.get("has_pdf"), bool) else None,
         "analyzed": selection.get("analyzed") if isinstance(selection.get("analyzed"), bool) else None,
+        "starred": selection.get("starred") if isinstance(selection.get("starred"), bool) else None,
+        "read": selection.get("read") if isinstance(selection.get("read"), bool) else None,
         "date_from": str(selection.get("date_from") or ""),
         "date_to": str(selection.get("date_to") or ""),
         "sort": str(selection.get("sort") or "newest"),
@@ -709,10 +711,12 @@ def run_query_batch(
                         cancel_event=cancel_event,
                     )
                     check_cancelled(cancel_event)
+                    output = result.model_dump()
                     db.finish_query_run(
                         run_id, matched_count=len(documents), input_chars=input_chars,
-                        output=result.model_dump(),
+                        output=output,
                     )
+                    db.apply_query_classifications(query_id, run_id, output)
                     completed += 1
                     publish(progress, "message", f"Completed {profile.model}")
                     progress_done += 1

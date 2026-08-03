@@ -324,7 +324,9 @@ def test_article_index_publications_docs_and_selector_fetch(monkeypatch):
         )
     assert publications.source_mode == "publications"
     assert publications.discovered_articles[0].url == "https://doi.org/10.1/paper"
-    assert publications.article_items == ()
+    assert [item.url for item in publications.article_items] == [
+        "https://doi.org/10.1/paper"
+    ]
 
     with httpx.Client(
         transport=httpx.MockTransport(
@@ -519,7 +521,7 @@ def test_semantic_diff_link_context_and_docs_thresholds():
 
 def test_database_source_settings_known_articles_and_schema(app_config, author_candidate):
     with Database(app_config.paths.database) as db:
-        assert SCHEMA_VERSION == 21
+        assert SCHEMA_VERSION == 23
         db.add_author(author_candidate)
         blog_id = db.add_author_blog(
             "A123",
@@ -836,7 +838,7 @@ def test_schema_18_promotes_and_seeds_initial_feed_items(tmp_path, author_candid
         entries = db.list_blog_entries()
         assert len(entries) == 1
         assert entries[0]["change_kind"] == "changed"
-        assert db._conn.execute("PRAGMA user_version").fetchone()[0] == 21
+        assert db._conn.execute("PRAGMA user_version").fetchone()[0] == 23
         assert db.known_blog_article_urls(blog_id) == ("https://example.com/post",)
 
 

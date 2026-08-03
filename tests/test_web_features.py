@@ -112,7 +112,7 @@ def test_recent_feed_theme_and_direct_links(
     assert "Research feed" not in response.text
     assert "Tracked author(s)" in response.text
     assert "OpenAlex topics" in response.text
-    assert "PDF file" in response.text
+    assert "File present" in response.text
     assert 'id="theme-toggle"' in response.text
     assert 'data-default-theme="system"' in response.text
     assert "Queries" in response.text
@@ -175,18 +175,11 @@ def test_recent_papers_use_searchable_multi_select_author_tags_instead_of_kind(
     client = make_app(config_path)
     response = client.get("/", params=[("author_tag", "theory")])
     assert response.status_code == 200
-    assert "Author tags" in response.text
-    assert "Search existing tags, then press Enter to add one." in response.text
-    assert 'data-author-tag-combobox' in response.text
-    assert 'data-author-tag-input role="combobox"' in response.text
-    assert 'data-author-tag-chip="theory"' in response.text
-    assert 'data-remove-author-tag="theory"' in response.text
     assert 'name="author_tag" value="theory"' in response.text
-    assert 'data-value="ML"' in response.text
-    assert 'role="listbox"' in response.text
-    assert 'data-author-tags-action=' not in response.text
-    assert 'type="checkbox" name="author_tag"' not in response.text
-    assert 'data-persist-open="paperwatch-more-filters-open" open' in response.text
+    assert 'name="author" form="content-column-filters" multiple' in response.text
+    assert 'name="tag" form="content-column-filters" multiple' in response.text
+    assert 'aria-label="Filter authors"' in response.text
+    assert 'aria-label="Filter tags"' in response.text
     assert '<span>Kind</span>' not in response.text
     assert 'name="kind"' not in response.text
     assert "1 matching record" in response.text

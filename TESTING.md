@@ -1,4 +1,4 @@
-# Automated testing strategy — paperwatch 0.9.7
+# Automated testing strategy — paperwatch 0.9.9
 
 The default suite is deterministic and requires no live OpenAlex index, arXiv service, Ollama server, OpenAI account, PDF host, or external browser assets.
 
@@ -11,7 +11,9 @@ pytest
 Release result:
 
 - 374 tests passed
-- 95.03% branch-aware coverage
+- Existing 95% branch-coverage gate retained
+- Shared notes, author/blog-source tags, bulk tag undo, CSV metadata round trips,
+  PDF replacement/integrity state, asynchronous filters and regexp test panes
 - Python 3.13.5 release environment
 
 ## Feature coverage

@@ -21,7 +21,9 @@
       <label><span>Venue or journal</span><input name="venue" value="{{ import_values.get('venue', '') }}" maxlength="500"></label>
       <label><span>DOI</span><input name="doi" value="{{ import_values.get('doi', '') }}" placeholder="10.1234/example"></label>
       <label><span>arXiv ID</span><input name="arxiv_id" value="{{ import_values.get('arxiv_id', '') }}" placeholder="2607.12345"></label>
+      <label class="full"><span>Tags</span><input name="tags" value="{{ import_values.get('tags', '') }}" placeholder="optimization, robotics"><small>Separate tags with commas, semicolons, or new lines.</small></label>
       <label class="full"><span>Abstract (optional)</span><textarea name="abstract" rows="8">{{ import_values.get('abstract', '') }}</textarea></label>
+      <label class="full"><span>Notes (optional, Markdown)</span><textarea name="notes" rows="6">{{ import_values.get('notes', '') }}</textarea></label>
     </div>
     <div class="import-actions"><button class="button button-primary" type="submit">Import paper</button><a class="button" href="/discover">Cancel</a></div>
   </form>

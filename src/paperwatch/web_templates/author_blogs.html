@@ -1,7 +1,8 @@
 {% extends "base.html" %}
 {% block title %}{{ author.name }} blogs · paperwatch{% endblock %}
 {% block content %}
-<section class="page-heading split"><div><p class="eyebrow">Author blogs</p><h1>{{ author.name }}</h1><p>{{ author.institution or 'Institution unavailable' }}</p></div><a class="button" href="/authors">Back to authors</a></section>
+<section class="page-heading split"><div><p class="eyebrow">Author blogs</p><h1{% if author.notes %} class="object-name-noted"{% endif %}>{{ author.name }}</h1><p>{{ author.institution or 'Institution unavailable' }}</p></div><a class="button" href="/authors">Back to authors</a></section>
+<section class="panel object-notes-panel"><div class="panel-heading"><div><h2>Author notes</h2><p>Private Markdown notes.</p></div></div>{% if author.notes %}<article class="notes-rendered">{{ author.notes|markdown|safe }}</article>{% else %}<p class="muted">No notes.</p>{% endif %}<details><summary>Edit notes</summary><form method="post" action="/notes/author/{{ author.id }}" data-async-action data-refresh-selector=".object-notes-panel"><textarea name="notes" rows="6">{{ author.notes or '' }}</textarea><button class="button button-small" type="submit">Save</button></form></details></section>
 <section class="panel">
   <div class="panel-heading"><div><h2>Add source</h2><p>Choose automatic detection or a source-specific mode. CSS selectors and URL patterns are optional guardrails for noisy sites.</p></div></div>
   <form method="post" action="/authors/{{ author.openalex_id }}/blogs" class="filter-grid blog-link-form">
@@ -11,13 +12,15 @@
     <label><span>Mode</span><select name="source_mode">{% for mode in source_modes %}<option value="{{ mode }}"{% if mode == 'auto' %} selected{% endif %}>{{ mode }}</option>{% endfor %}</select></label>
     <label><span>Content selector</span><input name="content_selector" maxlength="500" placeholder="main, article, .post-list"></label>
     <label class="wide"><span>Article URL pattern</span><input name="article_url_pattern" maxlength="500" placeholder="/blog/|/posts/"></label>
+    <label><span>Tags</span><input name="tags" maxlength="500" placeholder="comma-separated"></label>
     <button class="button button-primary" type="submit">Link source</button>
   </form>
 </section>
 <section class="panel">
   <div class="panel-heading"><div><h2>Linked sources</h2><p>Settings are shared when the same URL is linked to multiple authors. Marking a source broken pauses checks without deleting history.</p></div><span>{{ blogs|length }}</span></div>
+  <form method="get" class="author-filter-form"><label><span>Filter source tag</span><select name="tag"><option value="">All tags</option>{% for tag in content_tags %}<option value="{{ tag.name }}" {% if active_tag == tag.name %}selected{% endif %}>{{ tag.name }}</option>{% endfor %}</select></label>{% if active_tag %}<a class="button button-small" href="/authors/{{ author.openalex_id }}/blogs">Clear</a>{% endif %}</form>
   <div class="table-wrap"><table class="author-blog-table"><thead><tr><th>Source and extraction</th><th>Relationship</th><th>Method</th><th>Last checked</th><th>Updates</th><th>Status</th><th>Availability</th><th>Remove</th></tr></thead><tbody>
-  {% for blog in blogs %}<tr class="{% if not blog.enabled %}blog-source-broken{% endif %}">
+  {% for blog in blogs %}<tr class="{% if not blog.enabled %}blog-source-broken {% endif %}{% if blog.notes %}object-row-mark{% endif %}">
     <td class="blog-source-cell">
       <div class="blog-source-heading"><strong>{{ blog.label or blog.title or 'Blog source' }}</strong><a href="{{ blog.url }}" target="_blank" rel="noreferrer" aria-label="Open {{ blog.url }}">Open ↗</a></div>
       <form method="post" action="/authors/{{ author.openalex_id }}/blogs/{{ blog.id }}/edit" class="blog-source-settings-form">
@@ -31,6 +34,8 @@
       {% if blog.item_stream_mode %}<small class="block muted">Effective mode: {{ blog.item_stream_mode }}</small>{% endif %}
       {% if blog.feed_diagnostics %}<details class="source-diagnostics"><summary>Diagnostics</summary><code>{{ blog.feed_diagnostics }}</code></details>{% endif %}
       {% if blog.linked_author_count > 1 %}<small class="block muted">Shared by {{ blog.linked_author_count }} authors; edits affect all links.</small>{% endif %}
+      <div class="content-tag-row source-tag-row">{% for tag in blog.source_tags.split(', ') if tag %}<form method="post" action="/authors/{{ author.openalex_id }}/blogs/{{ blog.id }}/tags/remove" data-async-action><input type="hidden" name="tag" value="{{ tag }}"><button class="tag removable-tag" type="submit">{{ tag }} ×</button></form>{% endfor %}<form method="post" action="/authors/{{ author.openalex_id }}/blogs/{{ blog.id }}/tags/add" class="inline-tag-form" data-async-action><input name="tag" list="source-tag-options" placeholder="Add source tag" required><button class="button button-small" type="submit">Add</button></form></div>
+      <details class="row-notes-editor"><summary>Notes{% if blog.notes %} · saved{% endif %}</summary>{% if blog.notes %}<article class="notes-rendered">{{ blog.notes|markdown|safe }}</article>{% endif %}<form method="post" action="/notes/blog_source/{{ blog.id }}" data-async-action><textarea name="notes" rows="4">{{ blog.notes or '' }}</textarea><button class="button button-small" type="submit">Save</button></form></details>
     </td>
     <td>{{ blog.relationship or '—' }}</td>
     <td>{% if blog.last_fetch_method == 'rss' %}<span class="status status-success">items</span>{% elif blog.last_fetch_method == 'snapshot' %}<span class="status">snapshot</span>{% else %}<span class="muted">pending</span>{% endif %}</td>
@@ -41,5 +46,6 @@
     <td class="icon-action-cell"><form method="post" action="/authors/{{ author.openalex_id }}/blogs/{{ blog.id }}/remove" data-confirm="Unlink this source from {{ author.name }}?"><button class="icon-button icon-danger" type="submit" aria-label="Unlink {{ blog.url }}">×</button></form></td>
   </tr>{% else %}<tr><td colspan="8" class="empty">No blogs linked to this author.</td></tr>{% endfor %}
   </tbody></table></div>
+<datalist id="source-tag-options">{% for tag in content_tags %}<option value="{{ tag.name }}">{% endfor %}</datalist>
 </section>
 {% endblock %}

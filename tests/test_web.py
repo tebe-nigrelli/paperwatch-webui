@@ -206,14 +206,14 @@ def test_dashboard_assets_and_security_headers(config_path, seeded_web):
     assert "Research feed" not in response.text
     assert "Tracked author(s)" in response.text
     assert "OpenAlex topics" in response.text
-    assert "PDF file" in response.text
+    assert "File present" in response.text
     assert "Minimal Agents" in response.text
     assert "Open PDF" in response.text
     assert "Backfill 1 year PDFs" not in response.text
     assert "Discover" in response.text
     assert "Diagnostics" not in response.text
     assert "broken PDF" not in response.text
-    assert response.text.index("More filters") < response.text.index("Run on these 2 papers")
+    assert response.text.index("content-column-filters") < response.text.index("Run on these 2 papers")
     assert '<details class="advanced-filters collection-runner-details">' in response.text
     assert response.headers["x-frame-options"] == "DENY"
     assert "default-src 'self'" in response.headers["content-security-policy"]
@@ -326,7 +326,7 @@ def test_paper_list_filters_and_invalid_query_values(config_path, seeded_web):
         },
     )
     assert response.status_code == 200
-    assert "No papers match" in response.text
+    assert "No downloaded content matches" in response.text
 
     assert _parse_tristate("0") is False
     assert _parse_tristate("1") is True
@@ -706,8 +706,8 @@ def test_openalex_topics_render_filter_and_export(config_path, seeded_web):
 
     response = client.get("/")
     assert response.status_code == 200
-    assert '<select name="topic">' in response.text
-    assert "Machine Learning (1)" in response.text
+    assert 'name="topic" form="content-column-filters"' in response.text
+    assert ">Machine Learning<" in response.text
     assert 'href="/?topic=T100"' in response.text
     assert "Autonomous Agents" in response.text
 
@@ -961,7 +961,7 @@ def test_manual_import_restores_previous_pdf_when_database_update_fails(
         path = Path(db.get_paper(paper_id)["local_pdf_path"])
     original = path.read_bytes()
 
-    def fail_set_local_pdf(self, imported_paper_id, imported_path):
+    def fail_set_local_pdf(self, imported_paper_id, imported_path, imported_hash=None):
         raise OSError("database write failed")
 
     monkeypatch.setattr(Database, "set_local_pdf", fail_set_local_pdf)

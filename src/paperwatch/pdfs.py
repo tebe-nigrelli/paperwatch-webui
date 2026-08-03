@@ -41,6 +41,17 @@ def safe_pdf_name(identity_key: str) -> str:
     return f"{cleaned[:100]}-{digest}.pdf"
 
 
+def pdf_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    try:
+        with path.open("rb") as handle:
+            for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                digest.update(chunk)
+    except OSError as exc:
+        raise PDFError(f"Could not hash PDF: {exc}") from exc
+    return digest.hexdigest()
+
+
 def is_complete_pdf(path: Path) -> bool:
     """Return whether a file has both a PDF header and a final EOF marker."""
     try:
