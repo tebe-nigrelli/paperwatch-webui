@@ -14,7 +14,16 @@ from paperwatch.db import Database
 from paperwatch.models import BatchQueryResult
 from paperwatch.pipeline import PaperWatch, RunStats
 from paperwatch.query_jobs import QueryBatchSnapshot
-from paperwatch.web import RunSnapshot, _configured_context_window, create_app
+from paperwatch.web import (
+    RunSnapshot,
+    _configured_context_window,
+    _paper_pdf_state,
+    _paper_table_view,
+    _parse_filter_values,
+    _query_profile_names,
+    _query_view,
+    create_app,
+)
 
 
 class RunStub:
@@ -54,6 +63,101 @@ def _client(config_path, query=None):
             author_client_factory=lambda config: AuthorClient(),
         )
     )
+
+
+def test_query_and_paper_view_helper_edge_cases(config_path, tmp_path, monkeypatch):
+    import paperwatch.web as web
+
+    assert _query_profile_names("") == ()
+    assert _query_profile_names("plain") == ("plain",)
+    assert _query_profile_names('" encoded "') == ("encoded",)
+    assert _query_profile_names(["one", "", "one", "two"]) == ("one", "two")
+    assert _query_profile_names({"bad": "shape"}) == ()
+
+    class Params:
+        def get(self, name, default=None):
+            return default
+
+        def getlist(self, name):
+            if name == "author_tag":
+                return [f"author-{index}" for index in range(60)]
+            if name == "tag":
+                return [f"content-{index}" for index in range(60)]
+            return []
+
+    filters = _parse_filter_values(Params())
+    assert len(filters.author_tags) == 50
+    assert len(filters.content_tags) == 50
+
+    config = load_config(config_path)
+    view = _query_view(
+        {
+            "model_profile": "",
+            "label_values_json": "{}",
+            "regexp_radius": 0,
+        },
+        config,
+    )
+    assert view["model_profiles"] == ["default"]
+    assert view["label_values"] == []
+
+    class FakeDB:
+        def __init__(self):
+            self.hash_calls = []
+            self.fingerprint_calls = []
+
+        def set_paper_pdf_hash(self, *args, **kwargs):
+            self.hash_calls.append((args, kwargs))
+            return True
+
+        def set_paper_pdf_fingerprint(self, *args, **kwargs):
+            self.fingerprint_calls.append((args, kwargs))
+            return True
+
+    db = FakeDB()
+    pdf = tmp_path / "paper.pdf"
+    pdf.write_bytes(b"%PDF-1.4\ncontent\n%%EOF")
+    stat = pdf.stat()
+
+    legacy = _paper_pdf_state(
+        db,
+        {"id": 1, "local_pdf_path": str(pdf), "pdf_sha256": ""},
+        verify_hash=False,
+    )
+    assert legacy["pdf_modified"] is False
+
+    changed = _paper_pdf_state(
+        db,
+        {
+            "id": 1,
+            "local_pdf_path": str(pdf),
+            "pdf_size": stat.st_size + 1,
+            "pdf_mtime_ns": stat.st_mtime_ns,
+            "pdf_sha256": "old",
+        },
+        verify_hash=False,
+    )
+    assert changed["pdf_modified"] is True
+
+    monkeypatch.setattr(web, "pdf_sha256", lambda path: "fresh")
+    refreshed = _paper_pdf_state(
+        db,
+        {"id": 2, "local_pdf_path": str(pdf), "pdf_sha256": ""},
+    )
+    assert refreshed["pdf_sha256"] == "fresh"
+    assert db.hash_calls
+
+    table = _paper_table_view(
+        db,
+        {
+            "id": 3,
+            "title": "Paper",
+            "local_pdf_path": None,
+            "tracked_authors_json": "{}",
+            "author_count": 2,
+        },
+    )
+    assert table["tracked_authors"] == [] and table["other_author_count"] == 2
 
 
 def test_query_page_stores_one_model_and_uses_config_context(config_path):

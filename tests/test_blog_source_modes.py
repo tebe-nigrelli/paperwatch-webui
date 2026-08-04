@@ -486,6 +486,72 @@ def test_youtube_uses_ytdlp_video_descriptions(monkeypatch):
             )
 
 
+def test_youtube_metadata_and_ytdlp_error_paths(monkeypatch):
+    assert blogs._html_first_date(
+        "<script>2020-01-01</script><style>x</style><p>Published 2026-08-02</p>"
+    ) == "2026-08-02"
+    assert blogs._plain_text_html("\n \n") is None
+    assert blogs._plain_text_html("One\nline\n\nTwo") == "<p>One<br>line</p><p>Two</p>"
+
+    assert blogs._youtube_published_at({"timestamp": 0}, "") == "1970-01-01T00:00:00+00:00"
+    assert blogs._youtube_published_at(
+        {"release_timestamp": 10**30, "release_date": "20261340", "upload_date": "Jul 3, 2026"},
+        "",
+    ) == "2026-07-03"
+    assert blogs._youtube_published_at({}, "Recorded on June, 2020") == "2020-06"
+
+    fallback = "https://www.youtube.com/watch?v=fallback"
+    item = blogs._youtube_feed_item(
+        {"id": "fallback", "url": "https://example.com/not-youtube", "fulltitle": "Fallback"},
+        fallback,
+    )
+    assert item is not None and item.url == fallback and item.published_at is None
+    assert "rss-published" not in (item.rendered_html or "")
+    assert blogs._youtube_feed_item({}, "not a valid url") is None
+
+    monkeypatch.setattr(blogs.importlib.util, "find_spec", lambda name: object())
+
+    def raises_oserror(*args, **kwargs):
+        raise OSError("missing executable")
+
+    monkeypatch.setattr(blogs.subprocess, "run", raises_oserror)
+    with pytest.raises(ValueError, match="yt-dlp failed: missing executable"):
+        blogs._youtube_fetch({"url": fallback})
+
+    cases = [
+        (
+            blogs.subprocess.CompletedProcess([], 2, stdout="", stderr="fatal\nlast error"),
+            "last error",
+        ),
+        (blogs.subprocess.CompletedProcess([], 0, stdout="not json", stderr=""), "invalid JSON"),
+        (blogs.subprocess.CompletedProcess([], 0, stdout="[]", stderr=""), "invalid result"),
+        (
+            blogs.subprocess.CompletedProcess([], 0, stdout=json.dumps({"entries": []}), stderr=""),
+            "no readable videos",
+        ),
+    ]
+    for process, message in cases:
+        monkeypatch.setattr(blogs.subprocess, "run", lambda *args, value=process, **kwargs: value)
+        with pytest.raises(ValueError, match=message):
+            blogs._youtube_fetch({"url": fallback})
+
+    direct = {
+        "id": "direct",
+        "title": "Direct video",
+        "webpage_url": fallback,
+        "description": "Description",
+    }
+    monkeypatch.setattr(
+        blogs.subprocess,
+        "run",
+        lambda *args, **kwargs: blogs.subprocess.CompletedProcess(
+            [], 0, stdout=json.dumps(direct), stderr=""
+        ),
+    )
+    fetched = blogs._youtube_fetch({"url": fallback, "title": "Row title"})
+    assert fetched.title == "Direct video" and len(fetched.feed_items) == 1
+
+
 def test_auto_index_fetches_child_article_and_visible_date():
     index_html = """
     <html><title>Robotics</title><main>

@@ -2305,7 +2305,12 @@ def create_app(
 
     @app.post("/blogs/import")
     async def import_blog_entry(request: Request) -> RedirectResponse:
-        form = await request.form()
+        # The entry text limit is 5 MB, so allow the form parser to receive a
+        # value slightly larger than that before applying the domain-level
+        # validation below.  Newer Starlette releases otherwise reject the
+        # request with a bare 400 response before we can return the normal
+        # validation redirect.
+        form = await request.form(**({"max_part_size": 5_100_000} if "max_part_size" in inspect.signature(request.form).parameters else {}))
         author_id = str(form.get("author_id", "")).strip()
         title = clean_text(str(form.get("entry_title", "")))
         content = str(form.get("content", "")).strip()

@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import threading
 from dataclasses import replace
+from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -16,6 +18,7 @@ from paperwatch.query_jobs import (
     _split_oversized_document,
     collect_query_documents,
     run_query_batch,
+    run_query_for_native_pdfs,
     run_query_for_model,
     validate_query_sources,
 )
@@ -51,6 +54,35 @@ class FakeQueryLLM:
         self.closed = True
 
 
+class FakeNativePDFLLM(FakeQueryLLM):
+    provider = "codex"
+
+    def __init__(self):
+        super().__init__(model="native-query-model")
+        self.pdf_calls: list[tuple[str, Path]] = []
+
+    def generate_json_with_pdf(self, prompt, path, *, schema, schema_name):
+        self.pdf_calls.append((prompt, path))
+        index = len(self.pdf_calls)
+        result = BatchQueryResult(
+            title=f"Native result {index}",
+            summary=f"Summary {index}",
+            items=[
+                {
+                    "paper_id": index,
+                    "title": f"Paper {index}",
+                    "output": f"Output {index}",
+                }
+            ],
+        )
+        usage = (
+            {"input_tokens": 2, "provider": "codex"}
+            if index == 1
+            else {"input_tokens": 3, "provider": "ignored", "cached": True}
+        )
+        return SimpleNamespace(data=result.model_dump(), usage=usage)
+
+
 def _add_second_profile(config_path):
     with config_path.open("a", encoding="utf-8") as handle:
         handle.write(
@@ -65,6 +97,26 @@ timeout_seconds = 1
 max_input_chars = 5000
 context_window_tokens = 2048
 analyze_pdfs = true
+prompt_version = "test-v1"
+"""
+        )
+
+
+def _add_codex_profile(config_path):
+    with config_path.open("a", encoding="utf-8") as handle:
+        handle.write(
+            """
+
+[[llm_profiles]]
+name = "codex-review"
+provider = "codex"
+model = "gpt-5.3-codex"
+api_key = "secret"
+timeout_seconds = 1
+max_input_chars = 5000
+context_window_tokens = 400000
+analyze_pdfs = true
+pdf_analysis_strategy = "direct"
 prompt_version = "test-v1"
 """
         )
@@ -278,6 +330,187 @@ def test_collection_query_map_reduce_and_empty_result():
     )
     assert len(__import__("json").dumps(nested[0], ensure_ascii=False, separators=(",", ":"))) <= 800
     assert nested[0][0]["paper_id"] == 3
+
+
+def test_native_pdf_query_single_multi_and_provider_validation(monkeypatch):
+    import paperwatch.query_jobs as query_jobs
+
+    rows = [
+        {"id": 1, "title": "Paper 1"},
+        {"id": 2, "title": "Paper 2"},
+    ]
+    monkeypatch.setattr(
+        query_jobs,
+        "_paper_pdf_path",
+        lambda config, db, paper_id, client: (None, Path(f"/tmp/{paper_id}.pdf")),
+    )
+    monkeypatch.setattr(
+        query_jobs,
+        "_paper_document",
+        lambda db, row: {
+            "paper_id": row["id"],
+            "title": row["title"],
+            "fulltext": "large text that must not be repeated in metadata",
+        },
+    )
+
+    llm = FakeNativePDFLLM()
+    single, usage, chars = run_query_for_native_pdfs(
+        llm,
+        user_prompt="Critique",
+        papers=rows[:1],
+        db=None,
+        config=None,
+        context_window_tokens=4096,
+        max_input_chars=10_000,
+    )
+    assert single.title == "Native result 1"
+    assert usage == {"input_tokens": 2, "provider": "codex"}
+    assert chars > 0
+    assert "large text" not in llm.pdf_calls[0][0]
+    assert llm.pdf_calls[0][1] == Path("/tmp/1.pdf")
+
+    merged = BatchQueryResult(title="Merged", summary="Merged summary", items=[])
+    monkeypatch.setattr(
+        query_jobs,
+        "run_query_for_model",
+        lambda *args, **kwargs: (
+            merged,
+            {"input_tokens": 7, "merge_provider": "ollama"},
+            11,
+        ),
+    )
+    llm = FakeNativePDFLLM()
+    result, usage, chars = run_query_for_native_pdfs(
+        llm,
+        user_prompt="Compare",
+        papers=rows,
+        db=None,
+        config=None,
+        context_window_tokens=4096,
+        max_input_chars=10_000,
+    )
+    assert result == merged
+    assert usage == {
+        "input_tokens": 12,
+        "provider": "codex",
+        "cached": True,
+        "merge_provider": "ollama",
+    }
+    assert chars > 11
+
+    with pytest.raises(LLMError, match="cannot read PDFs directly"):
+        run_query_for_native_pdfs(
+            FakeQueryLLM(),
+            user_prompt="Compare",
+            papers=rows,
+            db=None,
+            config=None,
+            context_window_tokens=4096,
+            max_input_chars=10_000,
+        )
+
+
+def test_native_pdf_batch_and_controller_force_fulltext(
+    config_path, paper_record, monkeypatch
+):
+    import paperwatch.query_jobs as query_jobs
+
+    _add_codex_profile(config_path)
+    config = load_config(config_path)
+    pdf = config.paths.pdf_dir / "native.pdf"
+    pdf.parent.mkdir(parents=True, exist_ok=True)
+    pdf.write_bytes(b"%PDF-1.7\ncomplete paper\n%%EOF")
+    with Database(config.paths.database) as db:
+        paper_id, _ = db.upsert_paper(paper_record)
+        db.set_local_pdf(paper_id, str(pdf))
+        query_id = db.create_saved_query(
+            name="Native critique", source_type="papers", search_query="", prompt="Critique"
+        )
+        db.create_query_runs(
+            batch_id="native-batch",
+            query_id=query_id,
+            profiles=[("codex-review", "codex", "gpt-5.3-codex")],
+            context_window_tokens=400000,
+            selection={
+                "paper_ids": [paper_id],
+                "source_scope": "fulltext",
+                "pdf_strategy": "direct",
+            },
+        )
+
+    class NativeClient:
+        provider = "codex"
+        model = "gpt-5.3-codex"
+
+        def close(self):
+            self.closed = True
+
+    client = NativeClient()
+    client.closed = False
+    active: list[object | None] = []
+    seen: dict[str, object] = {}
+    monkeypatch.setattr(query_jobs, "create_llm", lambda profile: client)
+
+    def fake_native(llm, **kwargs):
+        seen.update(kwargs)
+        return (
+            BatchQueryResult(
+                title="Native batch result",
+                summary="Native summary",
+                items=[
+                    {
+                        "paper_id": paper_id,
+                        "title": paper_record.title,
+                        "output": "Native output",
+                    }
+                ],
+            ),
+            {"input_tokens": 4},
+            321,
+        )
+
+    monkeypatch.setattr(query_jobs, "run_query_for_native_pdfs", fake_native)
+    outcome = run_query_batch(
+        config_path,
+        "native-batch",
+        query_id,
+        ("codex-review",),
+        2048,
+        active_client=active.append,
+    )
+    assert outcome == {"completed": 1, "failed": 0}
+    assert [row["id"] for row in seen["papers"]] == [paper_id]
+    assert seen["context_window_tokens"] == 400000
+    assert active == [client, None]
+    assert client.closed is True
+    with Database(config.paths.database) as db:
+        row = db.query_runs_for_batch("native-batch")[0]
+        assert row["status"] == "success" and row["input_chars"] == 321
+
+    runner_calls = []
+
+    def runner(path, batch, query, profiles, context):
+        runner_calls.append((batch, query, profiles, context))
+        return {"completed": 1, "failed": 0}
+
+    controller = QueryController(config_path, runner=runner)
+    batch_id = controller.start(
+        query_id,
+        ("codex-review",),
+        2048,
+        selection={"paper_ids": [paper_id]},
+        source_scope="abstract",
+        pdf_strategy="auto",
+    )
+    assert batch_id
+    controller.wait()
+    assert runner_calls[0][3] == 400000
+    with Database(config.paths.database) as db:
+        row = db.query_runs_for_batch(batch_id)[0]
+        selection = __import__("json").loads(row["selection_json"])
+        assert selection["source_scope"] == "fulltext"
+        assert selection["pdf_strategy"] == "direct"
 
 
 def test_query_batch_persists_success_and_failure(

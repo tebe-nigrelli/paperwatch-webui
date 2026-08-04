@@ -622,6 +622,178 @@ def test_version_seven_database_gains_query_selection_column(tmp_path):
         assert db._conn.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
 
 
+def test_saved_query_v25_migration_normalizes_legacy_values(tmp_path):
+    import sqlite3
+
+    path = tmp_path / "saved-query-v24.sqlite"
+    conn = sqlite3.connect(path)
+    conn.executescript(
+        """
+        CREATE TABLE saved_queries (
+            id INTEGER PRIMARY KEY,
+            name TEXT,
+            source_type TEXT,
+            search_query TEXT,
+            prompt TEXT,
+            is_builtin TEXT,
+            auto_run_papers TEXT,
+            auto_run_blogs TEXT,
+            model_profiles_json TEXT,
+            context_window_tokens TEXT,
+            paper_source_scope TEXT,
+            pdf_strategy TEXT,
+            regexp_pattern TEXT,
+            regexp_radius TEXT,
+            regexp_mode TEXT,
+            content_scope TEXT,
+            query_kind TEXT,
+            label_class TEXT,
+            label_values_json TEXT,
+            created_at TEXT,
+            updated_at TEXT,
+            last_run_at TEXT
+        );
+        """
+    )
+    conn.execute(
+        """
+        INSERT INTO saved_queries VALUES (
+            7, 'Legacy invalid', 'blogs', 'q', 'Prompt', 'bad', '1', NULL,
+            'not-json', '4096', 'invalid', 'invalid', 'x', '-5', 'invalid',
+            'invalid', 'invalid', 'Class', '["a"]', '', NULL, NULL
+        )
+        """
+    )
+    conn.execute(
+        """
+        INSERT INTO saved_queries VALUES (
+            8, 'Legacy profiles', 'summaries', '', 'Summarize', '0', '0', '1',
+            '["", "second", "third"]', NULL, 'fulltext', 'direct', '', '3',
+            'print', 'papers', 'classification', 'Importance', '["high"]',
+            '2026-01-01T00:00:00+00:00', '2026-01-02T00:00:00+00:00', NULL
+        )
+        """
+    )
+    conn.execute("PRAGMA user_version = 24")
+    conn.commit()
+    conn.close()
+
+    with Database(path) as db:
+        rows = {
+            row["id"]: row
+            for row in db._conn.execute(
+                "SELECT * FROM saved_queries WHERE id IN (7, 8) ORDER BY id"
+            )
+        }
+        invalid = rows[7]
+        assert invalid["model_profile"] == ""
+        assert invalid["source_type"] == "papers"
+        assert invalid["paper_source_scope"] == "auto"
+        assert invalid["pdf_strategy"] == "chunked"
+        assert invalid["regexp_radius"] == 0
+        assert invalid["regexp_mode"] == "query"
+        assert invalid["content_scope"] == "both"
+        assert invalid["query_kind"] == "summary"
+        assert invalid["is_builtin"] == 0
+        assert invalid["created_at"] and invalid["updated_at"]
+
+        profiles = rows[8]
+        assert profiles["model_profile"] == "second"
+        assert profiles["source_type"] == "summaries"
+        assert profiles["paper_source_scope"] == "fulltext"
+        assert profiles["pdf_strategy"] == "direct"
+        assert profiles["regexp_mode"] == "print"
+        assert profiles["content_scope"] == "papers"
+        assert profiles["query_kind"] == "classification"
+        assert db._conn.execute("PRAGMA foreign_key_check").fetchall() == []
+
+
+def test_bulk_selection_filters_and_malformed_query_scopes(
+    tmp_path, author_candidate, paper_record
+):
+    import json
+
+    with Database(tmp_path / "bulk-and-scopes.sqlite") as db:
+        db.add_author(author_candidate)
+        paper_id, _ = db.upsert_paper(paper_record)
+        blog_id = db.add_author_blog(
+            author_candidate.openalex_id, "https://example.test/blog/"
+        )
+        entry_id = db.save_blog_entry(
+            blog_id=blog_id,
+            title="Scoped blog entry",
+            content_sha256="scope-entry",
+            normalized_text="Body",
+            rendered_html=None,
+            diff_text="",
+            change_kind="changed",
+            previous_entry_id=None,
+            entry_kind="rss",
+            external_id="scope-entry",
+            source_url="https://example.test/blog/entry",
+        )
+
+        assert db.bulk_set_content_selected(
+            paper_ids=[paper_id, paper_id, 0, -1],
+            blog_entry_ids=[entry_id, entry_id, 0, -1],
+            selected=True,
+        ) == 2
+        assert db.bulk_set_content_selected(selected=False) == 0
+        assert db.get_paper(paper_id)["selected"] == 1
+        assert db.get_blog_entry(entry_id)["selected"] == 1
+
+        assert db.set_content_read("paper", paper_id, True)
+        assert db.set_object_notes("paper", paper_id, "note")
+        rows, total = db.search_papers(read=True, notes=True, ids_only=True)
+        assert total == 1 and [row["id"] for row in rows] == [paper_id]
+        assert db.search_papers(read=False)[1] == 0
+        assert db.search_papers(notes=False)[1] == 0
+        assert db.set_paper_pdf_hash(paper_id, "abc", pdf_size=10, pdf_mtime_ns=20)
+        assert not db.set_paper_pdf_hash(999999, "missing")
+
+        query_id = db.create_saved_query(
+            name="Scope checks", source_type="papers", search_query="", prompt="Check"
+        )
+        malformed = [
+            "not-json",
+            "[]",
+            json.dumps({"paper_ids": "bad", "blog_entry_ids": "bad"}),
+            json.dumps({"paper_ids": ["bad"], "blog_entry_ids": ["bad"]}),
+        ]
+        for index, selection_json in enumerate(malformed):
+            run_id = db.create_query_runs(
+                batch_id=f"malformed-{index}",
+                query_id=query_id,
+                profiles=[(f"p{index}", "ollama", "m")],
+                context_window_tokens=2048,
+                selection={},
+            )[0]
+            db.finish_query_run(
+                run_id,
+                matched_count=0,
+                input_chars=0,
+                output={"title": "x", "summary": "x", "items": []},
+            )
+            db._conn.execute(
+                "UPDATE query_runs SET selection_json=? WHERE id=?",
+                (selection_json, run_id),
+            )
+
+        failed_id = db.create_query_runs(
+            batch_id="failed-valid",
+            query_id=query_id,
+            profiles=[("failed", "ollama", "m")],
+            context_window_tokens=2048,
+            selection={"paper_ids": [paper_id], "blog_entry_ids": [entry_id]},
+        )[0]
+        db.finish_query_run(failed_id, matched_count=0, input_chars=0, error="failed")
+
+        assert db.query_runs_for_paper(paper_id) == []
+        assert db.query_runs_for_blog_entry(entry_id) == []
+        assert len(db.query_runs_for_paper(paper_id, successful_only=False)) == 1
+        assert len(db.query_runs_for_blog_entry(entry_id, successful_only=False)) == 1
+
+
 def test_author_openalex_id_update_preserves_relationships(
     tmp_path, author_candidate, paper_record
 ):
