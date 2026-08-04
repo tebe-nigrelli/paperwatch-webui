@@ -2302,6 +2302,47 @@ class Database:
                 ).rowcount
         return int(changed)
 
+    def bulk_set_filtered_content_selected(
+        self,
+        *,
+        selected: bool,
+        paper_filters: dict[str, Any] | None = None,
+        blog_filters: dict[str, Any] | None = None,
+    ) -> int:
+        """Set selection state without materializing every matching ID in Python."""
+        changed = 0
+        value = 1 if selected else 0
+        with self.transaction() as conn:
+            if paper_filters is not None:
+                where_sql, params = self._paper_filter_sql(**paper_filters)
+                changed += conn.execute(
+                    f"""
+                    UPDATE papers
+                    SET selected=?
+                    WHERE id IN (
+                        SELECT p.id
+                        FROM papers p{where_sql}
+                    )
+                    """,
+                    (value, *params),
+                ).rowcount
+            if blog_filters is not None:
+                where_sql, params = self._blog_entry_filter_sql(**blog_filters)
+                changed += conn.execute(
+                    f"""
+                    UPDATE blog_entries
+                    SET selected=?
+                    WHERE id IN (
+                        SELECT be.id
+                        FROM blog_entries be
+                        JOIN blogs b ON b.id=be.blog_id
+                        WHERE {where_sql}
+                    )
+                    """,
+                    (value, *params),
+                ).rowcount
+        return int(changed)
+
     def selected_content_state(self) -> dict[str, int]:
         row = self._conn.execute(
             """
@@ -2628,7 +2669,7 @@ class Database:
             "years": [dict(row) for row in years],
         }
 
-    def search_papers(
+    def _paper_filter_sql(
         self,
         *,
         query: str = "",
@@ -2649,12 +2690,7 @@ class Database:
         selected: bool | None = None,
         date_from: str = "",
         date_to: str = "",
-        sort: str = "newest",
-        limit: int | None = 25,
-        offset: int = 0,
-        ids_only: bool = False,
-        table_view: bool = False,
-    ) -> tuple[list[sqlite3.Row], int]:
+    ) -> tuple[str, list[Any]]:
         where: list[str] = []
         params: list[Any] = []
         if query:
@@ -2806,6 +2842,55 @@ class Database:
             params.append(date_to)
 
         where_sql = " WHERE " + " AND ".join(where) if where else ""
+        return where_sql, params
+
+    def search_papers(
+        self,
+        *,
+        query: str = "",
+        title_query: str = "",
+        author_id: str = "",
+        author_ids: Iterable[str] = (),
+        author_tags: Iterable[str] = (),
+        content_tags: Iterable[str] = (),
+        topic_id: str = "",
+        topic_ids: Iterable[str] = (),
+        paper_kind: str = "",
+        scope: str = "",
+        has_pdf: bool | None = None,
+        analyzed: bool | None = None,
+        starred: bool | None = None,
+        read: bool | None = None,
+        notes: bool | None = None,
+        selected: bool | None = None,
+        date_from: str = "",
+        date_to: str = "",
+        sort: str = "newest",
+        limit: int | None = 25,
+        offset: int = 0,
+        ids_only: bool = False,
+        table_view: bool = False,
+    ) -> tuple[list[sqlite3.Row], int]:
+        where_sql, params = self._paper_filter_sql(
+            query=query,
+            title_query=title_query,
+            author_id=author_id,
+            author_ids=author_ids,
+            author_tags=author_tags,
+            content_tags=content_tags,
+            topic_id=topic_id,
+            topic_ids=topic_ids,
+            paper_kind=paper_kind,
+            scope=scope,
+            has_pdf=has_pdf,
+            analyzed=analyzed,
+            starred=starred,
+            read=read,
+            notes=notes,
+            selected=selected,
+            date_from=date_from,
+            date_to=date_to,
+        )
         order_map = {
             "newest": "COALESCE(p.publication_date, '') DESC, p.id DESC",
             "oldest": "COALESCE(p.publication_date, '9999-12-31') ASC, p.id ASC",

@@ -1705,8 +1705,6 @@ def create_app(
         content_filter = _content_kind(form.get("content"), "all")
         selected = str(form.get("selected", "1")) in {"1", "true", "on"}
         target_state = not selected
-        paper_ids: list[int] = []
-        blog_ids: list[int] = []
         paper_filters = {
             "query": filters.query,
             "title_query": filters.title_query,
@@ -1726,7 +1724,6 @@ def create_app(
             "selected": target_state,
             "date_from": filters.date_from,
             "date_to": filters.date_to,
-            "sort": filters.sort,
         }
         blog_filters = {
             "query": filters.query,
@@ -1737,7 +1734,6 @@ def create_app(
             "author_tags": filters.author_tags,
             "date_from": filters.date_from,
             "date_to": filters.date_to,
-            "sort": filters.sort,
             "starred": filters.starred,
             "read": filters.read,
             "notes": filters.notes,
@@ -1752,18 +1748,14 @@ def create_app(
             or filters.has_pdf is True
         )
         with Database(config.paths.database) as db:
-            if content_filter != "blogs":
-                rows, _ = db.search_papers(
-                    **paper_filters, limit=None, offset=0, ids_only=True
-                )
-                paper_ids = [int(row["id"]) for row in rows]
-            if content_filter != "papers" and blog_compatible:
-                rows = db.list_blog_entries(
-                    **blog_filters, limit=None, offset=0, ids_only=True
-                )
-                blog_ids = [int(row["id"]) for row in rows]
-            changed = db.bulk_set_content_selected(
-                paper_ids=paper_ids, blog_entry_ids=blog_ids, selected=selected
+            changed = db.bulk_set_filtered_content_selected(
+                selected=selected,
+                paper_filters=(paper_filters if content_filter != "blogs" else None),
+                blog_filters=(
+                    blog_filters
+                    if content_filter != "papers" and blog_compatible
+                    else None
+                ),
             )
         if _async_request(request):
             return JSONResponse({"ok": True, "selected": selected, "changed": changed})
