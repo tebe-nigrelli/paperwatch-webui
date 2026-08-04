@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import sqlite3
 from dataclasses import replace
 from pathlib import Path
@@ -207,3 +208,71 @@ def test_select_results_endpoint_does_not_fetch_matching_ids(
     assert response.json() == {"ok": True, "selected": True, "changed": 1}
     with Database(config.paths.database) as db:
         assert db.get_paper(paper_id)["selected"] == 1
+
+
+def test_content_blog_summary_lookup_is_not_correlated_per_row(
+    config_path, author_candidate
+):
+    """A large query history must be expanded once, not once per visible row."""
+    config = load_config(config_path)
+    with Database(config.paths.database) as db:
+        db.add_author(author_candidate)
+        blog_id = db.add_author_blog(
+            author_candidate.openalex_id, "https://example.test/performance-blog"
+        )
+        for index in range(40):
+            db.save_blog_entry(
+                blog_id=blog_id,
+                title=f"Performance entry {index:02d}",
+                content_sha256=f"performance-{index}",
+                normalized_text="body",
+                rendered_html="<p>body</p>",
+                diff_text="",
+                change_kind="changed",
+                previous_entry_id=None,
+                entry_kind="rss",
+                external_id=f"performance-{index}",
+                source_url=f"https://example.test/performance-blog/{index}",
+            )
+        query_id = db.create_saved_query(name="Performance summary", prompt="Summarize")
+        now = "2026-08-04T12:00:00+00:00"
+        db._conn.executemany(
+            """
+            INSERT INTO query_runs(
+                batch_id, query_id, profile, provider, model, status,
+                context_window_tokens, selection_json, created_at, started_at, finished_at
+            ) VALUES (?, ?, ?, 'ollama', 'model', 'success', 2048, ?, ?, ?, ?)
+            """,
+            (
+                (
+                    f"performance-{index}",
+                    query_id,
+                    f"profile-{index}",
+                    json.dumps(
+                        {"blog_entry_ids": [1_000_000 + value for value in range(40)]}
+                    ),
+                    now,
+                    now,
+                    now,
+                )
+                for index in range(200)
+            ),
+        )
+        db._conn.commit()
+
+        progress_calls = 0
+
+        def stop_runaway_query() -> int:
+            nonlocal progress_calls
+            progress_calls += 1
+            return 1 if progress_calls > 500 else 0
+
+        db._conn.set_progress_handler(stop_runaway_query, 1_000)
+        try:
+            rows = db.list_blog_entries(limit=25, table_view=True)
+        finally:
+            db._conn.set_progress_handler(None, 0)
+
+        assert len(rows) == 25
+        assert all(int(row["has_summary"]) == 0 for row in rows)
+        assert progress_calls < 500

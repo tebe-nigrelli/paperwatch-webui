@@ -399,6 +399,7 @@ CREATE TABLE IF NOT EXISTS query_runs (
 );
 CREATE INDEX IF NOT EXISTS idx_query_runs_query ON query_runs(query_id, id DESC);
 CREATE INDEX IF NOT EXISTS idx_query_runs_batch ON query_runs(batch_id, id);
+CREATE INDEX IF NOT EXISTS idx_query_runs_success ON query_runs(id) WHERE status='success';
 
 CREATE TABLE IF NOT EXISTS query_classification_results (
     id INTEGER PRIMARY KEY,
@@ -1913,6 +1914,23 @@ class Database:
                     ),
                 )
 
+    @staticmethod
+    def _successful_blog_entry_ids_sql() -> str:
+        """Return an uncorrelated query for blog entries with successful query output.
+
+        Keep this as a list subquery. Correlating ``be.id`` inside ``json_each``
+        makes SQLite expand every historical selection once per rendered row,
+        which can pin a CPU when the Content page opens.
+        """
+        return (
+            "SELECT CAST(selected_entry.value AS INTEGER) "
+            "FROM query_runs qr, "
+            "json_each(qr.selection_json, '$.blog_entry_ids') selected_entry "
+            "WHERE qr.status='success' "
+            "AND selected_entry.type IN ('integer', 'text') "
+            "AND CAST(selected_entry.value AS INTEGER) > 0"
+        )
+
     def _blog_entry_filter_sql(
         self,
         *,
@@ -2030,12 +2048,9 @@ class Database:
             where.append("be.selected=?")
             params.append(1 if selected else 0)
         if analyzed is not None:
-            clause = "EXISTS" if analyzed else "NOT EXISTS"
+            operator = "IN" if analyzed else "NOT IN"
             where.append(
-                f"{clause} ("
-                "SELECT 1 FROM query_runs qr, json_each(qr.selection_json, '$.blog_entry_ids') selected_entry "
-                "WHERE qr.status='success' AND CAST(selected_entry.value AS INTEGER)=be.id"
-                ")"
+                f"be.id {operator} ({self._successful_blog_entry_ids_sql()})"
             )
         return " AND ".join(where), params
 
@@ -2086,6 +2101,13 @@ class Database:
             selected=selected,
             analyzed=analyzed,
         )
+        has_summary_sql = (
+            "1"
+            if analyzed is True
+            else "0"
+            if analyzed is False
+            else f"be.id IN ({self._successful_blog_entry_ids_sql()})"
+        )
         order_sql = {
             "newest": "COALESCE(be.published_at, be.fetched_at) DESC, be.id DESC",
             "oldest": "COALESCE(be.published_at, be.fetched_at) ASC, be.id ASC",
@@ -2135,12 +2157,7 @@ class Database:
                     FROM author_blogs ab JOIN authors a ON a.id=ab.author_id
                     WHERE ab.blog_id=b.id ORDER BY a.name COLLATE NOCASE
                 )), '[]') AS tracked_authors_json,
-                EXISTS (
-                    SELECT 1 FROM query_runs qrs,
-                    json_each(qrs.selection_json, '$.blog_entry_ids') selected_entry
-                    WHERE qrs.status='success'
-                    AND CAST(selected_entry.value AS INTEGER)=be.id
-                ) AS has_summary,
+                {has_summary_sql} AS has_summary,
                 COALESCE((SELECT group_concat(name, ', ') FROM (
                     SELECT ct.name AS name
                     FROM blog_entry_tag_links betl
@@ -2171,10 +2188,7 @@ class Database:
                     FROM author_blogs ab JOIN authors a ON a.id=ab.author_id
                     WHERE ab.blog_id=b.id ORDER BY a.name COLLATE NOCASE
                 )), '[]') AS tracked_authors_json,
-                EXISTS (
-                    SELECT 1 FROM query_runs qrs, json_each(qrs.selection_json, '$.blog_entry_ids') selected_entry
-                    WHERE qrs.status='success' AND CAST(selected_entry.value AS INTEGER)=be.id
-                ) AS has_summary,
+                {has_summary_sql} AS has_summary,
                 COALESCE((SELECT group_concat(name, ', ') FROM (
                     SELECT ct.name AS name
                     FROM blog_entry_tag_links betl
