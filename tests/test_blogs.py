@@ -92,6 +92,17 @@ def test_extract_fetch_and_diff_branches(monkeypatch):
     assert blogs.blog_diff(None, "a") == ("baseline", "")
     kind, diff = blogs.blog_diff("a", "b")
     assert kind == "changed" and "-a" in diff and "+b" in diff
+    kind, diff = blogs.blog_diff(
+        "header\nunchanged one\nold value\nunchanged two\nfooter",
+        "header\nunchanged one\nnew value\nunchanged two\nfooter",
+    )
+    assert kind == "changed"
+    assert "-old value" in diff and "+new value" in diff
+    assert "unchanged one" not in diff and "unchanged two" not in diff
+    assert "--- previous" not in diff and "+++ current" not in diff
+    assert blogs.compact_blog_diff(
+        "--- previous\n+++ current\n@@ -1,3 +1,3 @@\n context\n-old\n+new"
+    ) == "@@ -1,3 +1,3 @@\n-old\n+new"
     kind, _ = blogs.blog_diff("\n".join(f"old {i}" for i in range(30)), "\n".join(f"new {i}" for i in range(30)))
     assert kind == "reset"
     monkeypatch.setattr(blogs, "MAX_DIFF_CHARS", 10)

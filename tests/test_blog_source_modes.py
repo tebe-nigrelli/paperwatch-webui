@@ -10,6 +10,7 @@ import pytest
 from bs4 import BeautifulSoup
 
 from paperwatch import blogs
+from paperwatch import db as db_module
 from paperwatch.blogs import ArticleItem, ArticleLink, BlogFetch
 from paperwatch.db import Database, SCHEMA_VERSION
 from paperwatch.models import AuthorCandidate
@@ -68,6 +69,7 @@ def test_source_mode_validation_inference_and_link_helpers(monkeypatch):
     assert blogs._normalize_link_url("mailto:a@example.com", "https://example.com") is None
     assert blogs._normalize_link_url("http://user:pass@example.com/a", "https://example.com") is None
     assert blogs._normalize_link_url("http://127.0.0.1/a", "https://example.com") is None
+    assert blogs._normalize_link_url("http://localhost/a", "https://example.com") is None
     assert blogs._normalize_link_url("http://example.com:bad/a", "https://example.com") is None
 
     soup = BeautifulSoup(
@@ -88,6 +90,16 @@ def test_source_mode_validation_inference_and_link_helpers(monkeypatch):
     assert blogs._link_label(object()) == ""
     assert blogs._link_label(root.find_all("a")[2]) == "ARIA label"
     assert blogs._link_label(BeautifulSoup(f"<a>{'x' * 301}</a>", "html.parser").a) == ""
+    candidate_soup = BeautifulSoup(
+        """<main><ul><li><a href='/products/widget'>Widget</a></li></ul>
+        <article><a href='/blog/real-post'>Real post</a></article></main>""",
+        "html.parser",
+    )
+    candidates = blogs._article_candidates(
+        candidate_soup, base_url="https://example.com/blog/"
+    )
+    assert [item.url for item in candidates] == ["https://example.com/blog/real-post"]
+
     pairs = blogs._outbound_link_pairs(root, "https://example.com/blog")
     assert pairs == (
         ("Useful post", "https://example.com/post"),
@@ -124,6 +136,14 @@ def test_source_mode_validation_inference_and_link_helpers(monkeypatch):
     assert blogs._published_at("") is None
     assert blogs._published_at("2026-08-01T12:00:00") == "2026-08-01T12:00:00+00:00"
     assert blogs._published_at("not-a-real-date") == "not-a-real-date"
+    assert blogs.extract_first_date("Jul 18, 2022") == "2022-07-18"
+    assert blogs.extract_first_date("June, 2020") == "2020-06"
+    assert blogs.extract_first_date("9/10/2025") == "2025-09-10"
+    assert blogs.extract_first_date(" 2023-09-22 ") == "2023-09-22"
+    assert blogs.extract_first_date("ertApr 14, 20265554Share") == "2026-04-14"
+    assert blogs.extract_first_date("31 Dec 2024") == "2024-12-31"
+    assert blogs.extract_first_date("2/30/2025 then Jul 1, 2020") == "2020-07-01"
+    assert blogs.extract_first_date("not a date") is None
 
     monkeypatch.setattr(blogs, "MAX_TEXT_CHARS", 20)
     assert len(blogs._text_with_links("Body", pairs)) == 20
@@ -383,23 +403,6 @@ def test_feed_video_and_direct_xml_fallback_paths():
     assert feed.method == "rss" and feed.feed_url == "https://example.com/blog/feed/"
     assert calls[:2] == ["/blog", "/blog/feed/"]
 
-    channel_page = '<html><script>var x={"channelId":"UCabc_123"}</script><main>Videos</main></html>'
-    atom = """<feed xmlns='http://www.w3.org/2005/Atom'><title>Videos</title><entry><id>video-1</id><title>Lecture</title><link href='https://youtube.com/watch?v=1'/><updated>2026-08-01T00:00:00Z</updated><summary>Talk</summary></entry></feed>"""
-
-    def video_handler(request: httpx.Request) -> httpx.Response:
-        if request.url.path == "/channel/videos":
-            return httpx.Response(200, headers={"content-type": "text/html"}, text=channel_page)
-        if request.url.path == "/feeds/videos.xml":
-            assert request.url.params["channel_id"] == "UCabc_123"
-            return httpx.Response(200, headers={"content-type": "application/atom+xml"}, text=atom)
-        return httpx.Response(404)
-
-    with httpx.Client(transport=httpx.MockTransport(video_handler)) as client:
-        video = blogs.fetch_blog(
-            client,
-            {"url": "https://www.youtube.com/channel/videos", "source_mode": "video"},
-        )
-    assert video.method == "rss" and video.feed_items[0].title == "Lecture"
     assert blogs._youtube_feed_url(
         "<link rel='alternate' type='application/rss+xml' href='/feeds/videos.xml?channel_id=UCx'>",
         "https://www.youtube.com/x",
@@ -416,6 +419,222 @@ def test_feed_video_and_direct_xml_fallback_paths():
             {"url": "https://example.com/page", "source_mode": "article"},
         )
     assert fallback.method == "snapshot" and fallback.snapshot_text == "Readable text"
+
+
+def test_youtube_uses_ytdlp_video_descriptions(monkeypatch):
+    payload = {
+        "title": "Neubig videos",
+        "entries": [
+            {
+                "id": "video-1",
+                "title": "Lecture one",
+                "webpage_url": "https://www.youtube.com/watch?v=video-1",
+                "upload_date": "20260731",
+                "description": (
+                    "The complete lecture description.\n\n"
+                    "Slides: https://example.com/slides?utm_source=youtube"
+                ),
+            }
+        ],
+    }
+    commands: list[list[str]] = []
+
+    monkeypatch.setattr(blogs.importlib.util, "find_spec", lambda name: object())
+
+    def fake_run(command, **kwargs):
+        commands.append(command)
+        assert kwargs["timeout"] == blogs.YOUTUBE_REQUEST_TIMEOUT
+        return blogs.subprocess.CompletedProcess(
+            command,
+            0,
+            stdout=json.dumps(payload),
+            stderr="",
+        )
+
+    monkeypatch.setattr(blogs.subprocess, "run", fake_run)
+
+    def unexpected_http(request):
+        raise AssertionError(f"YouTube HTML should not be fetched: {request.url}")
+
+    with httpx.Client(transport=httpx.MockTransport(unexpected_http)) as client:
+        fetched = blogs.fetch_blog(
+            client,
+            {
+                "url": "https://www.youtube.com/neubig/videos",
+                "title": "Neubig",
+                "source_mode": "video",
+            },
+        )
+
+    assert commands and commands[0][:3] == [blogs.sys.executable, "-m", "yt_dlp"]
+    assert commands[0][-1] == "https://www.youtube.com/neubig/videos"
+    assert fetched.method == "rss" and fetched.source_mode == "video"
+    assert fetched.feed_items[0].published_at == "2026-07-31"
+    assert "complete lecture description" in fetched.feed_items[0].text
+    assert fetched.feed_items[0].outbound_links == ("https://example.com/slides",)
+    assert "Loaded 1 YouTube video descriptions" in fetched.diagnostics[0]
+
+    monkeypatch.setattr(blogs.importlib.util, "find_spec", lambda name: None)
+    with httpx.Client(transport=httpx.MockTransport(unexpected_http)) as client:
+        with pytest.raises(ValueError, match="yt-dlp is not installed"):
+            blogs.fetch_blog(
+                client,
+                {
+                    "url": "https://www.youtube.com/neubig/videos",
+                    "source_mode": "video",
+                },
+            )
+
+
+def test_auto_index_fetches_child_article_and_visible_date():
+    index_html = """
+    <html><title>Robotics</title><main>
+      <article><span>Jul 18, 2022</span>
+        <a href='/blog/robotics-post/'>Robotics post</a>
+        <p>This is only the index summary.</p>
+      </article>
+    </main></html>
+    """
+    article_html = """
+    <html><title>Robotics post</title><main>
+      <h1>Robotics post</h1>
+      <div>ertApr 14, 20265554Share</div>
+      <p>The complete article body, not the category index.</p>
+      <a href='/blog/nested-reference/'>Nested reference</a>
+    </main></html>
+    """
+    requested: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requested.append(request.url.path)
+        if request.url.path == "/blog/category/robotics/":
+            return httpx.Response(
+                200,
+                headers={"content-type": "text/html"},
+                text=index_html,
+            )
+        if request.url.path == "/blog/robotics-post/":
+            return httpx.Response(
+                200,
+                headers={"content-type": "text/html"},
+                text=article_html,
+            )
+        return httpx.Response(404)
+
+    with httpx.Client(transport=httpx.MockTransport(handler)) as client:
+        fetched = blogs.fetch_blog(
+            client,
+            {
+                "url": "https://developer.nvidia.com/blog/category/robotics/",
+                "title": "Robotics",
+                "source_mode": "auto",
+                "_known_article_urls": (),
+                "article_cursor": 0,
+            },
+        )
+
+    assert requested == ["/blog/category/robotics/", "/blog/robotics-post/"]
+    assert fetched.source_mode == "article_index"
+    assert fetched.snapshot_text and "index summary" in fetched.snapshot_text
+    assert len(fetched.article_items) == 1
+    article = fetched.article_items[0]
+    assert article.url == "https://developer.nvidia.com/blog/robotics-post/"
+    assert "complete article body" in article.text
+    assert article.published_at == "2026-04-14"
+
+
+
+def test_auto_direct_article_is_not_misclassified_or_recursively_crawled():
+    article_html = """
+    <html><title>Main article</title><main>
+      <article>
+        <h1>Main article</h1>
+        <p>The complete source article body.</p>
+        <section class='related-posts'>
+          <a href='/blog/related-one/'>Related one</a>
+          <a href='/blog/related-two/'>Related two</a>
+        </section>
+      </article>
+    </main></html>
+    """
+    requested: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requested.append(request.url.path)
+        if request.url.path == "/blog/main-article/":
+            return httpx.Response(
+                200,
+                headers={"content-type": "text/html"},
+                text=article_html,
+            )
+        raise AssertionError(f"Related links must not be crawled: {request.url}")
+
+    with httpx.Client(transport=httpx.MockTransport(handler)) as client:
+        fetched = blogs.fetch_blog(
+            client,
+            {
+                "url": "https://example.com/blog/main-article/",
+                "title": "Main article",
+                "source_mode": "auto",
+                "_known_article_urls": (),
+                "article_cursor": 0,
+            },
+        )
+
+    assert requested == ["/blog/main-article/"]
+    assert fetched.source_mode == "article"
+    assert fetched.article_items == ()
+    assert fetched.snapshot_text and "complete source article body" in fetched.snapshot_text
+    assert any("lacked index-page evidence" in item for item in fetched.diagnostics)
+
+
+def test_feed_discovery_and_child_crawling_have_hard_request_caps():
+    feed_links = "".join(
+        f"<link rel='alternate' type='application/rss+xml' href='/feeds/{index}.xml'>"
+        for index in range(20)
+    )
+    index_html = (
+        "<html><head>" + feed_links + "</head><main>"
+        + "".join(
+            f"<article><a href='/blog/post-{index}/'>Post {index}</a></article>"
+            for index in range(20)
+        )
+        + "</main></html>"
+    )
+    requested: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requested.append(request.url.path)
+        if request.url.path == "/blog/":
+            return httpx.Response(
+                200, headers={"content-type": "text/html"}, text=index_html
+            )
+        if request.url.path.startswith("/feeds/"):
+            return httpx.Response(404)
+        if request.url.path.startswith("/blog/post-"):
+            return httpx.Response(
+                200,
+                headers={"content-type": "text/html"},
+                text=f"<html><main><h1>{request.url.path}</h1><p>Body</p></main></html>",
+            )
+        raise AssertionError(request.url)
+
+    with httpx.Client(transport=httpx.MockTransport(handler)) as client:
+        fetched = blogs.fetch_blog(
+            client,
+            {
+                "url": "https://example.com/blog/",
+                "source_mode": "auto",
+                "_known_article_urls": (),
+                "article_cursor": 0,
+            },
+        )
+
+    feed_requests = [path for path in requested if path.startswith("/feeds/")]
+    child_requests = [path for path in requested if path.startswith("/blog/post-")]
+    assert len(feed_requests) <= blogs.MAX_FEED_CANDIDATES
+    assert len(child_requests) <= blogs.MAX_ARTICLE_FETCHES
+    assert len(fetched.article_items) <= blogs.MAX_ARTICLE_FETCHES
 
 
 def test_github_release_commit_and_api_modes():
@@ -605,6 +824,18 @@ def test_pipeline_article_discovery_and_child_updates(app_config, author_candida
             llm=NoLLM(),
             pdf_client=httpx.Client(transport=httpx.MockTransport(lambda request: httpx.Response(500))),
         )
+        legacy_id = db.save_blog_entry(
+            blog_id=blog_id,
+            title="Index",
+            content_sha256=hashlib.sha256(b"old index").hexdigest(),
+            normalized_text="Old index page",
+            diff_text="+Old index page",
+            change_kind="changed",
+            previous_entry_id=None,
+            entry_kind="snapshot",
+            external_id="source-page",
+            source_url="https://example.com/blog",
+        )
         first_row = app._prepare_blog_fetch_rows(db.list_enabled_blogs())[0]
         first_text = "Title: One\nURL: https://example.com/posts/one\nInitial body"
         first = BlogFetch(
@@ -626,6 +857,7 @@ def test_pipeline_article_discovery_and_child_updates(app_config, author_candida
                     url="https://example.com/posts/one",
                     text=first_text,
                     sha256=hashlib.sha256(first_text.encode()).hexdigest(),
+                    published_at="2024-03-12",
                 ),
             ),
         )
@@ -637,6 +869,9 @@ def test_pipeline_article_discovery_and_child_updates(app_config, author_candida
         assert len(initial_entries) == 1
         assert initial_entries[0]["title"] == "One"
         assert initial_entries[0]["source_url"] == "https://example.com/posts/one"
+        assert initial_entries[0]["published_at"] == "2024-03-12"
+        assert db.get_blog_entry(legacy_id)["change_kind"] == "baseline"
+        assert db.get_blog_entry(legacy_id)["diff_text"] == ""
 
         second_row = app._prepare_blog_fetch_rows(db.list_enabled_blogs())[0]
         second_text = "Title: One\nURL: https://example.com/posts/one\nSubstantially changed body"
@@ -665,12 +900,15 @@ def test_pipeline_article_discovery_and_child_updates(app_config, author_candida
         )
         second_stats = RunStats(run_id=db.start_run())
         app._apply_blog_fetch(second_stats, second_row, second, None)
-        assert second_stats.blog_updates_found == 2
+        assert second_stats.blog_updates_found == 1
         updates = db.blog_entries_by_ids(second_stats.new_blog_entry_ids)
         assert {row["source_url"] for row in updates} == {
             "https://example.com/posts/one",
-            "https://example.com/posts/two",
         }
+        assert all(
+            row["source_url"] != "https://example.com/blog"
+            for row in db.list_blog_entries()
+        )
         assert set(db.known_blog_article_urls(blog_id)) == {
             "https://example.com/posts/one",
             "https://example.com/posts/two",
@@ -678,6 +916,38 @@ def test_pipeline_article_discovery_and_child_updates(app_config, author_candida
         stored = db.author_blogs("A123")[0]
         assert stored["article_cursor"] == 2
         assert "second" in stored["feed_diagnostics"]
+
+        current = db.latest_blog_entry(
+            blog_id, entry_kind="rss", external_id=hashlib.sha256(b"body-one").hexdigest()
+        )
+        assert current is not None
+        with db.transaction() as conn:
+            conn.execute("UPDATE blog_entries SET published_at=NULL WHERE id=?", (current["id"],))
+        unchanged_with_date = BlogFetch(
+            method="snapshot",
+            title="Index",
+            status_code=200,
+            snapshot_text="Index one\nIndex two",
+            snapshot_sha256=hashlib.sha256(b"Index one\nIndex two").hexdigest(),
+            source_mode="article_index",
+            article_cursor_next=2,
+            discovered_articles=second.discovered_articles,
+            article_items=(
+                ArticleItem(
+                    external_id=hashlib.sha256(b"body-one").hexdigest(),
+                    title="One",
+                    url="https://example.com/posts/one",
+                    text=second_text,
+                    sha256=hashlib.sha256(second_text.encode()).hexdigest(),
+                    published_at="2026-04-14",
+                ),
+            ),
+        )
+        third_stats = RunStats(run_id=db.start_run())
+        third_row = app._prepare_blog_fetch_rows(db.list_enabled_blogs())[0]
+        app._apply_blog_fetch(third_stats, third_row, unchanged_with_date, None)
+        assert third_stats.blog_updates_found == 0
+        assert db.get_blog_entry(int(current["id"]))["published_at"] == "2026-04-14"
         app.close()
 
 
@@ -812,6 +1082,31 @@ def test_blog_fetch_batch_fetches_multiple_sources_concurrently(
         assert [result[0]["id"] for result in results] == [1, 2]
         assert all(result[1] is not None and result[2] is None for result in results)
         app.close()
+
+
+
+def test_known_article_history_is_bounded(app_config, author_candidate, monkeypatch):
+    monkeypatch.setattr(db_module, "MAX_KNOWN_BLOG_ARTICLES", 2)
+    with Database(app_config.paths.database) as db:
+        db.add_author(author_candidate)
+        blog_id = db.add_author_blog("A123", "https://example.com/blog")
+        db.sync_known_blog_articles(
+            blog_id,
+            [(f"https://example.com/posts/{index}", str(index)) for index in range(5)],
+        )
+        db.sync_known_blog_articles(
+            blog_id,
+            [("https://example.com/posts/current", "Current")],
+        )
+        rows = db._conn.execute(
+            "SELECT article_url, active FROM known_blog_articles WHERE blog_id=?",
+            (blog_id,),
+        ).fetchall()
+        assert len(rows) == 3
+        assert sum(int(row["active"]) for row in rows) == 1
+        known = db.known_blog_article_urls(blog_id)
+        assert known[0] == "https://example.com/posts/current"
+        assert len(known) == 2
 
 
 def test_schema_18_promotes_and_seeds_initial_feed_items(tmp_path, author_candidate):

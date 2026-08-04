@@ -270,6 +270,18 @@ def test_blog_csv_import_and_feed_ui(config_path):
     assert detail.status_code == 200
     assert "Version difference" in detail.text
     assert "+new" in detail.text
+    assert f'action="/content/blog/{changed}/star"' in detail.text
+    starred = client.post(
+        f"/content/blog/{changed}/star",
+        data={"starred": "1"},
+        headers={"X-Paperwatch-Async": "1"},
+    )
+    assert starred.status_code == 200
+    assert starred.json() == {"ok": True, "starred": True}
+    with Database(config.paths.database) as db:
+        assert db.get_blog_entry(changed)["starred"] == 1
+    starred_detail = client.get(f"/blogs/{changed}")
+    assert "Remove star" in starred_detail.text and "★" in starred_detail.text
     assert client.get("/blogs/9999").status_code == 404
 
 

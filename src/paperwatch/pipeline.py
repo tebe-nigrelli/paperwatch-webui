@@ -40,6 +40,9 @@ from .sources.arxiv import ArxivClient
 from .sources.openalex import OpenAlexClient
 
 
+MAX_BLOG_FETCH_WORKERS = 8
+
+
 @dataclass(slots=True)
 class RunStats:
     authors_total: int = 0
@@ -216,9 +219,10 @@ class PaperWatch:
         """
         if not blogs:
             return []
-        # Each configured source gets its own worker. Slow or broken websites
-        # therefore cannot serialize the rest of a large watchlist.
-        worker_count = len(blogs)
+        # Bound concurrency because each source may perform several child-page
+        # requests. This prevents a large watchlist from creating one thread and
+        # up to MAX_ARTICLE_FETCHES outbound requests per source simultaneously.
+        worker_count = min(len(blogs), MAX_BLOG_FETCH_WORKERS)
         if worker_count == 1:
             blog = blogs[0]
             check_cancelled(self._cancel_event)
@@ -501,6 +505,9 @@ class PaperWatch:
                     if previous is not None and previous["content_sha256"] == item_sha256:
                         if linked_paper_id is not None:
                             self.db.link_blog_entry_to_paper(int(previous["id"]), linked_paper_id)
+                        self.db.set_blog_entry_published_at(
+                            int(previous["id"]), item.published_at
+                        )
                         continue
                     initial_item = previous is None and initial_sync
                     if previous is None:
@@ -568,6 +575,11 @@ class PaperWatch:
                             content_sha256=combined_sha256,
                             normalized_text=combined_text,
                             rendered_html=combined_html,
+                            published_at=article.published_at,
+                        )
+                    else:
+                        self.db.set_blog_entry_published_at(
+                            int(rss_entry["id"]), article.published_at
                         )
                 discovered = tuple(fetched.discovered_articles)
                 fetched_article_urls = {item.url for item in fetched.article_items}
@@ -587,6 +599,9 @@ class PaperWatch:
                         previous_article is not None
                         and previous_article["content_sha256"] == article.sha256
                     ):
+                        self.db.set_blog_entry_published_at(
+                            int(previous_article["id"]), article.published_at
+                        )
                         continue
                     first_page_fetch = previous_article is None
                     if previous_article is None:
@@ -613,6 +628,7 @@ class PaperWatch:
                         external_id=article.external_id,
                         source_url=article.url,
                         rendered_html=article.rendered_html,
+                        published_at=article.published_at,
                     )
                     # The feed item itself is the new-content notification. The
                     # first HTML fetch is a usable website snapshot, not a
@@ -651,7 +667,6 @@ class PaperWatch:
                 str(value) for value in (blog.get("_known_article_urls", ()) or ())
             }
             discovered = tuple(fetched.discovered_articles)
-            discovered_urls = {item.url for item in discovered}
             new_discoveries = [
                 item for item in discovered if item.url not in existing_article_urls
             ]
@@ -662,10 +677,11 @@ class PaperWatch:
                     ((item.url, item.title) for item in discovered),
                     fetched_urls=fetched_article_urls,
                 )
+            # Article-index pages are navigation, not content. Store only pages
+            # that were actually fetched; publication lists retain their useful
+            # discovery records for external paper targets.
             discovery_candidates = (
-                discovered
-                if fetched.source_mode == "publications"
-                else new_discoveries
+                discovered if fetched.source_mode == "publications" else ()
             )
             for article in discovery_candidates:
                 # A successfully fetched child page is stored below as the
@@ -707,6 +723,7 @@ class PaperWatch:
                     entry_kind="rss",
                     external_id=external_id,
                     source_url=article.url,
+                    published_at=article.published_at,
                     linked_paper_id=linked_paper_id,
                 )
                 if not initial_article_sync and article.url not in existing_article_urls:
@@ -737,6 +754,9 @@ class PaperWatch:
                         int(previous_article["id"]), linked_paper_id
                     )
                 if previous_article is not None and previous_article["content_sha256"] == article.sha256:
+                    self.db.set_blog_entry_published_at(
+                        int(previous_article["id"]), article.published_at
+                    )
                     continue
                 if reuse_source_entry and previous_article is not None:
                     self.db.update_blog_entry_content(
@@ -744,6 +764,7 @@ class PaperWatch:
                         content_sha256=article.sha256,
                         normalized_text=article.text,
                         rendered_html=article.rendered_html,
+                        published_at=article.published_at,
                     )
                     continue
                 initial_article = previous_article is None and (
@@ -773,11 +794,31 @@ class PaperWatch:
                     external_id=article.external_id,
                     source_url=article.url,
                     rendered_html=article.rendered_html,
+                    published_at=article.published_at,
                     linked_paper_id=linked_paper_id,
                 )
                 if article_kind != "baseline" and not initial_article:
                     stats.blog_updates_found += 1
                     stats.new_blog_entry_ids.append(article_entry_id)
+
+            if fetched.source_mode in {"article_index", "publications"}:
+                self.db.suppress_blog_source_page_entries(blog_id)
+                self.db.mark_blog_checked(
+                    blog_id,
+                    status=fetched.status_code,
+                    etag=fetched.etag,
+                    last_modified=fetched.last_modified,
+                    title=fetched.title,
+                    error=None,
+                    fetch_method="snapshot",
+                    feed_url=fetched.feed_url,
+                    feed_discovery_checked=fetched.discovery_checked,
+                    article_initialized=True,
+                    article_cursor=fetched.article_cursor_next,
+                    diagnostics=json.dumps(fetched.diagnostics),
+                    item_stream_mode=fetched.source_mode,
+                )
+                return
 
             previous = self.db.latest_blog_entry(
                 blog_id, entry_kind="snapshot", external_id="source-page"
@@ -786,6 +827,9 @@ class PaperWatch:
                 previous is not None
                 and previous["content_sha256"] == fetched.snapshot_sha256
             ):
+                self.db.set_blog_entry_published_at(
+                    int(previous["id"]), fetched.snapshot_published_at
+                )
                 self.db.mark_blog_checked(
                     blog_id,
                     status=fetched.status_code,
@@ -825,6 +869,7 @@ class PaperWatch:
                 external_id="source-page",
                 source_url=str(blog["url"]),
                 rendered_html=fetched.snapshot_rendered_html,
+                published_at=fetched.snapshot_published_at,
             )
             if kind != "baseline":
                 stats.blog_updates_found += 1

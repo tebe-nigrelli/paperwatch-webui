@@ -32,6 +32,8 @@ BLOG_SOURCE_MODES = {
     "video",
 }
 
+MAX_KNOWN_BLOG_ARTICLES = 2_000
+
 DEFAULT_SUMMARY_QUERY_NAME = "Summarize"
 DEFAULT_SUMMARY_QUERY_PROMPT = (
     "Summarize each selected paper. Cover the research problem, methods, main results, "
@@ -1574,11 +1576,13 @@ class Database:
                 FROM known_blog_articles
                 WHERE blog_id=?
                 ORDER BY
+                    active DESC,
                     CASE WHEN last_fetched_at IS NULL THEN 0 ELSE 1 END,
                     COALESCE(last_fetched_at, first_seen_at),
                     article_url
+                LIMIT ?
                 """,
-                (blog_id,),
+                (blog_id, MAX_KNOWN_BLOG_ARTICLES),
             ).fetchall()
         )
 
@@ -1589,17 +1593,32 @@ class Database:
         *,
         fetched_urls: Iterable[str] = (),
     ) -> set[str]:
-        values = [(str(url), str(title or "")) for url, title in articles if str(url)]
+        values = list(
+            dict.fromkeys(
+                (str(url), str(title or ""))
+                for url, title in articles
+                if str(url)
+            )
+        )
         fetched = {str(url) for url in fetched_urls if str(url)}
         now = utcnow()
         with self.transaction() as conn:
-            existing = {
-                str(row["article_url"])
-                for row in conn.execute(
-                    "SELECT article_url FROM known_blog_articles WHERE blog_id=?",
-                    (blog_id,),
-                ).fetchall()
-            }
+            value_urls = [url for url, _title in values]
+            if value_urls:
+                placeholders = ",".join("?" for _ in value_urls)
+                existing = {
+                    str(row["article_url"])
+                    for row in conn.execute(
+                        f"""
+                        SELECT article_url
+                        FROM known_blog_articles
+                        WHERE blog_id=? AND article_url IN ({placeholders})
+                        """,
+                        (blog_id, *value_urls),
+                    ).fetchall()
+                }
+            else:
+                existing = set()
             if values:
                 conn.execute(
                     "UPDATE known_blog_articles SET active=0 WHERE blog_id=?",
@@ -1632,6 +1651,19 @@ class Database:
                     """,
                     (now, blog_id, url),
                 )
+            conn.execute(
+                """
+                DELETE FROM known_blog_articles
+                WHERE blog_id=? AND active=0 AND article_url IN (
+                    SELECT article_url
+                    FROM known_blog_articles
+                    WHERE blog_id=? AND active=0
+                    ORDER BY COALESCE(last_seen_at, first_seen_at) DESC, article_url
+                    LIMIT -1 OFFSET ?
+                )
+                """,
+                (blog_id, blog_id, MAX_KNOWN_BLOG_ARTICLES),
+            )
         return {url for url, _ in values if url not in existing}
 
     def latest_blog_entry(
@@ -1682,18 +1714,57 @@ class Database:
         content_sha256: str,
         normalized_text: str,
         rendered_html: str | None,
+        published_at: str | None = None,
     ) -> bool:
         """Enrich an existing feed record without creating a false new update."""
         with self.transaction() as conn:
             cur = conn.execute(
                 """
                 UPDATE blog_entries
-                SET content_sha256=?, normalized_text=?, rendered_html=?
+                SET content_sha256=?, normalized_text=?, rendered_html=?,
+                    published_at=COALESCE(?, published_at)
                 WHERE id=?
                 """,
-                (content_sha256, normalized_text, rendered_html, entry_id),
+                (
+                    content_sha256,
+                    normalized_text,
+                    rendered_html,
+                    published_at,
+                    entry_id,
+                ),
             )
         return cur.rowcount > 0
+
+    def set_blog_entry_published_at(
+        self, entry_id: int, published_at: str | None
+    ) -> bool:
+        """Backfill a missing publication date without rewriting unchanged content."""
+        if not published_at:
+            return False
+        with self.transaction() as conn:
+            cur = conn.execute(
+                """
+                UPDATE blog_entries
+                SET published_at=?
+                WHERE id=? AND trim(COALESCE(published_at, ''))=''
+                """,
+                (published_at, entry_id),
+            )
+        return cur.rowcount > 0
+
+    def suppress_blog_source_page_entries(self, blog_id: int) -> int:
+        """Hide legacy index-page snapshots once child articles are tracked."""
+        with self.transaction() as conn:
+            cur = conn.execute(
+                """
+                UPDATE blog_entries
+                SET change_kind='baseline', diff_text=''
+                WHERE blog_id=? AND entry_kind='snapshot'
+                    AND external_id='source-page' AND change_kind!='baseline'
+                """,
+                (blog_id,),
+            )
+        return int(cur.rowcount)
 
     def link_blog_entry_to_paper(self, entry_id: int, paper_id: int) -> bool:
         with self.transaction() as conn:

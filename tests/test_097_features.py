@@ -220,17 +220,26 @@ def test_schema_21_backfills_arxiv_blog_paper_links(
         assert db.get_blog_entry(entry_id)["linked_paper_id"] == paper_id
 
 
-def test_every_blog_source_gets_a_parallel_worker(
-    config_path, monkeypatch
-):
+def test_blog_fetch_worker_pool_is_bounded(config_path, monkeypatch):
     config = load_config(config_path)
     client = httpx.Client(
         transport=httpx.MockTransport(lambda request: httpx.Response(404))
     )
-    barrier = threading.Barrier(10)
+    lock = threading.Lock()
+    release = threading.Event()
+    active = 0
+    peak = 0
 
     def fake_fetch(_client, row):
-        barrier.wait(timeout=3)
+        nonlocal active, peak
+        with lock:
+            active += 1
+            peak = max(peak, active)
+            if peak == pipeline_module.MAX_BLOG_FETCH_WORKERS:
+                release.set()
+        assert release.wait(timeout=3)
+        with lock:
+            active -= 1
         return BlogFetch(
             method="snapshot",
             title=str(row["id"]),
@@ -249,9 +258,13 @@ def test_every_blog_source_gets_a_parallel_worker(
             llm=NoLLM(),
             pdf_client=client,
         )
-        rows = [{"id": index, "url": f"https://example.test/{index}"} for index in range(10)]
+        rows = [
+            {"id": index, "url": f"https://example.test/{index}"}
+            for index in range(pipeline_module.MAX_BLOG_FETCH_WORKERS + 4)
+        ]
         results = app._fetch_blog_batch(rows)
-    assert len(results) == 10
+    assert len(results) == len(rows)
+    assert peak == pipeline_module.MAX_BLOG_FETCH_WORKERS
     assert all(error is None for _row, _fetched, error in results)
     client.close()
 

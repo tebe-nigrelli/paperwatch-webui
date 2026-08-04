@@ -1199,8 +1199,14 @@
           const button = form.querySelector(".star-button");
           if (input) input.value = payload.starred ? "0" : "1";
           if (button) {
-            button.classList.toggle("is-starred", Boolean(payload.starred));
-            button.textContent = payload.starred ? "★" : "☆";
+            const active = Boolean(payload.starred);
+            const label = active
+              ? (button.dataset.starredLabel || "Remove star")
+              : (button.dataset.unstarredLabel || "Star content");
+            button.classList.toggle("is-starred", active);
+            button.textContent = active ? "★" : "☆";
+            button.title = label;
+            button.setAttribute("aria-label", label);
           }
         } else if ("read" in payload) {
           const input = form.querySelector('input[name="read"]');

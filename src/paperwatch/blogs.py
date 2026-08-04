@@ -2,12 +2,15 @@ from __future__ import annotations
 
 import hashlib
 import html
+import importlib.util
 import ipaddress
 import json
 import re
+import subprocess
+import sys
 from collections import Counter
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from difflib import SequenceMatcher, unified_diff
 from email.utils import parsedate_to_datetime
 from urllib.parse import parse_qsl, urlencode, urljoin, urlsplit, urlunsplit
@@ -23,8 +26,11 @@ MAX_RESPONSE_BYTES = 5_000_000
 MAX_TEXT_CHARS = 1_000_000
 MAX_DIFF_CHARS = 200_000
 MAX_FEED_ITEMS = 200
+MAX_FEED_CANDIDATES = 8
 MAX_ARTICLE_FETCHES = 8
 BLOG_REQUEST_TIMEOUT = 20.0
+YOUTUBE_PLAYLIST_LIMIT = 20
+YOUTUBE_REQUEST_TIMEOUT = 90.0
 FEED_CONTENT_TYPES = {
     "application/atom+xml",
     "application/rdf+xml",
@@ -110,6 +116,26 @@ ARTICLE_PATH_WORDS = {
     "stories",
     "writing",
 }
+INDEX_PATH_WORDS = {
+    "archive",
+    "archives",
+    "articles",
+    "blog",
+    "blogs",
+    "category",
+    "categories",
+    "insight",
+    "insights",
+    "news",
+    "newsroom",
+    "posts",
+    "publication",
+    "publications",
+    "research",
+    "stories",
+    "tag",
+    "tags",
+}
 NON_ARTICLE_PATH_WORDS = {
     "about",
     "author",
@@ -117,10 +143,17 @@ NON_ARTICLE_PATH_WORDS = {
     "category",
     "categories",
     "contact",
+    "download",
+    "downloads",
+    "event",
+    "events",
     "feed",
     "login",
     "privacy",
+    "product",
+    "products",
     "search",
+    "support",
     "signin",
     "signup",
     "tag",
@@ -146,6 +179,7 @@ class ArticleLink:
     title: str
     url: str
     summary: str = ""
+    published_at: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -157,6 +191,7 @@ class ArticleItem:
     sha256: str
     outbound_links: tuple[str, ...] = ()
     rendered_html: str | None = None
+    published_at: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -173,6 +208,7 @@ class BlogFetch:
     snapshot_sha256: str | None = None
     snapshot_links: tuple[str, ...] = ()
     snapshot_rendered_html: str | None = None
+    snapshot_published_at: str | None = None
     feed_items: tuple[FeedItem, ...] = ()
     discovered_articles: tuple[ArticleLink, ...] = ()
     article_items: tuple[ArticleItem, ...] = ()
@@ -301,6 +337,8 @@ def _normalize_link_url(value: str, base_url: str) -> str | None:
         if parsed.username or parsed.password:
             return None
         hostname = parsed.hostname.lower().rstrip(".")
+        if hostname == "localhost" or hostname.endswith(".localhost"):
+            return None
         try:
             address = ipaddress.ip_address(hostname)
         except ValueError:
@@ -639,6 +677,299 @@ def _published_at(value: str) -> str | None:
     return parsed.astimezone(timezone.utc).replace(microsecond=0).isoformat()
 
 
+_MONTH_NUMBERS = {
+    "jan": 1,
+    "january": 1,
+    "feb": 2,
+    "february": 2,
+    "mar": 3,
+    "march": 3,
+    "apr": 4,
+    "april": 4,
+    "may": 5,
+    "jun": 6,
+    "june": 6,
+    "jul": 7,
+    "july": 7,
+    "aug": 8,
+    "august": 8,
+    "sep": 9,
+    "sept": 9,
+    "september": 9,
+    "oct": 10,
+    "october": 10,
+    "nov": 11,
+    "november": 11,
+    "dec": 12,
+    "december": 12,
+}
+_MONTH_PATTERN = (
+    r"Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|"
+    r"Jun(?:e)?|Jul(?:y)?|Aug(?:ust)?|Sep(?:t(?:ember)?)?|"
+    r"Oct(?:ober)?|Nov(?:ember)?|Dec(?:ember)?"
+)
+
+
+def _date_value(year: int, month: int, day: int | None) -> str | None:
+    try:
+        if day is None:
+            date(year, month, 1)
+            return f"{year:04d}-{month:02d}"
+        return date(year, month, day).isoformat()
+    except ValueError:
+        return None
+
+
+def extract_first_date(value: str) -> str | None:
+    """Return the first valid date-like string as ISO, preserving month precision.
+
+    Numeric dates use US month/day/year order when ambiguous. Patterns do not
+    require surrounding whitespace so dates embedded in minified text remain
+    detectable, for example ``ertApr 14, 20265554Share``.
+    """
+    candidates: list[tuple[int, int, str]] = []
+
+    def add(match: re.Match[str], parsed: str | None, precision: int) -> None:
+        if parsed is not None:
+            candidates.append((match.start(), -precision, parsed))
+
+    for match in re.finditer(
+        rf"(?P<month>{_MONTH_PATTERN})\s*,?\s*(?P<day>\d{{1,2}})"
+        rf"(?:st|nd|rd|th)?\s*,?\s*(?P<year>(?:19|20)\d{{2}})",
+        value,
+        re.IGNORECASE,
+    ):
+        month = _MONTH_NUMBERS[match.group("month").casefold()]
+        add(
+            match,
+            _date_value(int(match.group("year")), month, int(match.group("day"))),
+            3,
+        )
+
+    for match in re.finditer(
+        rf"(?P<day>\d{{1,2}})(?:st|nd|rd|th)?\s*(?P<month>{_MONTH_PATTERN})"
+        rf"\s*,?\s*(?P<year>(?:19|20)\d{{2}})",
+        value,
+        re.IGNORECASE,
+    ):
+        month = _MONTH_NUMBERS[match.group("month").casefold()]
+        add(
+            match,
+            _date_value(int(match.group("year")), month, int(match.group("day"))),
+            3,
+        )
+
+    for match in re.finditer(
+        r"(?P<year>(?:19|20)\d{2})\s*[-/.]\s*(?P<month>\d{1,2})"
+        r"\s*[-/.]\s*(?P<day>\d{1,2})",
+        value,
+    ):
+        add(
+            match,
+            _date_value(
+                int(match.group("year")),
+                int(match.group("month")),
+                int(match.group("day")),
+            ),
+            3,
+        )
+
+    for match in re.finditer(
+        r"(?P<month>\d{1,2})\s*[/.-]\s*(?P<day>\d{1,2})"
+        r"\s*[/.-]\s*(?P<year>(?:19|20)\d{2})",
+        value,
+    ):
+        add(
+            match,
+            _date_value(
+                int(match.group("year")),
+                int(match.group("month")),
+                int(match.group("day")),
+            ),
+            3,
+        )
+
+    for match in re.finditer(
+        rf"(?P<month>{_MONTH_PATTERN})\s*,?\s*(?P<year>(?:19|20)\d{{2}})",
+        value,
+        re.IGNORECASE,
+    ):
+        month = _MONTH_NUMBERS[match.group("month").casefold()]
+        add(match, _date_value(int(match.group("year")), month, None), 2)
+
+    if not candidates:
+        return None
+    return min(candidates)[2]
+
+
+def _html_first_date(value: str) -> str | None:
+    soup = BeautifulSoup(value, "html.parser")
+    for element in soup(["script", "style", "noscript", "svg"]):
+        element.decompose()
+    return extract_first_date(soup.get_text(" ", strip=True))
+
+
+def _youtube_url(value: str) -> bool:
+    parsed = urlsplit(value)
+    host = (parsed.hostname or "").lower().removeprefix("www.")
+    return host in {"youtube.com", "m.youtube.com", "youtu.be"}
+
+
+def _description_links(value: str, base_url: str) -> tuple[str, ...]:
+    links: list[str] = []
+    for raw in re.findall(r"https?://[^\s<>\[\](){}\"']+", value):
+        candidate = raw.rstrip(".,;:!?")
+        normalized = _normalize_link_url(candidate, base_url)
+        if normalized and normalized not in links:
+            links.append(normalized)
+    return tuple(links)
+
+
+def _plain_text_html(value: str) -> str | None:
+    paragraphs = [part.strip() for part in re.split(r"\n\s*\n", value) if part.strip()]
+    if not paragraphs:
+        return None
+    return "".join(
+        "<p>" + html.escape(part).replace("\n", "<br>") + "</p>"
+        for part in paragraphs
+    )
+
+
+def _youtube_published_at(payload: dict[str, object], description: str) -> str | None:
+    for key in ("release_timestamp", "timestamp"):
+        raw = payload.get(key)
+        if isinstance(raw, (int, float)):
+            try:
+                return datetime.fromtimestamp(raw, timezone.utc).replace(microsecond=0).isoformat()
+            except (OverflowError, OSError, ValueError):
+                pass
+    for key in ("release_date", "upload_date"):
+        raw = str(payload.get(key) or "").strip()
+        if re.fullmatch(r"\d{8}", raw):
+            try:
+                return datetime.strptime(raw, "%Y%m%d").date().isoformat()
+            except ValueError:
+                pass
+        parsed = extract_first_date(raw)
+        if parsed:
+            return parsed
+    return extract_first_date(description)
+
+
+def _youtube_feed_item(payload: dict[str, object], fallback_url: str) -> FeedItem | None:
+    url = str(
+        payload.get("webpage_url")
+        or payload.get("original_url")
+        or payload.get("url")
+        or fallback_url
+    ).strip()
+    if not _youtube_url(url):
+        url = fallback_url
+    try:
+        normalized_url = normalize_blog_url(url)
+    except ValueError:
+        return None
+    title = str(payload.get("title") or payload.get("fulltitle") or "YouTube video").strip()
+    description = str(payload.get("description") or "").strip()
+    published_at = _youtube_published_at(payload, description)
+    links = _description_links(description, normalized_url)
+    text = _clean_lines(
+        "\n".join(
+            part
+            for part in (
+                f"Title: {title}",
+                f"Published: {published_at}" if published_at else "",
+                f"URL: {normalized_url}",
+                description,
+            )
+            if part
+        )
+    )
+    html_parts = [
+        '<p class="rss-source-link"><a href="'
+        + html.escape(normalized_url, quote=True)
+        + '" target="_blank" rel="noreferrer">Open source</a></p>'
+    ]
+    if published_at:
+        html_parts.append(
+            '<p class="rss-published"><time datetime="'
+            + html.escape(published_at, quote=True)
+            + '">'
+            + html.escape(published_at)
+            + "</time></p>"
+        )
+    description_html = _plain_text_html(description)
+    if description_html:
+        html_parts.append(description_html)
+    identity = str(payload.get("id") or normalized_url)
+    return FeedItem(
+        external_id=hashlib.sha256(f"youtube\0{identity}".encode("utf-8")).hexdigest(),
+        title=title,
+        url=normalized_url,
+        published_at=published_at,
+        text=text,
+        sha256=_content_sha256(text, links),
+        outbound_links=links,
+        rendered_html="".join(html_parts),
+    )
+
+
+def _youtube_fetch(row: object) -> BlogFetch:
+    url = str(_row_value(row, "url", ""))
+    if importlib.util.find_spec("yt_dlp") is None:
+        raise ValueError("yt-dlp is not installed")
+    try:
+        process = subprocess.run(
+            [
+                sys.executable,
+                "-m",
+                "yt_dlp",
+                "--dump-single-json",
+                "--skip-download",
+                "--no-warnings",
+                "--ignore-errors",
+                "--playlist-end",
+                str(YOUTUBE_PLAYLIST_LIMIT),
+                url,
+            ],
+            capture_output=True,
+            text=True,
+            timeout=YOUTUBE_REQUEST_TIMEOUT,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise ValueError(f"yt-dlp failed: {exc}") from exc
+    if process.returncode != 0:
+        detail = process.stderr.strip().splitlines()[-1:] or ["unknown error"]
+        raise ValueError(f"yt-dlp failed: {detail[0][:300]}")
+    try:
+        payload = json.loads(process.stdout)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("yt-dlp returned invalid JSON") from exc
+    if not isinstance(payload, dict):
+        raise ValueError("yt-dlp returned an invalid result")
+    raw_entries = payload.get("entries")
+    entries = raw_entries if isinstance(raw_entries, list) else [payload]
+    items = tuple(
+        item
+        for raw in entries[:YOUTUBE_PLAYLIST_LIMIT]
+        if isinstance(raw, dict)
+        and (item := _youtube_feed_item(raw, url)) is not None
+    )
+    if not items:
+        raise ValueError("yt-dlp returned no readable videos")
+    title = str(payload.get("title") or _row_value(row, "title", "") or url).strip()
+    return BlogFetch(
+        method="rss",
+        title=title,
+        status_code=200,
+        feed_items=items,
+        source_mode="video",
+        discovery_checked=True,
+        diagnostics=(f"Loaded {len(items)} YouTube video descriptions with yt-dlp",),
+    )
+
+
 @dataclass(frozen=True, slots=True)
 class _RawFeedItem:
     title: str
@@ -734,7 +1065,12 @@ def _feed_external_id(
     return hashlib.sha256(raw.encode("utf-8")).hexdigest(), None if item_url in duplicated_urls else item_url
 
 
-def _feed_item_html(item: _RawFeedItem, item_url: str | None) -> str | None:
+def _feed_item_html(
+    item: _RawFeedItem,
+    item_url: str | None,
+    *,
+    published_at: str | None = None,
+) -> str | None:
     """Render feed metadata with a real source link before the sanitized body."""
     parts: list[str] = []
     if item_url:
@@ -743,12 +1079,13 @@ def _feed_item_html(item: _RawFeedItem, item_url: str | None) -> str | None:
             + html.escape(item_url, quote=True)
             + '" target="_blank" rel="noreferrer">Open source</a></p>'
         )
-    if item.published_at:
+    displayed_date = published_at or item.published_at
+    if displayed_date:
         parts.append(
             '<p class="rss-published"><time datetime="'
-            + html.escape(item.published_at, quote=True)
+            + html.escape(displayed_date, quote=True)
             + '">'
-            + html.escape(item.published_at)
+            + html.escape(displayed_date)
             + '</time></p>'
         )
     if item.rendered_html:
@@ -798,12 +1135,13 @@ def parse_feed(xml: str, base_url: str, fallback_title: str) -> tuple[str, tuple
         if external_id in seen_external_ids:
             external_id = hashlib.sha256(f"{external_id}\0{index}".encode("utf-8")).hexdigest()
         seen_external_ids.add(external_id)
+        published_at = item.published_at or extract_first_date(item.body_text)
         normalized = _clean_lines(
             "\n".join(
                 part
                 for part in (
                     f"Title: {item.title}",
-                    f"Published: {item.published_at}" if item.published_at else "",
+                    f"Published: {published_at}" if published_at else "",
                     f"URL: {item_url}" if item_url else "",
                     item.body_text,
                 )
@@ -815,11 +1153,13 @@ def parse_feed(xml: str, base_url: str, fallback_title: str) -> tuple[str, tuple
                 external_id=external_id,
                 title=item.title,
                 url=item_url,
-                published_at=item.published_at,
+                published_at=published_at,
                 text=normalized,
                 sha256=_content_sha256(normalized, item.outbound_links),
                 outbound_links=item.outbound_links,
-                rendered_html=_feed_item_html(item, item_url),
+                rendered_html=_feed_item_html(
+                    item, item_url, published_at=published_at
+                ),
             )
         )
     return title.strip() or fallback_title, tuple(parsed)
@@ -829,6 +1169,8 @@ def discover_feed_urls(html: str, base_url: str) -> tuple[str, ...]:
     soup = BeautifulSoup(html, "html.parser")
     found: list[str] = []
     for link in soup.find_all("link", href=True):
+        if len(found) >= MAX_FEED_CANDIDATES:
+            break
         rel = {str(value).lower() for value in (link.get("rel") or [])}
         content_type = str(link.get("type") or "").split(";", 1)[0].strip().lower()
         href = str(link.get("href") or "")
@@ -938,21 +1280,52 @@ def _article_score(element: object, *, url: str, base_url: str) -> int:
     if any(part in ARTICLE_PATH_WORDS for part in path_parts):
         score += 20
     if any(part in NON_ARTICLE_PATH_WORDS for part in path_parts):
-        score -= 40
+        score -= 50
     try:
-        parent = element.find_parent(["article", "li"])  # type: ignore[attr-defined]
-        if parent is not None:
-            score += 25
+        if element.find_parent("article") is not None:  # type: ignore[attr-defined]
+            score += 30
+        elif element.find_parent("li") is not None:  # type: ignore[attr-defined]
+            score += 5
         classes = " ".join(
             str(value)
             for ancestor in element.parents  # type: ignore[attr-defined]
             for value in (ancestor.get("class") or [])
         ).casefold()
-        if re.search(r"\b(?:article|card|entry|item|news|post|publication|story)\b", classes):
+        if re.search(r"\b(?:article|blog|entry|news|post|publication|story)\b", classes):
             score += 20
     except AttributeError:
         pass
     return score
+
+
+def _index_url_hint(value: str) -> bool:
+    path_parts = [part.casefold() for part in urlsplit(value).path.split("/") if part]
+    if not path_parts:
+        return True
+    if any(part in SCOPED_PATH_MARKERS for part in path_parts):
+        return True
+    return path_parts[-1] in INDEX_PATH_WORDS
+
+
+def _should_crawl_article_index(
+    *,
+    configured_mode: str,
+    page_url: str,
+    pattern: str | None,
+    candidates: tuple[ArticleLink, ...],
+) -> bool:
+    if configured_mode in {"article_index", "publications"}:
+        return True
+    if not candidates:
+        return False
+    if configured_mode in {"feed", "video"}:
+        return True
+    if configured_mode != "auto":
+        return False
+    # Auto mode must be conservative: a normal article often contains related
+    # links. Treat it as an index only when the URL itself looks like a listing
+    # or the user supplied an explicit article URL pattern.
+    return bool(pattern) or _index_url_hint(page_url)
 
 
 def _article_candidates(
@@ -990,7 +1363,7 @@ def _article_candidates(
         score = _article_score(element, url=url, base_url=base_url)
         if compiled:
             score += 50
-        if score < 25:
+        if not compiled and score < 40:
             continue
         if url in seen:
             continue
@@ -1002,7 +1375,17 @@ def _article_candidates(
             summary = label
         if len(summary) > 500:
             summary = summary[:500]
-        candidates.append((score, ArticleLink(label, url, summary)))
+        candidates.append(
+            (
+                score,
+                ArticleLink(
+                    label,
+                    url,
+                    summary,
+                    published_at=extract_first_date(summary),
+                ),
+            )
+        )
     candidates.sort(key=lambda item: item[0], reverse=True)
     return tuple(item for _, item in candidates[:MAX_FEED_ITEMS])
 
@@ -1122,6 +1505,9 @@ def _fetch_article_pages(
                 url,
                 selector=None,
             )
+            published_at = _html_first_date(response.text) or extract_first_date(body) or (
+                fallback.published_at if fallback is not None else None
+            )
             text = f"Title: {title}\nURL: {url}\n\n{body}"[:MAX_TEXT_CHARS]
             items.append(
                 ArticleItem(
@@ -1132,6 +1518,7 @@ def _fetch_article_pages(
                     sha256=_content_sha256(text, links),
                     outbound_links=links,
                     rendered_html=rendered_html,
+                    published_at=published_at,
                 )
             )
         except (httpx.HTTPError, ValueError) as exc:
@@ -1167,7 +1554,14 @@ def _feed_article_links(
             if not line.startswith(("Title:", "Published:", "URL:", OUTBOUND_LINKS_HEADER, "- "))
         ]
         summary = re.sub(r"\s+", " ", " ".join(summary_lines)).strip()[:500]
-        found.append(ArticleLink(item.title, item.url, summary))
+        found.append(
+            ArticleLink(
+                item.title,
+                item.url,
+                summary,
+                published_at=item.published_at or extract_first_date(summary),
+            )
+        )
     return tuple(found)
 
 
@@ -1393,7 +1787,11 @@ def _fetch_page(
         if youtube and youtube not in feed_candidates:
             feed_candidates.insert(0, youtube)
     if mode in {"auto", "feed", "video"}:
-        for candidate in feed_candidates:
+        if len(feed_candidates) > MAX_FEED_CANDIDATES:
+            diagnostics.append(
+                f"Limited feed discovery to {MAX_FEED_CANDIDATES} candidates"
+            )
+        for candidate in feed_candidates[:MAX_FEED_CANDIDATES]:
             if candidate == skip_feed_url:
                 continue
             score = feed_scope_score(url, candidate)
@@ -1419,31 +1817,49 @@ def _fetch_page(
     title, text, outbound_links, rendered_html = _extract_blog_document_full(
         response.text, fallback, url, selector
     )
-    effective_mode = "article_index" if mode in {"auto", "feed", "video"} else mode
+    effective_mode = mode
     discovered: tuple[ArticleLink, ...] = ()
     article_items: tuple[ArticleItem, ...] = ()
     cursor_next: int | None = None
-    if effective_mode in {"article_index", "publications"}:
+    if mode in {"auto", "feed", "video", "article_index", "publications"}:
         soup = BeautifulSoup(response.text, "html.parser")
         for element in soup(["script", "style", "noscript", "svg", "form", "nav", "footer"]):
             element.decompose()
         root = _document_root(soup, selector)
-        discovered = _article_candidates(
+        candidates = _article_candidates(
             root,
             base_url=url,
             pattern=pattern,
-            allow_external=effective_mode == "publications",
+            allow_external=mode == "publications",
         )
-        diagnostics.append(f"Discovered {len(discovered)} candidate content links")
-        known_urls = tuple(str(value) for value in (_row_value(row, "_known_article_urls", ()) or ()))
-        article_items, cursor_next, child_diagnostics = _fetch_article_pages(
-            client,
-            candidates=discovered,
-            known_urls=known_urls,
-            cursor=int(_row_value(row, "article_cursor", 0) or 0),
-            selector=selector,
+        diagnostics.append(f"Discovered {len(candidates)} candidate content links")
+        crawl_index = _should_crawl_article_index(
+            configured_mode=mode,
+            page_url=url,
+            pattern=pattern,
+            candidates=candidates,
         )
-        diagnostics.extend(child_diagnostics)
+        if crawl_index:
+            effective_mode = "publications" if mode == "publications" else "article_index"
+            discovered = candidates
+            known_urls = tuple(
+                str(value)
+                for value in (_row_value(row, "_known_article_urls", ()) or ())
+            )
+            article_items, cursor_next, child_diagnostics = _fetch_article_pages(
+                client,
+                candidates=discovered,
+                known_urls=known_urls,
+                cursor=int(_row_value(row, "article_cursor", 0) or 0),
+                selector=selector,
+            )
+            diagnostics.extend(child_diagnostics)
+        elif mode in {"auto", "feed", "video"}:
+            effective_mode = "article"
+            if candidates:
+                diagnostics.append(
+                    "Kept source as a direct article; candidate links lacked index-page evidence"
+                )
     return BlogFetch(
         method="snapshot",
         title=title,
@@ -1456,6 +1872,7 @@ def _fetch_page(
         snapshot_sha256=_content_sha256(text, outbound_links),
         snapshot_links=outbound_links,
         snapshot_rendered_html=rendered_html,
+        snapshot_published_at=_html_first_date(response.text) or extract_first_date(text),
         discovered_articles=discovered,
         article_items=article_items,
         source_mode=effective_mode,
@@ -1467,6 +1884,10 @@ def _fetch_page(
 def fetch_blog(client: httpx.Client, row: object) -> BlogFetch:
     mode = normalize_source_mode(_row_value(row, "source_mode", "auto"))
     url = str(_row_value(row, "url", ""))
+    if mode == "video" and _youtube_url(url):
+        # Never fall back to the YouTube HTML page: unauthenticated requests can
+        # return a consent document whose rotating URLs look like content changes.
+        return _youtube_fetch(row)
     if mode == "github" or (mode == "auto" and urlsplit(url).hostname == "github.com"):
         return _github_fetch(client, row)
     feed_url = str(_row_value(row, "feed_url", "") or "").strip()
@@ -1654,6 +2075,21 @@ def _is_meaningful_change(
     return content_meaningful or link_meaningful, reset
 
 
+def compact_blog_diff(value: str) -> str:
+    """Remove unchanged context and redundant file headers from a unified diff."""
+    lines = value.splitlines()
+    if not any(line.startswith("@@") for line in lines):
+        return value
+    compact = [
+        line
+        for line in lines
+        if line.startswith("@@")
+        or (line.startswith("-") and not line.startswith("---"))
+        or (line.startswith("+") and not line.startswith("+++"))
+    ]
+    return "\n".join(compact)
+
+
 def blog_diff(
     previous: str | None,
     current: str,
@@ -1679,8 +2115,17 @@ def blog_diff(
         or (ratio < 0.15 and max(len(old_lines), len(new_lines)) > 20)
         else "changed"
     )
-    diff = "\n".join(
-        unified_diff(old_lines, new_lines, fromfile="previous", tofile="current", lineterm="")
+    diff = compact_blog_diff(
+        "\n".join(
+            unified_diff(
+                old_lines,
+                new_lines,
+                fromfile="previous",
+                tofile="current",
+                lineterm="",
+                n=0,
+            )
+        )
     )
     if len(diff) > MAX_DIFF_CHARS:
         diff = diff[:MAX_DIFF_CHARS] + "\n... diff truncated ..."

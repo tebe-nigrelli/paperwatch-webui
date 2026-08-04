@@ -34,6 +34,7 @@ from .blog_import import import_blog_links
 from .blogs import (
     SOURCE_MODES,
     blog_diff,
+    compact_blog_diff,
     normalize_blog_url,
     normalize_source_mode,
     validate_article_url_pattern,
@@ -2395,6 +2396,7 @@ def create_app(
         if entry is None:
             raise HTTPException(404, "Blog update not found")
         entry_view = dict(entry)
+        entry_view["diff_text"] = compact_blog_diff(str(entry_view.get("diff_text") or ""))
         entry_view["tracked_authors"] = [
             {
                 "name": str(author["name"]),
