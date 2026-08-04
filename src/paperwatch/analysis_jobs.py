@@ -217,7 +217,11 @@ def run_analysis_batch(
                     configure_job_runtime(llm, progress, cancel_event)
                     if active_client is not None:
                         active_client(llm)
-                    effective_context = context_window_tokens or profile.context_window_tokens
+                    effective_context = (
+                        profile.context_window_tokens
+                        if profile.provider in {"codex", "claude-code"}
+                        else context_window_tokens or profile.context_window_tokens
+                    )
                     configure_context_window(llm, effective_context)
                     effective_strategy = analysis_strategy
                     if scope == "abstract":

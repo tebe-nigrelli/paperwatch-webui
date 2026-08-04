@@ -207,12 +207,15 @@
     const strategy = form.querySelector("[data-pdf-strategy]");
     const context = form.querySelector("[data-context-window]");
     const models = form.querySelector("[data-model-picker]");
-    if (!source || !strategy) return;
+    if (!models && !context && (!source || !strategy)) return;
     const setLocked = (control, locked) => {
       if (!control) return;
       control.dataset.profileLocked = locked ? "true" : "false";
       control.setAttribute("aria-disabled", String(locked));
-      if (control instanceof HTMLInputElement) control.readOnly = locked;
+      if (control instanceof HTMLInputElement) {
+        if (control === context) control.disabled = locked;
+        else control.readOnly = locked;
+      }
       const wrapper = control.previousElementSibling;
       if (wrapper?.classList.contains("search-select")) {
         wrapper.classList.toggle("control-disabled", locked);
@@ -222,6 +225,7 @@
       control.closest("label")?.classList.toggle("control-disabled", locked);
     };
     const syncSourceOptions = () => {
+      if (!source || !strategy) return;
       const locked = source.dataset.profileLocked === "true";
       const usesPdf = source.value === "fulltext";
       if (!usesPdf) strategy.value = "auto";
@@ -243,21 +247,22 @@
         });
         selected = [nativeProfile];
       }
-      const profile = selected.length === 1 ? selected[0] : null;
-      const native = profile && ["codex", "claude-code"].includes(profile.dataset.provider || "");
-      if (native) {
+      const native = Boolean(nativeProfile);
+      if (native && source && strategy) {
         const fulltext = Array.from(source.options).find((option) => option.value === "fulltext");
         if (fulltext) source.value = "fulltext";
-        strategy.value = profile.dataset.pdfStrategy || "direct";
-        if (context && profile.dataset.contextWindow) context.value = profile.dataset.contextWindow;
+        strategy.value = nativeProfile.dataset.pdfStrategy || "direct";
+      }
+      if (native && context && nativeProfile.dataset.contextWindow) {
+        context.value = nativeProfile.dataset.contextWindow;
       }
       setLocked(source, Boolean(native));
       setLocked(strategy, Boolean(native));
       setLocked(context, Boolean(native));
-      source.dispatchEvent(new Event("change", { bubbles: true }));
-      strategy.dispatchEvent(new Event("change", { bubbles: true }));
+      source?.dispatchEvent(new Event("change", { bubbles: true }));
+      strategy?.dispatchEvent(new Event("change", { bubbles: true }));
     };
-    source.addEventListener("change", syncSourceOptions);
+    source?.addEventListener("change", syncSourceOptions);
     models?.addEventListener("change", syncProfileOptions);
     syncProfileOptions();
   });
@@ -985,6 +990,36 @@
     root.querySelectorAll("select").forEach((select) => enhanceSelect(select, dynamicSelectIndex++));
   };
 
+  document.addEventListener("click", (event) => {
+    const button = event.target.closest("[data-filter-cycle]");
+    if (!button) return;
+    event.preventDefault();
+    const form = document.getElementById(button.dataset.filterForm || "");
+    const name = button.dataset.filterName || "";
+    const values = (button.dataset.filterValues || "").split("|").filter(Boolean);
+    const labels = (button.dataset.filterLabels || "").split("|");
+    const input = form ? Array.from(form.elements).find((control) => control.name === name) : null;
+    if (!form || !input || values.length === 0) return;
+    const currentValue = String(input.value || "");
+    const currentState = currentValue || "any";
+    const currentIndex = Math.max(0, values.indexOf(currentState));
+    const nextState = values[(currentIndex + 1) % values.length];
+    input.value = nextState === "any" ? "" : nextState;
+    button.dataset.filterState = nextState;
+    const label = labels[values.indexOf(nextState)] || nextState;
+    const prefixes = {
+      starred: "Star filter",
+      content: "Content type",
+      read: "Reading filter",
+      notes: "Notes filter",
+      enabled: "Fetch state",
+    };
+    const prefix = prefixes[name] || "Filter";
+    button.title = `${prefix}: ${label.toLocaleLowerCase()}`;
+    button.setAttribute("aria-label", `${prefix}: ${label.toLocaleLowerCase()}. Click to change.`);
+    form.requestSubmit();
+  });
+
   const parseHtml = (text) => new DOMParser().parseFromString(text, "text/html");
   const replaceFromResponse = async (response, selector) => {
     if (!response.ok) throw new Error(`Request failed with HTTP ${response.status}`);
@@ -1091,7 +1126,8 @@
     }
   };
 
-  const updateRowsForBulkAction = (action) => {
+  const updateRowsForBulkAction = (form) => {
+    const action = new URL(form.action).pathname;
     const rows = Array.from(selectedBody()?.querySelectorAll("tr.content-row") || []);
     if (action.endsWith("/unselect")) {
       rows.forEach((row) => row.remove());
@@ -1108,10 +1144,28 @@
         if (button) { button.classList.toggle("is-starred", starred); button.textContent = starred ? "★" : "☆"; }
         if (input) input.value = starred ? "0" : "1";
       });
+      const button = form.querySelector(".star-button");
+      form.setAttribute("action", `/content/selected/${starred ? "unstar" : "star"}`);
+      if (button) {
+        const label = starred ? "Unstar all selected content" : "Star all selected content";
+        button.classList.toggle("is-starred", starred);
+        button.textContent = starred ? "★" : "☆";
+        button.title = label;
+        button.setAttribute("aria-label", label);
+      }
     }
     if (action.endsWith("/read") || action.endsWith("/unread")) {
       const read = action.endsWith("/read");
       rows.forEach((row) => { row.dataset.read = read ? "true" : "false"; });
+      const button = form.querySelector(".selected-read-button");
+      form.setAttribute("action", `/content/selected/${read ? "unread" : "read"}`);
+      if (button) {
+        const label = read ? "Mark all selected content unread" : "Mark all selected content read";
+        button.classList.toggle("is-read", read);
+        button.textContent = read ? "✓" : "○";
+        button.title = label;
+        button.setAttribute("aria-label", label);
+      }
     }
   };
 
@@ -1165,7 +1219,7 @@
       event.preventDefault();
       try {
         await postAsync(form);
-        if (form.closest(".selected-content-dock")) updateRowsForBulkAction(new URL(form.action).pathname);
+        if (form.closest(".selected-content-dock")) updateRowsForBulkAction(form);
         const selector = form.dataset.refreshSelector;
         if (selector) await refreshSelector(selector);
         else {

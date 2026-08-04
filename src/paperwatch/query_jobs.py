@@ -229,7 +229,7 @@ def _selected_blog_entries(db: Database, selection: dict[str, Any] | None) -> li
             except (TypeError, ValueError):
                 continue
     if selected_ids:
-        return db.blog_entries_by_ids(selected_ids)
+        return db.blog_entries_by_ids(selected_ids, query_view=True)
     args = _selection_search_args(selection)
     return db.list_blog_entries(
         limit=None,
@@ -250,6 +250,7 @@ def _selected_blog_entries(db: Database, selection: dict[str, Any] | None) -> li
         read=args["read"] if isinstance(args["read"], bool) else None,
         analyzed=args["analyzed"] if isinstance(args["analyzed"], bool) else None,
         notes=args["notes"] if isinstance(args["notes"], bool) else None,
+        query_view=True,
     )
 
 
@@ -263,14 +264,44 @@ def validate_query_sources(
     """Reject a saved-prompt run when any selected record lacks its source."""
     content_type = str((selection or {}).get("content_type") or "papers")
     if content_type == "blogs":
-        entries = _selected_blog_entries(db, selection)
-        if not entries:
+        selected_ids = (
+            selection.get("blog_entry_ids")
+            if selection and isinstance(selection.get("blog_entry_ids"), list)
+            else None
+        )
+        count = (
+            db.count_blog_entries_by_ids(selected_ids)
+            if selected_ids is not None
+            else db.count_blog_entries(
+                query=str((selection or {}).get("query") or ""),
+                title_query=str((selection or {}).get("title_query") or ""),
+                tags=tuple((selection or {}).get("content_tags") or ()),
+                author_id=str((selection or {}).get("author_id") or ""),
+                author_ids=tuple((selection or {}).get("author_ids") or ()),
+                author_tags=tuple((selection or {}).get("author_tags") or ()),
+                date_from=str((selection or {}).get("date_from") or ""),
+                date_to=str((selection or {}).get("date_to") or ""),
+                starred=(selection or {}).get("starred")
+                if isinstance((selection or {}).get("starred"), bool)
+                else None,
+                read=(selection or {}).get("read")
+                if isinstance((selection or {}).get("read"), bool)
+                else None,
+                analyzed=(selection or {}).get("analyzed")
+                if isinstance((selection or {}).get("analyzed"), bool)
+                else None,
+                notes=(selection or {}).get("notes")
+                if isinstance((selection or {}).get("notes"), bool)
+                else None,
+            )
+        )
+        if not count:
             raise ValueError("No blog entries match the current selection")
         if source_scope != "blog":
             raise ValueError("Blog saved prompts use the stored blog entry text")
         if pdf_strategy != "auto":
             raise ValueError("PDF strategy does not apply to blog entries")
-        return len(entries)
+        return count
     if content_type != "papers":
         raise ValueError("Content type must be papers or blogs")
     papers = _selected_papers(db, selection)
@@ -819,7 +850,12 @@ def run_query_batch(
                     configure_job_runtime(llm, progress, cancel_event)
                     if active_client is not None:
                         active_client(llm)
-                    configure_context_window(llm, context_window_tokens)
+                    effective_context = (
+                        profile.context_window_tokens
+                        if profile.provider in {"codex", "claude-code"}
+                        else context_window_tokens
+                    )
+                    configure_context_window(llm, effective_context)
                     if (
                         profile.provider in {"codex", "claude-code"}
                         and content_type == "papers"
@@ -842,7 +878,7 @@ def run_query_batch(
                     else:
                         result, _usage, input_chars = run_query_for_model(
                             llm, user_prompt=query["prompt"], documents=documents,
-                            context_window_tokens=context_window_tokens,
+                            context_window_tokens=effective_context,
                             max_input_chars=profile.max_input_chars,
                             pdf_strategy=pdf_strategy,
                             content_type=content_type,

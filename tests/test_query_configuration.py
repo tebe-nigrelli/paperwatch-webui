@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import sqlite3
 from dataclasses import replace
 
 import httpx
@@ -13,7 +14,7 @@ from paperwatch.db import Database
 from paperwatch.models import BatchQueryResult
 from paperwatch.pipeline import PaperWatch, RunStats
 from paperwatch.query_jobs import QueryBatchSnapshot
-from paperwatch.web import RunSnapshot, create_app
+from paperwatch.web import RunSnapshot, _configured_context_window, create_app
 
 
 class RunStub:
@@ -55,11 +56,14 @@ def _client(config_path, query=None):
     )
 
 
-def test_query_page_stores_execution_settings_and_automatic_columns(config_path):
+def test_query_page_stores_one_model_and_uses_config_context(config_path):
     client = _client(config_path)
     page = client.get("/queries/new")
     assert page.status_code == 200
-    assert "Context tokens" in page.text
+    assert "Context tokens" not in page.text
+    assert 'name="context_window_tokens"' not in page.text
+    model_field = page.text.split('name="model"', 1)[1].split("</select>", 1)[0]
+    assert " multiple" not in model_field
     assert "Full paper PDF" in page.text
     assert 'value="default"' in page.text
 
@@ -69,6 +73,7 @@ def test_query_page_stores_execution_settings_and_automatic_columns(config_path)
             "name": "Deep review",
             "prompt": "Review the evidence.",
             "model": "default",
+            # Legacy clients may still submit this field; query definitions ignore it.
             "context_window_tokens": "4096",
             "paper_source_scope": "fulltext",
             "pdf_strategy": "chunked",
@@ -80,8 +85,9 @@ def test_query_page_stores_execution_settings_and_automatic_columns(config_path)
     with Database(config.paths.database) as db:
         row = next(item for item in db.list_saved_queries() if item["name"] == "Deep review")
         query_id = int(row["id"])
-        assert json.loads(row["model_profiles_json"]) == ["default"]
-        assert row["context_window_tokens"] == 4096
+        assert row["model_profile"] == "default"
+        assert "model_profiles_json" not in row.keys()
+        assert "context_window_tokens" not in row.keys()
         assert row["paper_source_scope"] == "fulltext"
         assert row["pdf_strategy"] == "chunked"
 
@@ -124,6 +130,7 @@ def test_query_page_stores_execution_settings_and_automatic_columns(config_path)
             "name": "Deep review",
             "prompt": "Review the evidence and caveats.",
             "model": "default",
+            # Legacy clients may submit this field; it is not persisted.
             "context_window_tokens": "8192",
             "paper_source_scope": "abstract",
             "pdf_strategy": "direct",
@@ -133,7 +140,8 @@ def test_query_page_stores_execution_settings_and_automatic_columns(config_path)
     assert edited.status_code == 303
     with Database(config.paths.database) as db:
         row = db.get_saved_query(query_id)
-        assert row["context_window_tokens"] == 8192
+        assert "context_window_tokens" not in row.keys()
+        assert row["model_profile"] == "default"
         assert row["pdf_strategy"] == "auto"
         assert row["auto_run_papers"] == 0
         assert row["auto_run_blogs"] == 1
@@ -151,8 +159,10 @@ def test_query_page_stores_execution_settings_and_automatic_columns(config_path)
 def test_query_execution_validation_and_bulk_targets(config_path):
     config = load_config(config_path)
     with Database(config.paths.database) as db:
-        with pytest.raises(ValueError, match="Context window"):
-            db.create_saved_query(name="Bad", prompt="P", context_window_tokens=10)
+        with pytest.raises(ValueError, match="only one model"):
+            db.create_saved_query(
+                name="Bad", prompt="P", model_profiles=("default", "secondary")
+            )
         with pytest.raises(ValueError, match="Paper source"):
             db.create_saved_query(name="Bad", prompt="P", paper_source_scope="html")
         with pytest.raises(ValueError, match="PDF strategy"):
@@ -162,7 +172,7 @@ def test_query_execution_validation_and_bulk_targets(config_path):
             prompt="P",
             model_profiles=("default", "default", ""),
         )
-        assert json.loads(db.get_saved_query(query_id)["model_profiles_json"]) == ["default"]
+        assert db.get_saved_query(query_id)["model_profile"] == "default"
         db.update_automatic_queries(
             [query_id], paper_query_ids=[query_id], blog_query_ids=[]
         )
@@ -174,7 +184,115 @@ def test_query_execution_validation_and_bulk_targets(config_path):
         assert row["auto_run_papers"] == 0 and row["auto_run_blogs"] == 1
 
 
-def test_backward_run_uses_saved_models_and_context(config_path, paper_record):
+
+def test_schema_25_migrates_saved_query_model_and_removes_context(tmp_path):
+    path = tmp_path / "legacy-v24.db"
+    with Database(path) as db:
+        query_id = db.create_saved_query(
+            name="Legacy query",
+            prompt="Review",
+            model_profiles=("secondary",),
+        )
+        run_id = db.create_query_runs(
+            batch_id="legacy-batch",
+            query_id=query_id,
+            profiles=[("secondary", "ollama", "legacy-model")],
+            context_window_tokens=7777,
+        )[0]
+
+    conn = sqlite3.connect(path)
+    conn.execute("PRAGMA foreign_keys = OFF")
+    row = conn.execute("SELECT * FROM saved_queries WHERE id=?", (query_id,)).fetchone()
+    columns = [item[1] for item in conn.execute("PRAGMA table_info(saved_queries)")]
+    values = dict(zip(columns, row, strict=True))
+    conn.execute("DROP TABLE saved_queries")
+    conn.execute(
+        """
+        CREATE TABLE saved_queries (
+            id INTEGER PRIMARY KEY,
+            name TEXT NOT NULL,
+            source_type TEXT NOT NULL,
+            search_query TEXT NOT NULL DEFAULT '',
+            prompt TEXT NOT NULL,
+            is_builtin INTEGER NOT NULL DEFAULT 0,
+            auto_run_papers INTEGER NOT NULL DEFAULT 0,
+            auto_run_blogs INTEGER NOT NULL DEFAULT 0,
+            model_profiles_json TEXT NOT NULL DEFAULT '[]',
+            context_window_tokens INTEGER NOT NULL DEFAULT 16384,
+            paper_source_scope TEXT NOT NULL DEFAULT 'auto',
+            pdf_strategy TEXT NOT NULL DEFAULT 'chunked',
+            regexp_pattern TEXT NOT NULL DEFAULT '',
+            regexp_radius INTEGER NOT NULL DEFAULT 0,
+            regexp_mode TEXT NOT NULL DEFAULT 'query',
+            content_scope TEXT NOT NULL DEFAULT 'both',
+            query_kind TEXT NOT NULL DEFAULT 'summary',
+            label_class TEXT NOT NULL DEFAULT '',
+            label_values_json TEXT NOT NULL DEFAULT '[]',
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            last_run_at TEXT
+        )
+        """
+    )
+    conn.execute(
+        """
+        INSERT INTO saved_queries(
+            id, name, source_type, search_query, prompt, is_builtin,
+            auto_run_papers, auto_run_blogs, model_profiles_json,
+            context_window_tokens, paper_source_scope, pdf_strategy,
+            regexp_pattern, regexp_radius, regexp_mode, content_scope,
+            query_kind, label_class, label_values_json, created_at,
+            updated_at, last_run_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            values["id"], values["name"], values["source_type"],
+            values["search_query"], values["prompt"], values["is_builtin"],
+            values["auto_run_papers"], values["auto_run_blogs"],
+            json.dumps(["secondary", "default"]), 9999,
+            values["paper_source_scope"], values["pdf_strategy"],
+            values["regexp_pattern"], values["regexp_radius"],
+            values["regexp_mode"], values["content_scope"],
+            values["query_kind"], values["label_class"],
+            values["label_values_json"], values["created_at"],
+            values["updated_at"], values["last_run_at"],
+        ),
+    )
+    conn.execute("PRAGMA user_version = 24")
+    conn.commit()
+    conn.close()
+
+    with Database(path) as db:
+        columns = [row["name"] for row in db._conn.execute("PRAGMA table_info(saved_queries)")]
+        assert "model_profile" in columns
+        assert "model_profiles_json" not in columns
+        assert "context_window_tokens" not in columns
+        assert db.get_saved_query(query_id)["model_profile"] == "secondary"
+        assert db.get_query_run(run_id)["context_window_tokens"] == 7777
+        assert db._conn.execute("PRAGMA user_version").fetchone()[0] == 25
+        assert db._conn.execute("PRAGMA foreign_key_check").fetchall() == []
+
+def test_context_window_override_is_local_only(app_config):
+    codex = replace(
+        app_config.llm,
+        profile="codex-review",
+        provider="codex",
+        model="gpt-5.3-codex",
+        context_window_tokens=400000,
+    )
+    config = replace(app_config, llm_profiles=(codex,))
+
+    assert _configured_context_window(config, ("default",), 2048) == 2048
+    assert _configured_context_window(config, ("codex-review",), 2048) == 400000
+    with pytest.raises(ValueError, match="only selected model"):
+        _configured_context_window(
+            config,
+            ("default", "codex-review"),
+            2048,
+        )
+
+
+def test_backward_run_uses_saved_model_and_config_context(config_path, paper_record):
     controller = QueryStub()
     client = _client(config_path, controller)
     config = load_config(config_path)
@@ -195,15 +313,24 @@ def test_backward_run_uses_saved_models_and_context(config_path, paper_record):
     )
     assert response.status_code == 303
     args, kwargs = controller.calls[-1]
-    assert args[:3] == (query_id, ("default",), 7777)
+    assert args[:3] == (
+        query_id,
+        ("default",),
+        config.llm.context_window_tokens,
+    )
     assert kwargs["source_scope"] == "abstract"
     assert kwargs["pdf_strategy"] == "auto"
 
 
-def test_automatic_queries_use_each_saved_model_and_context(
+def test_automatic_queries_use_saved_model_config_context(
     app_config, paper_record, analysis_result, monkeypatch
 ):
-    secondary = replace(app_config.llm, profile="secondary", model="second-model")
+    secondary = replace(
+        app_config.llm,
+        profile="secondary",
+        model="second-model",
+        context_window_tokens=24000,
+    )
     config = replace(app_config, llm_profiles=(secondary,))
     calls = []
 
@@ -252,10 +379,10 @@ def test_automatic_queries_use_each_saved_model_and_context(
     with Database(config.paths.database) as db:
         paper_id, _ = db.upsert_paper(paper_record)
         db.create_saved_query(
-            name="Two models",
+            name="Configured model",
             prompt="Review",
             auto_run_papers=True,
-            model_profiles=("default", "secondary"),
+            model_profiles=("secondary",),
             context_window_tokens=6000,
             paper_source_scope="fulltext",
             pdf_strategy="direct",
@@ -279,8 +406,10 @@ def test_automatic_queries_use_each_saved_model_and_context(
         )
         app._run_automatic_queries(stats)
         rows = [row for row in db.list_query_runs() if row["query_id"] != 1]
-        assert {row["model"] for row in rows} == {"test-model", "second-model"}
-        assert {row["context_window_tokens"] for row in rows} == {6000}
+        assert {row["model"] for row in rows} == {"second-model"}
+        assert {row["context_window_tokens"] for row in rows} == {
+            secondary.context_window_tokens
+        }
         assert all(row["status"] == "success" for row in rows)
         assert stats.errors_count == 1
 
@@ -293,8 +422,12 @@ def test_automatic_queries_use_each_saved_model_and_context(
         assert failed.errors_count >= 1
         assert db.list_query_runs()[0]["status"] == "failed"
     assert ("collect", "fulltext", "direct") in calls
-    assert ("run", "fake-model", 6000, "direct") in calls
-    assert ("run", "second-model", 6000, "direct") in calls
+    assert (
+        "run",
+        "second-model",
+        secondary.context_window_tokens,
+        "direct",
+    ) in calls
     assert ("ready", "second-model") in calls
     assert ("closed", "second-model") in calls
 
@@ -349,7 +482,7 @@ def test_query_form_validation_and_missing_routes(config_path):
         follow_redirects=False,
     )
     assert unknown.status_code == 303 and "level=error" in unknown.headers["location"]
-    tiny = client.post(
+    legacy_context = client.post(
         "/queries",
         data={
             "name": "Tiny",
@@ -359,7 +492,8 @@ def test_query_form_validation_and_missing_routes(config_path):
         },
         follow_redirects=False,
     )
-    assert tiny.status_code == 303 and "level=error" in tiny.headers["location"]
+    assert legacy_context.status_code == 303
+    assert "level=success" in legacy_context.headers["location"]
     assert client.get("/queries/999999/edit").status_code == 404
     missing_edit = client.post(
         "/queries/999999/edit",
@@ -367,7 +501,6 @@ def test_query_form_validation_and_missing_routes(config_path):
             "name": "Missing",
             "prompt": "P",
             "model": "default",
-            "context_window_tokens": "2048",
             "paper_source_scope": "auto",
             "pdf_strategy": "chunked",
         },

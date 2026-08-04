@@ -373,8 +373,18 @@ def test_author_tags_filter_suggestions_and_cleanup(tmp_path, author_candidate):
         assert not db.add_author_tag("A999", "unknown")
         rows = db.list_authors_with_tags(tag="ML")
         assert [row["name"] for row in rows] == ["Ada Lovelace", "Grace Hopper"]
+        rows = db.list_authors_with_tags(tags=("theory", "ML"))
+        assert [row["name"] for row in rows] == ["Ada Lovelace", "Grace Hopper"]
         ada = db.list_authors_with_tags(tag="theory")[0]
         assert ada["tags"] == "ML, theory"
+        db.set_object_notes("author", int(ada["id"]), "has notes")
+        db.set_author_enabled("A456", False)
+        assert [row["name"] for row in db.list_authors_with_tags(notes=True)] == [
+            "Ada Lovelace"
+        ]
+        assert [row["name"] for row in db.list_authors_with_tags(enabled=False)] == [
+            "Grace Hopper"
+        ]
         assert [row["name"] for row in db.list_authors_with_tags(query="Engine")] == [
             "Ada Lovelace"
         ]

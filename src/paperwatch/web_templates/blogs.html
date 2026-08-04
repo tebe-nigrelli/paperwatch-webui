@@ -13,10 +13,9 @@
 <section class="panel model-runner">
   <div class="panel-heading"><div><h2>Run saved prompt</h2><p>Regexp-only queries run locally; other queries use the selected model.</p></div>{% if query_state.running and query_state.content_type == 'blogs' %}<span class="status status-running">running</span>{% endif %}</div>
   <form method="post" action="/queries/run-blogs" class="saved-prompt-runner">
-    {% for entry in entries %}<input type="hidden" name="blog_entry_id" value="{{ entry.id }}">{% endfor %}
     <label class="grow"><span>Saved query</span><select name="query_id" required>{% for query in saved_queries %}<option value="{{ query.id }}" {% if selected_query_id == query.id %}selected{% endif %}>{{ query.name }}{% if query.local_regexp %} · local regexp{% endif %}</option>{% endfor %}</select></label>
-    {% if model_profiles %}<label><span>Models</span><select name="model" multiple size="5" required data-model-picker data-search-placeholder="Search model profiles">{% for profile in model_profiles %}<option value="{{ profile.profile }}" {% if loop.first %}selected{% endif %}>{{ profile.profile }} · {{ profile.provider }} · {{ profile.model }}</option>{% endfor %}</select></label>{% endif %}
-    <div class="model-run-actions"><label><span>Context window tokens</span><input type="number" name="context_window_tokens" min="512" max="1000000" value="16384"></label><button class="button button-primary" type="submit" {% if query_state.running %}disabled{% endif %}>Run on visible blogs</button></div>
+    {% if model_profiles %}<label><span>Model</span><select name="model" required data-model-picker data-search-placeholder="Search model profiles">{% for profile in model_profiles %}<option value="{{ profile.profile }}" {% if loop.first %}selected{% endif %}>{{ profile.profile }} · {{ profile.provider }} · {{ profile.model }}</option>{% endfor %}</select></label>{% endif %}
+    <div class="model-run-actions"><small>Uses globally selected blog entries. Context size comes from the selected model profile.</small><button class="button button-primary" type="submit" {% if query_state.running %}disabled{% endif %}>Run on selected</button></div>
   </form>
 </section>
 {% endif %}

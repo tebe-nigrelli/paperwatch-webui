@@ -1137,16 +1137,14 @@ def test_query_controller_scope_mismatch_and_invalid_snapshot_id(
             selection={"blog_entry_ids": [entry_id]},
             content_type="blogs",
         )
-    batch = controller.start(
-        normal,
-        ("default",),
-        2048,
-        selection={"content_type": "blogs", "blog_entry_ids": ["invalid"]},
-        content_type="blogs",
-    )
-    assert batch
-    controller.wait()
-    assert controller.snapshot().blog_entry_id is None
+    with pytest.raises(ValueError, match="No blog entries"):
+        controller.start(
+            normal,
+            ("default",),
+            2048,
+            selection={"content_type": "blogs", "blog_entry_ids": ["invalid"]},
+            content_type="blogs",
+        )
 
 
 def test_run_query_batch_cancels_all_pending_runs_before_model(

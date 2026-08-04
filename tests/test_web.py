@@ -238,7 +238,7 @@ def test_author_search_add_toggle_remove(config_path, seeded_web):
     author_page = client.get("/authors")
     assert "Ada Lovelace" in author_page.text
     assert "Name<br>University" in author_page.text
-    assert "Pause / resume" in author_page.text
+    assert 'data-filter-name="enabled"' in author_page.text
     assert "last checked" not in author_page.text
     assert 'placeholder="Add tag"' in author_page.text
     assert ">Add</button>" not in author_page.text

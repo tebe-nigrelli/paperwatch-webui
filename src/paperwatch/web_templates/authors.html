@@ -2,21 +2,23 @@
 {% block title %}Authors · paperwatch{% endblock %}
 {% block content %}
 <section class="page-heading"><h1>Authors</h1><p>Search, tag, pause, or archive tracked authors and their blogs.</p></section>
+
 <section class="panel">
   <div class="panel-heading author-table-heading">
     <div><h2>Tracked authors</h2><p>Edit an OpenAlex ID in place and press Enter to save it.</p></div>
     <span>{{ authors|length }} visible</span>
   </div>
-  <form method="get" action="/authors" class="author-filter-form">
+  <form id="author-filter-form" method="get" action="/authors" class="author-filter-form">
+    <input type="hidden" name="starred" value="{{ 'yes' if author_starred is sameas true else ('no' if author_starred is sameas false else '') }}">
+    <input type="hidden" name="notes" value="{{ 'yes' if author_notes is sameas true else ('no' if author_notes is sameas false else '') }}">
+    <input type="hidden" name="enabled" value="{{ 'yes' if author_enabled is sameas true else ('no' if author_enabled is sameas false else '') }}">
     <label class="grow"><span>Filter tracked authors</span><input id="author-filter" name="q" value="{{ author_query or '' }}" placeholder="Name, tag, university, ORCID, or OpenAlex ID" autocomplete="off"></label>
-    <label><span>Star</span><select name="starred"><option value="">Any</option><option value="yes" {% if author_starred is sameas true %}selected{% endif %}>Starred</option><option value="no" {% if author_starred is sameas false %}selected{% endif %}>Not starred</option></select></label>
-    <label><span>Tag</span><select name="tag"><option value="">All tags</option>{% for tag in tags %}<option value="{{ tag.name }}" {% if active_tag == tag.name %}selected{% endif %}>{{ tag.name }}</option>{% endfor %}</select></label>
     <button class="button button-primary" type="submit">Filter</button>
-    {% if author_query or active_tag or author_starred is not none %}<a class="button" href="/authors">Clear</a>{% endif %}
+    {% if author_query or active_tags or author_starred is not none or author_notes is not none or author_enabled is not none %}<a class="button" href="/authors">Clear</a>{% endif %}
   </form>
   <div class="table-wrap">
     <table class="author-table" id="tracked-authors-table">
-      <thead><tr><th class="author-name-column">Name<br>University</th><th class="author-star-column">Star</th><th class="author-openalex-column">OpenAlex ID</th><th class="author-papers-column">Papers</th><th class="author-blogs-column">Blogs</th><th class="author-sources-column">Sources</th><th class="author-tags-column">Add tag</th><th class="author-state-column">Pause / resume</th><th class="author-remove-column">Remove</th></tr></thead>
+      <thead><tr><th class="author-name-column"><div class="author-header-title"><span>Name<br>University</span><button class="filter-word-button filter-cycle-button" type="button" data-filter-cycle data-filter-form="author-filter-form" data-filter-name="notes" data-filter-values="any|yes|no" data-filter-labels="Either|Has notes|No notes" data-filter-state="{{ 'yes' if author_notes is sameas true else ('no' if author_notes is sameas false else 'any') }}" title="Notes filter: {{ 'has notes' if author_notes is sameas true else ('no notes' if author_notes is sameas false else 'either') }}" aria-label="Notes filter: {{ 'has notes' if author_notes is sameas true else ('no notes' if author_notes is sameas false else 'either') }}. Click to change.">Notes</button></div></th><th class="author-star-column"><button class="icon-button filter-cycle-button star-filter-button" type="button" data-filter-cycle data-filter-form="author-filter-form" data-filter-name="starred" data-filter-values="any|yes|no" data-filter-labels="Either|Starred|Unstarred" data-filter-state="{{ 'yes' if author_starred is sameas true else ('no' if author_starred is sameas false else 'any') }}" title="Star filter: {{ 'starred' if author_starred is sameas true else ('unstarred' if author_starred is sameas false else 'either') }}" aria-label="Star filter: {{ 'starred' if author_starred is sameas true else ('unstarred' if author_starred is sameas false else 'either') }}. Click to change."><span data-filter-state-value="any">✦</span><span data-filter-state-value="yes">★</span><span data-filter-state-value="no">☆</span></button></th><th class="author-openalex-column">OpenAlex ID</th><th class="author-papers-column">Papers</th><th class="author-blogs-column">Blogs</th><th class="author-sources-column">Sources</th><th class="author-tags-column"><span>Tags</span><select name="tag" form="author-filter-form" multiple size="3" data-search-placeholder="Filter tags" aria-label="Filter authors by one or more tags">{% for tag in tags %}<option value="{{ tag.name }}" {% if tag.name in active_tags %}selected{% endif %}>{{ tag.name }}</option>{% endfor %}</select></th><th class="author-state-column"><button class="icon-button filter-cycle-button author-enabled-filter-button" type="button" data-filter-cycle data-filter-form="author-filter-form" data-filter-name="enabled" data-filter-values="any|yes|no" data-filter-labels="Either|Active|Paused" data-filter-state="{{ 'yes' if author_enabled is sameas true else ('no' if author_enabled is sameas false else 'any') }}" title="Fetch state: {{ 'active' if author_enabled is sameas true else ('paused' if author_enabled is sameas false else 'either') }}" aria-label="Fetch state: {{ 'active' if author_enabled is sameas true else ('paused' if author_enabled is sameas false else 'either') }}. Click to change."><span data-filter-state-value="any">◐</span><span data-filter-state-value="yes">▶</span><span data-filter-state-value="no">⏸</span></button></th><th class="author-remove-column">Remove</th></tr></thead>
       <tbody id="tracked-author-rows">
       {% for author in authors %}
       <tr class="author-main-row{% if author.notes %} author-has-notes{% endif %}" data-author-search="{{ author.name }} {{ author.institution or '' }} {{ author.tags }} {{ author.orcid or '' }} {{ author.openalex_id }}">
@@ -46,6 +48,4 @@
   </div>
   <datalist id="tag-suggestions">{% for tag in tags %}<option value="{{ tag.name }}">{% endfor %}</datalist>
 </section>
-
-
 {% endblock %}

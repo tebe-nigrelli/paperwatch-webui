@@ -11,11 +11,11 @@
 <section class="panel model-runner">
   <div class="panel-heading"><div><h2>Run saved prompt</h2><p>Use the same reusable prompts and model profiles available for research papers. Regexp-only queries run locally.</p></div>{% if query_state.running and query_state.blog_entry_id == entry.id %}<span class="status status-running">running</span>{% endif %}</div>
   {% if saved_queries %}
-  <form id="saved-prompt-form" data-paper-job="query" method="post" action="/blogs/{{ entry.id }}/prompt" class="collection-runner-form paper-saved-prompt-form blog-saved-prompt-form">
+  <form id="saved-prompt-form" data-paper-job="query" method="post" action="/blogs/{{ entry.id }}/prompt" class="collection-runner-form paper-saved-prompt-form blog-saved-prompt-form" data-profile-controls>
     <label><span>Saved query</span><select name="query_id" required>{% for query in saved_queries %}<option value="{{ query.id }}">{{ query.name }}{% if query.local_regexp %} · local regexp{% endif %}</option>{% endfor %}</select><small>Choose one reusable query.</small></label>
-    {% if model_profiles %}<label class="collection-models"><span>Models</span><select name="model" multiple size="5" required data-model-picker data-search-placeholder="Search model profiles">{% for profile in model_profiles %}<option value="{{ profile.profile }}" {% if loop.first %}selected{% endif %}>{{ profile.profile }} · {{ profile.provider }} · {{ profile.model }}</option>{% endfor %}</select><small>Select one or more configured profiles.</small></label>{% endif %}
+    {% if model_profiles %}<label class="collection-models"><span>Models</span><select name="model" multiple size="5" required data-model-picker data-search-placeholder="Search model profiles">{% for profile in model_profiles %}<option value="{{ profile.profile }}" {% if loop.first %}selected{% endif %} data-provider="{{ profile.provider }}" data-context-window="{{ profile.context_window_tokens or '' }}">{{ profile.profile }} · {{ profile.provider }} · {{ profile.model }}</option>{% endfor %}</select><small>Select one or more configured profiles.</small></label>{% endif %}
     <label><span>Source</span><input value="Stored blog entry" disabled><small>The complete stored entry is used.</small></label>
-    <label><span>Context window tokens</span><input type="number" name="context_window_tokens" min="512" max="1000000" value="16384"><small>Maximum context per model.</small></label>
+    <label><span>Context window tokens</span><input type="number" name="context_window_tokens" min="512" max="1000000" value="16384" data-context-window><small>Available for local models; online profiles use their configured value.</small></label>
     <button class="button button-primary" type="submit" {% if query_state.running %}disabled{% endif %}>Run saved prompt</button>
   </form>
   {% else %}<p class="form-help">Create a reusable query on <a href="/queries">Queries</a>.</p>{% endif %}

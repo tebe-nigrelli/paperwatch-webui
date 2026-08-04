@@ -54,6 +54,16 @@ def test_manual_author_and_blog_management_ui(config_path):
     assert "Add author manually" in page.text
     assert "Import blog links" in page.text
     assert "Manual blog import" in page.text
+    assert "Create missing authors" in page.text
+    manual_form = page.text.split('class="inline-blog-import-form"', 1)[1].split(
+        "</form>", 1
+    )[0]
+    assert manual_form.count("<label") == 3
+    csv_row = page.text.split('class="author-csv-import-row blog-csv-import-row"', 1)[1].split(
+        "</div>", 1
+    )[0]
+    assert 'class="inline-blog-csv-form"' in csv_row
+    assert "Create missing authors" in csv_row
     assert "Fetch new papers, download available PDFs" in page.text
     assert 'href="/" data-content-home-link>Content</a>' in page.text
 
@@ -317,6 +327,8 @@ def _seed_query_blog(config_path):
 
 def test_blog_saved_prompt_routes_and_collection_runner(config_path):
     config, entry_id, query_id = _seed_query_blog(config_path)
+    with Database(config.paths.database) as db:
+        db.set_content_selected("blog", entry_id, True)
     controller = RecordingQueryStub()
     client = TestClient(
         create_app(
@@ -364,17 +376,29 @@ def test_blog_saved_prompt_routes_and_collection_runner(config_path):
     )
     assert selected.status_code == 303
     assert "Started+1+saved+query" in selected.headers["location"]
-    selection = controller.calls[-1][1]["selection"]
+    args, kwargs = controller.calls[-1]
+    assert args[:3] == (
+        query_id,
+        ("default",),
+        config.llm.context_window_tokens,
+    )
+    selection = kwargs["selection"]
     assert selection["content_type"] == "blogs"
-    assert selection["query"] == "Stored"
+    assert selection["blog_entry_ids"] == [entry_id]
+    assert "query" not in selection
 
-    all_entries = client.post(
+    with Database(config.paths.database) as db:
+        db.set_content_selected("blog", entry_id, False)
+    no_selection = client.post(
         "/queries/run-blogs",
         data={"query_id": str(query_id), "model": "default"},
         follow_redirects=False,
     )
-    assert all_entries.status_code == 303
-    assert "blog_entry_ids" not in controller.calls[-1][1]["selection"]
+    assert no_selection.status_code == 303
+    assert "Select+at+least+one+blog+entry" in no_selection.headers["location"]
+
+    with Database(config.paths.database) as db:
+        db.set_content_selected("blog", entry_id, True)
 
     missing_query = client.post("/queries/run-blogs", data={}, follow_redirects=False)
     assert "Select+a+saved+query" in missing_query.headers["location"]

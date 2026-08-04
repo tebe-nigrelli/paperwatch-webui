@@ -20,7 +20,7 @@ from .models import (
 )
 
 
-SCHEMA_VERSION = 24
+SCHEMA_VERSION = 25
 BLOG_SOURCE_MODES = {
     "auto",
     "feed",
@@ -357,8 +357,7 @@ CREATE TABLE IF NOT EXISTS saved_queries (
     is_builtin INTEGER NOT NULL DEFAULT 0,
     auto_run_papers INTEGER NOT NULL DEFAULT 0,
     auto_run_blogs INTEGER NOT NULL DEFAULT 0,
-    model_profiles_json TEXT NOT NULL DEFAULT '[]',
-    context_window_tokens INTEGER NOT NULL DEFAULT 16384,
+    model_profile TEXT NOT NULL DEFAULT '',
     paper_source_scope TEXT NOT NULL DEFAULT 'auto'
         CHECK (paper_source_scope IN ('auto', 'abstract', 'fulltext')),
     pdf_strategy TEXT NOT NULL DEFAULT 'chunked'
@@ -494,6 +493,7 @@ class Database:
         self._conn.executescript(ANALYSIS_TASKS_SCHEMA)
         self._ensure_analysis_columns()
         self._conn.executescript(EXTRA_SCHEMA)
+        self._migrate_saved_queries_v25()
         self._ensure_query_columns()
         self._ensure_default_saved_queries()
         self._conn.executescript(TOPICS_SCHEMA)
@@ -743,6 +743,152 @@ class Database:
                 if name not in existing:
                     self._conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {definition}")
 
+    def _migrate_saved_queries_v25(self) -> None:
+        """Canonicalize saved queries to one model and no stored context size."""
+        columns = {
+            row["name"]
+            for row in self._conn.execute("PRAGMA table_info(saved_queries)").fetchall()
+        }
+        if (
+            "model_profile" in columns
+            and "model_profiles_json" not in columns
+            and "context_window_tokens" not in columns
+        ):
+            return
+
+        rows = [dict(row) for row in self._conn.execute("SELECT * FROM saved_queries")]
+        now = utcnow()
+
+        def text(row: dict[str, Any], name: str, default: str = "") -> str:
+            value = row.get(name, default)
+            return default if value is None else str(value)
+
+        def integer(row: dict[str, Any], name: str, default: int = 0) -> int:
+            try:
+                return int(row.get(name, default) or 0)
+            except (TypeError, ValueError):
+                return default
+
+        migrated: list[tuple[Any, ...]] = []
+        for row in rows:
+            profile = text(row, "model_profile").strip()
+            if not profile:
+                try:
+                    legacy_profiles = json.loads(text(row, "model_profiles_json", "[]"))
+                except json.JSONDecodeError:
+                    legacy_profiles = []
+                if isinstance(legacy_profiles, list):
+                    profile = next(
+                        (str(value).strip() for value in legacy_profiles if str(value).strip()),
+                        "",
+                    )
+            source_type = text(row, "source_type", "papers")
+            if source_type not in {"papers", "summaries"}:
+                source_type = "papers"
+            paper_scope = text(row, "paper_source_scope", "auto")
+            if paper_scope not in {"auto", "abstract", "fulltext"}:
+                paper_scope = "auto"
+            pdf_strategy = text(row, "pdf_strategy", "chunked")
+            if pdf_strategy not in {"auto", "direct", "chunked"}:
+                pdf_strategy = "chunked"
+            regexp_mode = text(row, "regexp_mode", "query")
+            if regexp_mode not in {"query", "print"}:
+                regexp_mode = "query"
+            content_scope = text(row, "content_scope", "both")
+            if content_scope not in {"both", "papers", "blogs"}:
+                content_scope = "both"
+            query_kind = text(row, "query_kind", "summary")
+            if query_kind not in {"summary", "classification"}:
+                query_kind = "summary"
+            migrated.append(
+                (
+                    integer(row, "id"),
+                    text(row, "name"),
+                    source_type,
+                    text(row, "search_query"),
+                    text(row, "prompt"),
+                    integer(row, "is_builtin"),
+                    integer(row, "auto_run_papers"),
+                    integer(row, "auto_run_blogs"),
+                    profile,
+                    paper_scope,
+                    pdf_strategy,
+                    text(row, "regexp_pattern"),
+                    max(0, integer(row, "regexp_radius")),
+                    regexp_mode,
+                    content_scope,
+                    query_kind,
+                    text(row, "label_class"),
+                    text(row, "label_values_json", "[]"),
+                    text(row, "created_at", now) or now,
+                    text(row, "updated_at", now) or now,
+                    row.get("last_run_at"),
+                )
+            )
+
+        self._conn.commit()
+        self._conn.execute("PRAGMA foreign_keys = OFF")
+        try:
+            self._conn.execute("BEGIN IMMEDIATE")
+            self._conn.execute("DROP TABLE IF EXISTS saved_queries_v25")
+            self._conn.execute(
+                """
+                CREATE TABLE saved_queries_v25 (
+                    id INTEGER PRIMARY KEY,
+                    name TEXT NOT NULL,
+                    source_type TEXT NOT NULL CHECK (source_type IN ('papers', 'summaries')),
+                    search_query TEXT NOT NULL DEFAULT '',
+                    prompt TEXT NOT NULL,
+                    is_builtin INTEGER NOT NULL DEFAULT 0,
+                    auto_run_papers INTEGER NOT NULL DEFAULT 0,
+                    auto_run_blogs INTEGER NOT NULL DEFAULT 0,
+                    model_profile TEXT NOT NULL DEFAULT '',
+                    paper_source_scope TEXT NOT NULL DEFAULT 'auto'
+                        CHECK (paper_source_scope IN ('auto', 'abstract', 'fulltext')),
+                    pdf_strategy TEXT NOT NULL DEFAULT 'chunked'
+                        CHECK (pdf_strategy IN ('auto', 'direct', 'chunked')),
+                    regexp_pattern TEXT NOT NULL DEFAULT '',
+                    regexp_radius INTEGER NOT NULL DEFAULT 0,
+                    regexp_mode TEXT NOT NULL DEFAULT 'query'
+                        CHECK (regexp_mode IN ('query', 'print')),
+                    content_scope TEXT NOT NULL DEFAULT 'both'
+                        CHECK (content_scope IN ('both', 'papers', 'blogs')),
+                    query_kind TEXT NOT NULL DEFAULT 'summary'
+                        CHECK (query_kind IN ('summary', 'classification')),
+                    label_class TEXT NOT NULL DEFAULT '',
+                    label_values_json TEXT NOT NULL DEFAULT '[]',
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    last_run_at TEXT
+                )
+                """
+            )
+            self._conn.executemany(
+                """
+                INSERT INTO saved_queries_v25(
+                    id, name, source_type, search_query, prompt, is_builtin,
+                    auto_run_papers, auto_run_blogs, model_profile,
+                    paper_source_scope, pdf_strategy, regexp_pattern,
+                    regexp_radius, regexp_mode, content_scope, query_kind,
+                    label_class, label_values_json, created_at, updated_at,
+                    last_run_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                migrated,
+            )
+            self._conn.execute("DROP TABLE saved_queries")
+            self._conn.execute("ALTER TABLE saved_queries_v25 RENAME TO saved_queries")
+            self._conn.commit()
+        except Exception:
+            self._conn.rollback()
+            raise
+        finally:
+            self._conn.execute("PRAGMA foreign_keys = ON")
+
+        violations = self._conn.execute("PRAGMA foreign_key_check").fetchall()
+        if violations:
+            raise DatabaseError("Saved-query migration produced foreign-key violations")
+
     def _ensure_query_columns(self) -> None:
         run_columns = {
             row["name"]
@@ -763,8 +909,7 @@ class Database:
         query_additions = {
             "auto_run_papers": "INTEGER NOT NULL DEFAULT 0",
             "auto_run_blogs": "INTEGER NOT NULL DEFAULT 0",
-            "model_profiles_json": "TEXT NOT NULL DEFAULT '[]'",
-            "context_window_tokens": "INTEGER NOT NULL DEFAULT 16384",
+            "model_profile": "TEXT NOT NULL DEFAULT ''",
             "paper_source_scope": "TEXT NOT NULL DEFAULT 'auto'",
             "pdf_strategy": "TEXT NOT NULL DEFAULT 'chunked'",
             "regexp_pattern": "TEXT NOT NULL DEFAULT ''",
@@ -1853,6 +1998,7 @@ class Database:
         offset: int = 0,
         ids_only: bool = False,
         table_view: bool = False,
+        query_view: bool = False,
     ) -> list[sqlite3.Row]:
         where_sql, params = self._blog_entry_filter_sql(
             query=query,
@@ -1881,6 +2027,22 @@ class Database:
                 FROM blog_entries be JOIN blogs b ON b.id=be.blog_id
                 WHERE {where_sql}
                 ORDER BY {order_sql}
+            """
+        elif query_view:
+            sql = f"""
+            SELECT
+                be.id, be.title, be.normalized_text, be.diff_text,
+                be.entry_kind, be.change_kind, be.source_url,
+                be.published_at, be.fetched_at,
+                b.url, COALESCE(b.title, be.title) AS blog_title,
+                (SELECT group_concat(name, ', ') FROM (
+                    SELECT DISTINCT a.name AS name
+                    FROM author_blogs ab JOIN authors a ON a.id=ab.author_id
+                    WHERE ab.blog_id=b.id ORDER BY a.name COLLATE NOCASE
+                )) AS author_names
+            FROM blog_entries be JOIN blogs b ON b.id=be.blog_id
+            WHERE {where_sql}
+            ORDER BY {order_sql}
             """
         elif table_view:
             sql = f"""
@@ -1963,7 +2125,9 @@ class Database:
             self._conn.execute(sql + " LIMIT ? OFFSET ?", (*params, limit, offset)).fetchall()
         )
 
-    def blog_entries_by_ids(self, entry_ids: Iterable[int]) -> list[sqlite3.Row]:
+    def blog_entries_by_ids(
+        self, entry_ids: Iterable[int], *, query_view: bool = False
+    ) -> list[sqlite3.Row]:
         ids: list[int] = []
         for value in entry_ids:
             try:
@@ -1975,15 +2139,18 @@ class Database:
         if not ids:
             return []
         placeholders = ",".join("?" for _ in ids)
-        rows = self._conn.execute(
-            f"""
-            SELECT be.*, b.url, COALESCE(b.title, be.title) AS blog_title,
-                (SELECT group_concat(name, ', ') FROM (
-                    SELECT DISTINCT a.name AS name
-                    FROM author_blogs ab JOIN authors a ON a.id=ab.author_id
-                    WHERE ab.blog_id=b.id ORDER BY a.name COLLATE NOCASE
-                )) AS author_names,
-                COALESCE((SELECT group_concat(name, ', ') FROM (
+        if query_view:
+            columns = """
+                be.id, be.title, be.normalized_text, be.diff_text,
+                be.entry_kind, be.change_kind, be.source_url,
+                be.published_at, be.fetched_at,
+                b.url, COALESCE(b.title, be.title) AS blog_title,
+            """
+            tags_column = ""
+        else:
+            columns = "be.*, b.url, COALESCE(b.title, be.title) AS blog_title,"
+            tags_column = """
+                , COALESCE((SELECT group_concat(name, ', ') FROM (
                     SELECT ct.name AS name
                     FROM blog_entry_tag_links betl
                     JOIN content_tags ct ON ct.id=betl.tag_id
@@ -1994,6 +2161,16 @@ class Database:
                     WHERE qcr.blog_entry_id=be.id
                     ORDER BY name COLLATE NOCASE
                 )), '') AS content_tags
+            """
+        rows = self._conn.execute(
+            f"""
+            SELECT {columns}
+                (SELECT group_concat(name, ', ') FROM (
+                    SELECT DISTINCT a.name AS name
+                    FROM author_blogs ab JOIN authors a ON a.id=ab.author_id
+                    WHERE ab.blog_id=b.id ORDER BY a.name COLLATE NOCASE
+                )) AS author_names
+                {tags_column}
             FROM blog_entries be JOIN blogs b ON b.id=be.blog_id
             WHERE be.id IN ({placeholders}) AND be.change_kind != 'baseline'
             """,
@@ -2001,6 +2178,28 @@ class Database:
         ).fetchall()
         by_id = {int(row["id"]): row for row in rows}
         return [by_id[value] for value in ids if value in by_id]
+
+    def count_blog_entries_by_ids(self, entry_ids: Iterable[int]) -> int:
+        ids: list[int] = []
+        for value in entry_ids:
+            try:
+                parsed = int(value)
+            except (TypeError, ValueError):
+                continue
+            if parsed > 0 and parsed not in ids:
+                ids.append(parsed)
+        if not ids:
+            return 0
+        placeholders = ",".join("?" for _ in ids)
+        return int(
+            self._conn.execute(
+                f"""
+                SELECT count(*) FROM blog_entries
+                WHERE id IN ({placeholders}) AND change_kind != 'baseline'
+                """,
+                ids,
+            ).fetchone()[0]
+        )
 
     def get_blog_entry(self, entry_id: int) -> sqlite3.Row | None:
         return self._conn.execute(
@@ -2102,6 +2301,31 @@ class Database:
                     (1 if selected else 0, *blog_values),
                 ).rowcount
         return int(changed)
+
+    def selected_content_state(self) -> dict[str, int]:
+        row = self._conn.execute(
+            """
+            SELECT COALESCE(SUM(total), 0) AS total,
+                   COALESCE(SUM(starred), 0) AS starred,
+                   COALESCE(SUM(read_count), 0) AS read_count
+            FROM (
+                SELECT COUNT(*) AS total,
+                       COALESCE(SUM(starred != 0), 0) AS starred,
+                       COALESCE(SUM(read_at IS NOT NULL), 0) AS read_count
+                FROM papers WHERE selected=1
+                UNION ALL
+                SELECT COUNT(*) AS total,
+                       COALESCE(SUM(starred != 0), 0) AS starred,
+                       COALESCE(SUM(read_at IS NOT NULL), 0) AS read_count
+                FROM blog_entries WHERE selected=1
+            )
+            """
+        ).fetchone()
+        return {
+            "total": int(row["total"]),
+            "starred": int(row["starred"]),
+            "read": int(row["read_count"]),
+        }
 
     def bulk_update_selected_content(self, action: str) -> int:
         if action not in {"star", "unstar", "read", "unread", "unselect"}:
@@ -3023,18 +3247,30 @@ class Database:
         *,
         tracked_only: bool = True,
         tag: str = "",
+        tags: Iterable[str] = (),
         query: str = "",
         starred: bool | None = None,
+        notes: bool | None = None,
+        enabled: bool | None = None,
     ) -> list[sqlite3.Row]:
         where = ["a.tracked=1"] if tracked_only else []
         params: list[Any] = []
-        if tag:
+        clean_tags = tuple(dict.fromkeys(
+            " ".join(str(value).strip().split())
+            for value in tags
+            if str(value).strip()
+        ))
+        if not clean_tags and tag.strip():
+            clean_tags = (tag.strip(),)
+        if clean_tags:
+            placeholders = ",".join("?" for _ in clean_tags)
             where.append(
                 "EXISTS (SELECT 1 FROM author_tag_links atl2 "
                 "JOIN author_tags at2 ON at2.id=atl2.tag_id "
-                "WHERE atl2.author_id=a.id AND at2.name=? COLLATE NOCASE)"
+                "WHERE atl2.author_id=a.id "
+                f"AND at2.name COLLATE NOCASE IN ({placeholders}))"
             )
-            params.append(tag.strip())
+            params.extend(clean_tags)
         if query:
             escaped = query.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
             term = f"%{escaped}%"
@@ -3052,6 +3288,15 @@ class Database:
         if starred is not None:
             where.append("a.starred=?")
             params.append(1 if starred else 0)
+        if notes is not None:
+            where.append(
+                "trim(COALESCE(a.notes, '')) != ''"
+                if notes
+                else "trim(COALESCE(a.notes, '')) = ''"
+            )
+        if enabled is not None:
+            where.append("a.enabled=?")
+            params.append(1 if enabled else 0)
         where_sql = " WHERE " + " AND ".join(where) if where else ""
         return list(
             self._conn.execute(
@@ -3724,22 +3969,21 @@ class Database:
     def _query_execution_values(
         *,
         model_profiles: Iterable[str],
-        context_window_tokens: int,
         paper_source_scope: str,
         pdf_strategy: str,
-    ) -> tuple[str, int, str, str]:
+    ) -> tuple[str, str, str]:
         profiles = list(dict.fromkeys(
             value.strip() for value in model_profiles if value.strip()
         ))
-        if not 512 <= context_window_tokens <= 1_000_000:
-            raise ValueError("Context window must be between 512 and 1000000 tokens")
+        if len(profiles) > 1:
+            raise ValueError("A saved query can use only one model")
         if paper_source_scope not in {"auto", "abstract", "fulltext"}:
             raise ValueError("Paper source must be auto, abstract, or fulltext")
         if pdf_strategy not in {"auto", "direct", "chunked"}:
             raise ValueError("PDF strategy must be auto, direct, or chunked")
         if paper_source_scope == "abstract":
             pdf_strategy = "auto"
-        return json_dumps(profiles), context_window_tokens, paper_source_scope, pdf_strategy
+        return (profiles[0] if profiles else ""), paper_source_scope, pdf_strategy
 
     @staticmethod
     def _regexp_values(
@@ -3809,7 +4053,7 @@ class Database:
         auto_run_papers: bool = False,
         auto_run_blogs: bool = False,
         model_profiles: Iterable[str] = (),
-        context_window_tokens: int = 16384,
+        context_window_tokens: int | None = None,
         paper_source_scope: str = "auto",
         pdf_strategy: str = "chunked",
         regexp_pattern: str = "",
@@ -3822,9 +4066,8 @@ class Database:
     ) -> int:
         name = name.strip()
         prompt = prompt.strip()
-        profiles_json, context, scope, strategy = self._query_execution_values(
+        model_profile, scope, strategy = self._query_execution_values(
             model_profiles=model_profiles,
-            context_window_tokens=context_window_tokens,
             paper_source_scope=paper_source_scope,
             pdf_strategy=pdf_strategy,
         )
@@ -3856,20 +4099,19 @@ class Database:
                 """
                 INSERT INTO saved_queries(
                     name, source_type, search_query, prompt, is_builtin,
-                    auto_run_papers, auto_run_blogs, model_profiles_json,
-                    context_window_tokens, paper_source_scope, pdf_strategy,
+                    auto_run_papers, auto_run_blogs, model_profile,
+                    paper_source_scope, pdf_strategy,
                     regexp_pattern, regexp_radius, regexp_mode, content_scope,
                     query_kind, label_class, label_values_json,
                     created_at, updated_at
-                ) VALUES (?, 'papers', '', ?, 0, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, 'papers', '', ?, 0, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     name[:120],
                     prompt[:10000],
                     1 if auto_run_papers else 0,
                     1 if auto_run_blogs else 0,
-                    profiles_json,
-                    context,
+                    model_profile,
                     scope,
                     strategy,
                     regexp,
@@ -3896,7 +4138,7 @@ class Database:
         auto_run_papers: bool | None = None,
         auto_run_blogs: bool | None = None,
         model_profiles: Iterable[str] = (),
-        context_window_tokens: int = 16384,
+        context_window_tokens: int | None = None,
         paper_source_scope: str = "auto",
         pdf_strategy: str = "chunked",
         regexp_pattern: str = "",
@@ -3909,9 +4151,8 @@ class Database:
     ) -> bool:
         name = name.strip()
         prompt = prompt.strip()
-        profiles_json, context, scope, strategy = self._query_execution_values(
+        model_profile, scope, strategy = self._query_execution_values(
             model_profiles=model_profiles,
-            context_window_tokens=context_window_tokens,
             paper_source_scope=paper_source_scope,
             pdf_strategy=pdf_strategy,
         )
@@ -3941,8 +4182,7 @@ class Database:
                     source_type='papers', search_query='', prompt=?,
                     auto_run_papers=CASE WHEN ? IS NULL THEN auto_run_papers ELSE ? END,
                     auto_run_blogs=CASE WHEN ? IS NULL THEN auto_run_blogs ELSE ? END,
-                    model_profiles_json=?, context_window_tokens=?,
-                    paper_source_scope=?, pdf_strategy=?, regexp_pattern=?,
+                    model_profile=?, paper_source_scope=?, pdf_strategy=?, regexp_pattern=?,
                     regexp_radius=?, regexp_mode=?, content_scope=?, query_kind=?,
                     label_class=?, label_values_json=?, updated_at=?
                 WHERE id=?
@@ -3955,8 +4195,7 @@ class Database:
                     0 if auto_run_papers is None else int(auto_run_papers),
                     None if auto_run_blogs is None else int(auto_run_blogs),
                     0 if auto_run_blogs is None else int(auto_run_blogs),
-                    profiles_json,
-                    context,
+                    model_profile,
                     scope,
                     strategy,
                     regexp,

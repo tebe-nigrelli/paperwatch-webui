@@ -1518,14 +1518,20 @@ class PaperWatch:
     @staticmethod
     def _stored_query_profiles(query: Any) -> tuple[str, ...]:
         try:
+            profile = str(query["model_profile"] or "").strip()
+        except (KeyError, IndexError):
+            profile = ""
+        if profile:
+            return (profile,)
+        try:
             values = json.loads(str(query["model_profiles_json"] or "[]"))
-        except (TypeError, json.JSONDecodeError):
+        except (KeyError, IndexError, TypeError, json.JSONDecodeError):
             values = []
         if not isinstance(values, list):
             return ()
         return tuple(dict.fromkeys(
             str(value).strip() for value in values if str(value).strip()
-        ))
+        ))[:1]
 
     def _run_automatic_queries(self, stats: RunStats) -> None:
         from .query_jobs import collect_query_documents, run_query_for_model
@@ -1578,9 +1584,7 @@ class PaperWatch:
                 "auto" if content_type == "blogs"
                 else str(query["pdf_strategy"] or "chunked")
             )
-            context_window_tokens = int(
-                query["context_window_tokens"] or self.config.llm.context_window_tokens
-            )
+            context_window_tokens = available[profile_names[0]].context_window_tokens
             selection: dict[str, Any] = {
                 "content_type": content_type,
                 "source_scope": source_scope,

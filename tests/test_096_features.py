@@ -138,7 +138,7 @@ def seed_content(config_path, author_candidate, paper_record):
 def test_query_content_scope_cleanup_and_schema(config_path):
     config = load_config(config_path)
     with Database(config.paths.database) as db:
-        assert SCHEMA_VERSION == 24
+        assert SCHEMA_VERSION == 25
         paper_query = db.create_saved_query(
             name="Paper only",
             prompt="Paper prompt",

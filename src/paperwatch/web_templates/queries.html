@@ -2,27 +2,26 @@
 {% block title %}Saved queries · paperwatch{% endblock %}
 {% block content %}
 <section class="page-heading split">
-  <div><h1>Saved queries</h1><p>Each prompt stores its models, context window, and paper input strategy. Select papers and run manually, or check New papers or New blog entries to run it after a fetch. When all boxes are clear, fetching does not run a model.</p></div>
+  <div><h1>Saved queries</h1><p>Each prompt stores one model and its paper input strategy. Context size comes from that model's configuration. Select papers and run manually, or check New papers or New blog entries to run it after a fetch.</p></div>
   <a class="button button-primary" href="/queries/new">New query</a>
 </section>
 
 <form id="automatic-query-form" method="post" action="/queries/automatic" data-auto-save="query-selections"></form>
 <section class="panel">
   <div class="panel-heading"><div><h2>Queries</h2><p>These two columns are the only fetch-time model triggers.</p></div><div class="query-selection-meta"><span>{{ queries|length }}</span><small id="automatic-query-status" class="muted" aria-live="polite">Changes save automatically</small></div></div>
-  <div class="table-wrap"><table><thead><tr><th>Name</th><th>Type</th><th>Supports</th><th>Models</th><th>Context</th><th>Paper input</th><th>New papers</th><th>New blog entries</th><th>Runs</th><th>Latest</th><th>Actions</th></tr></thead><tbody>
+  <div class="table-wrap"><table><thead><tr><th>Name</th><th>Type</th><th>Supports</th><th>Model</th><th>Paper input</th><th>New papers</th><th>New blog entries</th><th>Runs</th><th>Latest</th><th>Actions</th></tr></thead><tbody>
   {% for query in queries %}<tr id="query-{{ query.id }}">
     <td><input type="hidden" name="query_id" value="{{ query.id }}" form="automatic-query-form"><strong>{{ query.name }}</strong>{% if query.is_builtin %}<small><span class="badge">Built in</span></small>{% endif %}<small>Updated {{ query.updated_at }}</small></td>
     <td>{% if query.query_kind == 'classification' %}<span class="status status-warning">Classifier</span><small>{{ query.label_class }} · {{ query.label_values|map(attribute='value')|join(', ') }}</small>{% else %}<span class="status status-disabled">Summary</span>{% endif %}</td>
     <td><span class="status status-{{ 'paper' if query.content_scope == 'papers' else 'blog' if query.content_scope == 'blogs' else 'success' }}">{{ {'both':'Both', 'papers':'Paper', 'blogs':'Blog'}.get(query.content_scope, 'Both') }}</span></td>
     <td>{% if query.local_regexp %}<span class="badge">Local regexp</span><small>No model call</small>{% else %}{% for model in query.selected_models %}<span class="badge">{{ model.profile }}</span><small>{{ model.model }}</small>{% else %}<span class="muted">No model</span>{% endfor %}{% endif %}{% if query.regexp_pattern %}<details class="query-regexp-summary"><summary>Regexp filter</summary><code>{{ query.regexp_pattern }}</code><small>{{ query.regexp_radius }} words around each match · {{ 'print excerpts' if query.regexp_mode == 'print' else 'query excerpts' }}</small></details>{% endif %}</td>
-    <td>{{ query.context_window_tokens }}</td>
     <td>{{ {'auto':'Auto', 'abstract':'Abstract', 'fulltext':'Full PDF'}.get(query.paper_source_scope, query.paper_source_scope) }}{% if query.paper_source_scope != 'abstract' %}<small>{{ {'auto':'Auto', 'direct':'Direct', 'chunked':'Chunk + merge'}.get(query.pdf_strategy, query.pdf_strategy) }}</small>{% endif %}</td>
     <td><label class="table-check"><input type="checkbox" name="auto_run_papers" value="{{ query.id }}" form="automatic-query-form" {% if query.auto_run_papers %}checked{% endif %} {% if query.content_scope == 'blogs' %}disabled{% endif %}><span class="sr-only">Run {{ query.name }} on new papers</span></label></td>
     <td><label class="table-check"><input type="checkbox" name="auto_run_blogs" value="{{ query.id }}" form="automatic-query-form" {% if query.auto_run_blogs %}checked{% endif %} {% if query.content_scope == 'papers' %}disabled{% endif %}><span class="sr-only">Run {{ query.name }} on new blog entries</span></label></td>
     <td>{{ query.run_count }}</td>
     <td><span class="status status-{{ query.latest_status or 'disabled' }}">{{ query.latest_status or 'not run' }}</span></td>
     <td><div class="button-group"><a class="button button-small button-primary" href="/queries/{{ query.id }}/edit">Edit</a>{% if query.content_scope in ('both', 'papers') %}<a class="button button-small" href="/?query_id={{ query.id }}">Papers</a>{% endif %}{% if query.content_scope in ('both', 'blogs') %}<a class="button button-small" href="/blogs?query_id={{ query.id }}">Blogs</a>{% endif %}{% if query.query_kind == 'classification' %}<form method="post" action="/queries/{{ query.id }}/classifications/delete" data-confirm="Remove every {{ query.label_class }} classification produced by this query?"><button class="button button-small button-danger" type="submit">Clear labels</button></form>{% endif %}</div></td>
-  </tr>{% else %}<tr><td colspan="11" class="empty">No saved queries.</td></tr>{% endfor %}
+  </tr>{% else %}<tr><td colspan="10" class="empty">No saved queries.</td></tr>{% endfor %}
   </tbody></table></div>
 </section>
 

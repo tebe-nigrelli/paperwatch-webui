@@ -93,7 +93,7 @@ def test_schema_notes_shared_tags_mass_actions_and_catalog_roundtrip(
     paper_id, blog_id, entry_id = seed(config_path, author_candidate, paper_record)
     config = load_config(config_path)
     with Database(config.paths.database) as db:
-        assert SCHEMA_VERSION == 24
+        assert SCHEMA_VERSION == 25
         author = db.get_author(author_candidate.openalex_id)
         assert author is not None
         assert db.set_object_notes("author", int(author["id"]), "**Author note**")
@@ -143,7 +143,7 @@ def test_content_ajax_filters_icons_selection_notes_and_tags(
     assert "content-kind-paper" in initial.text
     assert "content-kind-blog" in initial.text
     for text in (
-        "Filter starred",
+        "Star filter",
         "Filter matching title text",
         "Filter authors",
         "Filter topics",
@@ -856,7 +856,7 @@ def test_private_filter_and_regexp_helpers_cover_edge_inputs(config_path):
     assert _content_tag_values(QueryParams("tag=One&tag=one&tag=Two")) == ("One", "Two")
     assert _content_tag_values({"tag": " Single  tag "}) == ("Single tag",)
     assert len(_split_tags(",".join(f"tag-{index}" for index in range(110)))) == 100
-    assert _query_profile_names("not-json") == ()
+    assert _query_profile_names("not-json") == ("not-json",)
     assert _query_profile_names('{"profile":"bad"}') == ()
     config = load_config(config_path)
     query = _query_view(

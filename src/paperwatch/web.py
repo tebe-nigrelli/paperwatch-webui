@@ -67,7 +67,6 @@ SCOPES = ("abstract", "fulltext")
 SORTS = ("newest", "oldest", "discovered", "title")
 PAGE_SIZES = (25, 100, 250, 500, 1000)
 DEFAULT_PAGE_SIZE = 25
-DEFAULT_CONTEXT_WINDOW_TOKENS = 16384
 SELECTED_CONTENT_PREVIEW_LIMIT = 25
 
 
@@ -668,7 +667,20 @@ def _row_dict(row: Any) -> dict[str, Any]:
 
 
 def _query_profile_names(value: Any) -> tuple[str, ...]:
-    decoded = _json_value(value, [])
+    if value is None:
+        return ()
+    if isinstance(value, str):
+        stripped = value.strip()
+        if not stripped:
+            return ()
+        try:
+            decoded = json.loads(stripped)
+        except json.JSONDecodeError:
+            return (stripped,)
+    else:
+        decoded = value
+    if isinstance(decoded, str):
+        return (decoded.strip(),) if decoded.strip() else ()
     if not isinstance(decoded, list):
         return ()
     return tuple(dict.fromkeys(
@@ -676,10 +688,36 @@ def _query_profile_names(value: Any) -> tuple[str, ...]:
     ))
 
 
+def _configured_context_window(
+    config: AppConfig,
+    profile_names: Iterable[str],
+    requested: int | None = None,
+) -> int:
+    profiles = [
+        profile
+        for name in dict.fromkeys(str(value).strip() for value in profile_names)
+        if name and (profile := config.llm_profile(name)) is not None
+    ]
+    native = [
+        profile for profile in profiles if profile.provider in {"codex", "claude-code"}
+    ]
+    if native:
+        if len(profiles) != 1:
+            raise ValueError("Codex and Claude Code must run as the only selected model")
+        return native[0].context_window_tokens
+    if requested is not None:
+        return requested
+    if len(profiles) == 1:
+        return profiles[0].context_window_tokens
+    return config.llm.context_window_tokens
+
+
 def _query_view(row: Any, config: AppConfig) -> dict[str, Any]:
     query = _row_dict(row)
     available = {item.profile: item for item in config.available_llms}
-    selected = _query_profile_names(query.get("model_profiles_json"))
+    selected = _query_profile_names(
+        query.get("model_profile") or query.get("model_profiles_json")
+    )[:1]
     if not selected and available:
         selected = (next(iter(available)),)
     query["model_profiles"] = list(selected)
@@ -691,9 +729,6 @@ def _query_view(row: Any, config: AppConfig) -> dict[str, Any]:
         }
         for name in selected
     ]
-    query["context_window_tokens"] = int(
-        query.get("context_window_tokens") or DEFAULT_CONTEXT_WINDOW_TOKENS
-    )
     query["paper_source_scope"] = str(query.get("paper_source_scope") or "auto")
     query["pdf_strategy"] = str(query.get("pdf_strategy") or "chunked")
     query["regexp_pattern"] = str(query.get("regexp_pattern") or "")
@@ -743,11 +778,10 @@ def _query_execution_form(form: Any, config: AppConfig) -> dict[str, Any]:
     unknown = [name for name in profiles if name not in available]
     if unknown:
         raise ValueError(f"Unknown configured model profile(s): {', '.join(unknown)}")
+    if len(profiles) > 1:
+        raise ValueError("A saved query can use only one model")
     if available and not profiles:
         profiles = (next(iter(available)),)
-    context = _int_or_none(form.get("context_window_tokens"))
-    if context is None:
-        context = config.llm.context_window_tokens
     source_scope = str(form.get("paper_source_scope", "auto"))
     pdf_strategy = str(form.get("pdf_strategy", "chunked"))
     if source_scope == "abstract":
@@ -758,7 +792,6 @@ def _query_execution_form(form: Any, config: AppConfig) -> dict[str, Any]:
     query_kind = str(form.get("query_kind", "summary"))
     return {
         "model_profiles": profiles,
-        "context_window_tokens": context,
         "paper_source_scope": source_scope,
         "pdf_strategy": pdf_strategy,
         "regexp_pattern": str(form.get("regexp_pattern", "")),
@@ -1510,6 +1543,7 @@ def create_app(
                 sort="discovered",
                 table_view=True,
             )
+            selected_state = db.selected_content_state()
             author_rows = db.list_authors_with_tags(tracked_only=True)
             tag_rows = db.list_tags()
             content_tag_rows = db.list_content_tags()
@@ -1586,8 +1620,17 @@ def create_app(
             records=records,
             selected_records=selected_records,
             selected_count=selected_paper_total + selected_blog_total,
+            selected_blog_count=selected_blog_total,
             selected_visible_count=len(selected_records),
             selected_matching_count=selected_matching_papers + selected_matching_blogs,
+            selected_all_starred=(
+                selected_state["total"] > 0
+                and selected_state["starred"] == selected_state["total"]
+            ),
+            selected_all_read=(
+                selected_state["total"] > 0
+                and selected_state["read"] == selected_state["total"]
+            ),
             papers=visible_papers,
             blog_entries=visible_blogs,
             filters=filters,
@@ -1866,13 +1909,29 @@ def create_app(
 
     @app.get("/authors", response_class=HTMLResponse)
     def authors(request: Request) -> HTMLResponse:
-        tag = request.query_params.get("tag", "").strip()[:40]
-        name = request.query_params.get("name", "").strip()[:200]
+        raw_tags = request.query_params.getlist("tag")
+        active_tags: list[str] = []
+        seen_tags: set[str] = set()
+        for value in raw_tags:
+            tag = " ".join(str(value).strip().split())[:40]
+            normalized = tag.casefold()
+            if tag and normalized not in seen_tags:
+                active_tags.append(tag)
+                seen_tags.add(normalized)
+            if len(active_tags) >= 50:
+                break
         query = request.query_params.get("q", "").strip()[:200]
         starred = _parse_tristate(request.query_params.get("starred"))
+        notes = _parse_tristate(request.query_params.get("notes"))
+        enabled = _parse_tristate(request.query_params.get("enabled"))
         with Database(config.paths.database) as db:
             rows = [dict(row) for row in db.list_authors_with_tags(
-                tracked_only=True, tag=tag, query=query, starred=starred
+                tracked_only=True,
+                tags=active_tags,
+                query=query,
+                starred=starred,
+                notes=notes,
+                enabled=enabled,
             )]
             for row in rows:
                 row["is_local"] = str(row["openalex_id"]).startswith("LOCAL-")
@@ -1882,9 +1941,11 @@ def create_app(
             "authors.html",
             authors=rows,
             tags=tags,
-            active_tag=tag,
+            active_tags=tuple(active_tags),
             author_query=query,
             author_starred=starred,
+            author_notes=notes,
+            author_enabled=enabled,
         )
 
     @app.get("/data", response_class=HTMLResponse)
@@ -2371,7 +2432,7 @@ def create_app(
         form = await request.form()
         query_id = _int_or_none(form.get("query_id"))
         profiles = tuple(str(value) for value in form.getlist("model") if str(value))
-        context = _int_or_none(form.get("context_window_tokens")) or DEFAULT_CONTEXT_WINDOW_TOKENS
+        requested_context = _int_or_none(form.get("context_window_tokens"))
         with Database(config.paths.database) as db:
             entry = db.get_blog_entry(entry_id)
             query = db.get_saved_query(query_id) if query_id is not None else None
@@ -2387,6 +2448,10 @@ def create_app(
 
         if query is None:
             return failure("Select a saved prompt.")
+        try:
+            context = _configured_context_window(config, profiles, requested_context)
+        except ValueError as exc:
+            return failure(str(exc))
         try:
             batch_id = collection_controller.start(
                 int(query["id"]),
@@ -2906,7 +2971,7 @@ def create_app(
             raise HTTPException(400, "Invalid analysis scope")
         profile_names = tuple(str(value) for value in form.getlist("model"))
         strategy = str(form.get("strategy", "auto"))
-        context_tokens = _int_or_none(form.get("context_window_tokens"))
+        requested_context = _int_or_none(form.get("context_window_tokens"))
         with Database(config.paths.database) as db:
             paper = db.get_paper(paper_id)
         if paper is None:
@@ -2919,6 +2984,12 @@ def create_app(
                 _notice_url(f"/papers/{paper_id}", message, level="error"), status_code=303
             )
 
+        try:
+            context_tokens = _configured_context_window(
+                config, profile_names, requested_context
+            )
+        except ValueError as exc:
+            return failure(str(exc))
         if scope == "abstract" and not paper["abstract"]:
             return failure("This paper has no abstract to analyze.")
         if scope == "fulltext" and not (paper["pdf_url"] or paper["local_pdf_path"]):
@@ -2953,7 +3024,7 @@ def create_app(
         form = await request.form()
         query_id = _int_or_none(form.get("query_id"))
         profiles = tuple(str(value) for value in form.getlist("model") if str(value))
-        context = _int_or_none(form.get("context_window_tokens")) or DEFAULT_CONTEXT_WINDOW_TOKENS
+        requested_context = _int_or_none(form.get("context_window_tokens"))
         source_scope = str(form.get("source_scope", "abstract"))
         pdf_strategy = str(form.get("pdf_strategy", "auto"))
         with Database(config.paths.database) as db:
@@ -2971,6 +3042,10 @@ def create_app(
 
         if query is None:
             return failure("Select a saved prompt.")
+        try:
+            context = _configured_context_window(config, profiles, requested_context)
+        except ValueError as exc:
+            return failure(str(exc))
         if source_scope == "abstract" and not paper["abstract"]:
             return failure("This paper has no abstract to analyze.")
         if source_scope == "fulltext" and not (paper["pdf_url"] or paper["local_pdf_path"]):
@@ -3276,7 +3351,6 @@ def create_app(
             "prompt": "",
             "is_builtin": False,
             "model_profiles": selected,
-            "context_window_tokens": config.llm.context_window_tokens,
             "paper_source_scope": "auto",
             "pdf_strategy": "chunked",
             "regexp_pattern": "",
@@ -3346,7 +3420,7 @@ def create_app(
             legacy_target_form = not any(
                 key in form
                 for key in (
-                    "model", "context_window_tokens", "paper_source_scope", "pdf_strategy",
+                    "model", "paper_source_scope", "pdf_strategy",
                     "content_scope",
                 )
             )
@@ -3440,7 +3514,14 @@ def create_app(
     async def run_query(request: Request, query_id: int) -> RedirectResponse:
         form = await request.form()
         profiles = tuple(str(value) for value in form.getlist("model"))
-        context = _int_or_none(form.get("context_window_tokens")) or DEFAULT_CONTEXT_WINDOW_TOKENS
+        try:
+            context = _configured_context_window(
+                config, profiles, _int_or_none(form.get("context_window_tokens"))
+            )
+        except ValueError as exc:
+            return RedirectResponse(
+                _notice_url("/queries", str(exc), level="error"), status_code=303
+            )
         source_scope = str(form.get("source_scope", "abstract"))
         pdf_strategy = str(form.get("pdf_strategy", "auto"))
         try:
@@ -3470,7 +3551,14 @@ def create_app(
         form = await request.form()
         query_id = _int_or_none(form.get("query_id"))
         profiles = tuple(str(value) for value in form.getlist("model") if str(value))
-        context = _int_or_none(form.get("context_window_tokens")) or DEFAULT_CONTEXT_WINDOW_TOKENS
+        try:
+            context = _configured_context_window(
+                config, profiles, _int_or_none(form.get("context_window_tokens"))
+            )
+        except ValueError as exc:
+            return RedirectResponse(
+                _notice_url("/", str(exc), level="error"), status_code=303
+            )
         source_scope = str(form.get("source_scope", "abstract"))
         pdf_strategy = str(form.get("pdf_strategy", "auto"))
         if query_id is None:
@@ -3578,8 +3666,11 @@ def create_app(
             batch_id = collection_controller.start(
                 query_id,
                 profiles,
-                _int_or_none(form.get("context_window_tokens"))
-                or int(query["context_window_tokens"]),
+                _configured_context_window(
+                    config,
+                    profiles,
+                    _int_or_none(form.get("context_window_tokens")),
+                ),
                 selection=selection,
                 source_scope=source_scope,
                 pdf_strategy=pdf_strategy,
@@ -3618,16 +3709,35 @@ def create_app(
             )
         )
         profile = str(form.get("model", "")).strip()
-        context = _int_or_none(form.get("context_window_tokens")) or DEFAULT_CONTEXT_WINDOW_TOKENS
         if not query_ids:
             return RedirectResponse(
                 _notice_url("/blogs", "Select a saved query.", level="error"),
                 status_code=303,
             )
-        filters = _parse_filter_values(form)
-        selection = filters.selection()
-        selection["content_type"] = "blogs"
-        selection["labels"] = ["All blog entries matching the current Content filters"]
+        configured_profile = config.llm_profile(profile)
+        if configured_profile is None:
+            return RedirectResponse(
+                _notice_url("/", "Select a configured model.", level="error"),
+                status_code=303,
+            )
+        with Database(config.paths.database) as db:
+            selected_ids = [
+                int(row["id"])
+                for row in db.list_blog_entries(
+                    limit=None, selected=True, ids_only=True
+                )
+            ][:5000]
+        if not selected_ids:
+            return RedirectResponse(
+                _notice_url("/", "Select at least one blog entry.", level="error"),
+                status_code=303,
+            )
+        context = configured_profile.context_window_tokens
+        selection = {
+            "content_type": "blogs",
+            "blog_entry_ids": selected_ids,
+            "labels": [f"Selected blog entries: {len(selected_ids)}"],
+        }
         try:
             start_many = getattr(collection_controller, "start_many", None)
             if callable(start_many):
@@ -3660,7 +3770,13 @@ def create_app(
                 status_code=303,
             )
         return RedirectResponse(
-            _notice_url("/blogs", f"Started {len(query_ids)} saved quer{'y' if len(query_ids) == 1 else 'ies'} on matching blog entries."),
+            _notice_url(
+                "/",
+                f"Started {len(query_ids)} saved "
+                f"quer{'y' if len(query_ids) == 1 else 'ies'} on "
+                f"{len(selected_ids)} selected blog "
+                f"entr{'y' if len(selected_ids) == 1 else 'ies'}.",
+            ),
             status_code=303,
         )
 

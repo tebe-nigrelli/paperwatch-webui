@@ -84,9 +84,8 @@ def test_content_type_filter_and_version_brand(
     client = _client(config_path)
     page = client.get("/")
     assert page.status_code == 200
-    assert 'name="content" aria-label="Content type"' in page.text
-    assert ">Papers<" in page.text
-    assert ">Blogs<" in page.text
+    assert 'data-filter-name="content" data-filter-values="all|papers|blogs"' in page.text
+    assert 'data-filter-labels="Both|Papers|Blogs"' in page.text
     assert "paperwatch</span><small>v0.10.2</small>" in page.text
 
     papers = client.get("/?content=papers")

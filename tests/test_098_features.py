@@ -82,7 +82,7 @@ def test_schema_content_state_author_star_and_bulk_selection(
     paper_id, entry_id = seed(config_path, author_candidate, paper_record)
     config = load_config(config_path)
     with Database(config.paths.database) as db:
-        assert SCHEMA_VERSION == 24
+        assert SCHEMA_VERSION == 25
         assert db.get_paper(paper_id)["read_at"] is None
         assert db.get_blog_entry(entry_id)["read_at"] is None
         assert db.set_author_starred(author_candidate.openalex_id, True)

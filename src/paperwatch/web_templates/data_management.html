@@ -32,14 +32,16 @@
         <label><span>Tags</span><input name="tags" placeholder="optional, comma-separated"></label>
         <button class="button button-primary" type="submit">Link blog</button>
       </form>
-      <form method="post" action="/authors/blogs/import" enctype="multipart/form-data" class="inline-blog-csv-form">
-        <label class="grow"><span>CSV import</span><input type="file" name="csv_file" accept=".csv,text/csv" required></label>
-        <label class="check-row compact-check"><input type="checkbox" name="create_missing" value="1"><span>Create missing authors</span></label>
-        <label><span>Tags for every imported object</span><input name="import_tags" placeholder="optional, comma-separated"></label>
-        <button class="button button-primary" type="submit">Import CSV</button>
+      <div class="author-csv-import-row blog-csv-import-row">
+        <form method="post" action="/authors/blogs/import" enctype="multipart/form-data" class="inline-blog-csv-form">
+          <label class="grow"><span>CSV import</span><input type="file" name="csv_file" accept=".csv,text/csv" required></label>
+          <label><span>Tags for every imported object</span><input name="import_tags" placeholder="optional, comma-separated"></label>
+          <label class="check-row compact-check"><input type="checkbox" name="create_missing" value="1"><span>Create missing authors</span></label>
+          <button class="button button-primary" type="submit">Import CSV</button>
+        </form>
         <button class="icon-button info-button" type="button" data-dialog-open="blog-csv-info" aria-label="Blogs CSV schema" title="Blogs CSV schema">ⓘ</button>
         <a class="button button-small" href="/exports/blogs.csv">Export blogs CSV</a>
-      </form>
+      </div>
     </div>
   </article>
 </section>

@@ -155,7 +155,7 @@ def test_author_tags_filter_and_non_destructive_removal(
     assert 'list="tag-suggestions"' in page.text
     assert "last checked" not in page.text
     assert "Add tag</button>" not in page.text
-    assert "Pause / resume" in page.text
+    assert 'data-filter-name="enabled"' in page.text
     client.post("/authors/A123/remove", follow_redirects=False)
     with Database(config.paths.database) as db:
         row = db.get_author("A123")
