@@ -66,8 +66,9 @@ PAPER_KINDS = (
 SCOPES = ("abstract", "fulltext")
 SORTS = ("newest", "oldest", "discovered", "title")
 PAGE_SIZES = (25, 100, 250, 500, 1000)
-DEFAULT_PAGE_SIZE = 100
+DEFAULT_PAGE_SIZE = 25
 DEFAULT_CONTEXT_WINDOW_TOKENS = 16384
+SELECTED_CONTENT_PREVIEW_LIMIT = 25
 
 
 @dataclass(frozen=True, slots=True)
@@ -86,6 +87,7 @@ class PaperFilters:
     analyzed: bool | None = None
     starred: bool | None = None
     read: bool | None = None
+    notes: bool | None = None
     date_from: str = ""
     date_to: str = ""
     sort: str = "newest"
@@ -108,6 +110,7 @@ class PaperFilters:
             "analyzed": self.analyzed,
             "starred": self.starred,
             "read": self.read,
+            "notes": self.notes,
             "date_from": self.date_from,
             "date_to": self.date_to,
             "sort": self.sort,
@@ -127,6 +130,7 @@ class PaperFilters:
             ("analyzed", _bool_query(self.analyzed)),
             ("starred", _bool_query(self.starred)),
             ("read", _bool_query(self.read)),
+            ("notes", _bool_query(self.notes)),
             ("date_from", self.date_from),
             ("date_to", self.date_to),
             ("sort", self.sort if self.sort != "newest" else ""),
@@ -147,6 +151,7 @@ class PaperFilters:
             ("analyzed", _bool_query(self.analyzed)),
             ("starred", _bool_query(self.starred)),
             ("read", _bool_query(self.read)),
+            ("notes", _bool_query(self.notes)),
             ("date_from", self.date_from),
             ("date_to", self.date_to),
             ("sort", self.sort if self.sort != "newest" else ""),
@@ -596,6 +601,7 @@ def _parse_filter_values(params: Any) -> PaperFilters:
         analyzed=_parse_tristate(params.get("analyzed")),
         starred=_parse_tristate(params.get("starred")),
         read=_parse_tristate(params.get("read")),
+        notes=_parse_tristate(params.get("notes")),
         date_from=_valid_date(params.get("date_from")),
         date_to=_valid_date(params.get("date_to")),
         sort=sort,
@@ -1081,16 +1087,39 @@ def _paper_view(row: Any) -> dict[str, Any]:
     return data
 
 
-def _paper_pdf_state(db: Database, data: dict[str, Any]) -> dict[str, Any]:
+def _paper_pdf_state(
+    db: Database, data: dict[str, Any], *, verify_hash: bool = True
+) -> dict[str, Any]:
     value = str(data.get("local_pdf_path") or "").strip()
-    data["pdf_modified"] = False
+    known_modified = bool(data.get("pdf_modified_on_disk"))
+    data["pdf_modified"] = known_modified
     data["pdf_missing_on_disk"] = False
     if not value:
         return data
     path = Path(value).expanduser()
-    if not path.is_file():
+    try:
+        stat = path.stat()
+    except OSError:
         data["pdf_modified"] = True
         data["pdf_missing_on_disk"] = True
+        return data
+    size = int(stat.st_size)
+    mtime_ns = int(stat.st_mtime_ns)
+    stored_size = data.get("pdf_size")
+    stored_mtime = data.get("pdf_mtime_ns")
+
+    # A matching cheap fingerprint makes list rendering constant-time. Legacy rows
+    # without one are verified only on the detail page rather than hashing every PDF
+    # whenever Content is opened.
+    if stored_size is not None and stored_mtime is not None:
+        fingerprint_changed = int(stored_size) != size or int(stored_mtime) != mtime_ns
+        if not fingerprint_changed:
+            return data
+    elif not verify_hash:
+        return data
+
+    if not verify_hash:
+        data["pdf_modified"] = True
         return data
     try:
         current = pdf_sha256(path)
@@ -1099,23 +1128,50 @@ def _paper_pdf_state(db: Database, data: dict[str, Any]) -> dict[str, Any]:
         return data
     stored = str(data.get("pdf_sha256") or "")
     if not stored:
-        db.set_paper_pdf_hash(int(data["id"]), current)
+        db.set_paper_pdf_hash(
+            int(data["id"]), current, pdf_size=size, pdf_mtime_ns=mtime_ns
+        )
         data["pdf_sha256"] = current
+        data["pdf_modified_on_disk"] = 0
+        data["pdf_modified"] = False
+    elif stored != current:
+        data["pdf_modified"] = True
+        data["pdf_modified_on_disk"] = 1
+        db.set_paper_pdf_fingerprint(
+            int(data["id"]), pdf_size=size, pdf_mtime_ns=mtime_ns, modified=True
+        )
     else:
-        data["pdf_modified"] = stored != current
+        db.set_paper_pdf_fingerprint(
+            int(data["id"]), pdf_size=size, pdf_mtime_ns=mtime_ns, modified=False
+        )
+        data["pdf_size"] = size
+        data["pdf_mtime_ns"] = mtime_ns
+        data["pdf_modified_on_disk"] = 0
+        data["pdf_modified"] = False
     data["current_pdf_sha256"] = current
     return data
 
 
 def _paper_table_view(db: Database, row: Any) -> dict[str, Any]:
-    data = _paper_pdf_state(db, _paper_view(row))
-    paper_authors = [_author_view(item) for item in db.paper_authors(int(data["id"]))]
-    tracked_authors = [item for item in paper_authors if bool(item.get("is_tracked"))]
-    data["tracked_authors"] = tracked_authors
-    data["other_author_count"] = max(0, len(paper_authors) - len(tracked_authors))
-    data["all_authors"] = paper_authors
+    data = _paper_pdf_state(db, _paper_view(row), verify_hash=False)
+    tracked = _json_value(data.get("tracked_authors_json"), [])
+    if not isinstance(tracked, list):
+        tracked = []
+    data["tracked_authors"] = [
+        {
+            "name": str(item.get("name") or "Unknown author"),
+            "author_url": (
+                f"/authors/{quote_plus(str(item.get('openalex_id') or ''))}/blogs"
+                if item.get("openalex_id") else "/authors"
+            ),
+        }
+        for item in tracked
+        if isinstance(item, dict)
+    ]
+    author_count = int(data.get("author_count") or 0)
+    data["other_author_count"] = max(0, author_count - len(data["tracked_authors"]))
+    data["all_authors"] = []
     return data
-
 
 def _selection_with_labels(
     filters: PaperFilters,
@@ -1362,136 +1418,157 @@ def create_app(
         filters = _parse_filters(request)
         content_filter = _content_kind(request.query_params.get("content"), default_content)
         selected_query_id = _int_or_none(request.query_params.get("query_id"))
+        offset = (filters.page - 1) * filters.page_size
+        prefetch = offset + filters.page_size
+        paper_filters = {
+            "query": filters.query,
+            "title_query": filters.title_query,
+            "author_id": filters.author_id,
+            "author_ids": filters.author_ids,
+            "author_tags": filters.author_tags,
+            "content_tags": filters.content_tags,
+            "topic_id": filters.topic_id,
+            "topic_ids": filters.topic_ids,
+            "paper_kind": filters.paper_kind,
+            "scope": filters.scope,
+            "has_pdf": filters.has_pdf,
+            "analyzed": filters.analyzed,
+            "starred": filters.starred,
+            "read": filters.read,
+            "notes": filters.notes,
+            "date_from": filters.date_from,
+            "date_to": filters.date_to,
+            "sort": filters.sort,
+        }
+        blog_filters = {
+            "query": filters.query,
+            "title_query": filters.title_query,
+            "tags": filters.content_tags,
+            "author_id": filters.author_id,
+            "author_ids": filters.author_ids,
+            "author_tags": filters.author_tags,
+            "date_from": filters.date_from,
+            "date_to": filters.date_to,
+            "sort": filters.sort,
+            "starred": filters.starred,
+            "read": filters.read,
+            "notes": filters.notes,
+            "analyzed": filters.analyzed,
+        }
+        blog_compatible_filters = not (
+            filters.topic_id
+            or filters.topic_ids
+            or filters.paper_kind
+            or filters.scope
+            or filters.has_pdf is True
+        )
+
         with Database(config.paths.database) as db:
             paper_rows: list[Any] = []
             blog_rows: list[Any] = []
+            paper_total = 0
+            blog_total = 0
+            selected_matching_papers = 0
+            selected_matching_blogs = 0
             if content_filter != "blogs":
-                paper_rows, _paper_total = db.search_papers(
-                    query=filters.query,
-                    title_query=filters.title_query,
-                    author_id=filters.author_id,
-                    author_ids=filters.author_ids,
-                    author_tags=filters.author_tags,
-                    content_tags=filters.content_tags,
-                    topic_id=filters.topic_id,
-                    topic_ids=filters.topic_ids,
-                    paper_kind=filters.paper_kind,
-                    scope=filters.scope,
-                    has_pdf=filters.has_pdf,
-                    analyzed=filters.analyzed,
-                    starred=filters.starred,
-                    read=filters.read,
+                paper_rows, paper_total = db.search_papers(
+                    **paper_filters,
                     selected=False,
-                    date_from=filters.date_from,
-                    date_to=filters.date_to,
-                    sort=filters.sort,
-                    limit=None,
-                    offset=0,
+                    limit=(filters.page_size if content_filter == "papers" else prefetch),
+                    offset=(offset if content_filter == "papers" else 0),
+                    table_view=True,
                 )
-            blog_compatible_filters = not (
-                filters.topic_id
-                or filters.topic_ids
-                or filters.paper_kind
-                or filters.scope
-                or filters.has_pdf is True
-            )
+                _, selected_matching_papers = db.search_papers(
+                    **paper_filters, selected=True, limit=0, offset=0
+                )
             if content_filter != "papers" and blog_compatible_filters:
-                blog_rows = db.list_blog_entries(
-                    limit=None,
-                    query=filters.query,
-                    title_query=filters.title_query,
-                    tags=filters.content_tags,
-                    author_id=filters.author_id,
-                    author_ids=filters.author_ids,
-                    author_tags=filters.author_tags,
-                    date_from=filters.date_from,
-                    date_to=filters.date_to,
-                    sort=filters.sort,
-                    starred=filters.starred,
-                    read=filters.read,
-                    selected=False,
-                    analyzed=filters.analyzed,
+                blog_total = db.count_blog_entries(
+                    **{k: v for k, v in blog_filters.items() if k != "sort"}, selected=False
                 )
-            selected_paper_rows, _ = db.search_papers(
-                selected=True, limit=None, offset=0, sort="discovered"
+                selected_matching_blogs = db.count_blog_entries(
+                    **{k: v for k, v in blog_filters.items() if k != "sort"}, selected=True
+                )
+                blog_rows = db.list_blog_entries(
+                    **blog_filters,
+                    selected=False,
+                    limit=(filters.page_size if content_filter == "blogs" else prefetch),
+                    offset=(offset if content_filter == "blogs" else 0),
+                    table_view=True,
+                )
+
+            selected_paper_rows, selected_paper_total = db.search_papers(
+                selected=True,
+                limit=SELECTED_CONTENT_PREVIEW_LIMIT,
+                offset=0,
+                sort="discovered",
+                table_view=True,
             )
+            selected_blog_total = db.count_blog_entries(selected=True)
             selected_blog_rows = db.list_blog_entries(
-                limit=None, selected=True, sort="discovered"
+                limit=SELECTED_CONTENT_PREVIEW_LIMIT,
+                selected=True,
+                sort="discovered",
+                table_view=True,
             )
             author_rows = db.list_authors_with_tags(tracked_only=True)
             tag_rows = db.list_tags()
             content_tag_rows = db.list_content_tags()
             topic_rows = db.list_topics()
             saved_queries = [_query_view(row, config) for row in db.list_saved_queries()]
+
             paper_views = [_paper_table_view(db, row) for row in paper_rows]
             selected_paper_views = [_paper_table_view(db, row) for row in selected_paper_rows]
-            blog_views = []
-            for row in blog_rows:
+
+            def blog_view(row: Any) -> dict[str, Any]:
                 entry = dict(row)
+                raw_authors = _json_value(entry.get("tracked_authors_json"), [])
                 entry["tracked_authors"] = [
                     {
-                        "name": str(author["name"]),
-                        "url": f"/authors/{quote_plus(str(author['openalex_id']))}/blogs",
+                        "name": str(author.get("name") or "Unknown author"),
+                        "url": f"/authors/{quote_plus(str(author.get('openalex_id') or ''))}/blogs",
                     }
-                    for author in db.blog_authors(int(entry["blog_id"]))
+                    for author in raw_authors
+                    if isinstance(author, dict) and author.get("openalex_id")
                 ]
                 entry["source_site"], entry["source_site_url"] = _website_view(
                     str(entry.get("source_url") or entry.get("url") or "")
                 )
-                blog_views.append(entry)
-            selected_blog_views = []
-            for row in selected_blog_rows:
-                entry = dict(row)
-                entry["tracked_authors"] = [
-                    {
-                        "name": str(author["name"]),
-                        "url": f"/authors/{quote_plus(str(author['openalex_id']))}/blogs",
-                    }
-                    for author in db.blog_authors(int(entry["blog_id"]))
-                ]
-                entry["source_site"], entry["source_site_url"] = _website_view(
-                    str(entry.get("source_url") or entry.get("url") or "")
-                )
-                selected_blog_views.append(entry)
+                return entry
 
-        records: list[dict[str, Any]] = []
-        for paper in paper_views:
-            paper["content_type"] = "paper"
-            paper["record_date"] = paper.get("publication_date") or paper.get("discovered_at") or ""
-            paper["record_fetched"] = paper.get("fetched_at") or paper.get("discovered_at") or ""
-            records.append(paper)
-        for entry in blog_views:
-            entry["content_type"] = "blog"
-            entry["record_date"] = entry.get("published_at") or entry.get("fetched_at") or ""
-            entry["record_fetched"] = entry.get("fetched_at") or ""
-            records.append(entry)
+            blog_views = [blog_view(row) for row in blog_rows]
+            selected_blog_views = [blog_view(row) for row in selected_blog_rows]
 
-        selected_records: list[dict[str, Any]] = []
-        for paper in selected_paper_views:
-            paper["content_type"] = "paper"
-            paper["record_date"] = paper.get("publication_date") or paper.get("discovered_at") or ""
-            paper["record_fetched"] = paper.get("fetched_at") or paper.get("discovered_at") or ""
-            selected_records.append(paper)
-        for entry in selected_blog_views:
-            entry["content_type"] = "blog"
-            entry["record_date"] = entry.get("published_at") or entry.get("fetched_at") or ""
-            entry["record_fetched"] = entry.get("fetched_at") or ""
-            selected_records.append(entry)
-        selected_records.sort(
-            key=lambda item: _record_sort_key(item, "discovered"), reverse=True
-        )
+        def prepare_record(item: dict[str, Any], content_type: str) -> dict[str, Any]:
+            item["content_type"] = content_type
+            if content_type == "paper":
+                item["record_date"] = item.get("publication_date") or item.get("discovered_at") or ""
+                item["record_fetched"] = item.get("fetched_at") or item.get("discovered_at") or ""
+            else:
+                item["record_date"] = item.get("published_at") or item.get("fetched_at") or ""
+                item["record_fetched"] = item.get("fetched_at") or ""
+            return item
 
-        reverse = filters.sort not in {"oldest", "title"}
-        records.sort(key=lambda item: _record_sort_key(item, filters.sort), reverse=reverse)
-        total = len(records)
-        pages = max(1, (total + filters.page_size - 1) // filters.page_size)
-        if filters.page > pages and total:
+        records = [prepare_record(item, "paper") for item in paper_views]
+        records.extend(prepare_record(item, "blog") for item in blog_views)
+        selected_records = [prepare_record(item, "paper") for item in selected_paper_views]
+        selected_records.extend(prepare_record(item, "blog") for item in selected_blog_views)
+        selected_records.sort(key=lambda item: _record_sort_key(item, "discovered"), reverse=True)
+        selected_records = selected_records[:SELECTED_CONTENT_PREVIEW_LIMIT]
+
+        if content_filter == "all":
+            reverse = filters.sort not in {"oldest", "title"}
+            records.sort(key=lambda item: _record_sort_key(item, filters.sort), reverse=reverse)
+            records = records[offset : offset + filters.page_size]
+
+        unselected_total = paper_total + blog_total
+        matching_total = unselected_total + selected_matching_papers + selected_matching_blogs
+        pages = max(1, (unselected_total + filters.page_size - 1) // filters.page_size)
+        if filters.page > pages and unselected_total:
             items = filters.query_items(page=pages)
             if content_filter != "all":
                 items.append(("content", content_filter))
             return RedirectResponse(f"/?{urlencode(items)}", status_code=303)
-        offset = (filters.page - 1) * filters.page_size
-        records = records[offset : offset + filters.page_size]
+
         visible_papers = [item for item in records if item["content_type"] == "paper"]
         visible_blogs = [item for item in records if item["content_type"] == "blog"]
         previous_items = filters.query_items(page=filters.page - 1)
@@ -1508,7 +1585,9 @@ def create_app(
             "content.html",
             records=records,
             selected_records=selected_records,
-            selected_count=len(selected_records),
+            selected_count=selected_paper_total + selected_blog_total,
+            selected_visible_count=len(selected_records),
+            selected_matching_count=selected_matching_papers + selected_matching_blogs,
             papers=visible_papers,
             blog_entries=visible_blogs,
             filters=filters,
@@ -1522,9 +1601,10 @@ def create_app(
             blog_queries=[query for query in saved_queries if _query_supports(query, "blogs")],
             selected_query_id=selected_query_id,
             model_profiles=config.available_llms,
-            total=total,
-            paper_total=len(paper_views),
-            blog_total=len(blog_rows),
+            total=unselected_total,
+            matching_total=matching_total,
+            paper_total=paper_total + selected_matching_papers,
+            blog_total=blog_total + selected_matching_blogs,
             pages=pages,
             is_home=is_home,
             previous_query=urlencode(previous_items),
@@ -1573,6 +1653,77 @@ def create_app(
                 raise HTTPException(404, "Content not found")
         if request.headers.get("X-Paperwatch-Async") == "1":
             return JSONResponse({"ok": True, "selected": selected})
+        return RedirectResponse(_request_return_path(request), status_code=303)
+
+    @app.post("/content/select-results")
+    async def select_content_results(request: Request) -> Response:
+        form = await request.form()
+        filters = _parse_filter_values(form)
+        content_filter = _content_kind(form.get("content"), "all")
+        selected = str(form.get("selected", "1")) in {"1", "true", "on"}
+        target_state = not selected
+        paper_ids: list[int] = []
+        blog_ids: list[int] = []
+        paper_filters = {
+            "query": filters.query,
+            "title_query": filters.title_query,
+            "author_id": filters.author_id,
+            "author_ids": filters.author_ids,
+            "author_tags": filters.author_tags,
+            "content_tags": filters.content_tags,
+            "topic_id": filters.topic_id,
+            "topic_ids": filters.topic_ids,
+            "paper_kind": filters.paper_kind,
+            "scope": filters.scope,
+            "has_pdf": filters.has_pdf,
+            "analyzed": filters.analyzed,
+            "starred": filters.starred,
+            "read": filters.read,
+            "notes": filters.notes,
+            "selected": target_state,
+            "date_from": filters.date_from,
+            "date_to": filters.date_to,
+            "sort": filters.sort,
+        }
+        blog_filters = {
+            "query": filters.query,
+            "title_query": filters.title_query,
+            "tags": filters.content_tags,
+            "author_id": filters.author_id,
+            "author_ids": filters.author_ids,
+            "author_tags": filters.author_tags,
+            "date_from": filters.date_from,
+            "date_to": filters.date_to,
+            "sort": filters.sort,
+            "starred": filters.starred,
+            "read": filters.read,
+            "notes": filters.notes,
+            "selected": target_state,
+            "analyzed": filters.analyzed,
+        }
+        blog_compatible = not (
+            filters.topic_id
+            or filters.topic_ids
+            or filters.paper_kind
+            or filters.scope
+            or filters.has_pdf is True
+        )
+        with Database(config.paths.database) as db:
+            if content_filter != "blogs":
+                rows, _ = db.search_papers(
+                    **paper_filters, limit=None, offset=0, ids_only=True
+                )
+                paper_ids = [int(row["id"]) for row in rows]
+            if content_filter != "papers" and blog_compatible:
+                rows = db.list_blog_entries(
+                    **blog_filters, limit=None, offset=0, ids_only=True
+                )
+                blog_ids = [int(row["id"]) for row in rows]
+            changed = db.bulk_set_content_selected(
+                paper_ids=paper_ids, blog_entry_ids=blog_ids, selected=selected
+            )
+        if _async_request(request):
+            return JSONResponse({"ok": True, "selected": selected, "changed": changed})
         return RedirectResponse(_request_return_path(request), status_code=303)
 
     @app.post("/content/selected/{action}")
@@ -1736,6 +1887,12 @@ def create_app(
             author_starred=starred,
         )
 
+    @app.get("/data", response_class=HTMLResponse)
+    def data_management(request: Request) -> HTMLResponse:
+        with Database(config.paths.database) as db:
+            authors = [dict(row) for row in db.list_authors_with_tags(tracked_only=True)]
+        return render(request, "data_management.html", authors=authors)
+
     @app.post("/authors/manual")
     async def add_manual_author(request: Request) -> RedirectResponse:
         form = await request.form()
@@ -1765,11 +1922,11 @@ def create_app(
                 db.set_object_notes("author", author_db_id, str(form.get("notes", "")))
         except ValueError as exc:
             return RedirectResponse(
-                _notice_url("/authors", str(exc), level="error"), status_code=303
+                _notice_url("/data", str(exc), level="error"), status_code=303
             )
         suffix = " Papers are paused until an OpenAlex ID is provided." if not openalex_id else ""
         return RedirectResponse(
-            _notice_url("/authors", f"Added {name}.{suffix}"), status_code=303
+            _notice_url("/data", f"Added {name}.{suffix}"), status_code=303
         )
 
     @app.post("/authors/blogs/manual")
@@ -1786,10 +1943,10 @@ def create_app(
                     db.add_blog_source_tag(blog_id, tag)
         except ValueError as exc:
             return RedirectResponse(
-                _notice_url("/authors", str(exc), level="error"), status_code=303
+                _notice_url("/data", str(exc), level="error"), status_code=303
             )
         return RedirectResponse(
-            _notice_url("/authors", "Blog linked."), status_code=303
+            _notice_url("/data", "Blog linked."), status_code=303
         )
 
     @app.post("/authors/blogs/import")
@@ -1800,7 +1957,7 @@ def create_app(
         import_tags = _split_tags(str(form.get("import_tags", "")))
         if not isinstance(upload, UploadFile) or not upload.filename:
             return RedirectResponse(
-                _notice_url("/authors", "Choose a CSV file.", level="error"),
+                _notice_url("/data", "Choose a CSV file.", level="error"),
                 status_code=303,
             )
         try:
@@ -1817,7 +1974,7 @@ def create_app(
                 )
         except (UnicodeDecodeError, ValueError) as exc:
             return RedirectResponse(
-                _notice_url("/authors", f"Could not import blogs: {exc}", level="error"),
+                _notice_url("/data", f"Could not import blogs: {exc}", level="error"),
                 status_code=303,
             )
         finally:
@@ -1826,7 +1983,7 @@ def create_app(
             f"Imported {stats.links} blog links; created {stats.authors_created} authors, "
             f"skipped {stats.authors_missing} missing and {stats.authors_ambiguous} ambiguous authors."
         )
-        return RedirectResponse(_notice_url("/authors", message), status_code=303)
+        return RedirectResponse(_notice_url("/data", message), status_code=303)
 
     @app.post("/authors/import")
     async def import_authors_csv(request: Request) -> RedirectResponse:
@@ -1834,7 +1991,7 @@ def create_app(
         upload = form.get("csv_file")
         if not isinstance(upload, UploadFile) or not upload.filename:
             return RedirectResponse(
-                _notice_url("/authors", "Choose an author CSV file.", level="error"),
+                _notice_url("/data", "Choose an author CSV file.", level="error"),
                 status_code=303,
             )
         imported = 0
@@ -1916,13 +2073,13 @@ def create_app(
                     imported += 1
         except (UnicodeDecodeError, ValueError) as exc:
             return RedirectResponse(
-                _notice_url("/authors", f"Could not import authors: {exc}", level="error"),
+                _notice_url("/data", f"Could not import authors: {exc}", level="error"),
                 status_code=303,
             )
         finally:
             await upload.close()
         return RedirectResponse(
-            _notice_url("/authors", f"Imported {imported} author row{'s' if imported != 1 else ''}."),
+            _notice_url("/data", f"Imported {imported} author row{'s' if imported != 1 else ''}."),
             status_code=303,
         )
 
@@ -3127,9 +3284,12 @@ def create_app(
             "regexp_mode": "query",
             "content_scope": "both",
             "query_kind": "summary",
-            "label_class": "",
+            "label_class": "Relevance",
             "label_values": [],
-            "label_values_text": "",
+            "label_values_text": (
+                r"Relevant = (?i)\b(relevant|yes|include)\b" "\n"
+                r"Not relevant = (?i)\b(not relevant|no|exclude)\b"
+            ),
             "local_regexp": False,
         }
         return render(
@@ -3450,39 +3610,44 @@ def create_app(
     @app.post("/queries/run-blogs")
     async def run_blog_query(request: Request) -> RedirectResponse:
         form = await request.form()
-        query_id = _int_or_none(form.get("query_id"))
-        profiles = tuple(str(value) for value in form.getlist("model") if str(value))
+        query_ids = tuple(
+            dict.fromkeys(
+                query_id
+                for raw in form.getlist("query_id")
+                if (query_id := _int_or_none(raw)) is not None
+            )
+        )
+        profile = str(form.get("model", "")).strip()
         context = _int_or_none(form.get("context_window_tokens")) or DEFAULT_CONTEXT_WINDOW_TOKENS
-        if query_id is None:
+        if not query_ids:
             return RedirectResponse(
                 _notice_url("/blogs", "Select a saved query.", level="error"),
                 status_code=303,
             )
-        selected_ids: list[int] = []
-        for raw in form.getlist("blog_entry_id"):
-            entry_id = _int_or_none(raw)
-            if entry_id is not None and entry_id > 0:
-                selected_ids.append(entry_id)
-        selection: dict[str, Any] = {
-            "content_type": "blogs",
-            "labels": [
-                f"Visible blog entries: {len(set(selected_ids))}"
-                if selected_ids
-                else "All blog entries"
-            ],
-        }
-        if selected_ids:
-            selection["blog_entry_ids"] = list(dict.fromkeys(selected_ids))[:5000]
+        filters = _parse_filter_values(form)
+        selection = filters.selection()
+        selection["content_type"] = "blogs"
+        selection["labels"] = ["All blog entries matching the current Content filters"]
         try:
-            batch_id = collection_controller.start(
-                query_id,
-                profiles,
-                context,
-                selection=selection,
-                source_scope="blog",
-                pdf_strategy="auto",
-                content_type="blogs",
-            )
+            start_many = getattr(collection_controller, "start_many", None)
+            if callable(start_many):
+                batch_id = start_many(
+                    query_ids,
+                    profile,
+                    context,
+                    selection=selection,
+                    content_type="blogs",
+                )
+            else:
+                batch_id = collection_controller.start(
+                    query_ids[0],
+                    (profile,) if profile else (),
+                    context,
+                    selection=selection,
+                    source_scope="blog",
+                    pdf_strategy="auto",
+                    content_type="blogs",
+                )
         except ValueError as exc:
             return RedirectResponse(
                 _notice_url("/blogs", str(exc), level="error"), status_code=303
@@ -3495,7 +3660,7 @@ def create_app(
                 status_code=303,
             )
         return RedirectResponse(
-            _notice_url("/blogs", "Started saved query on blog entries."),
+            _notice_url("/blogs", f"Started {len(query_ids)} saved quer{'y' if len(query_ids) == 1 else 'ies'} on matching blog entries."),
             status_code=303,
         )
 

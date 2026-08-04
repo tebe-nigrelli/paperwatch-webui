@@ -20,7 +20,7 @@ from .models import (
 )
 
 
-SCHEMA_VERSION = 23
+SCHEMA_VERSION = 24
 BLOG_SOURCE_MODES = {
     "auto",
     "feed",
@@ -78,6 +78,9 @@ CREATE TABLE IF NOT EXISTS papers (
     pdf_url TEXT,
     local_pdf_path TEXT,
     pdf_sha256 TEXT,
+    pdf_size INTEGER,
+    pdf_mtime_ns INTEGER,
+    pdf_modified_on_disk INTEGER NOT NULL DEFAULT 0,
     auto_analyze INTEGER NOT NULL DEFAULT 1,
     starred INTEGER NOT NULL DEFAULT 0,
     read_at TEXT,
@@ -514,6 +517,9 @@ class Database:
             "authors": {"notes": "TEXT NOT NULL DEFAULT ''"},
             "papers": {
                 "pdf_sha256": "TEXT",
+                "pdf_size": "INTEGER",
+                "pdf_mtime_ns": "INTEGER",
+                "pdf_modified_on_disk": "INTEGER NOT NULL DEFAULT 0",
                 "notes": "TEXT NOT NULL DEFAULT ''",
             },
             "blogs": {"notes": "TEXT NOT NULL DEFAULT ''"},
@@ -1691,9 +1697,8 @@ class Database:
                     ),
                 )
 
-    def list_blog_entries(
+    def _blog_entry_filter_sql(
         self,
-        limit: int | None = 100,
         *,
         query: str = "",
         title_query: str = "",
@@ -1703,12 +1708,12 @@ class Database:
         author_tags: Iterable[str] = (),
         date_from: str = "",
         date_to: str = "",
-        sort: str = "newest",
         starred: bool | None = None,
         read: bool | None = None,
+        notes: bool | None = None,
         selected: bool | None = None,
         analyzed: bool | None = None,
-    ) -> list[sqlite3.Row]:
+    ) -> tuple[str, list[Any]]:
         where = ["be.change_kind != 'baseline'"]
         params: list[Any] = []
         if query.strip():
@@ -1717,16 +1722,28 @@ class Database:
             where.append(
                 "(be.title LIKE ? ESCAPE '\\' COLLATE NOCASE "
                 "OR be.normalized_text LIKE ? ESCAPE '\\' COLLATE NOCASE "
+                "OR COALESCE(be.notes, '') LIKE ? ESCAPE '\\' COLLATE NOCASE "
                 "OR COALESCE(b.title, '') LIKE ? ESCAPE '\\' COLLATE NOCASE "
+                "OR COALESCE(b.notes, '') LIKE ? ESCAPE '\\' COLLATE NOCASE "
+                "OR EXISTS (SELECT 1 FROM author_blogs abq JOIN authors aq ON aq.id=abq.author_id "
+                "WHERE abq.blog_id=b.id AND aq.name LIKE ? ESCAPE '\\' COLLATE NOCASE) "
+                "OR EXISTS (SELECT 1 FROM author_blogs abatq "
+                "JOIN author_tag_links atltq ON atltq.author_id=abatq.author_id "
+                "JOIN author_tags attq ON attq.id=atltq.tag_id "
+                "WHERE abatq.blog_id=b.id AND attq.name LIKE ? ESCAPE '\\' COLLATE NOCASE) "
                 "OR EXISTS (SELECT 1 FROM blog_entry_tag_links betlq "
                 "JOIN content_tags ctq ON ctq.id=betlq.tag_id "
                 "WHERE betlq.blog_entry_id=be.id "
                 "AND ctq.name LIKE ? ESCAPE '\\' COLLATE NOCASE) "
+                "OR EXISTS (SELECT 1 FROM blog_source_tag_links bstq "
+                "JOIN content_tags ctsq ON ctsq.id=bstq.tag_id "
+                "WHERE bstq.blog_id=b.id "
+                "AND ctsq.name LIKE ? ESCAPE '\\' COLLATE NOCASE) "
                 "OR EXISTS (SELECT 1 FROM query_classification_results qcrq "
                 "WHERE qcrq.blog_entry_id=be.id "
                 "AND qcrq.tag_name LIKE ? ESCAPE '\\' COLLATE NOCASE))"
             )
-            params.extend([term, term, term, term, term])
+            params.extend([term] * 10)
         if title_query.strip():
             escaped = title_query.strip().replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
             where.append("be.title LIKE ? ESCAPE '\\' COLLATE NOCASE")
@@ -1791,6 +1808,8 @@ class Database:
             params.append(1 if starred else 0)
         if read is not None:
             where.append("be.read_at IS NOT NULL" if read else "be.read_at IS NULL")
+        if notes is not None:
+            where.append("trim(COALESCE(be.notes, '')) != ''" if notes else "trim(COALESCE(be.notes, '')) = ''")
         if selected is not None:
             where.append("be.selected=?")
             params.append(1 if selected else 0)
@@ -1802,19 +1821,123 @@ class Database:
                 "WHERE qr.status='success' AND CAST(selected_entry.value AS INTEGER)=be.id"
                 ")"
             )
+        return " AND ".join(where), params
+
+    def count_blog_entries(self, **filters: Any) -> int:
+        where_sql, params = self._blog_entry_filter_sql(**filters)
+        return int(
+            self._conn.execute(
+                f"SELECT count(*) FROM blog_entries be JOIN blogs b ON b.id=be.blog_id WHERE {where_sql}",
+                tuple(params),
+            ).fetchone()[0]
+        )
+
+    def list_blog_entries(
+        self,
+        limit: int | None = 100,
+        *,
+        query: str = "",
+        title_query: str = "",
+        tags: Iterable[str] = (),
+        author_id: str = "",
+        author_ids: Iterable[str] = (),
+        author_tags: Iterable[str] = (),
+        date_from: str = "",
+        date_to: str = "",
+        sort: str = "newest",
+        starred: bool | None = None,
+        read: bool | None = None,
+        notes: bool | None = None,
+        selected: bool | None = None,
+        analyzed: bool | None = None,
+        offset: int = 0,
+        ids_only: bool = False,
+        table_view: bool = False,
+    ) -> list[sqlite3.Row]:
+        where_sql, params = self._blog_entry_filter_sql(
+            query=query,
+            title_query=title_query,
+            tags=tags,
+            author_id=author_id,
+            author_ids=author_ids,
+            author_tags=author_tags,
+            date_from=date_from,
+            date_to=date_to,
+            starred=starred,
+            read=read,
+            notes=notes,
+            selected=selected,
+            analyzed=analyzed,
+        )
         order_sql = {
             "newest": "COALESCE(be.published_at, be.fetched_at) DESC, be.id DESC",
             "oldest": "COALESCE(be.published_at, be.fetched_at) ASC, be.id ASC",
             "discovered": "be.fetched_at DESC, be.id DESC",
             "title": "be.title COLLATE NOCASE, be.id DESC",
         }.get(sort, "COALESCE(be.published_at, be.fetched_at) DESC, be.id DESC")
-        sql = f"""
+        if ids_only:
+            sql = f"""
+                SELECT be.id
+                FROM blog_entries be JOIN blogs b ON b.id=be.blog_id
+                WHERE {where_sql}
+                ORDER BY {order_sql}
+            """
+        elif table_view:
+            sql = f"""
+            SELECT
+                be.id, be.blog_id, be.previous_entry_id, be.title,
+                be.linked_paper_id, be.starred, be.read_at, be.selected,
+                be.notes, be.change_kind, be.entry_kind, be.source_url,
+                be.published_at, be.fetched_at,
+                b.url, COALESCE(b.title, be.title) AS blog_title,
+                (SELECT group_concat(name, ', ') FROM (
+                    SELECT DISTINCT a.name AS name
+                    FROM author_blogs ab JOIN authors a ON a.id=ab.author_id
+                    WHERE ab.blog_id=b.id ORDER BY a.name COLLATE NOCASE
+                )) AS author_names,
+                COALESCE((SELECT json_group_array(json_object(
+                    'name', name, 'openalex_id', openalex_id
+                )) FROM (
+                    SELECT DISTINCT a.name AS name, a.openalex_id AS openalex_id
+                    FROM author_blogs ab JOIN authors a ON a.id=ab.author_id
+                    WHERE ab.blog_id=b.id ORDER BY a.name COLLATE NOCASE
+                )), '[]') AS tracked_authors_json,
+                EXISTS (
+                    SELECT 1 FROM query_runs qrs,
+                    json_each(qrs.selection_json, '$.blog_entry_ids') selected_entry
+                    WHERE qrs.status='success'
+                    AND CAST(selected_entry.value AS INTEGER)=be.id
+                ) AS has_summary,
+                COALESCE((SELECT group_concat(name, ', ') FROM (
+                    SELECT ct.name AS name
+                    FROM blog_entry_tag_links betl
+                    JOIN content_tags ct ON ct.id=betl.tag_id
+                    WHERE betl.blog_entry_id=be.id
+                    UNION
+                    SELECT qcr.tag_name AS name
+                    FROM query_classification_results qcr
+                    WHERE qcr.blog_entry_id=be.id
+                    ORDER BY name COLLATE NOCASE
+                )), '') AS content_tags
+            FROM blog_entries be JOIN blogs b ON b.id=be.blog_id
+            WHERE {where_sql}
+            ORDER BY {order_sql}
+            """
+        else:
+            sql = f"""
             SELECT be.*, b.url, COALESCE(b.title, be.title) AS blog_title,
                 (SELECT group_concat(name, ', ') FROM (
                     SELECT DISTINCT a.name AS name
                     FROM author_blogs ab JOIN authors a ON a.id=ab.author_id
                     WHERE ab.blog_id=b.id ORDER BY a.name COLLATE NOCASE
                 )) AS author_names,
+                COALESCE((SELECT json_group_array(json_object(
+                    'name', name, 'openalex_id', openalex_id
+                )) FROM (
+                    SELECT DISTINCT a.name AS name, a.openalex_id AS openalex_id
+                    FROM author_blogs ab JOIN authors a ON a.id=ab.author_id
+                    WHERE ab.blog_id=b.id ORDER BY a.name COLLATE NOCASE
+                )), '[]') AS tracked_authors_json,
                 EXISTS (
                     SELECT 1 FROM query_runs qrs, json_each(qrs.selection_json, '$.blog_entry_ids') selected_entry
                     WHERE qrs.status='success' AND CAST(selected_entry.value AS INTEGER)=be.id
@@ -1831,12 +1954,14 @@ class Database:
                     ORDER BY name COLLATE NOCASE
                 )), '') AS content_tags
             FROM blog_entries be JOIN blogs b ON b.id=be.blog_id
-            WHERE {' AND '.join(where)}
+            WHERE {where_sql}
             ORDER BY {order_sql}
         """
         if limit is None:
             return list(self._conn.execute(sql, tuple(params)).fetchall())
-        return list(self._conn.execute(sql + " LIMIT ?", (*params, limit)).fetchall())
+        return list(
+            self._conn.execute(sql + " LIMIT ? OFFSET ?", (*params, limit, offset)).fetchall()
+        )
 
     def blog_entries_by_ids(self, entry_ids: Iterable[int]) -> list[sqlite3.Row]:
         ids: list[int] = []
@@ -1950,6 +2075,33 @@ class Database:
                 (1 if selected else 0, int(record_id)),
             )
         return cur.rowcount > 0
+
+    def bulk_set_content_selected(
+        self,
+        *,
+        paper_ids: Iterable[int] = (),
+        blog_entry_ids: Iterable[int] = (),
+        selected: bool,
+    ) -> int:
+        paper_values = tuple(dict.fromkeys(int(value) for value in paper_ids if int(value) > 0))
+        blog_values = tuple(
+            dict.fromkeys(int(value) for value in blog_entry_ids if int(value) > 0)
+        )
+        changed = 0
+        with self.transaction() as conn:
+            if paper_values:
+                placeholders = ",".join("?" for _ in paper_values)
+                changed += conn.execute(
+                    f"UPDATE papers SET selected=? WHERE id IN ({placeholders})",
+                    (1 if selected else 0, *paper_values),
+                ).rowcount
+            if blog_values:
+                placeholders = ",".join("?" for _ in blog_values)
+                changed += conn.execute(
+                    f"UPDATE blog_entries SET selected=? WHERE id IN ({placeholders})",
+                    (1 if selected else 0, *blog_values),
+                ).rowcount
+        return int(changed)
 
     def bulk_update_selected_content(self, action: str) -> int:
         if action not in {"star", "unstar", "read", "unread", "unselect"}:
@@ -2122,16 +2274,45 @@ class Database:
     def set_local_pdf(
         self, paper_id: int, path: str, pdf_sha256: str | None = None
     ) -> None:
+        candidate = Path(path).expanduser()
+        size: int | None = None
+        mtime_ns: int | None = None
+        try:
+            stat = candidate.stat()
+            size = int(stat.st_size)
+            mtime_ns = int(stat.st_mtime_ns)
+        except OSError:
+            pass
         with self.transaction() as conn:
             conn.execute(
-                "UPDATE papers SET local_pdf_path=?, pdf_sha256=? WHERE id=?",
-                (path, pdf_sha256, paper_id),
+                "UPDATE papers SET local_pdf_path=?, pdf_sha256=?, pdf_size=?, pdf_mtime_ns=?, pdf_modified_on_disk=0 WHERE id=?",
+                (path, pdf_sha256, size, mtime_ns, paper_id),
             )
 
-    def set_paper_pdf_hash(self, paper_id: int, pdf_sha256: str | None) -> bool:
+    def set_paper_pdf_hash(
+        self, paper_id: int, pdf_sha256: str | None, *,
+        pdf_size: int | None = None, pdf_mtime_ns: int | None = None,
+    ) -> bool:
         with self.transaction() as conn:
             cur = conn.execute(
-                "UPDATE papers SET pdf_sha256=? WHERE id=?", (pdf_sha256, paper_id)
+                "UPDATE papers SET pdf_sha256=?, pdf_size=COALESCE(?, pdf_size), "
+                "pdf_mtime_ns=COALESCE(?, pdf_mtime_ns), pdf_modified_on_disk=0 WHERE id=?",
+                (pdf_sha256, pdf_size, pdf_mtime_ns, paper_id),
+            )
+        return cur.rowcount > 0
+
+    def set_paper_pdf_fingerprint(
+        self,
+        paper_id: int,
+        *,
+        pdf_size: int,
+        pdf_mtime_ns: int,
+        modified: bool = False,
+    ) -> bool:
+        with self.transaction() as conn:
+            cur = conn.execute(
+                "UPDATE papers SET pdf_size=?, pdf_mtime_ns=?, pdf_modified_on_disk=? WHERE id=?",
+                (pdf_size, pdf_mtime_ns, 1 if modified else 0, paper_id),
             )
         return cur.rowcount > 0
 
@@ -2240,12 +2421,15 @@ class Database:
         analyzed: bool | None = None,
         starred: bool | None = None,
         read: bool | None = None,
+        notes: bool | None = None,
         selected: bool | None = None,
         date_from: str = "",
         date_to: str = "",
         sort: str = "newest",
         limit: int | None = 25,
         offset: int = 0,
+        ids_only: bool = False,
+        table_view: bool = False,
     ) -> tuple[list[sqlite3.Row], int]:
         where: list[str] = []
         params: list[Any] = []
@@ -2253,8 +2437,16 @@ class Database:
             where.append(
                 "(p.title LIKE ? ESCAPE '\\' COLLATE NOCASE "
                 "OR COALESCE(p.abstract, '') LIKE ? ESCAPE '\\' COLLATE NOCASE "
+                "OR COALESCE(p.notes, '') LIKE ? ESCAPE '\\' COLLATE NOCASE "
+                "OR COALESCE(p.venue, '') LIKE ? ESCAPE '\\' COLLATE NOCASE "
+                "OR COALESCE(p.doi, '') LIKE ? ESCAPE '\\' COLLATE NOCASE "
+                "OR COALESCE(p.arxiv_id, '') LIKE ? ESCAPE '\\' COLLATE NOCASE "
                 "OR EXISTS (SELECT 1 FROM paper_authors paq WHERE paq.paper_id=p.id "
                 "AND paq.name LIKE ? ESCAPE '\\' COLLATE NOCASE) "
+                "OR EXISTS (SELECT 1 FROM paper_authors paatq "
+                "JOIN author_tag_links atltq ON atltq.author_id=paatq.tracked_author_id "
+                "JOIN author_tags attq ON attq.id=atltq.tag_id "
+                "WHERE paatq.paper_id=p.id AND attq.name LIKE ? ESCAPE '\\' COLLATE NOCASE) "
                 "OR EXISTS (SELECT 1 FROM paper_tag_links ptlq "
                 "JOIN content_tags ctq ON ctq.id=ptlq.tag_id "
                 "WHERE ptlq.paper_id=p.id "
@@ -2265,7 +2457,7 @@ class Database:
             )
             escaped = query.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
             term = f"%{escaped}%"
-            params.extend([term, term, term, term, term])
+            params.extend([term] * 10)
         if title_query:
             escaped = title_query.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
             where.append("p.title LIKE ? ESCAPE '\\' COLLATE NOCASE")
@@ -2377,6 +2569,8 @@ class Database:
             params.append(1 if starred else 0)
         if read is not None:
             where.append("p.read_at IS NOT NULL" if read else "p.read_at IS NULL")
+        if notes is not None:
+            where.append("trim(COALESCE(p.notes, '')) != ''" if notes else "trim(COALESCE(p.notes, '')) = ''")
         if selected is not None:
             where.append("p.selected=?")
             params.append(1 if selected else 0)
@@ -2405,9 +2599,23 @@ class Database:
         if limit is not None:
             paging_sql = " LIMIT ? OFFSET ?"
             query_params = (*params, limit, offset)
+        if ids_only:
+            rows = self._conn.execute(
+                f"SELECT p.id FROM papers p{where_sql} ORDER BY {order_sql}{paging_sql}",
+                query_params,
+            ).fetchall()
+            return list(rows), total
+        paper_columns = (
+            "p.id, p.openalex_id, p.doi, p.arxiv_id, p.title, "
+            "p.publication_date, p.venue, p.publication_url, p.pdf_url, "
+            "p.local_pdf_path, p.pdf_sha256, p.pdf_size, p.pdf_mtime_ns, "
+            "p.pdf_modified_on_disk, p.starred, p.read_at, p.selected, "
+            "p.notes, p.abstract_source, p.pdf_source, p.discovered_at, p.fetched_at"
+            if table_view else "p.*"
+        )
         rows = self._conn.execute(
             f"""
-            SELECT p.*,
+            SELECT {paper_columns},
                 (SELECT group_concat(name, ' · ') FROM (
                     SELECT name FROM paper_authors
                     WHERE paper_id=p.id ORDER BY author_order
@@ -2436,8 +2644,18 @@ class Database:
                 ) AS latest_kind,
                 (SELECT ax.one_sentence_summary FROM analyses ax WHERE ax.paper_id=p.id
                     ORDER BY CASE ax.scope WHEN 'fulltext' THEN 0 ELSE 1 END, ax.id DESC LIMIT 1
-                ) AS latest_summary
-                ,COALESCE((SELECT group_concat(name, ', ') FROM (
+                ) AS latest_summary,
+                COALESCE((SELECT json_group_array(json_object(
+                    'name', name, 'openalex_id', openalex_id
+                )) FROM (
+                    SELECT pa.name AS name, pa.openalex_author_id AS openalex_id
+                    FROM paper_authors pa
+                    JOIN authors a ON a.id=pa.tracked_author_id
+                    WHERE pa.paper_id=p.id AND a.tracked=1
+                    ORDER BY pa.author_order
+                )), '[]') AS tracked_authors_json,
+                (SELECT count(*) FROM paper_authors pac WHERE pac.paper_id=p.id) AS author_count,
+                COALESCE((SELECT group_concat(name, ', ') FROM (
                     SELECT ct.name AS name
                     FROM paper_tag_links ptl
                     JOIN content_tags ct ON ct.id=ptl.tag_id

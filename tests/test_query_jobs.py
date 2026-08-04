@@ -932,3 +932,259 @@ def test_collection_query_accepts_outputs_longer_than_paper_summary_limit():
     assert len(result.summary.split()) == 350
     assert len(result.items[0].output.split()) == 350
     assert usage == {}
+
+
+def _seed_multi_blog_queries(config_path, author_candidate):
+    config = load_config(config_path)
+    with Database(config.paths.database) as db:
+        db.add_author(author_candidate)
+        blog_id = db.add_author_blog(
+            author_candidate.openalex_id,
+            "https://example.test/multi-query-blog",
+            label="Multi query blog",
+        )
+        entry_id = db.save_blog_entry(
+            blog_id=blog_id,
+            title="Stored batch entry",
+            content_sha256="multi-query-entry",
+            normalized_text="Stored batch entry discusses efficient inference.",
+            diff_text="+Stored batch entry discusses efficient inference.",
+            change_kind="changed",
+            previous_entry_id=None,
+            source_url="https://example.test/multi-query-blog/post",
+        )
+        normal = db.create_saved_query(
+            name="Normal blog query",
+            prompt="Summarize this entry.",
+            content_scope="blogs",
+        )
+        local = db.create_saved_query(
+            name="Local regexp query",
+            prompt="unused",
+            content_scope="blogs",
+            regexp_pattern=r"efficient\s+inference",
+            regexp_mode="print",
+        )
+        papers = db.create_saved_query(
+            name="Paper-only query",
+            prompt="paper",
+            content_scope="papers",
+        )
+    return entry_id, normal, local, papers
+
+
+def test_query_controller_runs_multiple_blog_queries_sequentially(
+    config_path, author_candidate
+):
+    entry_id, normal, local, _papers = _seed_multi_blog_queries(
+        config_path, author_candidate
+    )
+    calls = []
+
+    def runner(path, batch, query, profiles, context, progress, cancel, set_llm):
+        calls.append((batch, query, profiles, context))
+        progress("stage", f"Running {query}")
+        progress("progress", "1/1")
+        return {
+            "completed": 1 if query == normal else 0,
+            "failed": 0 if query == normal else 1,
+        }
+
+    controller = QueryController(config_path, runner=runner)
+    batch_ids = controller.start_many(
+        (normal, local, normal),
+        "default",
+        4096,
+        selection={"query": "Stored", "blog_entry_ids": [entry_id]},
+    )
+    assert batch_ids is not None and len(batch_ids) == 2
+    controller.wait()
+    snapshot = controller.snapshot()
+    assert snapshot.running is False
+    assert snapshot.stage == "Complete"
+    assert snapshot.completed == 1
+    assert snapshot.failed == 1
+    assert snapshot.progress_current == 2
+    assert [item[1] for item in calls] == [normal, local]
+    assert calls[0][2] == ("default",)
+    assert calls[1][2] == ("regexp",)
+    with Database(load_config(config_path).paths.database) as db:
+        rows = [db.query_runs_for_batch(batch_id)[0] for batch_id in batch_ids]
+        assert [row["profile"] for row in rows] == ["default", "regexp"]
+        selection = __import__("json").loads(rows[0]["selection_json"])
+        assert selection["content_type"] == "blogs"
+        assert selection["source_scope"] == "blog"
+        assert selection["pdf_strategy"] == "auto"
+
+
+def test_query_controller_multi_query_validation_and_busy(
+    config_path, author_candidate
+):
+    _entry_id, normal, _local, papers = _seed_multi_blog_queries(
+        config_path, author_candidate
+    )
+    gate = threading.Event()
+
+    def runner(path, batch, query, profiles, context):
+        gate.wait(1)
+        return {"completed": 1, "failed": 0}
+
+    controller = QueryController(config_path, runner=runner)
+    with pytest.raises(ValueError, match="between 512"):
+        controller.start_many((normal,), "default", 100)
+    with pytest.raises(ValueError, match="at least one"):
+        controller.start_many((), "default", 2048)
+    with pytest.raises(ValueError, match="blog results"):
+        controller.start_many((normal,), "default", 2048, content_type="papers")
+    with pytest.raises(ValueError, match="was not found"):
+        controller.start_many((999999,), "default", 2048)
+    with pytest.raises(ValueError, match="papers only"):
+        controller.start_many((papers,), "default", 2048)
+    with pytest.raises(ValueError, match="Unknown configured model"):
+        controller.start_many((normal,), "missing", 2048)
+
+    assert controller.start_many((normal,), "default", 2048)
+    assert controller.start_many((normal,), "default", 2048) is None
+    gate.set()
+    controller.wait()
+    assert controller.snapshot().stage == "Complete"
+
+
+def test_query_controller_multi_query_cancel_and_failure(
+    config_path, author_candidate
+):
+    _entry_id, normal, local, _papers = _seed_multi_blog_queries(
+        config_path, author_candidate
+    )
+    cancelling = None
+    call_count = 0
+
+    def cancel_runner(path, batch, query, profiles, context):
+        nonlocal call_count
+        call_count += 1
+        assert cancelling is not None
+        cancelling._cancel_event.set()
+        return {"completed": 1, "failed": 0}
+
+    cancelling = QueryController(config_path, runner=cancel_runner)
+    assert cancelling.start_many((normal, local), "default", 2048)
+    cancelling.wait()
+    snapshot = cancelling.snapshot()
+    assert call_count == 1
+    assert snapshot.cancelled is True
+    assert snapshot.stage == "Cancelled"
+    assert snapshot.completed == 1
+
+    broken = QueryController(
+        config_path,
+        runner=lambda *args: (_ for _ in ()).throw(RuntimeError("multi boom")),
+    )
+    assert broken.start_many((normal,), "default", 2048)
+    broken.wait()
+    snapshot = broken.snapshot()
+    assert snapshot.stage == "Failed"
+    assert snapshot.error == "multi boom"
+
+
+def test_collect_documents_auto_scope_chooses_pdf_or_abstract(
+    config_path, paper_record, monkeypatch
+):
+    config = load_config(config_path)
+    no_pdf = replace(
+        paper_record,
+        openalex_id="W-AUTO-ABSTRACT",
+        doi="10.1000/auto-abstract",
+        arxiv_id=None,
+        title="Auto abstract paper",
+        pdf_url=None,
+    )
+    with Database(config.paths.database) as db:
+        pdf_id, _ = db.upsert_paper(paper_record)
+        abstract_id, _ = db.upsert_paper(no_pdf)
+
+        def fake_paper_text(cfg, database, paper_id, scope, client):
+            assert paper_id == pdf_id
+            return database.get_paper(paper_id), "complete PDF text"
+
+        monkeypatch.setattr("paperwatch.query_jobs._paper_text", fake_paper_text)
+        documents = collect_query_documents(
+            db,
+            "auto",
+            selection={"paper_ids": [pdf_id, abstract_id]},
+            config=config,
+            pdf_client=object(),
+        )
+    by_id = {item["paper_id"]: item for item in documents}
+    assert by_id[pdf_id]["source"] == "fulltext"
+    assert by_id[pdf_id]["fulltext"] == "complete PDF text"
+    assert by_id[abstract_id]["source"] == "abstract"
+
+
+def test_query_controller_scope_mismatch_and_invalid_snapshot_id(
+    config_path, author_candidate
+):
+    entry_id, normal, _local, papers = _seed_multi_blog_queries(
+        config_path, author_candidate
+    )
+    controller = QueryController(
+        config_path, runner=lambda *args: {"completed": 1, "failed": 0}
+    )
+    with pytest.raises(ValueError, match="papers only"):
+        controller.start(
+            papers,
+            ("default",),
+            2048,
+            selection={"blog_entry_ids": [entry_id]},
+            content_type="blogs",
+        )
+    batch = controller.start(
+        normal,
+        ("default",),
+        2048,
+        selection={"content_type": "blogs", "blog_entry_ids": ["invalid"]},
+        content_type="blogs",
+    )
+    assert batch
+    controller.wait()
+    assert controller.snapshot().blog_entry_id is None
+
+
+def test_run_query_batch_cancels_all_pending_runs_before_model(
+    config_path, author_candidate
+):
+    entry_id, normal, _local, _papers = _seed_multi_blog_queries(
+        config_path, author_candidate
+    )
+    config = load_config(config_path)
+    batch_id = "cancel-before-model"
+    with Database(config.paths.database) as db:
+        db.create_query_runs(
+            batch_id=batch_id,
+            query_id=normal,
+            profiles=[
+                ("default", "ollama", "test-model"),
+                ("second", "ollama", "second-model"),
+            ],
+            context_window_tokens=2048,
+            selection={
+                "content_type": "blogs",
+                "blog_entry_ids": [entry_id],
+                "source_scope": "blog",
+                "pdf_strategy": "auto",
+            },
+        )
+    cancelled = threading.Event()
+    cancelled.set()
+    result = run_query_batch(
+        config_path,
+        batch_id,
+        normal,
+        ("default", "second"),
+        2048,
+        cancel_event=cancelled,
+    )
+    assert result == {"completed": 0, "failed": 0, "cancelled": True}
+    with Database(config.paths.database) as db:
+        rows = db.query_runs_for_batch(batch_id)
+        assert all(row["status"] == "failed" for row in rows)
+        assert all(row["error_text"] == "Cancelled by user" for row in rows)

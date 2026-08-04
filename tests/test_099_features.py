@@ -93,7 +93,7 @@ def test_schema_notes_shared_tags_mass_actions_and_catalog_roundtrip(
     paper_id, blog_id, entry_id = seed(config_path, author_candidate, paper_record)
     config = load_config(config_path)
     with Database(config.paths.database) as db:
-        assert SCHEMA_VERSION == 23
+        assert SCHEMA_VERSION == 24
         author = db.get_author(author_candidate.openalex_id)
         assert author is not None
         assert db.set_object_notes("author", int(author["id"]), "**Author note**")
@@ -139,7 +139,7 @@ def test_content_ajax_filters_icons_selection_notes_and_tags(
 
     initial = web.get("/")
     assert initial.status_code == 200
-    assert "Selected content" not in initial.text
+    assert 'class="panel selected-content-dock"' in initial.text and ' hidden' in initial.text
     assert "content-kind-paper" in initial.text
     assert "content-kind-blog" in initial.text
     for text in (
@@ -181,7 +181,8 @@ def test_content_ajax_filters_icons_selection_notes_and_tags(
     updated = web.get("/")
     assert "Selected content" in updated.text
     assert "Important" in updated.text
-    assert "object-row-mark" in updated.text
+    assert "notes-present" in updated.text
+    assert ">Notes<" in updated.text
     assert 'data-read="false"' in updated.text
     assert "content-row[data-read=\"true\"]" in web.get("/static/app.css").text
 
@@ -347,10 +348,10 @@ def test_regexp_debug_dialog_and_ajax_javascript(config_path):
     query = web.get(f"/queries/{query_id}/edit")
     assert 'data-regexp-debug="preprocess"' in query.text
     assert 'data-regexp-debug="classification"' in query.text
-    assert "Test classifier regexps" in query.text
-    authors = web.get("/authors")
-    assert "Blogs CSV schema" in authors.text
-    assert "Author CSV schema" in authors.text
+    assert "Debug answer text" in query.text
+    data_page = web.get("/data")
+    assert "Blogs CSV schema" in data_page.text
+    assert "Author CSV schema" in data_page.text
     script = web.get("/static/app.js").text
     assert '"X-Paperwatch-Async": "1"' in script
     assert "refreshContentPage" in script

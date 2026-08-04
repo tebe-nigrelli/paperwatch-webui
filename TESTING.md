@@ -1,4 +1,4 @@
-# Automated testing strategy — paperwatch 0.9.9
+# Automated testing strategy — paperwatch 0.10.2
 
 The default suite is deterministic and requires no live OpenAlex index, arXiv service, Ollama server, OpenAI account, PDF host, or external browser assets.
 
@@ -10,10 +10,10 @@ pytest
 
 Release result:
 
-- 374 tests passed
+- 415 deterministic tests passed with 95.06% branch-aware coverage
 - Existing 95% branch-coverage gate retained
 - Shared notes, author/blog-source tags, bulk tag undo, CSV metadata round trips,
-  PDF replacement/integrity state, asynchronous filters and regexp test panes
+  filtered select-all, notes filters, model-profile controls, and native-PDF query execution
 - Python 3.13.5 release environment
 
 ## Feature coverage
@@ -35,8 +35,8 @@ Release result:
 | Saved queries | Protected built-in Summarize prompt, paper/blog/both support scope, optional no-op regexp preprocessing, bounded match radius, local print mode, direct result pages, runtime abstract/full-PDF/blog source, exact mixed-content selection, map/reduce grouping, oversized record splitting/compaction, multi-model success/failure, status recovery |
 | Pipeline | Cursor-independent one-year download-only backfill, historical-analysis suppression, late-PDF analysis, normal initial/overlap windows, model preflight, automatic PDF chunking, cache behavior, error isolation, counters |
 | Concurrency | Separate cross-process fetch, paper-analysis, and saved-query locks; clean release behavior |
-| SQLite | Transactions, WAL, foreign keys, schema guards, migrations through schema v9, historical paper flags, tag/query/chunk persistence, integrity |
-| Unified download UI | Color-coded paper/blog rows, author-page links, explicit all/papers/blogs content-type filtering, shared text/author/date/tag filters, blog-tag column, remote image rendering without persistent media downloads, searchable selects with keyboard insertion and clear-on-reselect, persistent row selection, direct page-number jumps, exports, 25–1000 pagination, system/light/dark theme control, visible running version |
+| SQLite | Transactions, WAL, foreign keys, schema guards, migrations through schema v24, historical paper flags, tag/query/chunk persistence, integrity |
+| Unified download UI | Compact paper/blog type icons, author-page links, explicit all/papers/blogs content-type filtering, shared text/author/date/tag filters, blog-tag column, remote image rendering without persistent media downloads, searchable selects with keyboard insertion and clear-on-reselect, persistent row selection, direct page-number jumps, exports, 25–1000 pagination, system/light/dark theme control, visible running version |
 | Paper UI | Consolidated identifier/external/action metadata panel, author picker state, model reruns, saved prompts, 16384-token default context input, no-reload fragment refresh, scroll preservation, live output, cancellation, stale-attempt recovery, analysis rendering, exports |
 | Discovery/author/query UI | Mutually exclusive Paper/Author OpenAlex discovery modes, review-before-download, manual PDF import/backfill, table-based author filtering, Enter-to-tag, icon pause/resume/archive controls, protected Summarize prompt, prompt-only query CRUD, runtime source/strategy/context/model controls, persisted selections/outputs/errors |
 | Static resilience | System/light/dark preference cycle, hidden-state CSS precedence, no CDN dependency, responsive templates |

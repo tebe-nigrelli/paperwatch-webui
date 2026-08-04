@@ -1,0 +1,58 @@
+{% extends "base.html" %}
+{% block title %}Data management · paperwatch{% endblock %}
+{% block content %}
+<section class="page-heading"><h1>Data management</h1><p>Add tracked sources, import or export records, and safely remove stored data.</p></section>
+<section class="discover-search-grid author-add-grid">
+  <article class="panel">
+    <div class="panel-heading"><div><h2>Add author manually</h2><p>OpenAlex IDs enable paper fetching. Authors without one remain blog-only.</p></div></div>
+    <form method="post" action="/authors/manual" class="compact-form author-manual-form">
+      <label><span>Author Name</span><input name="name" maxlength="300" required placeholder="Author name"></label>
+      <label><span>Institution</span><input name="institution" maxlength="300" placeholder="Optional"></label>
+      <label><span>OpenAlex author ID</span><input name="openalex_id" maxlength="40" placeholder="Optional, for example A123456789"></label>
+      <label><span>Tags</span><input name="tags" maxlength="500" placeholder="comma-separated"></label>
+      <label class="grow"><span>Notes</span><input name="notes" maxlength="200000" placeholder="Optional Markdown notes"></label>
+      <button class="button button-primary" type="submit">Add author</button>
+    </form>
+    <div class="author-csv-import-row">
+      <form method="post" action="/authors/import" enctype="multipart/form-data" class="inline-blog-csv-form">
+        <label class="grow"><span>Author CSV import</span><input type="file" name="csv_file" accept=".csv,text/csv" required></label>
+        <label><span>Tags for every imported author</span><input name="import_tags" placeholder="optional, comma-separated"></label>
+        <button class="button button-primary" type="submit">Import authors</button>
+      </form>
+      <button class="icon-button info-button" type="button" data-dialog-open="author-csv-info" aria-label="Author CSV schema" title="Author CSV schema">ⓘ</button>
+      <a class="button button-small" href="/exports/authors.csv">Export authors CSV</a>
+    </div>
+  </article>
+  <article class="panel">
+    <div class="panel-heading"><div><h2>Import blog links</h2><p>Link one source directly, or match a CSV by exact author name.</p></div></div>
+    <div class="blog-import-stack">
+      <form method="post" action="/authors/blogs/manual" class="inline-blog-import-form">
+        <label><span>Manual blog import</span><select name="openalex_id" required><option value="">Choose author</option>{% for author in authors %}<option value="{{ author.openalex_id }}">{{ author.name }}</option>{% endfor %}</select></label>
+        <label class="grow"><span>Blog URL</span><input type="url" name="url" maxlength="2000" required placeholder="https://example.com/blog/"></label>
+        <label><span>Tags</span><input name="tags" placeholder="optional, comma-separated"></label>
+        <button class="button button-primary" type="submit">Link blog</button>
+      </form>
+      <form method="post" action="/authors/blogs/import" enctype="multipart/form-data" class="inline-blog-csv-form">
+        <label class="grow"><span>CSV import</span><input type="file" name="csv_file" accept=".csv,text/csv" required></label>
+        <label class="check-row compact-check"><input type="checkbox" name="create_missing" value="1"><span>Create missing authors</span></label>
+        <label><span>Tags for every imported object</span><input name="import_tags" placeholder="optional, comma-separated"></label>
+        <button class="button button-primary" type="submit">Import CSV</button>
+        <button class="icon-button info-button" type="button" data-dialog-open="blog-csv-info" aria-label="Blogs CSV schema" title="Blogs CSV schema">ⓘ</button>
+        <a class="button button-small" href="/exports/blogs.csv">Export blogs CSV</a>
+      </form>
+    </div>
+  </article>
+</section>
+<div class="data-management-grid data-management-page-grid">
+  <article class="data-management-card"><h3>Authors and blog sources</h3><p>Portable JSON containing tracked authors, tags, blog links, source modes, selectors, and URL patterns. Import merges with existing records.</p><div class="data-management-actions"><a class="button" href="/data/export/authors-blogs">Export authors + blogs</a><form method="post" action="/data/import/authors-blogs" enctype="multipart/form-data" class="file-import-form"><label><span>Authors + blogs JSON</span><input type="file" name="file" accept=".json,application/json" required></label><button class="button button-primary" type="submit">Import authors + blogs</button></form></div></article>
+  <article class="data-management-card"><h3>Whole data</h3><p>Export or replace the database and PDF store as one ZIP archive. Import creates timestamped backups.</p><div class="data-management-actions"><a class="button" href="/data/export/all">Export whole data</a><form method="post" action="/data/import/all" enctype="multipart/form-data" class="file-import-form" data-confirm="Replace the current database and PDF store with this archive?"><label><span>Full-data ZIP</span><input type="file" name="file" accept=".zip,application/zip" required></label><button class="button button-primary" type="submit">Import whole data</button></form></div></article>
+  <article class="data-management-card data-management-wide"><h3>Delete stored records</h3><p>Actions are grouped by what they remove. Every deletion requires confirmation.</p><div class="delete-record-groups">
+    <section class="delete-record-group"><h4>Tracked sources</h4><div class="delete-record-grid"><form method="post" action="/data/delete/authors" data-confirm="Delete every author record? Downloaded papers and blog sources will remain."><button class="button button-danger delete-record-button" type="submit"><span aria-hidden="true">👥</span><span>Delete all authors<small>Keep downloaded content and blog sources</small></span></button></form></div></section>
+    <section class="delete-record-group"><h4>Generated data</h4><div class="delete-record-grid"><form method="post" action="/data/delete/summaries" data-confirm="Delete every generated paper summary, summary task record, and cached summary chunk?"><button class="button button-danger delete-record-button" type="submit"><span aria-hidden="true">✨</span><span>Delete all summaries<small>Keep downloaded papers</small></span></button></form><form method="post" action="/data/delete/queries" data-confirm="Delete every saved query and its outputs?"><button class="button button-danger delete-record-button" type="submit"><span aria-hidden="true">🔎</span><span>Delete all queries<small>Restore the built-in query</small></span></button></form><form method="post" action="/data/delete/query-history" data-confirm="Delete all saved-query outputs while keeping definitions?"><button class="button button-danger delete-record-button" type="submit"><span aria-hidden="true">🧹</span><span>Delete query history<small>Keep query definitions</small></span></button></form></div></section>
+    <section class="delete-record-group"><h4>Downloaded content</h4><div class="delete-record-grid"><form method="post" action="/data/delete/papers" data-confirm="Delete every downloaded paper, analysis, tag link, and stored PDF?"><button class="button button-danger delete-record-button" type="submit"><span aria-hidden="true">📄</span><span>Delete all downloaded papers<small>Also remove analyses, tags, and PDFs</small></span></button></form><form method="post" action="/data/delete/blogs" data-confirm="Delete every downloaded blog entry? Configured sources remain."><button class="button button-danger delete-record-button" type="submit"><span aria-hidden="true">📰</span><span>Delete all downloaded blogs<small>Keep configured sources</small></span></button></form></div></section>
+    <section class="delete-record-group"><h4>Operational history</h4><div class="delete-record-grid"><form method="post" action="/data/delete/fetch-history" data-confirm="Delete fetch history and errors?"><button class="button button-danger delete-record-button" type="submit"><span aria-hidden="true">🕘</span><span>Delete fetch history<small>Keep downloaded content</small></span></button></form></div></section>
+  </div></article>
+</div>
+<dialog id="author-csv-info" class="info-dialog"><div class="panel-heading"><div><h2>Author CSV schema</h2><p>Headers are trimmed and matched case-insensitively.</p></div><button class="icon-button dialog-close-button" type="button" data-dialog-close aria-label="Close">×</button></div><table><thead><tr><th>Column</th><th>Required</th><th>Meaning</th></tr></thead><tbody><tr><td>Author Name</td><td>Yes</td><td>Also accepts Name or Researcher / author.</td></tr><tr><td>Institution</td><td>No</td><td>Also accepts Current lab / organization.</td></tr><tr><td>OpenAlex ID</td><td>No</td><td>For example A123456789.</td></tr><tr><td>Starred</td><td>No</td><td>yes, true, 1, on, or starred.</td></tr><tr><td>Enabled</td><td>No</td><td>yes/no fetch state.</td></tr><tr><td>Tags</td><td>No</td><td>Comma-separated tags.</td></tr><tr><td>Notes</td><td>No</td><td>Markdown comments.</td></tr></tbody></table><p><code>Author Name,Institution,OpenAlex ID,Starred,Enabled,Tags,Notes</code></p></dialog>
+<dialog id="blog-csv-info" class="info-dialog"><div class="panel-heading"><div><h2>Blogs CSV schema</h2><p>Headers are trimmed. The watchlist schema and compact exports are accepted.</p></div><button class="icon-button dialog-close-button" type="button" data-dialog-close aria-label="Close">×</button></div><table><thead><tr><th>Column</th><th>Required</th><th>Meaning</th></tr></thead><tbody><tr><td>Researcher / author</td><td>Yes</td><td>Exact tracked author name.</td></tr><tr><td>Primary source URL</td><td>Yes</td><td>First blog/source URL.</td></tr><tr><td>Primary applied-ML source</td><td>No</td><td>Display label.</td></tr><tr><td>Primary source type/mode</td><td>No</td><td>Extraction hints.</td></tr><tr><td>Primary tags / Blog tags</td><td>No</td><td>Comma-separated source tags.</td></tr><tr><td>Notes</td><td>No</td><td>Markdown source notes.</td></tr></tbody></table></dialog>
+{% endblock %}

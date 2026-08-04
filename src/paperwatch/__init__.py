@@ -1,4 +1,4 @@
 """Paperwatch package."""
 
-__version__ = "0.9.9"
+__version__ = "0.10.2"
 USER_AGENT = f"paperwatch/{__version__}"

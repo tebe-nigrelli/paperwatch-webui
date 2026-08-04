@@ -87,7 +87,7 @@ def test_content_type_filter_and_version_brand(
     assert 'name="content" aria-label="Content type"' in page.text
     assert ">Papers<" in page.text
     assert ">Blogs<" in page.text
-    assert "paperwatch</span><small>v0.9.9</small>" in page.text
+    assert "paperwatch</span><small>v0.10.2</small>" in page.text
 
     papers = client.get("/?content=papers")
     assert paper_record.title in papers.text
@@ -138,7 +138,7 @@ def test_delete_summaries_and_fetch_history(
         db.finish_run(run_id, "partial", {"errors_count": 1})
 
     client = _client(config_path)
-    runs = client.get("/runs")
+    runs = client.get("/data")
     assert "Delete all summaries" in runs.text
     assert "Delete fetch history" in runs.text
 

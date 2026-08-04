@@ -205,16 +205,61 @@
   document.querySelectorAll("form").forEach((form) => {
     const source = form.querySelector("[data-source-scope]");
     const strategy = form.querySelector("[data-pdf-strategy]");
+    const context = form.querySelector("[data-context-window]");
+    const models = form.querySelector("[data-model-picker]");
     if (!source || !strategy) return;
+    const setLocked = (control, locked) => {
+      if (!control) return;
+      control.dataset.profileLocked = locked ? "true" : "false";
+      control.setAttribute("aria-disabled", String(locked));
+      if (control instanceof HTMLInputElement) control.readOnly = locked;
+      const wrapper = control.previousElementSibling;
+      if (wrapper?.classList.contains("search-select")) {
+        wrapper.classList.toggle("control-disabled", locked);
+        const input = wrapper.querySelector(".search-select-input");
+        if (input) input.disabled = locked;
+      }
+      control.closest("label")?.classList.toggle("control-disabled", locked);
+    };
     const syncSourceOptions = () => {
+      const locked = source.dataset.profileLocked === "true";
       const usesPdf = source.value === "fulltext";
-      strategy.disabled = !usesPdf;
       if (!usesPdf) strategy.value = "auto";
-      const label = strategy.closest("label");
-      if (label) label.classList.toggle("control-disabled", !usesPdf);
+      setLocked(strategy, locked || !usesPdf);
+      strategy.dispatchEvent(new Event("change", { bubbles: true }));
+    };
+    const syncProfileOptions = () => {
+      if (!models) {
+        syncSourceOptions();
+        return;
+      }
+      let selected = Array.from(models.selectedOptions);
+      const nativeProfile = selected.find((candidate) =>
+        ["codex", "claude-code"].includes(candidate.dataset.provider || "")
+      );
+      if (nativeProfile && selected.length > 1) {
+        Array.from(models.options).forEach((candidate) => {
+          candidate.selected = candidate === nativeProfile;
+        });
+        selected = [nativeProfile];
+      }
+      const profile = selected.length === 1 ? selected[0] : null;
+      const native = profile && ["codex", "claude-code"].includes(profile.dataset.provider || "");
+      if (native) {
+        const fulltext = Array.from(source.options).find((option) => option.value === "fulltext");
+        if (fulltext) source.value = "fulltext";
+        strategy.value = profile.dataset.pdfStrategy || "direct";
+        if (context && profile.dataset.contextWindow) context.value = profile.dataset.contextWindow;
+      }
+      setLocked(source, Boolean(native));
+      setLocked(strategy, Boolean(native));
+      setLocked(context, Boolean(native));
+      source.dispatchEvent(new Event("change", { bubbles: true }));
+      strategy.dispatchEvent(new Event("change", { bubbles: true }));
     };
     source.addEventListener("change", syncSourceOptions);
-    syncSourceOptions();
+    models?.addEventListener("change", syncProfileOptions);
+    syncProfileOptions();
   });
 
   const automaticQueryForm = document.querySelector('form[data-auto-save="query-selections"]');
@@ -343,7 +388,11 @@
     const applyAuthorFilter = () => {
       const term = authorFilter.value.trim().toLocaleLowerCase();
       rows.forEach((row) => {
-        row.hidden = Boolean(term) && !row.dataset.authorSearch.toLocaleLowerCase().includes(term);
+        const hidden = Boolean(term) && !row.dataset.authorSearch.toLocaleLowerCase().includes(term);
+        row.hidden = hidden;
+        if (row.nextElementSibling?.matches("[data-author-notes-row]")) {
+          row.nextElementSibling.hidden = hidden;
+        }
       });
     };
     authorFilter.addEventListener("input", applyAuthorFilter);
@@ -584,6 +633,7 @@
     input.setAttribute("role", "combobox");
     input.setAttribute("aria-autocomplete", "list");
     input.setAttribute("aria-expanded", "false");
+    input.placeholder = select.dataset.searchPlaceholder || (multiple ? "Type to filter choices" : "Type to filter");
     if (cycle) input.readOnly = true;
     const list = document.createElement("div");
     list.className = "search-select-options";
@@ -595,7 +645,7 @@
     const chips = document.createElement("div");
     chips.className = "search-select-chips";
     if (!multiple) chips.hidden = true;
-    wrapper.append(chips, input, list);
+    wrapper.append(input, chips, list);
     select.before(wrapper);
     select.classList.add("search-select-native");
     select.setAttribute("aria-hidden", "true");
@@ -603,17 +653,10 @@
 
     let active = -1;
     const normalized = (value) => String(value || "").trim().toLocaleLowerCase();
-    const optionRows = Array.from(select.options).map((option, optionIndex) => {
-      const button = document.createElement("button");
-      button.type = "button";
-      button.className = "search-select-option";
-      button.dataset.optionIndex = String(optionIndex);
-      button.setAttribute("role", "option");
-      button.textContent = option.textContent || option.value;
-      list.appendChild(button);
-      return button;
-    });
-    const visibleRows = () => optionRows.filter((row) => !row.hidden);
+    const maxRenderedOptions = 80;
+    let optionRows = [];
+    let renderOptionRows = () => {};
+    const visibleRows = () => optionRows;
     const setActive = (rowIndex) => {
       const visible = visibleRows();
       optionRows.forEach((row) => row.classList.remove("active"));
@@ -630,8 +673,8 @@
       row.scrollIntoView({ block: "nearest" });
     };
     const selectedOptions = () => Array.from(select.selectedOptions);
-    const syncInput = () => {
-      if (!multiple && document.activeElement !== input) {
+    const syncInput = (force = false) => {
+      if (!multiple && (force || cycle || document.activeElement !== input)) {
         input.value = select.selectedIndex >= 0 ? select.options[select.selectedIndex].textContent || "" : "";
       }
       chips.replaceChildren();
@@ -651,8 +694,8 @@
           chips.appendChild(chip);
         });
       }
-      optionRows.forEach((row, rowIndex) => {
-        const selected = select.options[rowIndex]?.selected || false;
+      optionRows.forEach((row) => {
+        const selected = select.options[Number(row.dataset.optionIndex)]?.selected || false;
         row.classList.toggle("selected", selected);
         row.setAttribute("aria-selected", String(selected));
       });
@@ -660,12 +703,7 @@
       wrapper.classList.toggle("control-disabled", select.disabled);
     };
     const refresh = (open = true) => {
-      const term = normalized(input.value);
-      optionRows.forEach((row, rowIndex) => {
-        const option = select.options[rowIndex];
-        const matches = !term || normalized(option?.textContent).includes(term) || normalized(option?.value).includes(term);
-        row.hidden = !matches;
-      });
+      renderOptionRows();
       if (open && !select.disabled) {
         list.hidden = false;
         input.setAttribute("aria-expanded", "true");
@@ -685,6 +723,18 @@
       const option = select.options[optionIndex];
       if (!option || option.disabled) return;
       if (multiple) {
+        if (select.matches("[data-model-picker]") && !option.selected) {
+          const nativeProviders = new Set(["codex", "claude-code"]);
+          const choosingNative = nativeProviders.has(option.dataset.provider || "");
+          const hasNative = Array.from(select.selectedOptions).some((candidate) =>
+            nativeProviders.has(candidate.dataset.provider || "")
+          );
+          if (choosingNative || hasNative) {
+            Array.from(select.options).forEach((candidate) => {
+              candidate.selected = false;
+            });
+          }
+        }
         option.selected = !option.selected;
       } else if (option.selected) {
         const emptyOption = Array.from(select.options).find((candidate) => candidate.value === "");
@@ -696,7 +746,7 @@
         input.value = option.textContent || option.value;
       }
       select.dispatchEvent(new Event("change", { bubbles: true }));
-      syncInput();
+      syncInput(true);
       if (multiple) {
         input.value = "";
         refresh(true);
@@ -706,6 +756,39 @@
         input.focus();
       }
       autoApply();
+    };
+    renderOptionRows = () => {
+      const term = normalized(input.value);
+      const fragment = document.createDocumentFragment();
+      const rows = [];
+      let matches = 0;
+      Array.from(select.options).forEach((option, optionIndex) => {
+        if (option.disabled) return;
+        const label = option.textContent || option.value;
+        if (term && !normalized(option?.textContent).includes(term) && !normalized(option?.value).includes(term)) return;
+        matches += 1;
+        if (rows.length >= maxRenderedOptions) return;
+        const button = document.createElement("button");
+        button.type = "button";
+        button.className = "search-select-option";
+        button.dataset.optionIndex = String(optionIndex);
+        button.setAttribute("role", "option");
+        button.textContent = label;
+        button.addEventListener("mousedown", (event) => event.preventDefault());
+        button.addEventListener("mousemove", () => setActive(optionRows.indexOf(button)));
+        button.addEventListener("click", () => choose(button));
+        rows.push(button);
+        fragment.appendChild(button);
+      });
+      if (matches > maxRenderedOptions) {
+        const message = document.createElement("div");
+        message.className = "search-select-limit";
+        message.textContent = `${matches - maxRenderedOptions} more options. Keep typing to narrow the list.`;
+        fragment.appendChild(message);
+      }
+      optionRows = rows;
+      list.replaceChildren(fragment);
+      syncInput();
     };
     input.addEventListener("focus", () => {
       if (cycle) return;
@@ -720,7 +803,7 @@
         if (!next) return;
         select.value = next.value;
         select.dispatchEvent(new Event("change", { bubbles: true }));
-        syncInput();
+        syncInput(true);
         autoApply();
         return;
       }
@@ -743,7 +826,7 @@
         if (next) {
           select.value = next.value;
           select.dispatchEvent(new Event("change", { bubbles: true }));
-          syncInput();
+          syncInput(true);
           autoApply();
         }
         return;
@@ -770,21 +853,19 @@
         close();
       }
     });
-    optionRows.forEach((row) => {
-      row.addEventListener("mousedown", (event) => event.preventDefault());
-      row.addEventListener("mousemove", () => setActive(visibleRows().indexOf(row)));
-      row.addEventListener("click", () => choose(row));
-    });
     document.addEventListener("click", (event) => {
       if (!wrapper.contains(event.target)) close();
     });
     const observer = new MutationObserver(syncInput);
     observer.observe(select, { attributes: true, attributeFilter: ["disabled"] });
-    select.addEventListener("change", syncInput);
+    select.addEventListener("change", () => syncInput(true));
     syncInput();
   };
 
   document.querySelectorAll("select").forEach((select, index) => enhanceSelect(select, index));
+  document.querySelectorAll("[data-model-picker]").forEach((select) => {
+    select.dispatchEvent(new Event("change", { bubbles: true }));
+  });
 
   document.querySelectorAll("[data-cycle-toggle]").forEach((button) => {
     const input = button.parentElement?.querySelector("[data-cycle-value]");
@@ -915,11 +996,39 @@
     initializeDynamicSelects(incoming);
     return true;
   };
+  const contentUrlKey = "paperwatch-content-url";
+  const contentHome = document.querySelector("[data-content-home-link]");
+  const storedContentUrl = storageGet(contentUrlKey);
+  if (contentHome && storedContentUrl) contentHome.href = storedContentUrl;
+  const rememberContentUrl = (url) => {
+    const parsed = new URL(url, window.location.href);
+    const value = `${parsed.pathname}${parsed.search}`;
+    storageSet(contentUrlKey, value);
+    if (contentHome) contentHome.href = value;
+  };
+  if (document.querySelector("#content-page-root")) rememberContentUrl(window.location.href);
   const refreshContentPage = async (url = window.location.href, push = false) => {
     const response = await fetch(url, { headers: { "X-Paperwatch-Partial": "1" } });
-    const replaced = await replaceFromResponse(response, "#content-page-root");
-    if (replaced && push) window.history.pushState({}, "", url);
-    return replaced;
+    if (!response.ok) throw new Error(`Request failed with HTTP ${response.status}`);
+    const doc = parseHtml(await response.text());
+    const incomingResults = doc.querySelector("#content-results-root");
+    const currentResults = document.querySelector("#content-results-root");
+    if (!incomingResults || !currentResults) return false;
+    currentResults.replaceWith(incomingResults);
+    const incomingCount = doc.querySelector("#content-match-count");
+    const currentCount = document.querySelector("#content-match-count");
+    if (incomingCount && currentCount) currentCount.replaceWith(incomingCount);
+    const incomingForm = doc.querySelector("#content-column-filters");
+    const currentForm = document.querySelector("#content-column-filters");
+    if (incomingForm && currentForm) currentForm.replaceWith(incomingForm);
+    const incomingSearch = doc.querySelector('input[name="q"][form="content-column-filters"]');
+    const currentSearch = document.querySelector('input[name="q"][form="content-column-filters"]');
+    if (incomingSearch && currentSearch) currentSearch.value = incomingSearch.value;
+    initializeDynamicSelects(incomingResults);
+    const finalUrl = new URL(url, window.location.href).toString();
+    if (push) window.history.pushState({}, "", finalUrl);
+    rememberContentUrl(finalUrl);
+    return true;
   };
   const refreshSelector = async (selector) => {
     const response = await fetch(window.location.href, { headers: { "X-Paperwatch-Partial": "1" } });
@@ -937,6 +1046,75 @@
     return payload;
   };
 
+  const selectedDock = () => document.querySelector(".selected-content-dock");
+  const selectedBody = () => document.querySelector("[data-selected-content-body]");
+  const updateSelectedCount = (delta = null) => {
+    const dock = selectedDock();
+    const body = selectedBody();
+    if (!dock || !body) return;
+    const visible = body.querySelectorAll("tr.content-row").length;
+    const stored = Number(dock.dataset.selectedCount || visible);
+    const count = delta === null ? visible : Math.max(0, stored + delta);
+    dock.dataset.selectedCount = String(count);
+    const label = dock.querySelector(".selection-count");
+    if (label) label.textContent = String(count);
+    dock.hidden = count === 0;
+  };
+  const configureSelectedRow = (row, selected) => {
+    row.classList.toggle("content-row-selected", selected);
+    const selectForm = row.querySelector('form[action$="/select"]');
+    const input = selectForm?.querySelector('input[name="selected"]');
+    const button = selectForm?.querySelector(".content-select-button");
+    if (input) input.value = selected ? "0" : "1";
+    if (button) {
+      button.textContent = selected ? "☑" : "☐";
+      button.title = selected ? "Remove from selection" : "Keep in selection";
+    }
+  };
+  const syncSelectionRow = (form, selected) => {
+    const row = form.closest("tr.content-row");
+    const body = selectedBody();
+    if (!row || !body) return;
+    const key = `${row.dataset.contentType}:${row.dataset.contentId}`;
+    const existing = Array.from(body.querySelectorAll("tr.content-row")).find(
+      (candidate) => `${candidate.dataset.contentType}:${candidate.dataset.contentId}` === key
+    );
+    if (selected) {
+      const clone = existing || row.cloneNode(true);
+      configureSelectedRow(clone, true);
+      if (!existing) body.appendChild(clone);
+      if (!row.closest("[data-selected-content-body]")) row.remove();
+      updateSelectedCount(existing ? 0 : 1);
+    } else {
+      (existing || row).remove();
+      updateSelectedCount(-1);
+    }
+  };
+
+  const updateRowsForBulkAction = (action) => {
+    const rows = Array.from(selectedBody()?.querySelectorAll("tr.content-row") || []);
+    if (action.endsWith("/unselect")) {
+      rows.forEach((row) => row.remove());
+      const dock = selectedDock();
+      if (dock) dock.dataset.selectedCount = "0";
+      updateSelectedCount(0);
+      return;
+    }
+    if (action.endsWith("/star") || action.endsWith("/unstar")) {
+      const starred = action.endsWith("/star");
+      rows.forEach((row) => {
+        const button = row.querySelector(".star-button");
+        const input = row.querySelector('input[name="starred"]');
+        if (button) { button.classList.toggle("is-starred", starred); button.textContent = starred ? "★" : "☆"; }
+        if (input) input.value = starred ? "0" : "1";
+      });
+    }
+    if (action.endsWith("/read") || action.endsWith("/unread")) {
+      const read = action.endsWith("/read");
+      rows.forEach((row) => { row.dataset.read = read ? "true" : "false"; });
+    }
+  };
+
   document.addEventListener("submit", async (event) => {
     const form = event.target.closest("form");
     if (!form) return;
@@ -948,6 +1126,14 @@
       for (const [key, value] of Array.from(params.entries())) if (!String(value).trim()) params.delete(key);
       url.search = params.toString();
       try { await refreshContentPage(url.toString(), true); } catch (error) { console.error(error); }
+      return;
+    }
+    if (form.matches("[data-select-results]")) {
+      event.preventDefault();
+      try {
+        await postAsync(form);
+        await refreshContentPage(window.location.href, false);
+      } catch (error) { console.error(error); }
       return;
     }
     if (form.matches("[data-content-state]")) {
@@ -970,7 +1156,7 @@
           if (button) button.textContent = payload.read ? "Read" : "Unread";
           if (row) row.dataset.read = payload.read ? "true" : "false";
         } else if ("selected" in payload) {
-          await refreshContentPage(window.location.href, false);
+          syncSelectionRow(form, Boolean(payload.selected));
         }
       } catch (error) { console.error(error); }
       return;
@@ -979,9 +1165,9 @@
       event.preventDefault();
       try {
         await postAsync(form);
+        if (form.closest(".selected-content-dock")) updateRowsForBulkAction(new URL(form.action).pathname);
         const selector = form.dataset.refreshSelector;
-        if (document.querySelector("#content-page-root")) await refreshContentPage(window.location.href, false);
-        else if (selector) await refreshSelector(selector);
+        if (selector) await refreshSelector(selector);
         else {
           const panel = form.closest(".content-tags-panel, .classification-panel, .object-notes-panel");
           if (panel && panel.classList.length) {
@@ -999,9 +1185,68 @@
     event.preventDefault();
     try { await refreshContentPage(link.href, true); } catch (error) { console.error(error); }
   });
+  document.addEventListener("click", (event) => {
+    const reset = event.target.closest("[data-content-reset]");
+    if (!reset || !document.querySelector("#content-page-root")) return;
+    event.preventDefault();
+    refreshContentPage(reset.href, true).catch(console.error);
+  });
   window.addEventListener("popstate", () => {
     if (document.querySelector("#content-page-root")) refreshContentPage(window.location.href, false).catch(console.error);
   });
+
+  document.addEventListener("keydown", (event) => {
+    const form = event.target.closest("form[data-enter-submit]");
+    if (!form || event.key !== "Enter" || event.shiftKey || event.isComposing) return;
+    if (event.target instanceof HTMLTextAreaElement) return;
+    event.preventDefault();
+    form.requestSubmit();
+  });
+
+  document.addEventListener("change", (event) => {
+    const input = event.target.closest("[data-auto-upload]");
+    if (input?.files?.length) input.form?.requestSubmit();
+  });
+
+  document.addEventListener("click", (event) => {
+    const edit = event.target.closest("[data-notes-edit]");
+    const cancel = event.target.closest("[data-notes-cancel]");
+    const control = edit || cancel;
+    if (!control) return;
+    const panel = control.closest("[data-inline-notes]");
+    const display = panel?.querySelector("[data-notes-display]");
+    const form = panel?.querySelector("[data-notes-form]");
+    if (edit) {
+      if (display) display.hidden = true;
+      if (form) { form.hidden = false; form.querySelector("textarea")?.focus(); }
+    } else {
+      if (form) form.hidden = true;
+      if (display) display.hidden = false;
+    }
+  });
+
+  const pdfDropTarget = document.querySelector("[data-pdf-drop-target]");
+  const pdfUploadForm = document.querySelector("[data-pdf-upload-form]");
+  if (pdfDropTarget && pdfUploadForm) {
+    const input = pdfUploadForm.querySelector('input[type="file"]');
+    ["dragenter", "dragover"].forEach((name) => pdfDropTarget.addEventListener(name, (event) => {
+      event.preventDefault();
+      pdfDropTarget.classList.add("pdf-drop-active");
+    }));
+    ["dragleave", "drop"].forEach((name) => pdfDropTarget.addEventListener(name, (event) => {
+      event.preventDefault();
+      pdfDropTarget.classList.remove("pdf-drop-active");
+    }));
+    pdfDropTarget.addEventListener("drop", (event) => {
+      const files = Array.from(event.dataTransfer?.files || []);
+      const pdf = files.find((file) => file.type === "application/pdf" || file.name.toLowerCase().endsWith(".pdf"));
+      if (!pdf || !input) return;
+      const transfer = new DataTransfer();
+      transfer.items.add(pdf);
+      input.files = transfer.files;
+      pdfUploadForm.requestSubmit();
+    });
+  }
 
   const escapeHtml = (value) => value.replace(/[&<>"']/g, (char) => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[char]));
   const compileDebugRegexp = (pattern) => {

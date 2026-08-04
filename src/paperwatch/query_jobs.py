@@ -15,7 +15,7 @@ from typing import Any, Callable
 from pydantic import ValidationError
 
 from . import USER_AGENT
-from .analysis_jobs import _paper_text
+from .analysis_jobs import _paper_pdf_path, _paper_text
 from .chunking import context_char_budget
 from .config import load_config
 from .db import Database
@@ -199,6 +199,7 @@ def _selection_search_args(selection: dict[str, Any] | None) -> dict[str, Any]:
         "analyzed": selection.get("analyzed") if isinstance(selection.get("analyzed"), bool) else None,
         "starred": selection.get("starred") if isinstance(selection.get("starred"), bool) else None,
         "read": selection.get("read") if isinstance(selection.get("read"), bool) else None,
+        "notes": selection.get("notes") if isinstance(selection.get("notes"), bool) else None,
         "date_from": str(selection.get("date_from") or ""),
         "date_to": str(selection.get("date_to") or ""),
         "sort": str(selection.get("sort") or "newest"),
@@ -229,7 +230,27 @@ def _selected_blog_entries(db: Database, selection: dict[str, Any] | None) -> li
                 continue
     if selected_ids:
         return db.blog_entries_by_ids(selected_ids)
-    return db.list_blog_entries(limit=None)
+    args = _selection_search_args(selection)
+    return db.list_blog_entries(
+        limit=None,
+        query=str(args["query"]),
+        title_query=str((selection or {}).get("title_query") or ""),
+        tags=tuple(args["content_tags"]),
+        author_id=str(args["author_id"]),
+        author_ids=tuple(
+            str(value)
+            for value in (selection or {}).get("author_ids", ())
+            if str(value).strip()
+        ) if isinstance((selection or {}).get("author_ids"), (list, tuple)) else (),
+        author_tags=tuple(args["author_tags"]),
+        date_from=str(args["date_from"]),
+        date_to=str(args["date_to"]),
+        sort=str(args["sort"]),
+        starred=args["starred"] if isinstance(args["starred"], bool) else None,
+        read=args["read"] if isinstance(args["read"], bool) else None,
+        analyzed=args["analyzed"] if isinstance(args["analyzed"], bool) else None,
+        notes=args["notes"] if isinstance(args["notes"], bool) else None,
+    )
 
 
 def validate_query_sources(
@@ -395,6 +416,88 @@ def _generate(llm: LLMClient, prompt: str) -> tuple[BatchQueryResult, dict[str, 
         return BatchQueryResult.model_validate(response.data), response.usage
     except ValidationError as exc:
         raise LLMError(f"Invalid collection-query result: {exc}") from exc
+
+
+def _native_pdf_prompt(user_prompt: str, document: dict[str, Any]) -> str:
+    metadata = {key: value for key, value in document.items() if key != "fulltext"}
+    return f"""You are analyzing one complete research-paper PDF attached to this request.
+Return exactly one JSON object matching the supplied schema. Apply the user's prompt to the
+attached PDF, preserve the exact paper_id and title in every relevant item, and do not invent
+facts. The top-level summary should be useful on its own.
+
+USER PROMPT:
+{user_prompt}
+
+PAPER METADATA:
+{json.dumps(metadata, ensure_ascii=False)}
+"""
+
+
+def run_query_for_native_pdfs(
+    llm: LLMClient,
+    *,
+    user_prompt: str,
+    papers: list[Any],
+    db: Database,
+    config: Any,
+    context_window_tokens: int,
+    max_input_chars: int,
+    progress: ProgressCallback | None = None,
+    cancel_event: threading.Event | None = None,
+) -> tuple[BatchQueryResult, dict[str, Any], int]:
+    generate_with_pdf = getattr(llm, "generate_json_with_pdf", None)
+    if not callable(generate_with_pdf):
+        raise LLMError(
+            f"{getattr(llm, 'provider', 'Selected provider')} cannot read PDFs directly"
+        )
+    partials: list[dict[str, Any]] = []
+    usage: dict[str, Any] = {}
+    input_chars = 0
+    with httpx.Client(
+        timeout=60,
+        follow_redirects=True,
+        headers={"User-Agent": USER_AGENT},
+    ) as pdf_client:
+        for index, row in enumerate(papers, 1):
+            check_cancelled(cancel_event)
+            publish(progress, "message", f"Reading PDF {index}/{len(papers)} · {row['title']}")
+            _paper, path = _paper_pdf_path(config, db, int(row["id"]), pdf_client)
+            document = _paper_document(db, row)
+            document["source"] = "fulltext"
+            prompt = _native_pdf_prompt(user_prompt, document)
+            input_chars += len(prompt)
+            response = generate_with_pdf(
+                prompt,
+                path,
+                schema=BATCH_QUERY_JSON_SCHEMA,
+                schema_name="saved_query_result",
+            )
+            partials.append(BatchQueryResult.model_validate(response.data).model_dump())
+            for key, value in response.usage.items():
+                if isinstance(value, (int, float)):
+                    usage[key] = usage.get(key, 0) + value
+                elif key not in usage:
+                    usage[key] = value
+    if len(partials) == 1:
+        return BatchQueryResult.model_validate(partials[0]), usage, input_chars
+    merged, merge_usage, merge_chars = run_query_for_model(
+        llm,
+        user_prompt="Merge these per-paper saved-query results into one collection result.",
+        documents=partials,
+        context_window_tokens=context_window_tokens,
+        max_input_chars=max_input_chars,
+        pdf_strategy="auto",
+        content_type="papers",
+        progress=progress,
+        cancel_event=cancel_event,
+    )
+    input_chars += merge_chars
+    for key, value in merge_usage.items():
+        if isinstance(value, (int, float)):
+            usage[key] = usage.get(key, 0) + value
+        elif key not in usage:
+            usage[key] = value
+    return merged, usage, input_chars
 
 
 def _json_size(value: Any) -> int:
@@ -627,15 +730,31 @@ def run_query_batch(
             source_scope = str(selection.get("source_scope") or "abstract")
             pdf_strategy = str(selection.get("pdf_strategy") or "auto")
             content_type = str(selection.get("content_type") or "papers")
-            documents = collect_query_documents(
-                db,
-                source_scope,
-                selection=selection,
-                config=config,
-            )
             regexp_pattern = str(query["regexp_pattern"] or "")
             regexp_radius = int(query["regexp_radius"] or 0)
             regexp_mode = str(query["regexp_mode"] or "query")
+            native_profiles = {
+                name
+                for name in profile_names
+                if name in profiles and profiles[name].provider in {"codex", "claude-code"}
+            }
+            native_pdf_only = bool(profile_names) and native_profiles == set(profile_names)
+            native_papers: list[Any] = []
+            if (
+                native_pdf_only
+                and content_type == "papers"
+                and source_scope == "fulltext"
+                and not regexp_pattern
+            ):
+                native_papers = _selected_papers(db, selection)
+                documents = [_paper_document(db, row) for row in native_papers]
+            else:
+                documents = collect_query_documents(
+                    db,
+                    source_scope,
+                    selection=selection,
+                    config=config,
+                )
             regexp_matches = 0
             if regexp_pattern:
                 documents, regexp_matches = preprocess_regexp_documents(
@@ -701,15 +820,35 @@ def run_query_batch(
                     if active_client is not None:
                         active_client(llm)
                     configure_context_window(llm, context_window_tokens)
-                    result, _usage, input_chars = run_query_for_model(
-                        llm, user_prompt=query["prompt"], documents=documents,
-                        context_window_tokens=context_window_tokens,
-                        max_input_chars=profile.max_input_chars,
-                        pdf_strategy=pdf_strategy,
-                        content_type=content_type,
-                        progress=progress,
-                        cancel_event=cancel_event,
-                    )
+                    if (
+                        profile.provider in {"codex", "claude-code"}
+                        and content_type == "papers"
+                        and source_scope == "fulltext"
+                        and not regexp_pattern
+                    ):
+                        if not native_papers:
+                            native_papers = _selected_papers(db, selection)
+                        result, _usage, input_chars = run_query_for_native_pdfs(
+                            llm,
+                            user_prompt=query["prompt"],
+                            papers=native_papers,
+                            db=db,
+                            config=config,
+                            context_window_tokens=profile.context_window_tokens,
+                            max_input_chars=profile.max_input_chars,
+                            progress=progress,
+                            cancel_event=cancel_event,
+                        )
+                    else:
+                        result, _usage, input_chars = run_query_for_model(
+                            llm, user_prompt=query["prompt"], documents=documents,
+                            context_window_tokens=context_window_tokens,
+                            max_input_chars=profile.max_input_chars,
+                            pdf_strategy=pdf_strategy,
+                            content_type=content_type,
+                            progress=progress,
+                            cancel_event=cancel_event,
+                        )
                     check_cancelled(cancel_event)
                     output = result.model_dump()
                     db.finish_query_run(
@@ -824,6 +963,18 @@ class QueryController:
                     raise ValueError(
                         f"Unknown configured model profile(s): {', '.join(unknown)}"
                     )
+                configured_profiles = [available[name] for name in selected if name in available]
+                if (
+                    content_type == "papers"
+                    and len(configured_profiles) == 1
+                    and configured_profiles[0].provider in {"codex", "claude-code"}
+                ):
+                    native_profile = configured_profiles[0]
+                    source_scope = "fulltext"
+                    pdf_strategy = native_profile.pdf_analysis_strategy or "direct"
+                    context_window_tokens = native_profile.context_window_tokens
+                    selection["source_scope"] = source_scope
+                    selection["pdf_strategy"] = pdf_strategy
                 validate_query_sources(
                     db,
                     selection=selection,
@@ -865,6 +1016,93 @@ class QueryController:
             )
             self._thread.start()
             return batch_id
+
+    def start_many(
+        self,
+        query_ids: tuple[int, ...],
+        profile: str,
+        context_window_tokens: int,
+        *,
+        selection: dict[str, Any] | None = None,
+        content_type: str = "blogs",
+    ) -> tuple[str, ...] | None:
+        """Queue several saved queries as one sequential collection job.
+
+        This is intentionally single-model: it keeps the content-page runner
+        predictable while still allowing several prompts to reuse the same
+        filtered result set.
+        """
+        with self._lock:
+            if self._snapshot.running:
+                return None
+            if not 512 <= context_window_tokens <= 1_000_000:
+                raise ValueError("Context window must be between 512 and 1000000 tokens")
+            ordered_ids = tuple(dict.fromkeys(int(value) for value in query_ids if int(value) > 0))
+            if not ordered_ids:
+                raise ValueError("Select at least one saved query")
+            if content_type != "blogs":
+                raise ValueError("Multi-query runs currently support blog results")
+            selection = dict(selection or {})
+            selection["content_type"] = "blogs"
+            selection["source_scope"] = "blog"
+            selection["pdf_strategy"] = "auto"
+            config = load_config(self.config_path)
+            available = {item.profile: item for item in config.available_llms}
+            jobs: list[tuple[str, int, tuple[str, ...]]] = []
+            with Database(config.paths.database) as db:
+                validate_query_sources(
+                    db,
+                    selection=selection,
+                    source_scope="blog",
+                    pdf_strategy="auto",
+                )
+                for query_id in ordered_ids:
+                    query = db.get_saved_query(query_id)
+                    if query is None:
+                        raise ValueError(f"Saved query {query_id} was not found")
+                    supported = str(query["content_scope"] or "both")
+                    if supported not in {"both", "blogs"}:
+                        raise ValueError(f"{query['name']} is configured for papers only")
+                    local_print = (
+                        str(query["regexp_mode"] or "query") == "print"
+                        and bool(str(query["regexp_pattern"] or "").strip())
+                    )
+                    selected = ("regexp",) if local_print else (profile,)
+                    if selected != ("regexp",) and profile not in available:
+                        raise ValueError(f"Unknown configured model profile: {profile}")
+                    batch_id = secrets.token_hex(10)
+                    db.create_query_runs(
+                        batch_id=batch_id,
+                        query_id=query_id,
+                        profiles=[
+                            ("regexp", "local", "regexp")
+                            if selected == ("regexp",)
+                            else (profile, available[profile].provider, available[profile].model)
+                        ],
+                        context_window_tokens=context_window_tokens,
+                        selection=selection,
+                    )
+                    jobs.append((batch_id, query_id, selected))
+            self._cancel_event = threading.Event()
+            self._active_llm = None
+            self._snapshot = QueryBatchSnapshot(
+                running=True,
+                batch_id=jobs[0][0],
+                query_id=jobs[0][1],
+                content_type="blogs",
+                profiles=(profile,),
+                stage="Queued",
+                message=f"Preparing {len(jobs)} saved queries",
+                progress_total=len(jobs),
+            )
+            self._thread = threading.Thread(
+                target=self._work_many,
+                args=(tuple(jobs), context_window_tokens),
+                name="paperwatch-query-sequence",
+                daemon=True,
+            )
+            self._thread.start()
+            return tuple(job[0] for job in jobs)
 
     def _progress(self, kind: str, value: str) -> None:
         with self._lock:
@@ -938,6 +1176,70 @@ class QueryController:
                     self._snapshot.error = str(exc)
                     self._snapshot.stage = "Failed"
                     self._snapshot.message = str(exc)
+        finally:
+            with self._lock:
+                self._active_llm = None
+
+    def _work_many(
+        self,
+        jobs: tuple[tuple[str, int, tuple[str, ...]], ...],
+        context: int,
+    ) -> None:
+        completed = 0
+        failed = 0
+        try:
+            for index, (batch_id, query_id, profiles) in enumerate(jobs, 1):
+                check_cancelled(self._cancel_event)
+                with self._lock:
+                    self._snapshot.batch_id = batch_id
+                    self._snapshot.query_id = query_id
+                    self._snapshot.stage = f"Query {index}/{len(jobs)}"
+                    self._snapshot.message = "Preparing saved prompt"
+                    self._snapshot.progress_current = index - 1
+                    self._snapshot.progress_total = len(jobs)
+                parameter_count = len(inspect.signature(self._runner).parameters)
+                if parameter_count <= 5:
+                    result = self._runner(self.config_path, batch_id, query_id, profiles, context)
+                else:
+                    result = self._runner(
+                        self.config_path,
+                        batch_id,
+                        query_id,
+                        profiles,
+                        context,
+                        self._progress,
+                        self._cancel_event,
+                        self._set_active_llm,
+                    )
+                completed += int(result.get("completed", 0))
+                failed += int(result.get("failed", 0))
+                with self._lock:
+                    self._snapshot.progress_current = index
+                    self._snapshot.progress_total = len(jobs)
+            with self._lock:
+                self._snapshot.running = False
+                self._snapshot.completed = completed
+                self._snapshot.failed = failed
+                self._snapshot.cancel_requested = False
+                self._snapshot.stage = "Complete"
+                self._snapshot.message = f"Completed {len(jobs)} saved queries"
+        except JobCancelled:
+            with self._lock:
+                self._snapshot.running = False
+                self._snapshot.completed = completed
+                self._snapshot.failed = failed
+                self._snapshot.cancelled = True
+                self._snapshot.cancel_requested = False
+                self._snapshot.stage = "Cancelled"
+                self._snapshot.message = "Saved queries cancelled"
+        except Exception as exc:
+            with self._lock:
+                self._snapshot.running = False
+                self._snapshot.completed = completed
+                self._snapshot.failed = failed
+                self._snapshot.error = str(exc)
+                self._snapshot.stage = "Failed"
+                self._snapshot.message = str(exc)
         finally:
             with self._lock:
                 self._active_llm = None

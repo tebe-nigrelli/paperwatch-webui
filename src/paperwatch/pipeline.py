@@ -289,6 +289,26 @@ class PaperWatch:
         text = "\n".join(lines).strip()
         return text[:100_000] or None
 
+    @staticmethod
+    def _arxiv_fallback_date(article: ArticleItem | None) -> str | None:
+        if article is None:
+            return None
+        match = re.search(
+            r"\bSubmitted\s+on\s+(\d{1,2}\s+[A-Z][a-z]{2}\s+\d{4})\b",
+            article.text,
+        )
+        if match is None:
+            match = re.search(
+                r"\[v1\]\s+\w{3},\s+(\d{1,2}\s+[A-Z][a-z]{2}\s+\d{4})\b",
+                article.text,
+            )
+        if match is None:
+            return None
+        try:
+            return datetime.strptime(match.group(1), "%d %b %Y").date().isoformat()
+        except ValueError:
+            return None
+
     def _import_arxiv_feed_item(
         self,
         stats: RunStats,
@@ -354,7 +374,11 @@ class PaperWatch:
                 arxiv_id=arxiv_id,
                 title=self._arxiv_fallback_title(arxiv_id, feed_title, article),
                 abstract=abstract,
-                publication_date=(published_at or "")[:10] or None,
+                publication_date=(
+                    self._arxiv_fallback_date(article)
+                    or (published_at or "")[:10]
+                    or None
+                ),
                 updated_date=None,
                 venue="arXiv",
                 publication_url=f"https://arxiv.org/abs/{arxiv_id}",

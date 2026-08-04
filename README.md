@@ -2,7 +2,7 @@
 
 Paperwatch is a local, daily research-paper tracker for a curated set of authors. It discovers papers through OpenAlex, fills missing abstract and open-PDF metadata from arXiv, stores everything in SQLite, and produces strict structured summaries with Ollama, OpenAI, OpenAI Codex, or Claude Code models.
 
-Version 0.9.9 adds non-reloading table filters and metadata edits, shared notes and tags for papers, blog entries, authors, and blog sources, safe bulk tag editing with undo, CSV metadata round-tripping, manual PDF replacement and integrity checks, and regexp test panes for saved queries. The unified Content table now uses compact paper/blog icons, keeps the selected-content panel hidden until needed, and visually distinguishes read rows.
+Version 0.10.2 makes the Content page memory-bounded. Table queries no longer load stored article bodies, rendered HTML, diffs, abstracts, or metadata; the default page and selected-content preview are limited to 25 records; and large searchable dropdowns render only a small filtered window instead of duplicating every option in the DOM. It also includes the 0.10.1 select-all, notes-filtering, author-table, model-profile, and native PDF fixes.
 
 ## Main flow
 

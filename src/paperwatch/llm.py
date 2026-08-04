@@ -60,6 +60,16 @@ class LLMClient(Protocol):
     ) -> StructuredJSONResponse:
         ...
 
+    def generate_json_with_pdf(
+        self,
+        prompt: str,
+        pdf_path: Path,
+        *,
+        schema: dict[str, Any],
+        schema_name: str,
+    ) -> StructuredJSONResponse:
+        ...
+
     def set_runtime(
         self, progress: ProgressCallback | None, cancel_event: threading.Event | None
     ) -> None:
@@ -742,8 +752,15 @@ class CodexClient(OpenAIClient):
     def provider_name(self) -> str:
         return "OpenAI Codex"
 
-    def analyze_pdf(self, prompt: str, pdf_path: Path) -> LLMResponse:
-        """Upload the original PDF, attach it to one Responses API request, then delete it."""
+    def generate_json_with_pdf(
+        self,
+        prompt: str,
+        pdf_path: Path,
+        *,
+        schema: dict[str, Any],
+        schema_name: str,
+    ) -> StructuredJSONResponse:
+        """Upload one PDF and request arbitrary schema-constrained JSON."""
         if not self.api_key:
             raise LLMError(f"{self.provider_name} API key is missing")
         path = Path(pdf_path)
@@ -768,9 +785,7 @@ class CodexClient(OpenAIClient):
                 raise LLMError("OpenAI Codex file upload returned no file ID")
             file_id = upload_payload["id"]
 
-            request_payload = self._request_payload(
-                prompt, schema=ANALYSIS_JSON_SCHEMA, schema_name="paper_analysis"
-            )
+            request_payload = self._request_payload(prompt, schema=schema, schema_name=schema_name)
             request_payload["input"] = [
                 {
                     "role": "user",
@@ -788,22 +803,38 @@ class CodexClient(OpenAIClient):
             if response.is_error:
                 raise self._http_error(response)
             structured = self._structured_response(response.json())
-            result = AnalysisResult.model_validate(structured.data).model_copy(
-                update={"generated_by_model": model_attribution(self.model)}
-            )
             usage = dict(structured.usage)
             usage["input_file_bytes"] = path.stat().st_size
-            return LLMResponse(result=result, usage=usage, raw=structured.raw)
+            return StructuredJSONResponse(
+                data=structured.data, usage=usage, raw=structured.raw
+            )
         except LLMError:
             raise
         except (OSError, httpx.HTTPError, ValueError, ValidationError) as exc:
-            raise LLMError(f"{self.provider_name} PDF analysis failed: {exc}") from exc
+            raise LLMError(f"{self.provider_name} PDF request failed: {exc}") from exc
         finally:
             if file_id:
                 try:
                     self.client.delete(f"{self.base_url}/files/{file_id}", headers=headers)
                 except httpx.HTTPError:
                     pass
+
+    def analyze_pdf(self, prompt: str, pdf_path: Path) -> LLMResponse:
+        try:
+            response = self.generate_json_with_pdf(
+                prompt,
+                pdf_path,
+                schema=ANALYSIS_JSON_SCHEMA,
+                schema_name="paper_analysis",
+            )
+            result = AnalysisResult.model_validate(response.data).model_copy(
+                update={"generated_by_model": model_attribution(self.model)}
+            )
+            return LLMResponse(result=result, usage=response.usage, raw=response.raw)
+        except LLMError:
+            raise
+        except ValidationError as exc:
+            raise LLMError(f"{self.provider_name} PDF analysis failed: {exc}") from exc
 
 
 class ClaudeCodeClient:
@@ -966,6 +997,17 @@ class ClaudeCodeClient:
     ) -> StructuredJSONResponse:
         del schema_name
         return self._generate_json(prompt, schema=schema)
+
+    def generate_json_with_pdf(
+        self,
+        prompt: str,
+        pdf_path: Path,
+        *,
+        schema: dict[str, Any],
+        schema_name: str,
+    ) -> StructuredJSONResponse:
+        del schema_name
+        return self._generate_json(prompt, schema=schema, pdf_path=Path(pdf_path))
 
     def analyze(self, prompt: str) -> LLMResponse:
         try:

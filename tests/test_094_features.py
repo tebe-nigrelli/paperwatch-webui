@@ -233,7 +233,7 @@ def test_catalog_and_full_data_management_round_trip(
     config = load_config(config_path)
     client = _client(config_path)
 
-    runs = client.get("/runs")
+    runs = client.get("/data")
     assert runs.status_code == 200
     for label in (
         "Delete all authors",

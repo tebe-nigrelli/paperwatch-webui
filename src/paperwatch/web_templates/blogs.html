@@ -15,7 +15,7 @@
   <form method="post" action="/queries/run-blogs" class="saved-prompt-runner">
     {% for entry in entries %}<input type="hidden" name="blog_entry_id" value="{{ entry.id }}">{% endfor %}
     <label class="grow"><span>Saved query</span><select name="query_id" required>{% for query in saved_queries %}<option value="{{ query.id }}" {% if selected_query_id == query.id %}selected{% endif %}>{{ query.name }}{% if query.local_regexp %} · local regexp{% endif %}</option>{% endfor %}</select></label>
-    {% if model_profiles %}<fieldset class="model-options"><legend>Models</legend>{% for profile in model_profiles %}<label class="model-option"><input type="checkbox" name="model" value="{{ profile.profile }}" {% if loop.first %}checked{% endif %}><span><strong>{{ profile.profile }}</strong><small>{{ profile.provider }} · {{ profile.model }}</small></span></label>{% endfor %}</fieldset>{% endif %}
+    {% if model_profiles %}<label><span>Models</span><select name="model" multiple size="5" required data-model-picker data-search-placeholder="Search model profiles">{% for profile in model_profiles %}<option value="{{ profile.profile }}" {% if loop.first %}selected{% endif %}>{{ profile.profile }} · {{ profile.provider }} · {{ profile.model }}</option>{% endfor %}</select></label>{% endif %}
     <div class="model-run-actions"><label><span>Context window tokens</span><input type="number" name="context_window_tokens" min="512" max="1000000" value="16384"></label><button class="button button-primary" type="submit" {% if query_state.running %}disabled{% endif %}>Run on visible blogs</button></div>
   </form>
 </section>

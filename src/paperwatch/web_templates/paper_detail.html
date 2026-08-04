@@ -1,13 +1,12 @@
 {% extends "base.html" %}
 {% block title %}{{ paper.title }} · paperwatch{% endblock %}
 {% block content %}
+<div class="paper-detail-root" data-pdf-drop-target>
 <section class="page-heading paper-heading"{% if not paper.read_at %} data-auto-read data-content-type="paper" data-content-id="{{ paper.id }}"{% endif %}>
   <div class="paper-meta"><span>{{ paper.publication_date or 'Unknown date' }}</span><span>{{ paper.venue or 'Venue unavailable' }}</span></div>
   <h1{% if paper.notes or paper.pdf_modified %} class="object-name-noted"{% endif %}>{{ paper.title }}</h1>
   {% if topics %}<div class="topic-tags paper-topic-tags" aria-label="OpenAlex topics">{% for topic in topics %}<a class="tag topic-tag{% if topic.is_primary %} active{% endif %}" href="/?topic={{ topic.openalex_id }}" title="{% if topic.score is not none %}OpenAlex relevance {{ '%.3f'|format(topic.score) }}{% endif %}{% if topic.subfield_name %} · {{ topic.subfield_name }}{% endif %}">{{ topic.display_name }}</a>{% endfor %}</div>{% endif %}
 </section>
-
-<section class="panel content-tags-panel"><div class="panel-heading"><div><h2>Tags</h2><p>Tags are shared with blog entries and searchable from both lists.</p></div></div><div class="content-tag-editor"><div class="content-tag-row">{% for tag in paper_tags %}{% if tag.generated %}<span class="tag generated-tag" title="Managed by a classifier query">{{ tag.name }}</span>{% else %}<form method="post" action="/papers/{{ paper.id }}/tags/remove" data-async-action data-refresh-selector=".content-tags-panel"><input type="hidden" name="tag" value="{{ tag.name }}"><button class="tag removable-tag" type="submit" title="Remove tag">{{ tag.name }} ×</button></form>{% endif %}{% else %}<span class="muted">No tags</span>{% endfor %}</div><form method="post" action="/papers/{{ paper.id }}/tags/add" class="inline-tag-form" data-async-action data-refresh-selector=".content-tags-panel"><label><span>Add tag</span><input name="tag" list="content-tag-options" maxlength="40" required></label><button class="button button-small" type="submit">Add</button></form><datalist id="content-tag-options">{% for tag in content_tags %}<option value="{{ tag.name }}">{% endfor %}</datalist></div></section>
 
 {% if classifications %}<section class="panel classification-panel"><div class="panel-heading"><div><h2>Classifier labels</h2><p>Values are constrained by their saved query. Manual changes remain fixed on later runs.</p></div></div><div class="classification-grid">{% for item in classifications %}<form method="post" action="/content/paper/{{ paper.id }}/classifications/{{ item.query_id }}" class="classification-row" data-async-action data-refresh-selector=".classification-panel"><label><span>{{ item.label_class }}</span><select name="value">{% for choice in item.choices %}<option value="{{ choice }}" {% if choice == item.value %}selected{% endif %}>{{ choice }}</option>{% endfor %}</select></label><button class="button button-small" type="submit">Set</button><a href="/queries#query-{{ item.query_id }}">{{ item.query_name }}</a></form>{% endfor %}</div></section>{% endif %}
 
@@ -32,7 +31,13 @@
 <section class="panel paper-reference-panel">
   <div class="paper-reference-layout">
     <div class="metadata-grid paper-reference-metadata">
-      <div><span>DOI</span><strong>{{ paper.doi or '—' }}</strong></div><div><span>arXiv</span><strong>{{ paper.arxiv_id or '—' }}</strong></div><div><span>OpenAlex</span><strong>{{ paper.openalex_id or '—' }}</strong></div><div><span>Fetched</span><strong>{{ paper.fetched_at }}</strong></div><div><span>Abstract source</span><strong>{{ paper.abstract_source or '—' }}</strong></div><div><span>PDF source</span><strong>{{ paper.pdf_source or '—' }}</strong></div>
+      <div><span>DOI</span><strong>{{ paper.doi or '—' }}</strong></div>
+      <div><span>arXiv</span><strong>{{ paper.arxiv_id or '—' }}</strong></div>
+      <div><span>OpenAlex</span><strong>{{ paper.openalex_id or '—' }}</strong></div>
+      <div><span>Fetched</span><strong>{{ paper.fetched_at }}</strong></div>
+      <div><span>Abstract source</span><strong>{{ paper.abstract_source or '—' }}</strong></div>
+      <div><span>PDF source</span><strong>{{ paper.pdf_source or '—' }}</strong></div>
+      <div class="metadata-tags"><span>Tags</span><div class="content-tag-row" data-detail-tags>{% for tag in paper_tags %}{% if tag.generated %}<span class="tag generated-tag" title="Managed by a classifier query">{{ tag.name }}</span>{% else %}<form method="post" action="/papers/{{ paper.id }}/tags/remove" data-async-action data-refresh-selector=".paper-reference-panel"><input type="hidden" name="tag" value="{{ tag.name }}"><button class="tag removable-tag" type="submit" title="Remove tag">{{ tag.name }} ×</button></form>{% endif %}{% else %}<span class="muted">No tags</span>{% endfor %}</div></div>
     </div>
     <div class="paper-link-groups">
       <div class="paper-link-group">
@@ -52,28 +57,28 @@
           {% if paper.pdf_modified and paper.pdf_url %}<form method="post" action="/papers/{{ paper.id }}/pdf/restore" data-confirm="Replace the local PDF with a fresh download from the stored source?"><button class="button button-warning" type="submit">Restore PDF</button></form>{% endif %}
           <a class="button" href="/papers/{{ paper.id }}/export.json">Export JSON</a>
         </div>
+        <form method="post" action="/papers/{{ paper.id }}/tags/add" class="inline-tag-form compact-action-form" data-async-action data-refresh-selector=".paper-reference-panel" data-enter-submit><label><span>Add tag</span><input name="tag" list="content-tag-options" maxlength="40" required placeholder="Type and press Enter"></label></form>
+        <form method="post" action="/papers/{{ paper.id }}/pdf/upload" enctype="multipart/form-data" class="inline-upload-form compact-action-form" data-pdf-upload-form><label><span>{{ 'Replace local PDF' if paper.local_pdf_path else 'Import PDF' }}</span><input type="file" name="pdf" accept="application/pdf,.pdf" required data-auto-upload></label></form>
+        {% if paper.pdf_modified %}<span class="status status-warning">{{ 'Missing on disk' if paper.pdf_missing_on_disk else 'Modified on disk' }}</span>{% endif %}
+        <small class="muted">Drop a PDF anywhere on this page to replace the local file.</small>
       </div>
     </div>
   </div>
+  <datalist id="content-tag-options">{% for tag in content_tags %}<option value="{{ tag.name }}">{% endfor %}</datalist>
 </section>
-
-<section class="panel pdf-management-panel"><div class="panel-heading"><div><h2>Local PDF</h2><p>Upload or overwrite a PDF manually. Paperwatch stores a hash and warns when the file changes on disk.</p></div>{% if paper.pdf_modified %}<span class="status status-warning">{{ 'Missing on disk' if paper.pdf_missing_on_disk else 'Modified on disk' }}</span>{% endif %}</div><form method="post" action="/papers/{{ paper.id }}/pdf/upload" enctype="multipart/form-data" class="inline-upload-form"><label class="grow"><span>PDF file</span><input type="file" name="pdf" accept="application/pdf,.pdf" required></label><button class="button button-primary" type="submit">{{ 'Replace local PDF' if paper.local_pdf_path else 'Import PDF' }}</button></form>{% if paper.pdf_sha256 %}<small class="muted">Stored hash: <code>{{ paper.pdf_sha256 }}</code></small>{% endif %}</section>
-<section class="panel object-notes-panel"><div class="panel-heading"><div><h2>Notes</h2><p>Private Markdown notes for this paper.</p></div></div>{% if paper.notes %}<article class="prose notes-rendered">{{ paper.notes|markdown|safe }}</article>{% else %}<p class="muted">No notes.</p>{% endif %}<details><summary>Edit notes</summary><form method="post" action="/notes/paper/{{ paper.id }}" data-async-action data-refresh-selector=".object-notes-panel"><textarea name="notes" rows="8" maxlength="200000" placeholder="Markdown notes">{{ paper.notes or '' }}</textarea><button class="button button-primary" type="submit">Save notes</button></form></details></section>
 {% if paper.abstract %}<section class="panel prose"><div class="panel-heading"><h2>Source abstract</h2></div><p>{{ paper.abstract }}</p></section>{% endif %}
+<section class="panel object-notes-panel inline-notes-panel" data-inline-notes><div class="panel-heading">{% if not paper.notes %}<div><h2>Notes</h2><p>Private Markdown notes for this paper.</p></div>{% else %}<span></span>{% endif %}<button class="button button-small" type="button" data-notes-edit>{{ 'Edit' if paper.notes else 'Add notes' }}</button></div><div data-notes-display>{% if paper.notes %}<article class="prose notes-rendered">{{ paper.notes|markdown|safe }}</article>{% else %}<p class="muted">No notes.</p>{% endif %}</div><form method="post" action="/notes/paper/{{ paper.id }}" data-async-action data-refresh-selector=".object-notes-panel" data-notes-form hidden><textarea name="notes" rows="8" maxlength="200000" placeholder="Markdown notes">{{ paper.notes or '' }}</textarea><div class="button-group"><button class="button button-primary" type="submit">Save notes</button><button class="button" type="button" data-notes-cancel>Cancel</button></div></form></section>
 
 <section class="panel model-runner">
   <div class="panel-heading"><div><h2>Run saved prompt</h2><p>Choose the prompt, models, source, PDF handling, and context for this run.</p></div>{% if query_state.running and query_state.paper_id == paper.id %}<span class="status status-running">running</span>{% endif %}</div>
   {% if saved_queries and model_profiles and (paper.abstract or paper.pdf_url or paper.local_pdf_path) %}
-  <form id="saved-prompt-form" data-paper-job="query" method="post" action="/papers/{{ paper.id }}/prompt" class="saved-prompt-runner">
-    <label class="grow"><span>Saved prompt</span><select name="query_id" required>{% for query in saved_queries %}<option value="{{ query.id }}">{{ query.name }}</option>{% endfor %}</select></label>
-    <fieldset class="model-options"><legend>Models</legend>{% for profile in model_profiles %}<label class="model-option"><input type="checkbox" name="model" value="{{ profile.profile }}" {% if loop.first %}checked{% endif %}><span><strong>{{ profile.profile }}</strong><small>{{ profile.provider }} · {{ profile.model }}{% if profile.reasoning_effort %} · reasoning {{ profile.reasoning_effort }}{% endif %}</small></span></label>{% endfor %}</fieldset>
-    <div class="model-run-actions">
-      <label><span>Source</span><select name="source_scope" data-source-scope>{% if paper.pdf_url or paper.local_pdf_path %}<option value="fulltext">Full paper PDF</option>{% endif %}{% if paper.abstract %}<option value="abstract">Abstract</option>{% endif %}</select></label>
-      <label><span>PDF strategy</span><select name="pdf_strategy" data-pdf-strategy><option value="chunked">Chunk + merge</option><option value="auto">Auto</option><option value="direct">Direct</option></select></label>
-      <label><span>Context window tokens</span><input type="number" name="context_window_tokens" min="512" max="1000000" value="16384"></label>
-      <button class="button button-primary" type="submit" {% if query_state.running %}disabled{% endif %}>Run saved prompt</button>
-    </div>
-    <p class="form-help">Auto uses one request when the selected source fits, otherwise it chunks and merges. Direct fails rather than truncating when the context is too small.</p>
+  <form id="saved-prompt-form" data-paper-job="query" method="post" action="/papers/{{ paper.id }}/prompt" class="collection-runner-form paper-saved-prompt-form" data-profile-controls>
+    <label><span>Saved query</span><select name="query_id" required>{% for query in saved_queries %}<option value="{{ query.id }}">{{ query.name }}</option>{% endfor %}</select><small>Uses this paper only.</small></label>
+    <label><span>Models</span><select name="model" multiple size="5" required data-model-picker data-search-placeholder="Search model profiles">{% for profile in model_profiles %}<option value="{{ profile.profile }}" {% if loop.first %}selected{% endif %} data-provider="{{ profile.provider }}" data-context-window="{{ profile.context_window_tokens or '' }}" data-pdf-strategy="{{ profile.pdf_analysis_strategy or 'auto' }}">{{ profile.profile }} · {{ profile.model }}{% if profile.reasoning_effort %} · {{ profile.reasoning_effort }}{% endif %}</option>{% endfor %}</select><small>Select one or more configured profiles.</small></label>
+    <label><span>Source</span><select name="source_scope" data-source-scope>{% if paper.pdf_url or paper.local_pdf_path %}<option value="fulltext">Full paper PDF</option>{% endif %}{% if paper.abstract %}<option value="abstract">Abstract</option>{% endif %}</select><small>Codex and Claude Code use the original PDF.</small></label>
+    <label><span>PDF strategy</span><select name="pdf_strategy" data-pdf-strategy><option value="chunked">Chunk + merge</option><option value="auto">Auto</option><option value="direct">Direct</option></select><small>Locked to the profile setting for native PDF providers.</small></label>
+    <label><span>Context window tokens</span><input type="number" name="context_window_tokens" min="512" max="1000000" value="16384" data-context-window><small>Locked to the selected native profile when applicable.</small></label>
+    <button class="button button-primary" type="submit" {% if query_state.running %}disabled{% endif %}>Run saved prompt</button>
   </form>
   {% elif not saved_queries %}<p class="form-help">Create a reusable prompt on <a href="/queries">Queries</a>.</p>
   {% elif not model_profiles %}<p class="muted">No active LLM profiles are configured.</p>
@@ -95,5 +100,6 @@
 {% if analyses %}<section class="panel"><div class="panel-heading"><div><h2>Paper summaries</h2><p>Open a summary without embedding its full output on this page.</p></div><span>{{ analyses|length }}</span></div><div class="table-wrap"><table><thead><tr><th>Source</th><th>Model</th><th>Created</th><th>Result</th></tr></thead><tbody>{% for analysis in analyses %}<tr><td>{{ analysis.scope }}</td><td>{{ analysis.model }}</td><td>{{ analysis.created_at }}</td><td><a href="/analyses/{{ analysis.id }}">Summary</a></td></tr>{% endfor %}</tbody></table></div></section>{% endif %}
 
 {% if prompt_runs %}<section class="panel prompt-results"><div class="panel-heading"><div><h2>Query results</h2><p>Completed saved queries run on this paper.</p></div><span>{{ prompt_runs|length }}</span></div><div class="table-wrap"><table><thead><tr><th>Query</th><th>Model</th><th>Status</th><th>Records</th><th>Created</th><th>Result</th></tr></thead><tbody>{% for run in prompt_runs %}<tr><td><a href="/queries#query-{{ run.query_id }}">{{ run.query_name }}</a></td><td>{{ run.model }}</td><td><span class="status status-{{ run.status }}">{{ run.status }}</span></td><td>{{ run.matched_count }}</td><td>{{ run.created_at }}</td><td><a href="/queries/runs/{{ run.id }}">Summary</a></td></tr>{% endfor %}</tbody></table></div></section>{% endif %}
+</div>
 </div>
 {% endblock %}

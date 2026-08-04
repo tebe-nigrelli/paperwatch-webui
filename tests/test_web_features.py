@@ -130,7 +130,8 @@ def test_recent_feed_theme_and_direct_links(
     assert "author-picker" in js
     assert "localStorage" in js
     assert "PDF strategy only applies" not in js
-    assert "strategy.disabled = !usesPdf" in js
+    assert "setLocked(strategy, locked || !usesPdf)" in js
+    assert 'control.setAttribute("aria-disabled", String(locked))' in js
     css = client.get("/static/app.css").text
     assert "@media(prefers-color-scheme:dark)" in css
     assert "--bg:#05070a" in css

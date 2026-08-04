@@ -1,8 +1,8 @@
-# Release audit — paperwatch 0.9.9
+# Release audit — paperwatch 0.10.2
 
 ## Result
 
-This revision adds asynchronous Content filtering and metadata edits, shared Markdown notes and tags across content, authors, and blog sources, safe bulk tag operations with undo, import-wide tags and complete CSV metadata round-tripping. It also adds manual PDF replacement, on-disk hash verification and restore controls, regexp test panes, compact paper/blog icons, modal scroll locking, and darker read rows.
+This revision adds a filtered-result select-all toggle, notes filtering, restored full author rows, compact persistent-selection controls, searchable model-profile pickers, and consistent saved-prompt layouts. Codex and Claude Code now use their configured native-PDF strategy and context settings and receive original PDF files directly, avoiding extracted-text context-window rejection.
 
 ## Verified behavior
 
@@ -48,7 +48,7 @@ This revision adds asynchronous Content filtering and metadata edits, shared Mar
 
 ## Compatibility review
 
-- Existing SQLite data migrates incrementally through schema version 22. Hidden initial RSS, GitHub, video, and child-article records from schema 16 are promoted to usable entries.
+- Existing SQLite data migrates incrementally through schema version 24. Hidden initial RSS, GitHub, video, and child-article records from schema 16 are promoted to usable entries.
 - Legacy saved-query arguments and `/papers/{id}/pdf` remain accepted for API/backward compatibility.
 - Daily fetch, backfill, manual import, summaries, saved prompts, multi-model runs, exports, author tracking, tags, active-run links, PDF validation/redownload, Ollama recovery, OpenAI, and Codex paths remain covered.
 - New templates and static assets are included by the existing package-data rules.
@@ -57,8 +57,8 @@ This revision adds asynchronous Content filtering and metadata edits, shared Mar
 
 | Check | Result |
 |---|---|
-| Deterministic tests | 378 passed in split execution |
-| Coverage policy | Existing 95% branch gate retained |
+| Deterministic tests | 415 passed |
+| Coverage policy | 95.06% branch-aware coverage |
 | Enforced minimum | 95% |
 | Python compilation | Passed |
 | Wheel build | Passed |

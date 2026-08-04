@@ -49,13 +49,13 @@ def client_for(config_path):
 def test_manual_author_and_blog_management_ui(config_path):
     config = load_config(config_path)
     client = client_for(config_path)
-    page = client.get("/authors")
+    page = client.get("/data")
     assert page.status_code == 200
     assert "Add author manually" in page.text
     assert "Import blog links" in page.text
     assert "Manual blog import" in page.text
     assert "Fetch new papers, download available PDFs" in page.text
-    assert 'href="/">Content</a>' in page.text
+    assert 'href="/" data-content-home-link>Content</a>' in page.text
 
     response = client.post(
         "/authors/manual",
@@ -357,14 +357,16 @@ def test_blog_saved_prompt_routes_and_collection_runner(config_path):
             "query_id": str(query_id),
             "model": "default",
             "context_window_tokens": "4096",
-            "blog_entry_id": [str(entry_id), str(entry_id), "bad"],
+            "content": "blogs",
+            "q": "Stored",
         },
         follow_redirects=False,
     )
     assert selected.status_code == 303
-    assert "Started+saved+query" in selected.headers["location"]
+    assert "Started+1+saved+query" in selected.headers["location"]
     selection = controller.calls[-1][1]["selection"]
-    assert selection["blog_entry_ids"] == [entry_id]
+    assert selection["content_type"] == "blogs"
+    assert selection["query"] == "Stored"
 
     all_entries = client.post(
         "/queries/run-blogs",
@@ -603,7 +605,7 @@ def test_author_openalex_id_is_editable_inline(config_path):
     assert 'data-author-openalex-column hidden' not in page.text
     assert 'id="toggle-author-ids"' not in page.text
     assert 'title="Edit the ID and press Enter"' in page.text
-    assert page.text.index('href="/">Content</a>') < page.text.index('href="/authors"')
+    assert page.text.index('href="/" data-content-home-link>Content</a>') < page.text.index('href="/authors"')
 
     blank = client.post(
         f"/authors/{local_id}/openalex-id",
@@ -657,5 +659,5 @@ def test_author_openalex_id_is_editable_inline(config_path):
     javascript = client.get("/static/app.js")
     assert 'getElementById("toggle-author-ids")' not in javascript.text
     assert '.author-table.author-ids-visible' not in css.text
-    assert '/static/app.css?v=0.9.9' in page.text
-    assert '/static/app.js?v=0.9.9' in page.text
+    assert '/static/app.css?v=0.10.2' in page.text
+    assert '/static/app.js?v=0.10.2' in page.text

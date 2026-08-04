@@ -138,7 +138,7 @@ def seed_content(config_path, author_candidate, paper_record):
 def test_query_content_scope_cleanup_and_schema(config_path):
     config = load_config(config_path)
     with Database(config.paths.database) as db:
-        assert SCHEMA_VERSION == 23
+        assert SCHEMA_VERSION == 24
         paper_query = db.create_saved_query(
             name="Paper only",
             prompt="Paper prompt",
@@ -258,7 +258,7 @@ def test_content_author_links_page_jump_query_result_and_controls(
     assert "data-cycle-toggle" in editor.text
     assert 'value="blogs" data-cycle-value' in editor.text
 
-    runs = web.get("/runs")
+    runs = web.get("/data")
     assert "Delete all queries" in runs.text
     assert "Delete query history" in runs.text
     assert runs.text.index("Authors and blog sources") < runs.text.index("Whole data")

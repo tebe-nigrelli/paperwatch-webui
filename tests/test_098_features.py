@@ -82,7 +82,7 @@ def test_schema_content_state_author_star_and_bulk_selection(
     paper_id, entry_id = seed(config_path, author_candidate, paper_record)
     config = load_config(config_path)
     with Database(config.paths.database) as db:
-        assert SCHEMA_VERSION == 23
+        assert SCHEMA_VERSION == 24
         assert db.get_paper(paper_id)["read_at"] is None
         assert db.get_blog_entry(entry_id)["read_at"] is None
         assert db.set_author_starred(author_candidate.openalex_id, True)
@@ -198,9 +198,10 @@ def test_web_star_selection_reading_classifier_and_author_csv_ui(
     assert "Classifier" in query_list.text
     assert f'/queries/{query_id}/classifications/delete' in query_list.text
 
+    data_page = web.get("/data")
+    assert "Author CSV import" in data_page.text
+    assert "Author CSV schema" in data_page.text
     authors = web.get("/authors")
-    assert "Author CSV import" in authors.text
-    assert "Author CSV schema" in authors.text
     assert 'name="starred"' in authors.text
     imported = web.post(
         "/authors/import",
