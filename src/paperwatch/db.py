@@ -1222,7 +1222,11 @@ class Database:
             raise ValueError("OpenAlex author ID must look like A123456789")
         with self.transaction() as conn:
             row = conn.execute(
-                "SELECT id, metadata_json FROM authors WHERE openalex_id=?",
+                """
+                SELECT id, metadata_json, notes, starred, orcid, institution,
+                       works_count, cited_by_count, added_at
+                FROM authors WHERE openalex_id=?
+                """,
                 (current,),
             ).fetchone()
             if row is None:
@@ -1231,26 +1235,101 @@ class Database:
             if replacement == current:
                 return True
             duplicate = conn.execute(
-                "SELECT id FROM authors WHERE openalex_id=? AND id<>?",
+                """
+                SELECT id, tracked, metadata_json, notes, starred, orcid,
+                       institution, works_count, cited_by_count, added_at
+                FROM authors WHERE openalex_id=? AND id<>?
+                """,
                 (replacement, author_id),
             ).fetchone()
-            if duplicate is not None:
+            if duplicate is not None and duplicate["tracked"]:
                 raise ValueError("OpenAlex author ID is already assigned to another author")
+
             try:
                 metadata = json.loads(row["metadata_json"] or "{}")
             except (TypeError, json.JSONDecodeError):
                 metadata = {}
             if not isinstance(metadata, dict):
                 metadata = {}
+
+            notes = str(row["notes"] or "").strip()
+            starred = int(row["starred"] or 0)
+            orcid = row["orcid"]
+            institution = row["institution"]
+            works_count = int(row["works_count"] or 0)
+            cited_by_count = int(row["cited_by_count"] or 0)
+            added_at = str(row["added_at"])
+
+            if duplicate is not None:
+                archived_id = int(duplicate["id"])
+                conn.execute(
+                    """
+                    INSERT OR IGNORE INTO author_blogs(
+                        author_id, blog_id, label, relationship
+                    )
+                    SELECT ?, blog_id, label, relationship
+                    FROM author_blogs WHERE author_id=?
+                    """,
+                    (author_id, archived_id),
+                )
+                conn.execute(
+                    """
+                    INSERT OR IGNORE INTO author_tag_links(author_id, tag_id)
+                    SELECT ?, tag_id FROM author_tag_links WHERE author_id=?
+                    """,
+                    (author_id, archived_id),
+                )
+                conn.execute(
+                    """
+                    UPDATE paper_authors
+                    SET tracked_author_id=?, openalex_author_id=?
+                    WHERE tracked_author_id=? OR openalex_author_id=?
+                    """,
+                    (author_id, replacement, archived_id, replacement),
+                )
+
+                try:
+                    archived_metadata = json.loads(duplicate["metadata_json"] or "{}")
+                except (TypeError, json.JSONDecodeError):
+                    archived_metadata = {}
+                if isinstance(archived_metadata, dict):
+                    metadata = {**archived_metadata, **metadata}
+
+                archived_notes = str(duplicate["notes"] or "").strip()
+                if archived_notes and archived_notes != notes:
+                    notes = f"{notes}\n\n{archived_notes}" if notes else archived_notes
+                starred = max(starred, int(duplicate["starred"] or 0))
+                orcid = orcid or duplicate["orcid"]
+                institution = institution or duplicate["institution"]
+                works_count = max(works_count, int(duplicate["works_count"] or 0))
+                cited_by_count = max(
+                    cited_by_count, int(duplicate["cited_by_count"] or 0)
+                )
+                archived_added_at = str(duplicate["added_at"])
+                added_at = min(added_at, archived_added_at)
+                conn.execute("DELETE FROM authors WHERE id=?", (archived_id,))
+
             metadata["papers_enabled"] = True
             conn.execute(
                 """
                 UPDATE authors
                 SET openalex_id=?, enabled=1, tracked=1, last_checked_at=NULL,
-                    metadata_json=?
+                    metadata_json=?, notes=?, starred=?, orcid=?, institution=?,
+                    works_count=?, cited_by_count=?, added_at=?
                 WHERE id=?
                 """,
-                (replacement, json_dumps(metadata), author_id),
+                (
+                    replacement,
+                    json_dumps(metadata),
+                    notes,
+                    starred,
+                    orcid,
+                    institution,
+                    works_count,
+                    cited_by_count,
+                    added_at,
+                    author_id,
+                ),
             )
             conn.execute(
                 """

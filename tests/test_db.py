@@ -864,3 +864,93 @@ def test_author_openalex_id_update_preserves_relationships(
         )
         db._conn.commit()
         assert db.update_author_openalex_id("A998", "A997") is True
+
+
+def test_author_openalex_id_update_reclaims_archived_id(
+    tmp_path, author_candidate, paper_record
+):
+    import json
+
+    with Database(tmp_path / "archived-author-id.sqlite") as db:
+        archived_id = db.add_author(author_candidate)
+        paper_id, _ = db.upsert_paper(paper_record)
+        db.add_author_blog(
+            "A123", "https://example.test/archived", label="Archived only"
+        )
+        db.add_author_blog(
+            "A123", "https://example.test/shared", label="Archived shared"
+        )
+        db.add_author_tag("A123", "archived")
+        db._conn.execute(
+            """
+            UPDATE authors
+            SET notes='Archived note', starred=1, metadata_json='{"archived": true}'
+            WHERE id=?
+            """,
+            (archived_id,),
+        )
+        db._conn.commit()
+        assert db.remove_author("A123")
+
+        current_id = db.add_manual_author("Manual Researcher", "Local Lab")
+        current = db.find_authors_by_name("Manual Researcher")[0]
+        current_openalex_id = str(current["openalex_id"])
+        db.add_author_blog(
+            current_openalex_id,
+            "https://example.test/current",
+            label="Current only",
+        )
+        db.add_author_blog(
+            current_openalex_id,
+            "https://example.test/shared",
+            label="Current shared",
+        )
+        db.add_author_tag(current_openalex_id, "current")
+        db._conn.execute(
+            """
+            UPDATE authors
+            SET notes='Current note', metadata_json='{"current": true}'
+            WHERE id=?
+            """,
+            (current_id,),
+        )
+        db._conn.commit()
+
+        assert db.update_author_openalex_id(current_openalex_id, "A123") is True
+
+        merged = db.get_author("A123")
+        assert merged is not None
+        assert merged["id"] == current_id
+        assert merged["tracked"] == 1 and merged["enabled"] == 1
+        assert merged["notes"] == "Current note\n\nArchived note"
+        assert merged["starred"] == 1
+        assert merged["orcid"] == author_candidate.orcid
+        assert merged["institution"] == "Local Lab"
+        assert merged["works_count"] == author_candidate.works_count
+        assert merged["cited_by_count"] == author_candidate.cited_by_count
+        assert json.loads(merged["metadata_json"]) == {
+            "archived": True,
+            "current": True,
+            "papers_enabled": True,
+        }
+        assert db._conn.execute("SELECT count(*) FROM authors").fetchone()[0] == 1
+
+        paper_author = db._conn.execute(
+            """
+            SELECT tracked_author_id, openalex_author_id
+            FROM paper_authors
+            WHERE paper_id=? AND openalex_author_id='A123'
+            """,
+            (paper_id,),
+        ).fetchone()
+        assert paper_author["tracked_author_id"] == current_id
+
+        listed = db.list_authors_with_tags()[0]
+        assert listed["tags"] == "archived, current"
+        blogs = {row["url"]: row for row in db.author_blogs("A123")}
+        assert set(blogs) == {
+            "https://example.test/archived",
+            "https://example.test/current",
+            "https://example.test/shared",
+        }
+        assert blogs["https://example.test/shared"]["label"] == "Current shared"
