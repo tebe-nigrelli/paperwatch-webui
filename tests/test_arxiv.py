@@ -16,7 +16,7 @@ def test_arxiv_by_id_parses_atom(fixture_dir):
 
     client = httpx.Client(transport=httpx.MockTransport(handler))
     api = ArxivClient(base_url="https://arxiv.test/query", client=client)
-    entry = api.by_id("2607.12345")
+    entry = api.by_id("2607.12345v1")
     assert entry is not None
     assert entry.arxiv_id == "2607.12345"
     assert entry.abstract.startswith("We introduce")

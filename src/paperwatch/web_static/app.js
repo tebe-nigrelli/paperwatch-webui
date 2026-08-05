@@ -695,6 +695,7 @@
             select.dispatchEvent(new Event("change", { bubbles: true }));
             syncInput();
             refresh(true);
+            autoApply();
           });
           chips.appendChild(chip);
         });
@@ -868,6 +869,13 @@
   };
 
   document.querySelectorAll("select").forEach((select, index) => enhanceSelect(select, index));
+
+  document.querySelectorAll("[data-display-stubs]").forEach((toggle) => {
+    toggle.addEventListener("change", () => {
+      const form = toggle.form || toggle.closest("form");
+      if (form && (form.method || "get").toLocaleLowerCase() === "get") form.requestSubmit();
+    });
+  });
   document.querySelectorAll("[data-model-picker]").forEach((select) => {
     select.dispatchEvent(new Event("change", { bubbles: true }));
   });

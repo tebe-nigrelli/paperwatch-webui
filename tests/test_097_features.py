@@ -13,10 +13,11 @@ import paperwatch.pipeline as pipeline_module
 from paperwatch.analysis_jobs import AnalysisBatchSnapshot
 from paperwatch.blogs import ArticleItem, BlogFetch, FeedItem, parse_feed
 from paperwatch.config import load_config
-from paperwatch.db import Database, SCHEMA_VERSION
+from paperwatch.db import Database, SCHEMA_VERSION, _blog_entry_is_stub
 from paperwatch.models import PaperRecord
 from paperwatch.pipeline import PaperWatch, RunStats
 from paperwatch.query_jobs import QueryBatchSnapshot
+from paperwatch.sources.arxiv import ArxivEntry
 from paperwatch.web import RunSnapshot, _website_view, create_app
 
 
@@ -93,6 +94,7 @@ def test_arxiv_rss_fallback_links_entry_to_paper_and_query_result(
     article_text = (
         "Title: A Useful arXiv Paper\n"
         f"URL: {article_url}\n"
+        "Submitted on 8 Jun 2016\n"
         "This is the abstract extracted from the linked arXiv page."
     )
     article = ArticleItem(
@@ -147,7 +149,11 @@ def test_arxiv_rss_fallback_links_entry_to_paper_and_query_result(
         papers, total = db.search_papers(query="Useful arXiv")
         assert total == 1
         paper_id = int(papers[0]["id"])
-        rss_entry = next(row for row in db.list_blog_entries() if row["entry_kind"] == "rss")
+        assert papers[0]["publication_date"] == "2016-06-08"
+        rss_entry = next(
+            row for row in db.list_blog_entries(show_stubs=True)
+            if row["entry_kind"] == "rss"
+        )
         entry_id = int(rss_entry["id"])
         assert rss_entry["linked_paper_id"] == paper_id
         query_id = db.create_saved_query(name="One blog", prompt="Summarize")
@@ -189,6 +195,111 @@ def test_arxiv_rss_fallback_links_entry_to_paper_and_query_result(
     assert source.get_text(strip=True) == "arxiv.org"
     assert source.get("href") == "https://arxiv.org/"
     client.close()
+
+
+def test_arxiv_import_uses_latest_version_metadata(config_path):
+    config = load_config(config_path)
+
+    class LatestArxiv:
+        def __init__(self):
+            self.calls = []
+
+        def by_id(self, arxiv_id):
+            self.calls.append(arxiv_id)
+            return ArxivEntry(
+                arxiv_id="1904.05115",
+                title="Stochastic distributed learning",
+                abstract="Latest abstract.",
+                authors=["Ada Lovelace"],
+                published="2019-04-10T00:00:00Z",
+                updated="2020-02-02T00:00:00Z",
+                abstract_url="https://arxiv.org/abs/1904.05115v3",
+                pdf_url="https://arxiv.org/pdf/1904.05115v3",
+            )
+
+    arxiv = LatestArxiv()
+    client = httpx.Client(
+        transport=httpx.MockTransport(lambda request: httpx.Response(404))
+    )
+    with Database(config.paths.database) as db:
+        app = PaperWatch(
+            config,
+            db=db,
+            openalex=NoPapers(),
+            arxiv=arxiv,
+            llm=NoLLM(),
+            pdf_client=client,
+        )
+        stats = RunStats(run_id=db.start_run())
+        paper_id = app._import_arxiv_feed_item(
+            stats,
+            "https://arxiv.org/abs/1904.05115v1",
+        )
+        paper = db.get_paper(int(paper_id))
+        assert arxiv.calls == ["1904.05115"]
+        assert paper["publication_url"].endswith("1904.05115v3")
+        assert paper["pdf_url"].endswith("1904.05115v3")
+    client.close()
+
+
+def test_stub_detection_covers_linked_papers_and_metadata_only_profiles():
+    profile = (
+        '"\nURL: https://cispa.de/en/people/jeremy.rack\n\n'
+        "Title: Jeremy Rack\n"
+        "URL: https://cispa.de/en/people/jeremy.rack\n"
+        "Jeremy Rack\n\""
+    )
+    assert _blog_entry_is_stub(
+        profile,
+        "Jeremy Rack",
+        "https://cispa.de/en/people/jeremy.rack",
+        None,
+    ) == 1
+    assert _blog_entry_is_stub(
+        "Title: Paper\nURL: https://arxiv.org/abs/1904.05115\nBrief teaser",
+        "Paper",
+        "https://arxiv.org/abs/1904.05115",
+        42,
+    ) == 1
+    assert _blog_entry_is_stub(
+        "Title: Note\nURL: https://example.test/note\nA short but real announcement.",
+        "Note",
+        "https://example.test/note",
+        None,
+    ) == 0
+
+
+def test_display_stubs_toggle_controls_blog_results(config_path, author_candidate):
+    config = load_config(config_path)
+    profile_url = "https://cispa.de/en/people/jeremy.rack"
+    profile_text = (
+        f"URL: {profile_url}\n\nTitle: Jeremy Rack\nURL: {profile_url}\nJeremy Rack"
+    )
+    with Database(config.paths.database) as db:
+        db.add_author(author_candidate)
+        blog_id = db.add_author_blog(author_candidate.openalex_id, profile_url)
+        db.save_blog_entry(
+            blog_id=blog_id,
+            title="Jeremy Rack",
+            content_sha256="profile-stub",
+            normalized_text=profile_text,
+            diff_text="",
+            change_kind="changed",
+            previous_entry_id=None,
+            entry_kind="snapshot",
+            source_url=profile_url,
+        )
+        assert db.count_blog_entries(show_stubs=False) == 0
+        assert db.count_blog_entries() == 1
+        assert db.count_blog_entries(show_stubs=True) == 1
+
+    web = web_client(config_path)
+    hidden = web.get("/?content=blogs")
+    assert "Jeremy Rack" not in hidden.text
+    shown = web.get("/?content=blogs&display_stubs=yes")
+    assert "Jeremy Rack" in shown.text
+    toggle = BeautifulSoup(shown.text, "html.parser").select_one("[data-display-stubs]")
+    assert toggle is not None and toggle.has_attr("checked")
 
 
 def test_schema_21_backfills_arxiv_blog_paper_links(
@@ -274,6 +385,8 @@ def test_dropdown_and_delete_layout_assets(config_path):
     script = web.get("/static/app.js").text
     assert "enabledOptions.length <= 5" in script
     assert "form.requestSubmit()" in script
+    assert "refresh(true);\n            autoApply();" in script
+    assert "data-display-stubs" in script
     assert "search-select-cycle" in script
     runs = web.get("/data")
     assert "delete-record-grid" in runs.text

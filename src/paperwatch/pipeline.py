@@ -319,7 +319,6 @@ class PaperWatch:
         url: str | None,
         *,
         feed_title: str | None = None,
-        published_at: str | None = None,
         article: ArticleItem | None = None,
     ) -> int | None:
         """Import and return the paper linked by a primary arXiv RSS URL.
@@ -378,11 +377,7 @@ class PaperWatch:
                 arxiv_id=arxiv_id,
                 title=self._arxiv_fallback_title(arxiv_id, feed_title, article),
                 abstract=abstract,
-                publication_date=(
-                    self._arxiv_fallback_date(article)
-                    or (published_at or "")[:10]
-                    or None
-                ),
+                publication_date=self._arxiv_fallback_date(article),
                 updated_date=None,
                 venue="arXiv",
                 publication_url=f"https://arxiv.org/abs/{arxiv_id}",
@@ -499,7 +494,6 @@ class PaperWatch:
                         stats,
                         item.url,
                         feed_title=item.title,
-                        published_at=item.published_at,
                         article=article,
                     )
                     if item.url and linked_paper_id is not None:

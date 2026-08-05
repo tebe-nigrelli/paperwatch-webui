@@ -41,6 +41,41 @@ DEFAULT_SUMMARY_QUERY_PROMPT = (
     "the selected source text and preserve the paper title and paper_id."
 )
 
+BLOG_STUB_MAX_CHARS = 500
+
+
+def _blog_entry_is_stub(
+    normalized_text: str | None,
+    title: str | None,
+    source_url: str | None,
+    linked_paper_id: int | None,
+) -> int:
+    """Return 1 for short imported-paper or metadata-only blog entries."""
+    text = str(normalized_text or "").strip()
+    if len(text) > BLOG_STUB_MAX_CHARS:
+        return 0
+    if linked_paper_id is not None:
+        return 1
+
+    normalized_title = " ".join(str(title or "").split()).casefold()
+    normalized_url = str(source_url or "").strip().rstrip("/").casefold()
+    meaningful: list[str] = []
+    for raw_line in text.splitlines():
+        line = " ".join(raw_line.strip().strip('"').split())
+        if not line or not any(character.isalnum() for character in line):
+            continue
+        lower = line.casefold()
+        if lower.startswith(("title:", "url:", "published:", "outbound links:")):
+            continue
+        if lower.startswith(("http://", "https://")):
+            continue
+        if normalized_url and lower.rstrip("/") == normalized_url:
+            continue
+        if normalized_title and lower == normalized_title:
+            continue
+        meaningful.append(lower)
+    return 0 if meaningful else 1
+
 
 def utcnow() -> str:
     return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
@@ -483,6 +518,12 @@ class Database:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self._conn = sqlite3.connect(self.path, timeout=10)
         self._conn.row_factory = sqlite3.Row
+        self._conn.create_function(
+            "paperwatch_blog_stub",
+            4,
+            _blog_entry_is_stub,
+            deterministic=True,
+        )
         self._conn.execute("PRAGMA foreign_keys = ON")
         self._conn.execute("PRAGMA journal_mode = WAL")
         self._conn.execute("PRAGMA busy_timeout = 10000")
@@ -2091,9 +2132,15 @@ class Database:
         notes: bool | None = None,
         selected: bool | None = None,
         analyzed: bool | None = None,
+        show_stubs: bool = True,
     ) -> tuple[str, list[Any]]:
         where = ["be.change_kind != 'baseline'", "b.dead=0"]
         params: list[Any] = []
+        if not show_stubs:
+            where.append(
+                "paperwatch_blog_stub(be.normalized_text, be.title, "
+                "COALESCE(be.source_url, b.url), be.linked_paper_id)=0"
+            )
         if query.strip():
             escaped = query.strip().replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
             term = f"%{escaped}%"
@@ -2250,6 +2297,7 @@ class Database:
         notes: bool | None = None,
         selected: bool | None = None,
         analyzed: bool | None = None,
+        show_stubs: bool = True,
         offset: int = 0,
         ids_only: bool = False,
         table_view: bool = False,
@@ -2269,6 +2317,7 @@ class Database:
             notes=notes,
             selected=selected,
             analyzed=analyzed,
+            show_stubs=show_stubs,
         )
         has_summary_sql = (
             "1"

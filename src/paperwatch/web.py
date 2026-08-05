@@ -88,6 +88,7 @@ class PaperFilters:
     starred: bool | None = None
     read: bool | None = None
     notes: bool | None = None
+    display_stubs: bool = False
     date_from: str = ""
     date_to: str = ""
     sort: str = "newest"
@@ -111,6 +112,7 @@ class PaperFilters:
             "starred": self.starred,
             "read": self.read,
             "notes": self.notes,
+            "display_stubs": self.display_stubs,
             "date_from": self.date_from,
             "date_to": self.date_to,
             "sort": self.sort,
@@ -131,6 +133,7 @@ class PaperFilters:
             ("starred", _bool_query(self.starred)),
             ("read", _bool_query(self.read)),
             ("notes", _bool_query(self.notes)),
+            ("display_stubs", "yes" if self.display_stubs else ""),
             ("date_from", self.date_from),
             ("date_to", self.date_to),
             ("sort", self.sort if self.sort != "newest" else ""),
@@ -152,6 +155,7 @@ class PaperFilters:
             ("starred", _bool_query(self.starred)),
             ("read", _bool_query(self.read)),
             ("notes", _bool_query(self.notes)),
+            ("display_stubs", "yes" if self.display_stubs else ""),
             ("date_from", self.date_from),
             ("date_to", self.date_to),
             ("sort", self.sort if self.sort != "newest" else ""),
@@ -602,6 +606,7 @@ def _parse_filter_values(params: Any) -> PaperFilters:
         starred=_parse_tristate(params.get("starred")),
         read=_parse_tristate(params.get("read")),
         notes=_parse_tristate(params.get("notes")),
+        display_stubs=_parse_tristate(params.get("display_stubs")) is True,
         date_from=_valid_date(params.get("date_from")),
         date_to=_valid_date(params.get("date_to")),
         sort=sort,
@@ -1492,6 +1497,7 @@ def create_app(
             "read": filters.read,
             "notes": filters.notes,
             "analyzed": filters.analyzed,
+            "show_stubs": filters.display_stubs,
         }
         blog_compatible_filters = not (
             filters.topic_id
@@ -1756,6 +1762,7 @@ def create_app(
             "notes": filters.notes,
             "selected": target_state,
             "analyzed": filters.analyzed,
+            "show_stubs": filters.display_stubs,
         }
         blog_compatible = not (
             filters.topic_id
