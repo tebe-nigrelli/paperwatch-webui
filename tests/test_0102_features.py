@@ -96,6 +96,21 @@ def test_large_search_selects_are_rendered_lazily():
     assert "list.replaceChildren(fragment)" in script
 
 
+def test_profile_controls_select_actual_controls_not_model_options():
+    """Model option metadata must not be mistaken for the PDF strategy control.
+
+    A broad ``[data-pdf-strategy]`` selector matches the first model ``option``.
+    Dispatching its change event bubbles to the model picker and recursively calls
+    profile synchronization until the browser tab is CPU-bound.
+    """
+    script = Path("src/paperwatch/web_static/app.js").read_text(encoding="utf-8")
+    assert 'form.querySelector("select[data-source-scope]")' in script
+    assert 'form.querySelector("select[data-pdf-strategy]")' in script
+    assert 'form.querySelector("input[data-context-window]")' in script
+    assert 'form.querySelector("select[data-model-picker]")' in script
+    assert 'form.querySelector("[data-pdf-strategy]")' not in script
+
+
 def test_filtered_select_all_is_set_based(
     config_path, author_candidate, paper_record
 ):
@@ -276,3 +291,128 @@ def test_content_blog_summary_lookup_is_not_correlated_per_row(
         assert len(rows) == 25
         assert all(int(row["has_summary"]) == 0 for row in rows)
         assert progress_calls < 500
+
+
+def test_bulk_blog_delete_is_bounded_and_empty_content_skips_blog_row_queries(
+    config_path, author_candidate, paper_record, monkeypatch
+):
+    config = load_config(config_path)
+    with Database(config.paths.database) as db:
+        db.add_author(author_candidate)
+        db.upsert_paper(paper_record)
+        blog_id = db.add_author_blog(
+            author_candidate.openalex_id, "https://example.test/delete-performance"
+        )
+        now = "2026-08-04T12:00:00+00:00"
+        db._conn.executemany(
+            """
+            INSERT INTO blog_entries(
+                id, blog_id, previous_entry_id, title, content_sha256,
+                normalized_text, diff_text, change_kind, entry_kind,
+                external_id, source_url, fetched_at
+            ) VALUES (?, ?, ?, ?, ?, 'body', '', 'changed', 'rss', ?, ?, ?)
+            """,
+            (
+                (
+                    index,
+                    blog_id,
+                    index - 1 if index > 1 else None,
+                    f"Entry {index}",
+                    f"hash-{index}",
+                    f"entry-{index}",
+                    f"https://example.test/delete-performance/{index}",
+                    now,
+                )
+                for index in range(1, 3_001)
+            ),
+        )
+        # Simulate an existing database created before the performance index.
+        db._conn.execute("DROP INDEX idx_blog_entries_previous")
+        db._conn.execute("DROP INDEX idx_blog_entries_blog")
+        db._conn.commit()
+
+    with Database(config.paths.database) as db:
+        indexes = {
+            str(row["name"])
+            for row in db._conn.execute("PRAGMA index_list(blog_entries)").fetchall()
+        }
+        assert "idx_blog_entries_previous" in indexes
+        assert "idx_blog_entries_blog" in indexes
+
+        progress_calls = 0
+
+        def count_steps() -> int:
+            nonlocal progress_calls
+            progress_calls += 1
+            return 0
+
+        db._conn.set_progress_handler(count_steps, 1_000)
+        try:
+            assert db.delete_all_blog_entries() == 3_000
+        finally:
+            db._conn.set_progress_handler(None, 0)
+        assert progress_calls < 1_000
+        assert db.count_blog_entries() == 0
+
+    def unexpected_blog_rows(*args, **kwargs):
+        raise AssertionError("empty Content pages must not build blog row metadata")
+
+    monkeypatch.setattr(Database, "list_blog_entries", unexpected_blog_rows)
+    client = web_client(config_path)
+    assert client.get("/").status_code == 200
+    assert client.get("/blogs").status_code == 200
+
+
+def test_empty_blog_content_skips_expensive_saved_prompt_filters(
+    config_path, author_candidate, monkeypatch
+):
+    """A remembered analyzed filter must not scan query history after bulk delete."""
+    config = load_config(config_path)
+    with Database(config.paths.database) as db:
+        db.add_author(author_candidate)
+        blog_id = db.add_author_blog(
+            author_candidate.openalex_id, "https://example.test/empty-history"
+        )
+        db.save_blog_entry(
+            blog_id=blog_id,
+            title="Deleted entry",
+            content_sha256="deleted-entry",
+            normalized_text="body",
+            diff_text="",
+            change_kind="changed",
+            previous_entry_id=None,
+            entry_kind="rss",
+            external_id="deleted-entry",
+            source_url="https://example.test/empty-history/entry",
+        )
+        query_id = db.create_saved_query(name="Historical prompt", prompt="Summarize")
+        now = "2026-08-04T12:00:00+00:00"
+        selection = json.dumps({"blog_entry_ids": list(range(1, 2_001))})
+        db._conn.executemany(
+            """
+            INSERT INTO query_runs(
+                batch_id, query_id, profile, provider, model, status,
+                context_window_tokens, selection_json, created_at, started_at, finished_at
+            ) VALUES (?, ?, ?, 'ollama', 'model', 'success', 2048, ?, ?, ?, ?)
+            """,
+            (
+                (f"historical-{index}", query_id, f"profile-{index}", selection, now, now, now)
+                for index in range(100)
+            ),
+        )
+        db._conn.commit()
+        assert db.delete_all_blog_entries() == 1
+        assert not db.has_visible_blog_entries()
+
+    def unexpected_filtered_blog_query(*args, **kwargs):
+        raise AssertionError(
+            "empty Content pages must not evaluate blog filters or saved-prompt history"
+        )
+
+    monkeypatch.setattr(Database, "count_blog_entries", unexpected_filtered_blog_query)
+    monkeypatch.setattr(Database, "list_blog_entries", unexpected_filtered_blog_query)
+
+    response = web_client(config_path).get("/?content=blogs&analyzed=yes")
+    assert response.status_code == 200
+    assert "0 matching records" in response.text
+    assert "No downloaded content matches this search." in response.text

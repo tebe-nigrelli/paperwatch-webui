@@ -98,6 +98,9 @@ def import_blog_links(
             except ValueError:
                 stats.invalid_urls += 1
                 continue
+            dead = str(row.get("Dead") or "").strip().casefold() in {
+                "1", "true", "yes", "on", "dead"
+            }
             blog_id = db.add_author_blog(
                 author_id,
                 url,
@@ -109,6 +112,7 @@ def import_blog_links(
                 ),
                 content_selector=content_selector,
                 article_url_pattern=article_url_pattern,
+                dead=dead,
             )
             tag_value = (
                 row.get("Primary tags") if source_index == 0
@@ -121,7 +125,7 @@ def import_blog_links(
             if str(notes).strip():
                 db.set_object_notes("blog_source", blog_id, str(notes))
             enabled = str(row.get("Enabled") or "yes").strip().casefold()
-            if enabled in {"0", "false", "no", "off", "disabled"}:
+            if not dead and enabled in {"0", "false", "no", "off", "disabled"}:
                 db.set_author_blog_broken(author_id, blog_id, True)
             stats.links += 1
     return stats

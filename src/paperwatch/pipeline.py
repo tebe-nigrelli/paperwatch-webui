@@ -19,7 +19,7 @@ from .analysis import analyze_pdf_file, analyze_text
 from .blogs import ArticleItem, BlogFetch, blog_diff, fetch_blog
 from .chunking import analyze_chunked_text, direct_prompt_fit
 from .config import AppConfig
-from .db import Database
+from .db import Database, DeadSourceError
 from .llm import (
     LLMClient, configure_context_window, configure_job_runtime, create_llm
 )
@@ -398,6 +398,8 @@ class PaperWatch:
             if is_new:
                 stats.papers_found += 1
                 stats.new_paper_ids.append(paper_id)
+        except DeadSourceError:
+            return None
         except JobCancelled:
             raise
         except Exception as exc:
@@ -1180,7 +1182,12 @@ class PaperWatch:
                 paper=paper,
             )
 
-        paper_id, is_new = self.db.upsert_paper(paper, auto_analyze=auto_analyze)
+        try:
+            paper_id, is_new = self.db.upsert_paper(
+                paper, auto_analyze=auto_analyze
+            )
+        except DeadSourceError:
+            return
         if is_new:
             stats.new_paper_ids.append(paper_id)
         stored = self.db.get_paper(paper_id)

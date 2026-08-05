@@ -873,7 +873,9 @@ def _paper_export(db: Database, row: Any) -> dict[str, Any]:
     return paper
 
 
-def _all_filtered(db: Database, filters: PaperFilters) -> list[Any]:
+def _all_filtered(
+    db: Database, filters: PaperFilters, *, include_dead: bool = False
+) -> list[Any]:
     rows, _ = db.search_papers(
         query=filters.query,
         title_query=filters.title_query,
@@ -892,6 +894,7 @@ def _all_filtered(db: Database, filters: PaperFilters) -> list[Any]:
         sort=filters.sort,
         limit=None,
         offset=0,
+        include_dead=include_dead,
     )
     return rows
 
@@ -1327,6 +1330,7 @@ def _csv_response(records: Iterable[dict[str, Any]]) -> Response:
         "doi",
         "arxiv_id",
         "openalex_id",
+        "dead",
         "abstract",
         "publication_url",
         "pdf_url",
@@ -1504,6 +1508,7 @@ def create_app(
             blog_total = 0
             selected_matching_papers = 0
             selected_matching_blogs = 0
+            has_blog_entries = db.has_visible_blog_entries()
             if content_filter != "blogs":
                 paper_rows, paper_total = db.search_papers(
                     **paper_filters,
@@ -1515,20 +1520,25 @@ def create_app(
                 _, selected_matching_papers = db.search_papers(
                     **paper_filters, selected=True, limit=0, offset=0
                 )
-            if content_filter != "papers" and blog_compatible_filters:
+            if (
+                has_blog_entries
+                and content_filter != "papers"
+                and blog_compatible_filters
+            ):
                 blog_total = db.count_blog_entries(
                     **{k: v for k, v in blog_filters.items() if k != "sort"}, selected=False
                 )
                 selected_matching_blogs = db.count_blog_entries(
                     **{k: v for k, v in blog_filters.items() if k != "sort"}, selected=True
                 )
-                blog_rows = db.list_blog_entries(
-                    **blog_filters,
-                    selected=False,
-                    limit=(filters.page_size if content_filter == "blogs" else prefetch),
-                    offset=(offset if content_filter == "blogs" else 0),
-                    table_view=True,
-                )
+                if blog_total:
+                    blog_rows = db.list_blog_entries(
+                        **blog_filters,
+                        selected=False,
+                        limit=(filters.page_size if content_filter == "blogs" else prefetch),
+                        offset=(offset if content_filter == "blogs" else 0),
+                        table_view=True,
+                    )
 
             selected_paper_rows, selected_paper_total = db.search_papers(
                 selected=True,
@@ -1537,12 +1547,18 @@ def create_app(
                 sort="discovered",
                 table_view=True,
             )
-            selected_blog_total = db.count_blog_entries(selected=True)
-            selected_blog_rows = db.list_blog_entries(
-                limit=SELECTED_CONTENT_PREVIEW_LIMIT,
-                selected=True,
-                sort="discovered",
-                table_view=True,
+            selected_blog_total = (
+                db.count_blog_entries(selected=True) if has_blog_entries else 0
+            )
+            selected_blog_rows = (
+                db.list_blog_entries(
+                    limit=SELECTED_CONTENT_PREVIEW_LIMIT,
+                    selected=True,
+                    sort="discovered",
+                    table_view=True,
+                )
+                if selected_blog_total
+                else []
             )
             selected_state = db.selected_content_state()
             author_rows = db.list_authors_with_tags(tracked_only=True)
@@ -1877,7 +1893,7 @@ def create_app(
             "Researcher / author", "Current lab / organization",
             "Primary applied-ML source", "Primary source URL", "Relationship to author",
             "Primary source type", "Primary source mode", "Primary content selector",
-            "Primary article URL pattern", "Primary tags", "Notes", "Enabled",
+            "Primary article URL pattern", "Primary tags", "Notes", "Enabled", "Dead",
         ]
         writer = csv.DictWriter(output, fieldnames=fields)
         writer.writeheader()
@@ -1897,6 +1913,7 @@ def create_app(
                         "Primary tags": blog["source_tags"] or "",
                         "Notes": blog["notes"] or "",
                         "Enabled": "yes" if blog["enabled"] else "no",
+                        "Dead": "yes" if blog["dead"] else "no",
                     })
         return Response(output.getvalue(), media_type="text/csv; charset=utf-8", headers={"Content-Disposition": 'attachment; filename="paperwatch-blogs.csv"'})
 
@@ -2293,6 +2310,19 @@ def create_app(
             status_code=303,
         )
 
+    @app.post("/authors/{openalex_id}/blogs/{blog_id}/delete")
+    def delete_author_blog_source(openalex_id: str, blog_id: int) -> RedirectResponse:
+        with Database(config.paths.database) as db:
+            if not db.mark_author_blog_dead(openalex_id, blog_id):
+                raise HTTPException(404, "Blog link not found")
+        return RedirectResponse(
+            _notice_url(
+                f"/authors/{quote_plus(openalex_id)}/blogs",
+                "Blog source marked dead; it will not be fetched or re-imported.",
+            ),
+            status_code=303,
+        )
+
     @app.get("/blogs", response_class=HTMLResponse)
     def blog_feed(request: Request) -> HTMLResponse:
         return _render_content_page(request, default_content="blogs")
@@ -2423,6 +2453,19 @@ def create_app(
             entry_tags=entry_tags,
             content_tags=content_tags,
             classifications=classifications,
+        )
+
+    @app.post("/blogs/{entry_id}/delete")
+    def delete_blog_source(entry_id: int) -> RedirectResponse:
+        with Database(config.paths.database) as db:
+            if not db.mark_blog_entry_source_dead(entry_id):
+                raise HTTPException(404, "Blog update not found")
+        return RedirectResponse(
+            _notice_url(
+                "/?content=blogs",
+                "Blog source marked dead; it will not be fetched or re-imported.",
+            ),
+            status_code=303,
         )
 
     @app.post("/blogs/{entry_id}/prompt")
@@ -2898,6 +2941,19 @@ def create_app(
             classifications=classifications,
         )
 
+    @app.post("/papers/{paper_id}/delete")
+    def delete_paper(paper_id: int) -> RedirectResponse:
+        with Database(config.paths.database) as db:
+            if not db.mark_paper_dead(paper_id):
+                raise HTTPException(404, "Paper not found")
+        return RedirectResponse(
+            _notice_url(
+                "/?content=papers",
+                "Paper marked dead; its identifiers and source links will not be fetched again.",
+            ),
+            status_code=303,
+        )
+
     @app.post("/papers/{paper_id}/authors/{openalex_id}/add")
     def add_paper_author(paper_id: int, openalex_id: str) -> RedirectResponse:
         with Database(config.paths.database) as db:
@@ -3226,7 +3282,7 @@ def create_app(
     @app.get("/papers/{paper_id}/export.json")
     def export_paper(paper_id: int) -> JSONResponse:
         with Database(config.paths.database) as db:
-            paper = db.get_paper(paper_id)
+            paper = db.get_paper(paper_id, include_dead=True)
             if paper is None:
                 raise HTTPException(404, "Paper not found")
             payload = _paper_export(db, paper)
@@ -3270,7 +3326,10 @@ def create_app(
             raise HTTPException(404, "Unknown export format")
         filters = _parse_filters(request)
         with Database(config.paths.database) as db:
-            records = [_paper_export(db, row) for row in _all_filtered(db, filters)]
+            records = [
+                _paper_export(db, row)
+                for row in _all_filtered(db, filters, include_dead=True)
+            ]
         if format == "csv":
             return _csv_response(records)
         if format == "jsonl":

@@ -56,6 +56,7 @@
           {% if paper.pdf_url %}<a class="button" href="{{ paper.pdf_url }}" target="_blank" rel="noreferrer">Source PDF</a>{% endif %}
           {% if paper.pdf_modified and paper.pdf_url %}<form method="post" action="/papers/{{ paper.id }}/pdf/restore" data-confirm="Replace the local PDF with a fresh download from the stored source?"><button class="button button-warning" type="submit">Restore PDF</button></form>{% endif %}
           <a class="button" href="/papers/{{ paper.id }}/export.json">Export JSON</a>
+          <form method="post" action="/papers/{{ paper.id }}/delete" data-confirm="Mark this paper and all stored identifiers/source links as dead? It will not be fetched again."><button class="button button-danger" type="submit">Delete</button></form>
         </div>
         <form method="post" action="/papers/{{ paper.id }}/tags/add" class="inline-tag-form compact-action-form" data-async-action data-refresh-selector=".paper-reference-panel" data-enter-submit><label><span>Add tag</span><input name="tag" list="content-tag-options" maxlength="40" required placeholder="Type and press Enter"></label></form>
         <form method="post" action="/papers/{{ paper.id }}/pdf/upload" enctype="multipart/form-data" class="inline-upload-form compact-action-form" data-pdf-upload-form><label><span>{{ 'Replace local PDF' if paper.local_pdf_path else 'Import PDF' }}</span><input type="file" name="pdf" accept="application/pdf,.pdf" required data-auto-upload></label></form>

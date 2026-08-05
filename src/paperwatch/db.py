@@ -20,7 +20,7 @@ from .models import (
 )
 
 
-SCHEMA_VERSION = 25
+SCHEMA_VERSION = 26
 BLOG_SOURCE_MODES = {
     "auto",
     "feed",
@@ -87,6 +87,7 @@ CREATE TABLE IF NOT EXISTS papers (
     starred INTEGER NOT NULL DEFAULT 0,
     read_at TEXT,
     selected INTEGER NOT NULL DEFAULT 0,
+    dead INTEGER NOT NULL DEFAULT 0,
     notes TEXT NOT NULL DEFAULT '',
     abstract_source TEXT,
     pdf_source TEXT,
@@ -148,6 +149,7 @@ CREATE TABLE IF NOT EXISTS blogs (
     title TEXT,
     notes TEXT NOT NULL DEFAULT '',
     enabled INTEGER NOT NULL DEFAULT 1,
+    dead INTEGER NOT NULL DEFAULT 0,
     etag TEXT,
     last_modified TEXT,
     feed_url TEXT,
@@ -198,6 +200,10 @@ CREATE TABLE IF NOT EXISTS blog_entries (
     fetched_at TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_blog_entries_feed ON blog_entries(fetched_at DESC, id DESC);
+CREATE INDEX IF NOT EXISTS idx_blog_entries_blog
+ON blog_entries(blog_id, change_kind, id);
+CREATE INDEX IF NOT EXISTS idx_blog_entries_previous
+ON blog_entries(previous_entry_id);
 CREATE TABLE IF NOT EXISTS known_blog_articles (
     blog_id INTEGER NOT NULL REFERENCES blogs(id) ON DELETE CASCADE,
     article_url TEXT NOT NULL,
@@ -467,6 +473,10 @@ class DatabaseError(RuntimeError):
     pass
 
 
+class DeadSourceError(ValueError):
+    pass
+
+
 class Database:
     def __init__(self, path: str | Path):
         self.path = Path(path)
@@ -523,9 +533,13 @@ class Database:
                 "pdf_size": "INTEGER",
                 "pdf_mtime_ns": "INTEGER",
                 "pdf_modified_on_disk": "INTEGER NOT NULL DEFAULT 0",
+                "dead": "INTEGER NOT NULL DEFAULT 0",
                 "notes": "TEXT NOT NULL DEFAULT ''",
             },
-            "blogs": {"notes": "TEXT NOT NULL DEFAULT ''"},
+            "blogs": {
+                "dead": "INTEGER NOT NULL DEFAULT 0",
+                "notes": "TEXT NOT NULL DEFAULT ''",
+            },
             "blog_entries": {"notes": "TEXT NOT NULL DEFAULT ''"},
         }
         for table, definitions in additions.items():
@@ -1284,6 +1298,7 @@ class Database:
         source_mode: str = "auto",
         content_selector: str | None = None,
         article_url_pattern: str | None = None,
+        dead: bool = False,
     ) -> int:
         identifier = self._author_id(openalex_id)
         cleaned_url = url.strip()
@@ -1302,14 +1317,20 @@ class Database:
             ).fetchone()
             if author is None:
                 raise ValueError("Author not found")
+            existing = conn.execute(
+                "SELECT id, dead FROM blogs WHERE url=?", (cleaned_url,)
+            ).fetchone()
+            if existing is not None and existing["dead"] and not dead:
+                raise DeadSourceError("Blog source is marked dead and will not be fetched")
             conn.execute(
                 """
                 INSERT INTO blogs(
-                    url, title, enabled, source_mode, content_selector,
+                    url, title, enabled, dead, source_mode, content_selector,
                     article_url_pattern, added_at
-                ) VALUES (?, ?, 1, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(url) DO UPDATE SET
-                    enabled=1,
+                    enabled=CASE WHEN excluded.dead=1 THEN 0 ELSE 1 END,
+                    dead=CASE WHEN excluded.dead=1 THEN 1 ELSE blogs.dead END,
                     source_mode=CASE
                         WHEN blogs.source_mode='auto' THEN excluded.source_mode
                         ELSE blogs.source_mode
@@ -1322,6 +1343,8 @@ class Database:
                 (
                     cleaned_url,
                     cleaned_label,
+                    0 if dead else 1,
+                    1 if dead else 0,
                     cleaned_mode,
                     cleaned_selector,
                     cleaned_pattern,
@@ -1388,6 +1411,7 @@ class Database:
             linked = conn.execute(
                 """
                 SELECT b.url, b.source_mode, b.content_selector, b.article_url_pattern
+                     , b.dead
                 FROM authors a
                 JOIN author_blogs ab ON ab.author_id=a.id
                 JOIN blogs b ON b.id=ab.blog_id
@@ -1397,6 +1421,8 @@ class Database:
             ).fetchone()
             if linked is None:
                 return False
+            if linked["dead"]:
+                raise DeadSourceError("Blog source is marked dead and cannot be restored")
             current_url = str(linked["url"])
             effective_mode = cleaned_mode or str(linked["source_mode"] or "auto")
             effective_selector = (
@@ -1489,15 +1515,18 @@ class Database:
         with self.transaction() as conn:
             linked = conn.execute(
                 """
-                SELECT 1
+                SELECT b.dead
                 FROM authors a
                 JOIN author_blogs ab ON ab.author_id=a.id
+                JOIN blogs b ON b.id=ab.blog_id
                 WHERE a.openalex_id=? AND a.tracked=1 AND ab.blog_id=?
                 """,
                 (identifier, blog_id),
             ).fetchone()
             if linked is None:
                 return False
+            if linked["dead"]:
+                return bool(broken)
             conn.execute(
                 """
                 UPDATE blogs
@@ -1514,6 +1543,42 @@ class Database:
                 ),
             )
         return True
+
+    def mark_blog_dead(self, blog_id: int) -> bool:
+        """Permanently pause a blog URL while retaining its source history."""
+        with self.transaction() as conn:
+            cur = conn.execute(
+                """
+                UPDATE blogs
+                SET dead=1, enabled=0, last_error='Marked dead by user'
+                WHERE id=?
+                """,
+                (blog_id,),
+            )
+            if cur.rowcount:
+                conn.execute(
+                    "UPDATE blog_entries SET selected=0 WHERE blog_id=?", (blog_id,)
+                )
+        return cur.rowcount > 0
+
+    def mark_author_blog_dead(self, openalex_id: str, blog_id: int) -> bool:
+        identifier = self._author_id(openalex_id)
+        linked = self._conn.execute(
+            """
+            SELECT 1
+            FROM authors a
+            JOIN author_blogs ab ON ab.author_id=a.id
+            WHERE a.openalex_id=? AND ab.blog_id=?
+            """,
+            (identifier, blog_id),
+        ).fetchone()
+        return bool(linked is not None and self.mark_blog_dead(blog_id))
+
+    def mark_blog_entry_source_dead(self, entry_id: int) -> bool:
+        row = self._conn.execute(
+            "SELECT blog_id FROM blog_entries WHERE id=?", (entry_id,)
+        ).fetchone()
+        return bool(row is not None and self.mark_blog_dead(int(row["blog_id"])))
 
     def author_blogs(self, openalex_id: str, *, tag: str = "") -> list[sqlite3.Row]:
         identifier = self._author_id(openalex_id)
@@ -1558,7 +1623,7 @@ class Database:
                 """
                 SELECT b.*
                 FROM blogs b
-                WHERE b.enabled=1 AND EXISTS (
+                WHERE b.enabled=1 AND b.dead=0 AND EXISTS (
                     SELECT 1 FROM author_blogs ab
                     JOIN authors a ON a.id=ab.author_id
                     WHERE ab.blog_id=b.id AND a.tracked=1
@@ -1948,7 +2013,7 @@ class Database:
         selected: bool | None = None,
         analyzed: bool | None = None,
     ) -> tuple[str, list[Any]]:
-        where = ["be.change_kind != 'baseline'"]
+        where = ["be.change_kind != 'baseline'", "b.dead=0"]
         params: list[Any] = []
         if query.strip():
             escaped = query.strip().replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
@@ -2053,6 +2118,31 @@ class Database:
                 f"be.id {operator} ({self._successful_blog_entry_ids_sql()})"
             )
         return " AND ".join(where), params
+
+    def has_visible_blog_entries(self) -> bool:
+        """Return whether any active, user-visible blog entry exists.
+
+        This intentionally avoids filters and query-history joins. Content pages use
+        it as a cheap guard before evaluating expensive filters such as
+        ``analyzed=yes``.
+        """
+        if self._conn.execute(
+            "SELECT 1 FROM blog_entries LIMIT 1"
+        ).fetchone() is None:
+            return False
+        return bool(
+            self._conn.execute(
+                """
+                SELECT EXISTS(
+                    SELECT 1
+                    FROM blogs b
+                    JOIN blog_entries be ON be.blog_id=b.id
+                    WHERE b.dead=0 AND be.change_kind != 'baseline'
+                    LIMIT 1
+                )
+                """
+            ).fetchone()[0]
+        )
 
     def count_blog_entries(self, **filters: Any) -> int:
         where_sql, params = self._blog_entry_filter_sql(**filters)
@@ -2307,7 +2397,7 @@ class Database:
                     ORDER BY name COLLATE NOCASE
                 )), '') AS content_tags
             FROM blog_entries be JOIN blogs b ON b.id=be.blog_id
-            WHERE be.id=?
+            WHERE be.id=? AND b.dead=0
             """,
             (entry_id,),
         ).fetchone()
@@ -2513,6 +2603,27 @@ class Database:
         self, paper: PaperRecord, *, auto_analyze: bool = True
     ) -> tuple[int, bool]:
         existing = self._find_existing_paper(paper)
+        if existing is not None and existing["dead"]:
+            raise DeadSourceError(
+                "Paper identifiers are marked dead and will not be fetched"
+            )
+        for source_url in (paper.publication_url, paper.pdf_url):
+            if not source_url:
+                continue
+            dead_source = self._conn.execute(
+                """
+                SELECT id FROM papers
+                WHERE dead=1 AND (
+                    publication_url=? COLLATE NOCASE OR pdf_url=? COLLATE NOCASE
+                )
+                LIMIT 1
+                """,
+                (source_url, source_url),
+            ).fetchone()
+            if dead_source is not None:
+                raise DeadSourceError(
+                    "Paper source link is marked dead and will not be fetched"
+                )
         now = utcnow()
         metadata = json_dumps(paper.metadata)
 
@@ -2693,13 +2804,36 @@ class Database:
                 (url, source, utcnow(), paper_id),
             )
 
-    def get_paper(self, paper_id: int) -> sqlite3.Row | None:
-        return self._conn.execute("SELECT * FROM papers WHERE id = ?", (paper_id,)).fetchone()
+    def mark_paper_dead(self, paper_id: int) -> bool:
+        """Keep a paper tombstone so its identifiers and links cannot be re-fetched."""
+        with self.transaction() as conn:
+            cur = conn.execute(
+                """
+                UPDATE papers
+                SET dead=1, auto_analyze=0, selected=0
+                WHERE id=?
+                """,
+                (paper_id,),
+            )
+        return cur.rowcount > 0
+
+    def get_paper(
+        self, paper_id: int, *, include_dead: bool = False
+    ) -> sqlite3.Row | None:
+        where = "id = ?" if include_dead else "id = ? AND dead=0"
+        return self._conn.execute(
+            f"SELECT * FROM papers WHERE {where}", (paper_id,)
+        ).fetchone()
 
     def list_papers(self, limit: int = 20) -> list[sqlite3.Row]:
         return list(
             self._conn.execute(
-                "SELECT * FROM papers ORDER BY publication_date DESC, id DESC LIMIT ?", (limit,)
+                """
+                SELECT * FROM papers
+                WHERE dead=0
+                ORDER BY publication_date DESC, id DESC LIMIT ?
+                """,
+                (limit,),
             ).fetchall()
         )
 
@@ -2709,7 +2843,7 @@ class Database:
             self._conn.execute(
                 """
                 SELECT * FROM papers
-                WHERE COALESCE(publication_date, discovered_at) >= ?
+                WHERE dead=0 AND COALESCE(publication_date, discovered_at) >= ?
                 ORDER BY COALESCE(publication_date, discovered_at) DESC, id DESC
                 """,
                 (since,),
@@ -2723,9 +2857,9 @@ class Database:
                 (SELECT count(*) FROM authors WHERE tracked = 1) AS authors,
                 (SELECT count(*) FROM authors WHERE enabled = 1 AND tracked = 1) AS enabled_authors,
                 (SELECT count(*) FROM authors WHERE tracked = 0) AS archived_authors,
-                (SELECT count(*) FROM papers) AS papers,
-                (SELECT count(*) FROM papers WHERE abstract IS NOT NULL) AS with_abstract,
-                (SELECT count(*) FROM papers WHERE pdf_url IS NOT NULL OR local_pdf_path IS NOT NULL) AS with_pdf,
+                (SELECT count(*) FROM papers WHERE dead=0) AS papers,
+                (SELECT count(*) FROM papers WHERE dead=0 AND abstract IS NOT NULL) AS with_abstract,
+                (SELECT count(*) FROM papers WHERE dead=0 AND (pdf_url IS NOT NULL OR local_pdf_path IS NOT NULL)) AS with_pdf,
                 (SELECT count(*) FROM analyses) AS analyses,
                 (SELECT count(DISTINCT paper_id) FROM analyses) AS analyzed_papers
             """
@@ -2742,7 +2876,7 @@ class Database:
             """
             SELECT substr(publication_date, 1, 4) AS year, count(*) AS count
             FROM papers
-            WHERE publication_date IS NOT NULL AND length(publication_date) >= 4
+            WHERE dead=0 AND publication_date IS NOT NULL AND length(publication_date) >= 4
             GROUP BY year
             ORDER BY year DESC
             LIMIT 8
@@ -2775,8 +2909,9 @@ class Database:
         selected: bool | None = None,
         date_from: str = "",
         date_to: str = "",
+        include_dead: bool = False,
     ) -> tuple[str, list[Any]]:
-        where: list[str] = []
+        where: list[str] = [] if include_dead else ["p.dead=0"]
         params: list[Any] = []
         if query:
             where.append(
@@ -2955,6 +3090,7 @@ class Database:
         offset: int = 0,
         ids_only: bool = False,
         table_view: bool = False,
+        include_dead: bool = False,
     ) -> tuple[list[sqlite3.Row], int]:
         where_sql, params = self._paper_filter_sql(
             query=query,
@@ -2975,6 +3111,7 @@ class Database:
             selected=selected,
             date_from=date_from,
             date_to=date_to,
+            include_dead=include_dead,
         )
         order_map = {
             "newest": "COALESCE(p.publication_date, '') DESC, p.id DESC",
@@ -3906,6 +4043,13 @@ class Database:
         """Delete downloaded blog content but retain configured source links."""
         with self.transaction() as conn:
             count = int(conn.execute("SELECT count(*) FROM blog_entries").fetchone()[0])
+            # Every row is about to be removed. Clearing the self-reference once
+            # avoids repeated ON DELETE SET NULL updates while SQLite walks the
+            # table, and the index above keeps the remaining FK checks bounded.
+            conn.execute(
+                "UPDATE blog_entries SET previous_entry_id=NULL "
+                "WHERE previous_entry_id IS NOT NULL"
+            )
             conn.execute("DELETE FROM blog_entries")
             conn.execute("DELETE FROM known_blog_articles")
             conn.execute(
@@ -3966,7 +4110,7 @@ class Database:
                     SELECT b.id, b.url, COALESCE(ab.label, b.title, '') AS label,
                            COALESCE(ab.relationship, '') AS relationship,
                            b.source_mode, b.content_selector, b.article_url_pattern,
-                           b.enabled, b.notes,
+                           b.enabled, b.dead, b.notes,
                            COALESCE((SELECT group_concat(ct.name, ', ') FROM blog_source_tag_links bstl
                                JOIN content_tags ct ON ct.id=bstl.tag_id
                                WHERE bstl.blog_id=b.id), '') AS tags
@@ -4042,6 +4186,7 @@ class Database:
                     source_mode=str(blog.get("source_mode") or "auto"),
                     content_selector=str(blog.get("content_selector") or "") or None,
                     article_url_pattern=str(blog.get("article_url_pattern") or "") or None,
+                    dead=bool(blog.get("dead", 0)),
                 )
                 self.set_object_notes("blog_source", blog_id, str(blog.get("notes") or ""))
                 raw_tags = blog.get("tags")

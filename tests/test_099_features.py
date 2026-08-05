@@ -93,7 +93,7 @@ def test_schema_notes_shared_tags_mass_actions_and_catalog_roundtrip(
     paper_id, blog_id, entry_id = seed(config_path, author_candidate, paper_record)
     config = load_config(config_path)
     with Database(config.paths.database) as db:
-        assert SCHEMA_VERSION == 25
+        assert SCHEMA_VERSION == 26
         author = db.get_author(author_candidate.openalex_id)
         assert author is not None
         assert db.set_object_notes("author", int(author["id"]), "**Author note**")

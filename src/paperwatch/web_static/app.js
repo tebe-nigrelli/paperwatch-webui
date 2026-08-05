@@ -203,10 +203,10 @@
   });
 
   document.querySelectorAll("form").forEach((form) => {
-    const source = form.querySelector("[data-source-scope]");
-    const strategy = form.querySelector("[data-pdf-strategy]");
-    const context = form.querySelector("[data-context-window]");
-    const models = form.querySelector("[data-model-picker]");
+    const source = form.querySelector("select[data-source-scope]");
+    const strategy = form.querySelector("select[data-pdf-strategy]");
+    const context = form.querySelector("input[data-context-window]");
+    const models = form.querySelector("select[data-model-picker]");
     if (!models && !context && (!source || !strategy)) return;
     const setLocked = (control, locked) => {
       if (!control) return;
