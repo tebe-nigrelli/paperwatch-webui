@@ -5139,6 +5139,37 @@ class Database:
             )
         return int(cur.lastrowid)
 
+    def update_run_stats(self, run_id: int, stats: dict[str, int]) -> None:
+        """Persist counters for an in-progress fetch without completing it."""
+        with self.transaction() as conn:
+            conn.execute(
+                """
+                UPDATE runs SET authors_checked=?, papers_found=?, papers_analyzed=?,
+                    pdfs_downloaded=?, blogs_checked=?, blog_updates_found=?,
+                    errors_count=?, authors_total=?, papers_downloadable=?,
+                    papers_downloaded=?, blogs_total=?, blogs_with_content=?,
+                    blog_items_available=?, blog_items_downloaded=?
+                WHERE id=? AND status='running'
+                """,
+                (
+                    stats.get("authors_checked", 0),
+                    stats.get("papers_found", 0),
+                    stats.get("papers_analyzed", 0),
+                    stats.get("pdfs_downloaded", 0),
+                    stats.get("blogs_checked", 0),
+                    stats.get("blog_updates_found", 0),
+                    stats.get("errors_count", 0),
+                    stats.get("authors_total", 0),
+                    stats.get("papers_downloadable", 0),
+                    stats.get("papers_downloaded", 0),
+                    stats.get("blogs_total", 0),
+                    stats.get("blogs_with_content", 0),
+                    stats.get("blog_items_available", 0),
+                    stats.get("blog_items_downloaded", 0),
+                    run_id,
+                ),
+            )
+
     def finish_run(
         self,
         run_id: int,

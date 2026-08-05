@@ -69,6 +69,25 @@ def test_analysis_cache_and_run_accounting(tmp_path, paper_record, analysis_resu
         assert db.get_analysis(paper_id, "abstract", "ollama", "m", "v1", digest)["one_sentence_summary"]
 
         run_id = db.start_run()
+        db.update_run_stats(
+            run_id,
+            {
+                "authors_total": 3,
+                "authors_checked": 1,
+                "papers_found": 2,
+                "papers_downloadable": 1,
+                "blogs_total": 4,
+                "blogs_checked": 2,
+                "blog_items_available": 5,
+                "errors_count": 1,
+            },
+        )
+        running = db.get_run(run_id)
+        assert running["status"] == "running"
+        assert running["finished_at"] is None
+        assert running["authors_total"] == 3
+        assert running["papers_found"] == 2
+        assert running["blogs_checked"] == 2
         db.record_error(run_id, stage="test", message="boom", author_openalex_id="A123")
         db.finish_run(
             run_id,

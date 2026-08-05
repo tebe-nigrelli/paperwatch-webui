@@ -160,7 +160,18 @@ class PaperWatch:
         publish(self._progress, "stage", stage)
         publish(self._progress, "progress", f"0/{self._progress_total}")
 
-    def _advance_progress(self, message: str) -> None:
+    def _publish_run_stats(self, stats: RunStats) -> None:
+        if stats.run_id is None:
+            return
+        values = stats.as_dict()
+        self.db.update_run_stats(stats.run_id, values)
+        publish(
+            self._progress,
+            "run_stats",
+            json.dumps({"run_id": stats.run_id, **values}),
+        )
+
+    def _advance_progress(self, message: str, stats: RunStats | None = None) -> None:
         self._progress_current = min(
             self._progress_total,
             self._progress_current + 1,
@@ -171,6 +182,8 @@ class PaperWatch:
             f"{self._progress_current}/{self._progress_total}",
         )
         publish(self._progress, "message", message)
+        if stats is not None:
+            self._publish_run_stats(stats)
 
     def close(self) -> None:
         if self._owns_pdf_client:
@@ -207,6 +220,7 @@ class PaperWatch:
             author_openalex_id=author_id,
             paper_identity_key=paper.identity_key if paper else None,
         )
+        self._publish_run_stats(stats)
 
     def _fetch_blog_batch(
         self, blogs: list[Any]
@@ -393,6 +407,7 @@ class PaperWatch:
             if is_new:
                 stats.papers_found += 1
                 stats.new_paper_ids.append(paper_id)
+                self._publish_run_stats(stats)
         except DeadSourceError:
             return None
         except JobCancelled:
@@ -899,7 +914,7 @@ class PaperWatch:
                 exc=RuntimeError(f"{blog['url']}: {exc}"),
             )
         finally:
-            self._advance_progress(f"Checked blog {blog['url']}")
+            self._advance_progress(f"Checked blog {blog['url']}", stats)
 
     def _apply_blog_batch(
         self,
@@ -1019,6 +1034,7 @@ class PaperWatch:
             )
         if outcome.created:
             stats.papers_analyzed += 1
+            self._publish_run_stats(stats)
         return outcome.result
 
     @staticmethod
@@ -1090,6 +1106,7 @@ class PaperWatch:
 
         stats._downloadable_paper_ids.add(paper_id)
         stats.papers_downloadable = len(stats._downloadable_paper_ids)
+        self._publish_run_stats(stats)
 
         destination = self.config.paths.pdf_dir / safe_pdf_name(paper.identity_key)
         try:
@@ -1119,6 +1136,7 @@ class PaperWatch:
         self.db.set_local_pdf(paper_id, str(destination), pdf_sha256(destination))
         stats._downloaded_paper_ids.add(paper_id)
         stats.papers_downloaded = len(stats._downloaded_paper_ids)
+        self._publish_run_stats(stats)
 
         should_analyze = analyze or (downloaded and analyze_new_downloads)
         if (
@@ -1141,6 +1159,7 @@ class PaperWatch:
             )
             if outcome.created:
                 stats.papers_analyzed += 1
+                self._publish_run_stats(stats)
             return
         text = extract_pdf_text(
             destination, max_chars=self.config.fetch.max_pdf_chars
@@ -1224,6 +1243,8 @@ class PaperWatch:
                 author_id=author_id,
                 paper=paper,
             )
+        finally:
+            self._publish_run_stats(stats)
 
     @staticmethod
     def _local_pdf_missing(row: Any) -> bool:
@@ -1275,7 +1296,7 @@ class PaperWatch:
                     exc=RuntimeError(f"{title}: {exc}"),
                 )
             finally:
-                self._advance_progress(f"Retried PDF for {title}")
+                self._advance_progress(f"Retried PDF for {title}", stats)
 
     @staticmethod
     def _run_identity(paper: PaperRecord) -> str:
@@ -1313,6 +1334,7 @@ class PaperWatch:
     def _fetch_title_locked(self, title: str) -> tuple[RunStats, int | None]:
         stats = RunStats()
         stats.run_id = self.db.start_run()
+        self._publish_run_stats(stats)
         paper_id: int | None = None
         try:
             matches = self.openalex.search_works(title, limit=10)
@@ -1335,6 +1357,7 @@ class PaperWatch:
     def _fetch_work_locked(self, work_id: str) -> tuple[RunStats, int | None]:
         stats = RunStats()
         stats.run_id = self.db.start_run()
+        self._publish_run_stats(stats)
         try:
             paper = self.openalex.get_work(work_id)
             return self._download_selected_paper(stats, paper)
@@ -1354,11 +1377,14 @@ class PaperWatch:
         self, stats: RunStats, paper: PaperRecord
     ) -> tuple[RunStats, int | None]:
         blogs = self.db.list_enabled_blogs()
+        stats.blogs_total = len(blogs)
+        self._publish_run_stats(stats)
         self._start_progress(1 + len(blogs), "Fetching selected paper and blogs")
         blog_executor, blog_future = self._start_blog_fetches(blogs)
         try:
             check_cancelled(self._cancel_event)
             stats.papers_found = 1
+            self._publish_run_stats(stats)
             try:
                 paper = self._enrich_from_arxiv(paper)
             except Exception as exc:
@@ -1384,7 +1410,7 @@ class PaperWatch:
             except Exception as exc:
                 paper_error = _SelectedPaperDownloadError(str(exc), paper_id)
             finally:
-                self._advance_progress(f"Fetched paper {paper.title}")
+                self._advance_progress(f"Fetched paper {paper.title}", stats)
 
             # A manual paper fetch is a complete fetch cycle too. Blog network
             # requests start before paper enrichment/download and are committed
@@ -1435,6 +1461,7 @@ class PaperWatch:
             raise ValueError("max_papers_per_author_override must be at least 1")
         stats = RunStats()
         stats.run_id = self.db.start_run()
+        self._publish_run_stats(stats)
         current_day = today or datetime.now(timezone.utc).date()
         seen_papers: set[str] = set()
         implicit_analysis = (
@@ -1457,6 +1484,7 @@ class PaperWatch:
             blogs = [] if historical else self.db.list_enabled_blogs()
             stats.authors_total = len(authors)
             stats.blogs_total = len(blogs)
+            self._publish_run_stats(stats)
             self._start_progress(
                 len(authors) + len(retry_rows) + len(blogs),
                 (
@@ -1500,6 +1528,7 @@ class PaperWatch:
                     )
                 else:
                     stats.authors_checked += 1
+                    self._publish_run_stats(stats)
                     for paper in papers:
                         check_cancelled(self._cancel_event)
                         run_identity = self._run_identity(paper)
@@ -1507,6 +1536,7 @@ class PaperWatch:
                             continue
                         seen_papers.add(run_identity)
                         stats.papers_found += 1
+                        self._publish_run_stats(stats)
                         try:
                             self._process_paper(
                                 stats,
@@ -1531,7 +1561,7 @@ class PaperWatch:
                     if not implicit_analysis or not self._llm_preflight_failed:
                         self.db.mark_author_checked(author_id)
                 finally:
-                    self._advance_progress(f"Checked author {author['name']}")
+                    self._advance_progress(f"Checked author {author['name']}", stats)
 
             self._retry_missing_pdfs(
                 stats,
@@ -1670,7 +1700,9 @@ class PaperWatch:
                     self.db.finish_query_run(
                         run_id, matched_count=0, input_chars=0, error=str(exc)
                     )
-                    self._advance_progress(f"{query_name} failed before model execution")
+                    self._advance_progress(
+                        f"{query_name} failed before model execution", stats
+                    )
                 self._record_error(
                     stats,
                     stage=f"automatic_{content_type}_query",
@@ -1738,5 +1770,6 @@ class PaperWatch:
                     if llm is not None and owns_llm:
                         llm.close()
                     self._advance_progress(
-                        f"Ran {query_name} with {profile_name} on new {content_type}"
+                        f"Ran {query_name} with {profile_name} on new {content_type}",
+                        stats,
                     )

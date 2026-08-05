@@ -1115,6 +1115,81 @@ def test_runs_page_lists_active_summary_and_prompt_links(config_path, seeded_web
     assert f'href="/papers/{paper_id}"' in response.text
 
 
+def test_runs_page_exposes_live_fetch_history_counters(config_path, seeded_web):
+    config, *_ = seeded_web
+    stats = {
+        "authors_total": 4,
+        "authors_checked": 2,
+        "papers_found": 7,
+        "papers_downloadable": 5,
+        "papers_downloaded": 3,
+        "papers_analyzed": 1,
+        "pdfs_downloaded": 3,
+        "blogs_total": 6,
+        "blogs_checked": 4,
+        "blogs_with_content": 3,
+        "blog_items_available": 9,
+        "blog_items_downloaded": 8,
+        "blog_updates_found": 2,
+        "errors_count": 1,
+    }
+    with Database(config.paths.database) as db:
+        run_id = db.start_run()
+        db.update_run_stats(run_id, stats)
+    controller = StubController(
+        snapshot=RunSnapshot(
+            running=True,
+            run_id=run_id,
+            status="running",
+            stats=stats,
+            stage="Fetching papers, PDFs, and blogs",
+        )
+    )
+    client, _ = make_client(config_path, controller=controller)
+    response = client.get("/runs")
+    assert f'data-fetch-history-run-id="{run_id}"' in response.text
+    assert 'data-fetch-stat="authors_checked">2</strong>' in response.text
+    assert 'data-fetch-stat="blog_items_downloaded">8</strong>' in response.text
+    assert client.get("/api/running-status").json()["fetch"]["stats"] == stats
+    script = client.get("/static/app.js").text
+    assert "updateFetchHistory" in script
+    assert "data-fetch-history-run-id" in script
+
+
+def test_run_controller_accepts_live_fetch_stats(tmp_path):
+    published = threading.Event()
+    release = threading.Event()
+
+    def runner(path, mode, query, progress, cancel_event):
+        progress(
+            "run_stats",
+            json.dumps(
+                {
+                    "run_id": 17,
+                    "authors_total": 5,
+                    "authors_checked": 2,
+                    "papers_found": 9,
+                }
+            ),
+        )
+        published.set()
+        release.wait(2)
+        return {"run_id": 17, "status": "success", "papers_found": 9}
+
+    controller = RunController(tmp_path / "config.toml", runner=runner)
+    assert controller.start()
+    assert published.wait(1)
+    snapshot = controller.snapshot()
+    assert snapshot.run_id == 17
+    assert snapshot.stats == {
+        "authors_total": 5,
+        "authors_checked": 2,
+        "papers_found": 9,
+    }
+    release.set()
+    controller.wait()
+
+
 def test_run_controller_download_and_pipeline_mode(monkeypatch, config_path, tmp_path):
     calls = []
 

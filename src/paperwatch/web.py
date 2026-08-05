@@ -280,6 +280,21 @@ class RunController:
                 if separator:
                     self._snapshot.progress_current = _int_or_none(current) or 0
                     self._snapshot.progress_total = _int_or_none(total) or 0
+            elif kind == "run_stats":
+                try:
+                    payload = json.loads(value)
+                except (TypeError, json.JSONDecodeError):
+                    return
+                if not isinstance(payload, dict):
+                    return
+                run_id = _int_or_none(payload.pop("run_id", None))
+                if run_id is not None:
+                    self._snapshot.run_id = run_id
+                self._snapshot.stats = {
+                    str(key): int(item)
+                    for key, item in payload.items()
+                    if isinstance(item, int)
+                }
 
     def cancel(self) -> bool:
         with self._lock:

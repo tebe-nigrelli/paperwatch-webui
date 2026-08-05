@@ -533,11 +533,39 @@
     const liveRows = Array.from(runningJobsBody.querySelectorAll("tr[data-live-kind]"))
       .filter((row) => row.dataset.liveKind);
     if (liveRows.length) {
+      const updateFetchHistory = (snapshot) => {
+        const runId = Number(snapshot.run_id || 0);
+        if (!runId) return true;
+        const row = document.querySelector(
+          `[data-fetch-history-run-id="${runId}"]`,
+        );
+        if (!row) {
+          window.location.reload();
+          return false;
+        }
+        const stats = snapshot.stats || {};
+        row.querySelectorAll("[data-fetch-stat]").forEach((element) => {
+          const key = element.dataset.fetchStat;
+          if (key && Object.prototype.hasOwnProperty.call(stats, key)) {
+            element.textContent = String(stats[key] || 0);
+          }
+        });
+        const status = row.querySelector("[data-fetch-status]");
+        if (status) {
+          const value = snapshot.cancel_requested ? "stopping" : "running";
+          status.textContent = value;
+          status.className = `status status-${value}`;
+        }
+        const finished = row.querySelector("[data-fetch-finished]");
+        if (finished) finished.textContent = "Running";
+        return true;
+      };
       const pollRunning = async () => {
         try {
           const response = await fetch("/api/running-status", { cache: "no-store" });
           if (!response.ok) throw new Error("status unavailable");
           const payload = await response.json();
+          if (!updateFetchHistory(payload.fetch || {})) return;
           let anyRunning = false;
           liveRows.forEach((row) => {
             const snapshot = payload[row.dataset.liveKind] || {};
