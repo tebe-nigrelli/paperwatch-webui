@@ -60,12 +60,18 @@ def _blog_entry_is_stub(
     normalized_title = " ".join(str(title or "").split()).casefold()
     normalized_url = str(source_url or "").strip().rstrip("/").casefold()
     meaningful: list[str] = []
+    in_outbound_links = False
     for raw_line in text.splitlines():
         line = " ".join(raw_line.strip().strip('"').split())
         if not line or not any(character.isalnum() for character in line):
             continue
         lower = line.casefold()
-        if lower.startswith(("title:", "url:", "published:", "outbound links:")):
+        if lower.startswith("outbound links:"):
+            in_outbound_links = True
+            continue
+        if lower.startswith(("title:", "url:", "published:")):
+            continue
+        if in_outbound_links and ("http://" in lower or "https://" in lower):
             continue
         if lower.startswith(("http://", "https://")):
             continue
@@ -2426,6 +2432,30 @@ class Database:
             return list(self._conn.execute(sql, tuple(params)).fetchall())
         return list(
             self._conn.execute(sql + " LIMIT ? OFFSET ?", (*params, limit, offset)).fetchall()
+        )
+
+    def list_blog_stubs_for_enrichment(self, limit: int = 100) -> list[sqlite3.Row]:
+        """Return recent unexpanded stubs that may point at a full article page."""
+        return list(
+            self._conn.execute(
+                """
+                SELECT be.*, b.url AS blog_url
+                FROM blog_entries be
+                JOIN blogs b ON b.id=be.blog_id
+                WHERE be.change_kind != 'baseline'
+                  AND b.dead=0
+                  AND paperwatch_blog_stub(
+                      be.normalized_text,
+                      be.title,
+                      COALESCE(be.source_url, b.url),
+                      be.linked_paper_id
+                  )=1
+                  AND be.normalized_text NOT LIKE '%Imported page content:%'
+                ORDER BY COALESCE(be.published_at, be.fetched_at) DESC, be.id DESC
+                LIMIT ?
+                """,
+                (max(1, min(int(limit), 100)),),
+            ).fetchall()
         )
 
     def blog_entries_by_ids(

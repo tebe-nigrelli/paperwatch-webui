@@ -86,6 +86,123 @@ def test_arxiv_feed_urls_are_https_and_clickable():
     assert "Open source" in (items[0].rendered_html or "")
 
 
+def test_stub_links_are_fetched_appended_and_dated(config_path, author_candidate):
+    config = load_config(config_path)
+    requested: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requested.append(str(request.url))
+        if request.url.host == "huggingface.co":
+            return httpx.Response(
+                200,
+                headers={"content-type": "text/html"},
+                text="""<html><head><title>ScarfBench</title>
+                <meta property="article:published_time" content="2026-06-30T09:00:00Z">
+                </head><body><main><h1>ScarfBench</h1>
+                <p>Full benchmark article content with methods, results, and discussion.</p>
+                </main></body></html>""",
+            )
+        if request.url.host == "www.sh-reya.com":
+            return httpx.Response(
+                200,
+                headers={"content-type": "text/html"},
+                text="""<html><head><title>New grad advice</title></head><body><main>
+                <time datetime="2020-07-24">Jul 24, 2020</time>
+                <h1>Choosing Between a PhD and Industry</h1>
+                <p>Full advice article discussing graduate school and industry choices.</p>
+                </main></body></html>""",
+            )
+        raise AssertionError(f"Unexpected fetch: {request.url}")
+
+    client = httpx.Client(transport=httpx.MockTransport(handler))
+    with Database(config.paths.database) as db:
+        db.add_author(author_candidate)
+        db.add_author_blog(
+            author_candidate.openalex_id,
+            "https://example.test/publications",
+            source_mode="publications",
+        )
+        blog_id = int(db.author_blogs(author_candidate.openalex_id)[0]["id"])
+
+        scarf_url = "https://huggingface.co/blog/ibm-research/scarfbench"
+        scarf_text = f'Title: ScarfBench\nURL: {scarf_url}\nScarfBench'
+        scarf_id = db.save_blog_entry(
+            blog_id=blog_id,
+            title="ScarfBench",
+            content_sha256=hashlib.sha256(scarf_text.encode()).hexdigest(),
+            normalized_text=scarf_text,
+            diff_text="",
+            change_kind="changed",
+            previous_entry_id=None,
+            entry_kind="rss",
+            external_id="scarf-stub",
+            source_url=scarf_url,
+        )
+
+        advice_url = "https://www.sh-reya.com/blog/new-grad-advice/"
+        advice_text = (
+            "Title: New grad advice\n"
+            "URL: https://example.test/publications\n"
+            f"Outbound links:\n- New grad advice: {advice_url}"
+        )
+        advice_id = db.save_blog_entry(
+            blog_id=blog_id,
+            title="New grad advice",
+            content_sha256=hashlib.sha256(advice_text.encode()).hexdigest(),
+            normalized_text=advice_text,
+            diff_text="",
+            change_kind="changed",
+            previous_entry_id=None,
+            entry_kind="rss",
+            external_id="advice-stub",
+            source_url="https://example.test/publications",
+        )
+
+        profile_url = "https://cispa.de/en/people/jeremy.rack"
+        profile_text = f"Title: Jeremy Rack\nURL: {profile_url}\nJeremy Rack"
+        profile_id = db.save_blog_entry(
+            blog_id=blog_id,
+            title="Jeremy Rack",
+            content_sha256=hashlib.sha256(profile_text.encode()).hexdigest(),
+            normalized_text=profile_text,
+            diff_text="",
+            change_kind="changed",
+            previous_entry_id=None,
+            entry_kind="rss",
+            external_id="profile-stub",
+            source_url=profile_url,
+        )
+
+        app = PaperWatch(
+            config,
+            db=db,
+            openalex=NoPapers(),
+            arxiv=None,
+            llm=NoLLM(),
+            pdf_client=client,
+        )
+        stats = RunStats(run_id=db.start_run())
+        app._enrich_linked_blog_stubs(stats)
+
+        scarf = db.get_blog_entry(scarf_id)
+        advice = db.get_blog_entry(advice_id)
+        profile = db.get_blog_entry(profile_id)
+        assert scarf is not None and "Imported page content:" in scarf["normalized_text"]
+        assert "Full benchmark article content" in scarf["normalized_text"]
+        assert scarf["published_at"] == "2026-06-30"
+        assert advice is not None and "Full advice article" in advice["normalized_text"]
+        assert advice["published_at"] == "2020-07-24"
+        assert profile is not None and profile["normalized_text"] == profile_text
+        assert set(requested) == {scarf_url, advice_url}
+        assert len(requested) == 2
+        assert stats.blog_items_downloaded == 2
+        assert {int(row["id"]) for row in db.list_blog_entries(show_stubs=False)} == {
+            scarf_id,
+            advice_id,
+        }
+    client.close()
+
+
 def test_arxiv_rss_fallback_links_entry_to_paper_and_query_result(
     config_path, author_candidate
 ):

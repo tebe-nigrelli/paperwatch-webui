@@ -41,6 +41,23 @@ def test_normalize_blog_url_and_validation():
         blogs.normalize_blog_url("https://" + "a" * 2001)
 
 
+def test_html_date_prefers_structured_publication_metadata():
+    assert blogs._html_first_date(
+        """<html><head>
+        <meta property="article:published_time" content="2026-06-30T08:15:00Z">
+        </head><body><p>Copyright 2027</p></body></html>"""
+    ) == "2026-06-30"
+    assert blogs._html_first_date(
+        """<html><body><time datetime="2020-07-24">Jul 24, 2020</time>
+        <p>Updated footer 2026</p></body></html>"""
+    ) == "2020-07-24"
+    assert blogs._html_first_date(
+        """<script type="application/ld+json">
+        {"@type":"BlogPosting","datePublished":"2024-05-09"}
+        </script><main>Article text</main>"""
+    ) == "2024-05-09"
+
+
 def test_extract_fetch_and_diff_branches(monkeypatch):
     title, text = blogs.extract_blog_text(
         "<html><head><title> Site </title></head><body><nav>Noise</nav><main><h1>Post</h1><p>Hello  world</p><p>Hello world</p></main></body></html>",

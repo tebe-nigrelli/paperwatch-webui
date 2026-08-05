@@ -803,7 +803,70 @@ def extract_first_date(value: str) -> str | None:
 
 
 def _html_first_date(value: str) -> str | None:
+    """Extract a publication date from structured HTML, then visible text."""
     soup = BeautifulSoup(value, "html.parser")
+
+    def parsed_date(raw: object) -> str | None:
+        text = str(raw or "").strip()
+        if not text:
+            return None
+        if parsed := extract_first_date(text):
+            return parsed
+        parsed = _published_at(text)
+        return parsed if parsed and re.match(r"^\d{4}-\d{2}", parsed) else None
+
+    metadata_keys = {
+        "article:published_time",
+        "date",
+        "datecreated",
+        "datepublished",
+        "dc.date",
+        "dc.date.issued",
+        "og:published_time",
+        "publish-date",
+        "pubdate",
+    }
+    for element in soup.find_all("meta"):
+        key = str(
+            element.get("property")
+            or element.get("name")
+            or element.get("itemprop")
+            or ""
+        ).strip().casefold()
+        if key not in metadata_keys:
+            continue
+        if parsed := parsed_date(element.get("content")):
+            return parsed
+
+    for element in soup.find_all("time"):
+        if parsed := parsed_date(
+            element.get("datetime") or element.get_text(" ", strip=True)
+        ):
+            return parsed
+
+    def json_dates(payload: object) -> list[str]:
+        found: list[str] = []
+        if isinstance(payload, dict):
+            for key, item in payload.items():
+                if str(key).casefold() in {"datepublished", "datecreated"}:
+                    if parsed := parsed_date(item):
+                        found.append(parsed)
+                else:
+                    found.extend(json_dates(item))
+        elif isinstance(payload, list):
+            for item in payload:
+                found.extend(json_dates(item))
+        return found
+
+    for element in soup.find_all("script", attrs={"type": "application/ld+json"}):
+        try:
+            payload = json.loads(element.string or element.get_text())
+        except (TypeError, ValueError):
+            continue
+        dates = json_dates(payload)
+        if dates:
+            return dates[0]
+
     for element in soup(["script", "style", "noscript", "svg"]):
         element.decompose()
     return extract_first_date(soup.get_text(" ", strip=True))

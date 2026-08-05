@@ -6,20 +6,22 @@ from difflib import SequenceMatcher
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 import hashlib
+import html
 import json
 import re
 import threading
 from typing import Any
+from urllib.parse import urlsplit
 
 import httpx
 
 from . import USER_AGENT
 
 from .analysis import analyze_pdf_file, analyze_text
-from .blogs import ArticleItem, BlogFetch, blog_diff, fetch_blog
+from .blogs import ArticleItem, BlogFetch, blog_diff, fetch_blog, normalize_blog_url
 from .chunking import analyze_chunked_text, direct_prompt_fit
 from .config import AppConfig
-from .db import Database, DeadSourceError
+from .db import Database, DeadSourceError, _blog_entry_is_stub
 from .llm import (
     LLMClient, configure_context_window, configure_job_runtime, create_llm
 )
@@ -41,6 +43,65 @@ from .sources.openalex import OpenAlexClient
 
 
 MAX_BLOG_FETCH_WORKERS = 8
+MAX_STUB_LINK_FETCHES = 16
+IMPORTED_PAGE_MARKER = "\n\nImported page content:\n"
+IMPORTED_PAGE_HTML = re.compile(
+    r'<hr><section class="stub-imported-page">.*</section>\s*$',
+    re.DOTALL,
+)
+_STUB_URL_RE = re.compile(r"https?://[^\s<>\[\](){}\"']+")
+_STUB_ARTICLE_PATH_WORDS = {
+    "article",
+    "articles",
+    "blog",
+    "blogs",
+    "insight",
+    "insights",
+    "news",
+    "post",
+    "posts",
+    "publication",
+    "publications",
+    "research",
+    "story",
+    "stories",
+    "writing",
+}
+_STUB_NON_ARTICLE_PATH_WORDS = {
+    "about",
+    "author",
+    "authors",
+    "category",
+    "categories",
+    "contact",
+    "people",
+    "person",
+    "profile",
+    "profiles",
+    "staff",
+    "tag",
+    "tags",
+    "team",
+}
+_STUB_BLOCKED_SUFFIXES = {
+    ".csv",
+    ".doc",
+    ".docx",
+    ".gif",
+    ".jpeg",
+    ".jpg",
+    ".json",
+    ".pdf",
+    ".png",
+    ".ppt",
+    ".pptx",
+    ".svg",
+    ".webp",
+    ".xls",
+    ".xlsx",
+    ".xml",
+    ".zip",
+}
 
 
 @dataclass(slots=True)
@@ -113,6 +174,91 @@ def _rss_with_article(
         f"<h2>Website content</h2>{article_html}</section>"
         if article_html
         else (base_html or None)
+    )
+    return (
+        combined_text,
+        combined_html,
+        hashlib.sha256(combined_text.encode("utf-8")).hexdigest(),
+    )
+
+
+def _stub_link_is_article(value: str, *, blog_url: str = "") -> bool:
+    """Use conservative URL hints to avoid expanding profiles and navigation pages."""
+    try:
+        normalized = normalize_blog_url(value)
+    except ValueError:
+        return False
+    parsed = urlsplit(normalized)
+    host = (parsed.hostname or "").casefold()
+    if host in {
+        "arxiv.org",
+        "www.arxiv.org",
+        "export.arxiv.org",
+        "doi.org",
+        "www.doi.org",
+    }:
+        return False
+    path = parsed.path.casefold().rstrip("/")
+    if any(path.endswith(suffix) for suffix in _STUB_BLOCKED_SUFFIXES):
+        return False
+    parts = [part for part in path.split("/") if part]
+    if not parts:
+        return False
+    if any(part in _STUB_NON_ARTICLE_PATH_WORDS for part in parts):
+        return False
+    if parts[-1] in {"blog", "blogs", "news", "posts", "research", "publications"}:
+        return False
+    if any(part in _STUB_ARTICLE_PATH_WORDS for part in parts):
+        return True
+    try:
+        normalized_blog = normalize_blog_url(blog_url) if blog_url else ""
+    except ValueError:
+        normalized_blog = ""
+    return len(parts) >= 2 and normalized != normalized_blog
+
+
+def _stub_link_candidates(entry: Any) -> tuple[str, ...]:
+    values = [str(entry["source_url"] or "")]
+    values.extend(_STUB_URL_RE.findall(str(entry["normalized_text"] or "")))
+    candidates: list[str] = []
+    blog_url = str(entry["blog_url"] or "")
+    for raw in values:
+        raw = raw.rstrip(".,;:!?")
+        try:
+            normalized = normalize_blog_url(raw)
+        except ValueError:
+            continue
+        if normalized in candidates or not _stub_link_is_article(
+            normalized, blog_url=blog_url
+        ):
+            continue
+        candidates.append(normalized)
+    return tuple(candidates)
+
+
+def _stub_with_imported_page(
+    base_text: str,
+    base_html: str | None,
+    article: ArticleItem,
+) -> tuple[str, str | None, str]:
+    """Append a fetched article to a metadata-only record without duplicating it."""
+    clean_base = base_text.split(IMPORTED_PAGE_MARKER, 1)[0].rstrip()
+    imported_text = article.text.strip()
+    combined_text = (
+        f"{clean_base}{IMPORTED_PAGE_MARKER}{imported_text}"[:1_000_000]
+    )
+    clean_html = IMPORTED_PAGE_HTML.sub("", base_html or "").rstrip()
+    article_html = article.rendered_html or ""
+    source_link = (
+        '<p class="rss-source-link"><a href="'
+        + html.escape(article.url, quote=True)
+        + '" target="_blank" rel="noreferrer">Open imported page</a></p>'
+    )
+    imported_html = source_link + article_html
+    combined_html = (
+        f'{clean_html}{"<hr>" if clean_html else ""}'
+        f'<section class="stub-imported-page"><h2>Imported page content</h2>'
+        f"{imported_html}</section>"
     )
     return (
         combined_text,
@@ -280,6 +426,73 @@ class PaperWatch:
             )
             prepared.append(row)
         return prepared
+
+    def _fetch_stub_link(self, url: str, title: str) -> ArticleItem | None:
+        fetched = fetch_blog(
+            self.pdf_client,
+            {
+                "url": url,
+                "title": title or url,
+                "source_mode": "article",
+            },
+        )
+        if fetched.method != "snapshot" or not fetched.snapshot_text:
+            return None
+        article_text = (
+            f"Title: {fetched.title}\nURL: {url}\n\n{fetched.snapshot_text}"
+        )[:1_000_000]
+        if _blog_entry_is_stub(article_text, fetched.title, url, None):
+            return None
+        return ArticleItem(
+            external_id=hashlib.sha256(
+                f"stub-linked-page\0{url}".encode("utf-8")
+            ).hexdigest(),
+            title=fetched.title,
+            url=url,
+            text=article_text,
+            sha256=hashlib.sha256(article_text.encode("utf-8")).hexdigest(),
+            outbound_links=fetched.snapshot_links,
+            rendered_html=fetched.snapshot_rendered_html,
+            published_at=fetched.snapshot_published_at,
+        )
+
+    def _enrich_linked_blog_stubs(self, stats: RunStats) -> None:
+        """Expand recent metadata-only entries by fetching one article-like link."""
+        fetches = 0
+        for entry in self.db.list_blog_stubs_for_enrichment():
+            check_cancelled(self._cancel_event)
+            candidates = _stub_link_candidates(entry)
+            if not candidates:
+                continue
+            article: ArticleItem | None = None
+            for candidate in candidates:
+                if fetches >= MAX_STUB_LINK_FETCHES:
+                    return
+                fetches += 1
+                try:
+                    article = self._fetch_stub_link(candidate, str(entry["title"] or ""))
+                except JobCancelled:
+                    raise
+                except (httpx.HTTPError, ValueError):
+                    continue
+                if article is not None:
+                    break
+            if article is None:
+                continue
+            combined_text, combined_html, combined_sha256 = _stub_with_imported_page(
+                str(entry["normalized_text"] or ""),
+                str(entry["rendered_html"] or "") or None,
+                article,
+            )
+            self.db.update_blog_entry_content(
+                int(entry["id"]),
+                content_sha256=combined_sha256,
+                normalized_text=combined_text,
+                rendered_html=combined_html,
+                published_at=article.published_at,
+            )
+            stats.blog_items_downloaded += 1
+            self._publish_run_stats(stats)
 
     @staticmethod
     def _arxiv_fallback_title(
@@ -924,6 +1137,7 @@ class PaperWatch:
         for blog, fetched, error in results:
             check_cancelled(self._cancel_event)
             self._apply_blog_fetch(stats, blog, fetched, error)
+        self._enrich_linked_blog_stubs(stats)
 
     def _fetch_blogs(self, stats: RunStats, blogs: list[Any] | None = None) -> None:
         selected = blogs if blogs is not None else self.db.list_enabled_blogs()
