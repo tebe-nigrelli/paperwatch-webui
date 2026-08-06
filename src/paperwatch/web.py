@@ -42,6 +42,7 @@ from .blogs import (
 )
 from .config import AppConfig, load_config
 from .db import Database
+from .default_queries import add_default_queries
 from .job_runtime import ProgressCallback
 from .locking import AnalysisAlreadyInProgress, analysis_lock
 from .models import (
@@ -4182,6 +4183,18 @@ def create_app(
             ),
             status_code=303,
         )
+
+    @app.post("/data/queries/defaults")
+    def install_default_queries() -> RedirectResponse:
+        model_profile = config.available_llms[0].profile if config.available_llms else ""
+        with Database(config.paths.database) as db:
+            count = add_default_queries(db, model_profile)
+        message = (
+            f"Added {count} default quer{'y' if count == 1 else 'ies'}; automatic runs remain disabled."
+            if count
+            else "All default queries are already present."
+        )
+        return RedirectResponse(_notice_url("/queries", message), status_code=303)
 
     @app.post("/data/delete/queries")
     def delete_all_queries() -> RedirectResponse:

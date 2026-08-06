@@ -356,7 +356,7 @@ body.dialog-open{overflow:hidden}.dialog-close-button{display:grid!important;pla
 
 /* 0.10.0 detail layouts, data workspace, and responsive regexp editors */
 .table-wrap{overflow-x:auto;max-width:none}
-table:not(.unified-content-table){min-width:max-content}
+table:not(.unified-content-table):not(.saved-query-table){min-width:max-content}
 .paper-reference-layout{grid-template-columns:minmax(0,.75fr) minmax(420px,1.25fr);gap:26px}
 .paper-reference-metadata{grid-column:auto;grid-template-columns:repeat(2,minmax(0,1fr))}
 .paper-link-groups{padding-left:26px}
@@ -510,3 +510,25 @@ label.control-disabled{opacity:.68}
 .content-results-runner-row>.collection-source{flex:1 1 270px;min-width:250px}
 .content-results-runner-row>.collection-pdf-strategy{flex:0 1 145px;min-width:125px}
 .content-results-runner-row>.collection-context-window{flex:0 0 205px;min-width:205px}
+
+/* Saved queries table */
+.table-wrap>.saved-query-table{width:100%;min-width:100%;max-width:100%;table-layout:fixed;font-size:.82rem}
+.saved-query-table th,.saved-query-table td{padding:8px 6px;overflow-wrap:anywhere}
+.saved-query-table th:nth-child(1){width:16%}
+.saved-query-table th:nth-child(2){width:8%}
+.saved-query-table th:nth-child(3){width:7%}
+.saved-query-table th:nth-child(4){width:13%}
+.saved-query-table th:nth-child(5){width:10%}
+.saved-query-table th:nth-child(6){width:7%}
+.saved-query-table th:nth-child(7){width:8%}
+.saved-query-table th:nth-child(8){width:5%}
+.saved-query-table th:nth-child(9){width:8%}
+.saved-query-table th:nth-child(10){width:18%}
+.saved-query-actions{vertical-align:middle}
+.saved-query-action-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:6px;align-items:stretch}
+.saved-query-action-grid form{display:flex;margin:0}
+.saved-query-action-grid .button{width:100%;min-width:0;padding:4px 6px;font-size:.78rem;white-space:nowrap}
+.saved-query-action-edit{grid-column:1;grid-row:1}
+.saved-query-action-clear{grid-column:2;grid-row:1}
+.saved-query-action-delete{grid-column:1;grid-row:2}
+@media(max-width:900px){.saved-query-table{font-size:.78rem}.saved-query-table th,.saved-query-table td{padding:7px 4px}.saved-query-action-grid .button{white-space:normal}}

@@ -261,6 +261,74 @@ def test_query_page_stores_one_model_and_uses_config_context(config_path):
     assert "Changes save automatically" in table.text
 
 
+def test_default_query_installer_and_actions_column_deletion(config_path):
+    client = _client(config_path)
+    data_page = client.get("/data")
+    assert data_page.status_code == 200
+    assert 'action="/data/queries/defaults"' in data_page.text
+    assert "Add default queries" in data_page.text
+
+    installed = client.post("/data/queries/defaults", follow_redirects=False)
+    assert installed.status_code == 303
+    assert installed.headers["location"].startswith("/queries?")
+    assert "Added+30+default+queries" in installed.headers["location"]
+
+    config = load_config(config_path)
+    with Database(config.paths.database) as db:
+        rows = db.list_saved_queries()
+        optional = [row for row in rows if not bool(row["is_builtin"])]
+        assert len(optional) == 30
+        assert sum(row["query_kind"] == "classification" for row in optional) == 10
+        assert sum(row["regexp_mode"] == "print" for row in optional) == 10
+        assert all(row["auto_run_papers"] == 0 for row in optional)
+        assert all(row["auto_run_blogs"] == 0 for row in optional)
+        assert all(
+            row["model_profile"] == ("" if row["regexp_mode"] == "print" else "default")
+            for row in optional
+        )
+        default_id = int(
+            next(row for row in optional if row["name"] == "Evidence strength")["id"]
+        )
+        manual_id = db.create_saved_query(name="Manual query", prompt="Review this record")
+        summary_id = int(next(row for row in rows if bool(row["is_builtin"]))["id"])
+
+    repeated = client.post("/data/queries/defaults", follow_redirects=False)
+    assert repeated.status_code == 303
+    assert "All+default+queries+are+already+present" in repeated.headers["location"]
+
+    page = client.get("/queries")
+    assert page.status_code == 200
+    assert 'class="saved-query-table"' in page.text
+    assert 'class="saved-query-actions"' in page.text
+    assert 'class="saved-query-action-grid"' in page.text
+    assert 'saved-query-action-edit' in page.text
+    assert 'saved-query-action-clear' in page.text
+    assert 'saved-query-action-delete' in page.text
+    assert 'href="/?query_id=' not in page.text
+    assert 'href="/blogs?query_id=' not in page.text
+    assert "Regexp filter" not in page.text
+
+    css = client.get("/static/app.css")
+    assert css.status_code == 200
+    assert "table:not(.unified-content-table):not(.saved-query-table)" in css.text
+    assert ".table-wrap>.saved-query-table{width:100%;min-width:100%;max-width:100%" in css.text
+
+    for row in optional:
+        assert f'action="/queries/{int(row["id"])}/delete"' in page.text
+    assert f'action="/queries/{manual_id}/delete"' in page.text
+    assert f'action="/queries/{summary_id}/delete"' not in page.text
+
+    assert client.post(f"/queries/{default_id}/delete", follow_redirects=False).status_code == 303
+    assert client.post(f"/queries/{manual_id}/delete", follow_redirects=False).status_code == 303
+    protected = client.post(f"/queries/{summary_id}/delete", follow_redirects=False)
+    assert protected.status_code == 303
+    assert "cannot+be+deleted" in protected.headers["location"]
+    with Database(config.paths.database) as db:
+        assert db.get_saved_query(default_id) is None
+        assert db.get_saved_query(manual_id) is None
+        assert db.get_saved_query(summary_id) is not None
+
+
 def test_collection_runner_places_override_and_options_after_query(
     config_path, paper_record
 ):
