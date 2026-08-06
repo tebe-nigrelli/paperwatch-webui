@@ -356,12 +356,35 @@ def test_blog_saved_prompt_routes_and_collection_runner(config_path):
     assert "Run saved prompt" in feed.text
     assert "Watch implications" in feed.text
     detail = client.get(f"/blogs/{entry_id}")
-    assert "Use the same reusable prompts" in detail.text
+    assert "Use the same reusable prompts" not in detail.text
+    assert "Run saved prompt" not in detail.text
+    assert "Override Defaults" not in detail.text
+    assert 'id="saved-prompt-form"' not in detail.text
+    assert 'class="collection-runner-row content-results-runner-row"' in feed.text
 
     response = client.post(
         f"/blogs/{entry_id}/prompt",
         data={
             "query_id": str(query_id),
+            "model": "missing",
+            "context_window_tokens": "2048",
+        },
+        headers={"x-paperwatch-async": "1"},
+    )
+    assert response.status_code == 200
+    args, kwargs = controller.calls[-1]
+    assert args[:3] == (
+        query_id,
+        ("default",),
+        config.llm.context_window_tokens,
+    )
+    assert kwargs["content_type"] == "blogs"
+
+    response = client.post(
+        f"/blogs/{entry_id}/prompt",
+        data={
+            "query_id": str(query_id),
+            "override_query_defaults": "1",
             "model": "default",
             "context_window_tokens": "2048",
         },

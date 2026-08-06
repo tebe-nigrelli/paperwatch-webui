@@ -444,7 +444,7 @@ def test_schema_21_backfills_arxiv_blog_paper_links(
         db._conn.execute("PRAGMA user_version=20")
         db._conn.commit()
     with Database(path) as db:
-        assert SCHEMA_VERSION == 26
+        assert SCHEMA_VERSION == 27
         assert db.get_blog_entry(entry_id)["linked_paper_id"] == paper_id
 
 

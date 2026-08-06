@@ -20,7 +20,7 @@ from .models import (
 )
 
 
-SCHEMA_VERSION = 26
+SCHEMA_VERSION = 27
 BLOG_SOURCE_MODES = {
     "auto",
     "feed",
@@ -408,19 +408,21 @@ CREATE TABLE IF NOT EXISTS saved_queries (
     auto_run_blogs INTEGER NOT NULL DEFAULT 0,
     model_profile TEXT NOT NULL DEFAULT '',
     paper_source_scope TEXT NOT NULL DEFAULT 'auto'
-        CHECK (paper_source_scope IN ('auto', 'abstract', 'fulltext')),
+        CHECK (paper_source_scope IN ('auto', 'abstract', 'fulltext', 'pdf')),
     pdf_strategy TEXT NOT NULL DEFAULT 'chunked'
         CHECK (pdf_strategy IN ('auto', 'direct', 'chunked')),
     regexp_pattern TEXT NOT NULL DEFAULT '',
     regexp_radius INTEGER NOT NULL DEFAULT 0,
+    regexp_debug_text TEXT NOT NULL DEFAULT '',
     regexp_mode TEXT NOT NULL DEFAULT 'query'
         CHECK (regexp_mode IN ('query', 'print')),
     content_scope TEXT NOT NULL DEFAULT 'both'
         CHECK (content_scope IN ('both', 'papers', 'blogs')),
     query_kind TEXT NOT NULL DEFAULT 'summary'
-        CHECK (query_kind IN ('summary', 'classification')),
+        CHECK (query_kind IN ('summary', 'classification', 'regexp')),
     label_class TEXT NOT NULL DEFAULT '',
     label_values_json TEXT NOT NULL DEFAULT '[]',
+    label_debug_text TEXT NOT NULL DEFAULT '',
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL,
     last_run_at TEXT
@@ -813,10 +815,16 @@ class Database:
             row["name"]
             for row in self._conn.execute("PRAGMA table_info(saved_queries)").fetchall()
         }
+        table_sql_row = self._conn.execute(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name='saved_queries'"
+        ).fetchone()
+        table_sql = str(table_sql_row["sql"] or "") if table_sql_row is not None else ""
         if (
             "model_profile" in columns
             and "model_profiles_json" not in columns
             and "context_window_tokens" not in columns
+            and "'regexp'" in table_sql
+            and "'pdf'" in table_sql
         ):
             return
 
@@ -850,7 +858,7 @@ class Database:
             if source_type not in {"papers", "summaries"}:
                 source_type = "papers"
             paper_scope = text(row, "paper_source_scope", "auto")
-            if paper_scope not in {"auto", "abstract", "fulltext"}:
+            if paper_scope not in {"auto", "abstract", "fulltext", "pdf"}:
                 paper_scope = "auto"
             pdf_strategy = text(row, "pdf_strategy", "chunked")
             if pdf_strategy not in {"auto", "direct", "chunked"}:
@@ -862,7 +870,7 @@ class Database:
             if content_scope not in {"both", "papers", "blogs"}:
                 content_scope = "both"
             query_kind = text(row, "query_kind", "summary")
-            if query_kind not in {"summary", "classification"}:
+            if query_kind not in {"summary", "classification", "regexp"}:
                 query_kind = "summary"
             migrated.append(
                 (
@@ -879,11 +887,13 @@ class Database:
                     pdf_strategy,
                     text(row, "regexp_pattern"),
                     max(0, integer(row, "regexp_radius")),
+                    text(row, "regexp_debug_text"),
                     regexp_mode,
                     content_scope,
                     query_kind,
                     text(row, "label_class"),
                     text(row, "label_values_json", "[]"),
+                    text(row, "label_debug_text"),
                     text(row, "created_at", now) or now,
                     text(row, "updated_at", now) or now,
                     row.get("last_run_at"),
@@ -908,19 +918,21 @@ class Database:
                     auto_run_blogs INTEGER NOT NULL DEFAULT 0,
                     model_profile TEXT NOT NULL DEFAULT '',
                     paper_source_scope TEXT NOT NULL DEFAULT 'auto'
-                        CHECK (paper_source_scope IN ('auto', 'abstract', 'fulltext')),
+                        CHECK (paper_source_scope IN ('auto', 'abstract', 'fulltext', 'pdf')),
                     pdf_strategy TEXT NOT NULL DEFAULT 'chunked'
                         CHECK (pdf_strategy IN ('auto', 'direct', 'chunked')),
                     regexp_pattern TEXT NOT NULL DEFAULT '',
                     regexp_radius INTEGER NOT NULL DEFAULT 0,
+                    regexp_debug_text TEXT NOT NULL DEFAULT '',
                     regexp_mode TEXT NOT NULL DEFAULT 'query'
                         CHECK (regexp_mode IN ('query', 'print')),
                     content_scope TEXT NOT NULL DEFAULT 'both'
                         CHECK (content_scope IN ('both', 'papers', 'blogs')),
                     query_kind TEXT NOT NULL DEFAULT 'summary'
-                        CHECK (query_kind IN ('summary', 'classification')),
+                        CHECK (query_kind IN ('summary', 'classification', 'regexp')),
                     label_class TEXT NOT NULL DEFAULT '',
                     label_values_json TEXT NOT NULL DEFAULT '[]',
+                    label_debug_text TEXT NOT NULL DEFAULT '',
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL,
                     last_run_at TEXT
@@ -933,10 +945,10 @@ class Database:
                     id, name, source_type, search_query, prompt, is_builtin,
                     auto_run_papers, auto_run_blogs, model_profile,
                     paper_source_scope, pdf_strategy, regexp_pattern,
-                    regexp_radius, regexp_mode, content_scope, query_kind,
-                    label_class, label_values_json, created_at, updated_at,
+                    regexp_radius, regexp_debug_text, regexp_mode, content_scope, query_kind,
+                    label_class, label_values_json, label_debug_text, created_at, updated_at,
                     last_run_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 migrated,
             )
@@ -978,11 +990,13 @@ class Database:
             "pdf_strategy": "TEXT NOT NULL DEFAULT 'chunked'",
             "regexp_pattern": "TEXT NOT NULL DEFAULT ''",
             "regexp_radius": "INTEGER NOT NULL DEFAULT 0",
+            "regexp_debug_text": "TEXT NOT NULL DEFAULT ''",
             "regexp_mode": "TEXT NOT NULL DEFAULT 'query'",
             "content_scope": "TEXT NOT NULL DEFAULT 'both'",
             "query_kind": "TEXT NOT NULL DEFAULT 'summary'",
             "label_class": "TEXT NOT NULL DEFAULT ''",
             "label_values_json": "TEXT NOT NULL DEFAULT '[]'",
+            "label_debug_text": "TEXT NOT NULL DEFAULT ''",
         }
         for name, definition in query_additions.items():
             if name not in query_columns:
@@ -4450,11 +4464,11 @@ class Database:
         ))
         if len(profiles) > 1:
             raise ValueError("A saved query can use only one model")
-        if paper_source_scope not in {"auto", "abstract", "fulltext"}:
-            raise ValueError("Paper source must be auto, abstract, or fulltext")
+        if paper_source_scope not in {"auto", "abstract", "fulltext", "pdf"}:
+            raise ValueError("Paper source must be auto, abstract, fulltext, or pdf")
         if pdf_strategy not in {"auto", "direct", "chunked"}:
             raise ValueError("PDF strategy must be auto, direct, or chunked")
-        if paper_source_scope == "abstract":
+        if paper_source_scope in {"abstract", "pdf"}:
             pdf_strategy = "auto"
         return (profiles[0] if profiles else ""), paper_source_scope, pdf_strategy
 
@@ -4487,8 +4501,8 @@ class Database:
         label_values: Iterable[dict[str, str]],
     ) -> tuple[str, str, str]:
         kind = query_kind.strip().lower() or "summary"
-        if kind not in {"summary", "classification"}:
-            raise ValueError("Query type must be summary or classification")
+        if kind not in {"summary", "classification", "regexp"}:
+            raise ValueError("Query type must be summary, classification, or regexp")
         cleaned_class = " ".join(label_class.strip().split())[:40]
         values: list[dict[str, str]] = []
         seen: set[str] = set()
@@ -4506,11 +4520,15 @@ class Database:
                 raise ValueError(f"Invalid classification regexp for {value}: {exc}") from exc
             seen.add(key)
             values.append({"value": value, "pattern": pattern})
-        if kind == "classification":
+        if kind in {"classification", "regexp"}:
             if not cleaned_class:
-                raise ValueError("Classification queries need a tag class")
-            if len(values) < 2:
-                raise ValueError("Classification queries need at least two label values")
+                raise ValueError("Tagging queries need a tag class")
+            if len(values) < (2 if kind == "classification" else 1):
+                raise ValueError(
+                    "Classification queries need at least two label values"
+                    if kind == "classification"
+                    else "Regexp tag queries need at least one tag value"
+                )
         else:
             cleaned_class = ""
             values = []
@@ -4531,11 +4549,13 @@ class Database:
         pdf_strategy: str = "chunked",
         regexp_pattern: str = "",
         regexp_radius: int = 0,
+        regexp_debug_text: str = "",
         regexp_mode: str = "query",
         content_scope: str = "both",
         query_kind: str = "summary",
         label_class: str = "",
         label_values: Iterable[dict[str, str]] = (),
+        label_debug_text: str = "",
     ) -> int:
         name = name.strip()
         prompt = prompt.strip()
@@ -4547,24 +4567,32 @@ class Database:
         regexp, radius, regexp_action = self._regexp_values(
             regexp_pattern, regexp_radius, regexp_mode
         )
+        regexp_debug = str(regexp_debug_text)[:100000]
+        label_debug = str(label_debug_text)[:100000]
         kind, classification_class, classification_values = self._classification_values(
             query_kind, label_class, label_values
         )
-        if kind == "classification" and regexp_action == "print":
-            raise ValueError("Classification queries must run their prompt")
+        if kind == "regexp":
+            model_profile = ""
+            if scope == "pdf":
+                raise ValueError("Regexp tag queries cannot upload a whole PDF")
+        if kind in {"classification", "regexp"} and regexp_action == "print":
+            raise ValueError("Tagging queries cannot print regexp excerpts")
         if content_scope not in {"both", "papers", "blogs"}:
             raise ValueError("Query content scope must be both, papers, or blogs")
         if content_scope == "papers":
             auto_run_blogs = False
         elif content_scope == "blogs":
             auto_run_papers = False
-        if not name and not prompt and regexp_action != "print":
+        if not name and not prompt and regexp_action != "print" and kind != "regexp":
             raise ValueError("Query name and prompt are required")
         if not name:
             raise ValueError("Query name is required")
-        if not prompt and regexp_action != "print":
+        if not prompt and regexp_action != "print" and kind != "regexp":
             raise ValueError("Prompt is required unless regexp matches are printed directly")
-        if not prompt:
+        if not prompt and kind == "regexp":
+            prompt = "Apply regexp tags locally."
+        elif not prompt:
             prompt = "Print regexp matches."
         now = utcnow()
         with self.transaction() as conn:
@@ -4574,10 +4602,11 @@ class Database:
                     name, source_type, search_query, prompt, is_builtin,
                     auto_run_papers, auto_run_blogs, model_profile,
                     paper_source_scope, pdf_strategy,
-                    regexp_pattern, regexp_radius, regexp_mode, content_scope,
-                    query_kind, label_class, label_values_json,
+                    regexp_pattern, regexp_radius, regexp_debug_text, regexp_mode,
+                    content_scope, query_kind, label_class, label_values_json,
+                    label_debug_text,
                     created_at, updated_at
-                ) VALUES (?, 'papers', '', ?, 0, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, 'papers', '', ?, 0, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     name[:120],
@@ -4589,11 +4618,13 @@ class Database:
                     strategy,
                     regexp,
                     radius,
+                    regexp_debug,
                     regexp_action,
                     content_scope,
                     kind,
                     classification_class,
                     classification_values,
+                    label_debug,
                     now,
                     now,
                 ),
@@ -4616,11 +4647,13 @@ class Database:
         pdf_strategy: str = "chunked",
         regexp_pattern: str = "",
         regexp_radius: int = 0,
+        regexp_debug_text: str = "",
         regexp_mode: str = "query",
         content_scope: str = "both",
         query_kind: str = "summary",
         label_class: str = "",
         label_values: Iterable[dict[str, str]] = (),
+        label_debug_text: str = "",
     ) -> bool:
         name = name.strip()
         prompt = prompt.strip()
@@ -4632,20 +4665,28 @@ class Database:
         regexp, radius, regexp_action = self._regexp_values(
             regexp_pattern, regexp_radius, regexp_mode
         )
+        regexp_debug = str(regexp_debug_text)[:100000]
+        label_debug = str(label_debug_text)[:100000]
         kind, classification_class, classification_values = self._classification_values(
             query_kind, label_class, label_values
         )
-        if kind == "classification" and regexp_action == "print":
-            raise ValueError("Classification queries must run their prompt")
+        if kind == "regexp":
+            model_profile = ""
+            if scope == "pdf":
+                raise ValueError("Regexp tag queries cannot upload a whole PDF")
+        if kind in {"classification", "regexp"} and regexp_action == "print":
+            raise ValueError("Tagging queries cannot print regexp excerpts")
         if content_scope not in {"both", "papers", "blogs"}:
             raise ValueError("Query content scope must be both, papers, or blogs")
-        if not name and not prompt and regexp_action != "print":
+        if not name and not prompt and regexp_action != "print" and kind != "regexp":
             raise ValueError("Query name and prompt are required")
         if not name:
             raise ValueError("Query name is required")
-        if not prompt and regexp_action != "print":
+        if not prompt and regexp_action != "print" and kind != "regexp":
             raise ValueError("Prompt is required unless regexp matches are printed directly")
-        if not prompt:
+        if not prompt and kind == "regexp":
+            prompt = "Apply regexp tags locally."
+        elif not prompt:
             prompt = "Print regexp matches."
         with self.transaction() as conn:
             cur = conn.execute(
@@ -4656,8 +4697,9 @@ class Database:
                     auto_run_papers=CASE WHEN ? IS NULL THEN auto_run_papers ELSE ? END,
                     auto_run_blogs=CASE WHEN ? IS NULL THEN auto_run_blogs ELSE ? END,
                     model_profile=?, paper_source_scope=?, pdf_strategy=?, regexp_pattern=?,
-                    regexp_radius=?, regexp_mode=?, content_scope=?, query_kind=?,
-                    label_class=?, label_values_json=?, updated_at=?
+                    regexp_radius=?, regexp_debug_text=?, regexp_mode=?, content_scope=?,
+                    query_kind=?, label_class=?, label_values_json=?, label_debug_text=?,
+                    updated_at=?
                 WHERE id=?
                 """,
                 (
@@ -4673,11 +4715,13 @@ class Database:
                     strategy,
                     regexp,
                     radius,
+                    regexp_debug,
                     regexp_action,
                     content_scope,
                     kind,
                     classification_class,
                     classification_values,
+                    label_debug,
                     utcnow(),
                     query_id,
                 ),
@@ -4753,7 +4797,9 @@ class Database:
         output: dict[str, Any],
     ) -> int:
         query = self.get_saved_query(query_id)
-        if query is None or str(query["query_kind"] or "summary") != "classification":
+        if query is None or str(query["query_kind"] or "summary") not in {
+            "classification", "regexp"
+        }:
             return 0
         label_class = " ".join(str(query["label_class"] or "").split())
         values = self._decoded_label_values(query["label_values_json"])
@@ -4874,7 +4920,9 @@ class Database:
         value: str,
     ) -> bool:
         query = self.get_saved_query(query_id)
-        if query is None or str(query["query_kind"] or "summary") != "classification":
+        if query is None or str(query["query_kind"] or "summary") not in {
+            "classification", "regexp"
+        }:
             return False
         choices = [item["value"] for item in self._decoded_label_values(query["label_values_json"])]
         selected = next((item for item in choices if item.casefold() == value.strip().casefold()), None)

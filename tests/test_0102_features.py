@@ -225,6 +225,50 @@ def test_select_results_endpoint_does_not_fetch_matching_ids(
         assert db.get_paper(paper_id)["selected"] == 1
 
 
+def test_unselect_all_returns_selected_results_to_the_results_table(
+    config_path, author_candidate, paper_record
+):
+    config = load_config(config_path)
+    with Database(config.paths.database) as db:
+        db.add_author(author_candidate)
+        db.upsert_paper(paper_record)
+
+    client = web_client(config_path)
+    response = client.post(
+        "/content/select-results",
+        data={"content": "papers", "selected": "1", "title_query": "Minimal Agents"},
+        headers={"X-Paperwatch-Async": "1"},
+    )
+    assert response.status_code == 200
+
+    selected_page = client.get("/?content=papers&title_query=Minimal+Agents")
+    selected_body = selected_page.text.split("<tbody data-selected-content-body>", 1)[1].split(
+        "</tbody>", 1
+    )[0]
+    results_body = selected_page.text.split('<tbody id="paper-table-body">', 1)[1].split(
+        "</tbody>", 1
+    )[0]
+    assert paper_record.title in selected_body
+    assert paper_record.title not in results_body
+
+    response = client.post(
+        "/content/selected/unselect",
+        headers={"X-Paperwatch-Async": "1"},
+    )
+    assert response.status_code == 200
+    assert response.json()["changed"] == 1
+
+    refreshed_page = client.get("/?content=papers&title_query=Minimal+Agents")
+    selected_body = refreshed_page.text.split("<tbody data-selected-content-body>", 1)[1].split(
+        "</tbody>", 1
+    )[0]
+    results_body = refreshed_page.text.split('<tbody id="paper-table-body">', 1)[1].split(
+        "</tbody>", 1
+    )[0]
+    assert paper_record.title not in selected_body
+    assert paper_record.title in results_body
+
+
 def test_content_blog_summary_lookup_is_not_correlated_per_row(
     config_path, author_candidate
 ):

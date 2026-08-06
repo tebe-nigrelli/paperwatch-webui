@@ -130,14 +130,26 @@ def test_recent_feed_theme_and_direct_links(
     assert "author-picker" in js
     assert "localStorage" in js
     assert "PDF strategy only applies" not in js
-    assert "setLocked(strategy, locked || !usesPdf)" in js
+    assert "setLocked(strategy, lockedByDefaults || isClaude || !extractedPdf)" in js
+    assert 'const wrapCycle = cycle && select.hasAttribute("data-wrap-cycle")' in js
+    assert 'targetValue.value = targetValue.value === "selected" ? "results" : "selected"' in js
     assert 'control.setAttribute("aria-disabled", String(locked))' in js
+    assert 'select.matches("[data-model-picker]") && select.closest(".content-results-runner-row")' in js
+    assert 'document.body.appendChild(list)' in js
+    assert 'await refreshContentPage(window.location.href, false)' in js
+    assert 'response.url || url' in js
     css = client.get("/static/app.css").text
     assert "@media(prefers-color-scheme:dark)" in css
     assert "--bg:#05070a" in css
     assert "[hidden]{display:none!important}" in css
     assert ".discover-mode-option.active" in css
     assert "grid-template-columns:minmax(0,1fr) minmax(0,1fr) minmax(250px,.9fr)" in css
+    assert ".collection-runner-form>.content-results-runner-row{display:flex;flex-direction:row;align-items:flex-start;flex-wrap:nowrap" in css
+    assert ".content-results-runner-row>.collection-button-field{display:flex" in css
+    assert '.content-results-runner-row .collection-button-field>.button,.content-results-runner-row .search-select-input,.content-results-runner-row input[type="number"]{height:52px' in css
+    assert '.content-results-runner-row>.collection-context-window{flex:0 0 205px;min-width:205px}' in css
+    assert ".search-select-wrap-button{display:flex" in css
+    assert ".search-select-options-floating{position:fixed;z-index:1000}" in css
 
 
 def test_author_tags_filter_and_non_destructive_removal(
@@ -203,10 +215,14 @@ def test_paper_author_picker_and_chunked_multi_model_request(
     assert 'id="author-picker"' in page.text
     assert 'id="author-local"' in page.text
     assert 'id="author-track-form"' in page.text
-    assert "Context window tokens" in page.text
-    assert 'name="context_window_tokens" min="512" max="1000000" value="16384"' in page.text
-    assert "Chunk + merge" in page.text
-    assert "Run saved prompt" in page.text
+    assert "Run saved prompt" not in page.text
+    assert 'id="saved-prompt-form"' not in page.text
+    results_page = client.get("/")
+    assert "Run saved prompt on all 1 search result" in results_page.text
+    assert "Override Defaults" in results_page.text
+    runner = results_page.text.split('id="collection-runner-form"', 1)[1].split("</form>", 1)[0]
+    assert runner.index("Saved query") < runner.index("Override Defaults")
+    assert runner.index("Override Defaults") < runner.index("Models")
     assert "Run selected models" not in page.text
     response = client.post(
         f"/papers/{paper_id}/analyze",
@@ -279,12 +295,66 @@ def test_saved_query_create_edit_run_output_and_delete(
     assert "Select papers and run" in page.text
     assert "Paper search" not in page.text
     recent = client.get("/")
-    assert "Run on these" in recent.text
+    assert "Run saved prompt on all 1 search result" in recent.text
     assert "Saved query" in recent.text
+    assert 'name="override_query_defaults"' in recent.text
+    assert "data-query-defaults-form" in recent.text
+    assert 'class="collection-runner-row content-results-runner-row"' in recent.text
+    assert 'class="advanced-filters collection-runner-details content-results-runner-details"' in recent.text
+    assert 'content-results-runner-details" open' not in recent.text
+    assert 'name="selection_mode"' in recent.text
+    assert 'name="selection_mode" value="results" data-run-target-value' in recent.text
+    assert 'type="button" data-run-target-toggle' in recent.text
+    assert 'data-selected-count="0"' in recent.text
+    assert 'data-source-scope data-wrap-cycle' in recent.text
+    assert 'name="paper_ids"' not in recent.text
     response = client.post(
         "/queries/run-filtered",
         data={
             "query_id": str(query_id),
+            "model": "ignored-model",
+            "source_scope": "fulltext",
+            "pdf_strategy": "direct",
+            "context_window_tokens": "4096",
+            "q": "Minimal",
+        },
+        follow_redirects=False,
+    )
+    assert response.status_code == 303
+    assert query.calls[0][:3] == (query_id, ("default",), 16384)
+    assert query.calls[0][3]["query"] == "Minimal"
+    assert "paper_ids" not in query.calls[0][3]
+    assert query.calls[0][4:] == ("auto", "chunked")
+    query.calls.clear()
+    with Database(config.paths.database) as db:
+        assert db.set_content_selected("paper", 1, True)
+    selected_page = client.get("/")
+    assert "Run saved prompt on all 1 search result" in selected_page.text
+    assert 'data-selected-count="1"' in selected_page.text
+    assert 'name="paper_ids"' not in selected_page.text
+    response = client.post(
+        "/queries/run-filtered",
+        data={
+            "query_id": str(query_id),
+            "selection_mode": "selected",
+            "q": "Does not affect selected mode",
+        },
+        follow_redirects=False,
+    )
+    assert response.status_code == 303
+    assert query.calls[0][3]["paper_ids"] == [1]
+    assert query.calls[0][3]["labels"] == ["Selected papers: 1"]
+    assert "query" not in query.calls[0][3]
+    query.calls.clear()
+    with Database(config.paths.database) as db:
+        assert db.set_content_selected("paper", 1, False)
+        assert db.add_author_tag("A123", "theory")
+        assert db.add_author_tag("A123", "ML")
+    response = client.post(
+        "/queries/run-filtered",
+        data={
+            "query_id": str(query_id),
+            "override_query_defaults": "1",
             "model": "default",
             "source_scope": "fulltext",
             "pdf_strategy": "chunked",
@@ -297,7 +367,7 @@ def test_saved_query_create_edit_run_output_and_delete(
             "kind": "machine_learning",
             "scope": "fulltext",
             "has_pdf": "yes",
-            "analyzed": "no",
+            "analyzed": "yes",
             "date_from": "2026-01-01",
             "date_to": "2026-12-31",
         },
@@ -309,14 +379,25 @@ def test_saved_query_create_edit_run_output_and_delete(
     assert "notice=Started+saved+query" in response.headers["location"]
     assert query.calls[0][:3] == (query_id, ("default",), 4096)
     selection = query.calls[0][3]
-    assert selection["paper_ids"] == [1]
+    assert "paper_ids" not in selection
     assert query.calls[0][4:] == ("fulltext", "chunked")
     assert selection["query"] == "Minimal"
     assert selection["author_id"] == "A123"
     assert selection["author_tags"] == ["theory", "ML"]
     assert selection["topic_id"] == "T100"
     assert selection["has_pdf"] is True
-    assert selection["labels"] == ["Selected papers: 1"]
+    assert selection["labels"] == [
+        "Search “Minimal”",
+        "Author: Ada Lovelace",
+        "Authors: theory, ML",
+        "Topic: Machine Learning",
+        "Kind: machine learning",
+        "Scope: fulltext",
+        "PDF available",
+        "Analyzed",
+        "From 2026-01-01",
+        "To 2026-12-31",
+    ]
     client.post(
         f"/queries/{query_id}/edit",
         data={
@@ -433,14 +514,14 @@ def test_saved_query_validation_missing_routes_busy_and_status(
     assert 'Select+a+saved+query' in response.headers['location']
     response = client.post(
         '/queries/run-filtered',
-        data={'query_id': str(query_id), 'model': 'missing'},
+        data={'query_id': str(query_id), 'override_query_defaults': '1', 'model': 'missing'},
         follow_redirects=False,
     )
     assert 'Select+a+configured+model' in response.headers['location']
 
     response = error_client.post(
         '/queries/run-filtered',
-        data={'query_id': str(query_id), 'model': 'default'},
+        data={'query_id': str(query_id), 'override_query_defaults': '1', 'model': 'default'},
         follow_redirects=False,
     )
     assert 'Select+at+least+one+configured+model' in response.headers['location']
@@ -449,9 +530,9 @@ def test_saved_query_validation_missing_routes_busy_and_status(
         '/queries/run-filtered',
         data={
             'query_id': str(query_id),
+            'override_query_defaults': '1',
             'model': 'default',
-            'has_pdf': 'no',
-            'analyzed': 'yes',
+            'q': 'Minimal',
         },
         follow_redirects=False,
     )

@@ -101,7 +101,7 @@ def test_schema_25_pdf_fingerprint_persists_modified_state(
     with Database(config.paths.database) as db:
         db.set_local_pdf(paper_id, str(pdf), expected)
         row = dict(db.get_paper(paper_id))
-        assert SCHEMA_VERSION == 26
+        assert SCHEMA_VERSION == 27
         assert "pdf_modified_on_disk" in row
         assert _paper_pdf_state(db, row)["pdf_modified"] is False
 
@@ -216,11 +216,13 @@ def test_blog_results_runner_accepts_multiple_queries_and_one_model(
     capture = QueryCapture()
     web = client(config_path, capture)
     content = web.get("/")
-    assert "Run saved prompt on selected blogs (1)" in content.text
-    assert ">Run on selected<" in content.text
-    assert 'name="context_window_tokens"' not in content.text.split(
-        'class="blog-results-runner"', 1
-    )[1].split("</form>", 1)[0]
+    assert "Run saved prompt on all 2 search results" in content.text
+    runner = content.text.split('id="collection-runner-form"', 1)[1].split(
+        "</form>", 1
+    )[0]
+    assert ">Run saved prompt<" in runner
+    assert 'name="context_window_tokens"' in runner
+    assert 'name="paper_ids"' not in runner
     response = web.post(
         "/queries/run-blogs",
         data={

@@ -202,20 +202,21 @@
     closeDropdown();
   });
 
-  document.querySelectorAll("form").forEach((form) => {
+  document.querySelectorAll("form[data-profile-controls]").forEach((form) => {
     const source = form.querySelector("select[data-source-scope]");
     const strategy = form.querySelector("select[data-pdf-strategy]");
     const context = form.querySelector("input[data-context-window]");
     const models = form.querySelector("select[data-model-picker]");
-    if (!models && !context && (!source || !strategy)) return;
+    const defaults = form.querySelector("select[data-query-defaults]");
+    const defaultsToggle = form.querySelector("input[data-query-defaults-toggle]");
+    const queryKind = form.querySelector('input[name="query_kind"][data-cycle-value]');
+    if (!models && !context && !source && !strategy) return;
+
     const setLocked = (control, locked) => {
       if (!control) return;
       control.dataset.profileLocked = locked ? "true" : "false";
       control.setAttribute("aria-disabled", String(locked));
-      if (control instanceof HTMLInputElement) {
-        if (control === context) control.disabled = locked;
-        else control.readOnly = locked;
-      }
+      control.disabled = locked;
       const wrapper = control.previousElementSibling;
       if (wrapper?.classList.contains("search-select")) {
         wrapper.classList.toggle("control-disabled", locked);
@@ -224,47 +225,99 @@
       }
       control.closest("label")?.classList.toggle("control-disabled", locked);
     };
-    const syncSourceOptions = () => {
-      if (!source || !strategy) return;
-      const locked = source.dataset.profileLocked === "true";
-      const usesPdf = source.value === "fulltext";
-      if (!usesPdf) strategy.value = "auto";
-      setLocked(strategy, locked || !usesPdf);
-      strategy.dispatchEvent(new Event("change", { bubbles: true }));
+
+    let syncingProfileOptions = false;
+    const selectedModels = () => models ? Array.from(models.selectedOptions) : [];
+    const defaultsLocked = () => Boolean(defaultsToggle && !defaultsToggle.checked);
+    const localQuery = () => {
+      if (queryKind?.value === "regexp") return true;
+      const option = defaults?.selectedOptions[0];
+      return option?.dataset.local === "true";
     };
+
     const syncProfileOptions = () => {
-      if (!models) {
-        syncSourceOptions();
-        return;
-      }
-      let selected = Array.from(models.selectedOptions);
-      const nativeProfile = selected.find((candidate) =>
+      if (syncingProfileOptions) return;
+      syncingProfileOptions = true;
+      let selected = selectedModels();
+      const native = selected.find((candidate) =>
         ["codex", "claude-code"].includes(candidate.dataset.provider || "")
       );
-      if (nativeProfile && selected.length > 1) {
+      if (native && selected.length > 1 && models) {
         Array.from(models.options).forEach((candidate) => {
-          candidate.selected = candidate === nativeProfile;
+          candidate.selected = candidate === native;
         });
-        selected = [nativeProfile];
+        selected = [native];
       }
-      const native = Boolean(nativeProfile);
-      if (native && source && strategy) {
-        const fulltext = Array.from(source.options).find((option) => option.value === "fulltext");
-        if (fulltext) source.value = "fulltext";
-        strategy.value = nativeProfile.dataset.pdfStrategy || "direct";
+      const single = selected.length === 1 ? selected[0] : null;
+      const provider = single?.dataset.provider || "";
+      const isClaude = provider === "claude-code";
+      const isCodex = provider === "codex";
+      const local = localQuery();
+
+      const codexOnly = source?.querySelector('option[data-codex-only]');
+      if (codexOnly) {
+        codexOnly.disabled = local || !isCodex;
+        if (source?.value === "pdf" && codexOnly.disabled) source.value = "auto";
       }
-      if (native && context && nativeProfile.dataset.contextWindow) {
-        context.value = nativeProfile.dataset.contextWindow;
+      if (isClaude && source && strategy) {
+        source.value = "fulltext";
+        strategy.value = single?.dataset.pdfStrategy || "direct";
       }
-      setLocked(source, Boolean(native));
-      setLocked(strategy, Boolean(native));
-      setLocked(context, Boolean(native));
+      if ((isCodex || isClaude) && context && single?.dataset.contextWindow) {
+        context.value = single.dataset.contextWindow;
+      }
+
+      const lockedByDefaults = defaultsLocked();
+      setLocked(models, lockedByDefaults || local);
+      setLocked(source, lockedByDefaults || isClaude);
+      setLocked(context, lockedByDefaults || local || isCodex || isClaude);
+      if (strategy) {
+        const extractedPdf = source?.value === "fulltext";
+        if (!extractedPdf) strategy.value = "auto";
+        setLocked(strategy, lockedByDefaults || isClaude || !extractedPdf);
+      }
       source?.dispatchEvent(new Event("change", { bubbles: true }));
       strategy?.dispatchEvent(new Event("change", { bubbles: true }));
+      syncingProfileOptions = false;
     };
-    source?.addEventListener("change", syncSourceOptions);
+
+    const applyQueryDefaults = () => {
+      const option = defaults?.selectedOptions[0];
+      if (!option) {
+        syncProfileOptions();
+        return;
+      }
+      if (models) {
+        const wanted = option.dataset.model || "";
+        let matched = false;
+        Array.from(models.options).forEach((candidate) => {
+          candidate.selected = Boolean(wanted && candidate.value === wanted);
+          matched ||= candidate.selected;
+        });
+        if (!matched && wanted === "" && !localQuery() && models.options.length) {
+          models.options[0].selected = true;
+        }
+        const selected = Array.from(models.selectedOptions);
+        if (context && selected.length === 1 && selected[0].dataset.contextWindow) {
+          context.value = selected[0].dataset.contextWindow;
+        }
+      }
+      if (source && option.dataset.source) source.value = option.dataset.source;
+      if (strategy && option.dataset.pdfStrategy) strategy.value = option.dataset.pdfStrategy;
+      syncProfileOptions();
+      models?.dispatchEvent(new Event("change", { bubbles: true }));
+    };
+
+    source?.addEventListener("change", syncProfileOptions);
     models?.addEventListener("change", syncProfileOptions);
-    syncProfileOptions();
+    defaults?.addEventListener("change", applyQueryDefaults);
+    defaultsToggle?.addEventListener("change", () => {
+      if (defaultsLocked()) applyQueryDefaults();
+      else syncProfileOptions();
+    });
+    queryKind?.addEventListener("change", syncProfileOptions);
+    if (defaults) applyQueryDefaults();
+    else syncProfileOptions();
   });
 
   const automaticQueryForm = document.querySelector('form[data-auto-save="query-selections"]');
@@ -313,28 +366,74 @@
       }));
   }
 
+  const contentResultsRunnerForm = document.querySelector("form.content-results-runner-form");
+  const syncContentRunTarget = () => {
+    if (!contentResultsRunnerForm) return;
+    const targetToggle = contentResultsRunnerForm.querySelector("[data-run-target-toggle]");
+    const targetValue = contentResultsRunnerForm.querySelector("[data-run-target-value]");
+    const targetLabel = contentResultsRunnerForm.querySelector("[data-run-target-label]");
+    const runButton = contentResultsRunnerForm.querySelector(".collection-run-button");
+    const summary = document.querySelector(".content-results-runner-details #collection-run-label");
+    if (!targetToggle || !targetValue || !targetLabel || !runButton) return;
+    const resultCount = Number(targetToggle.dataset.resultCount || 0);
+    const selectedCount = Number(targetToggle.dataset.selectedCount || 0);
+    if (selectedCount === 0) targetValue.value = "results";
+    targetToggle.disabled = selectedCount === 0;
+    const useSelected = targetValue.value === "selected";
+    targetToggle.setAttribute("aria-pressed", String(useSelected));
+    const activeCount = useSelected ? selectedCount : resultCount;
+    targetLabel.textContent = useSelected
+      ? `Selected (${selectedCount})`
+      : `Search results (${resultCount})`;
+    const running = runButton.dataset.runRunning === "true";
+    runButton.disabled = running || activeCount === 0;
+    if (summary) {
+      summary.textContent = useSelected
+        ? `Run saved prompt on ${selectedCount} selected record${selectedCount === 1 ? "" : "s"}`
+        : `Run saved prompt on all ${resultCount} search result${resultCount === 1 ? "" : "s"}`;
+    }
+  };
+  contentResultsRunnerForm?.querySelector("[data-run-target-toggle]")?.addEventListener(
+    "click", () => {
+      const targetValue = contentResultsRunnerForm.querySelector("[data-run-target-value]");
+      if (!targetValue) return;
+      targetValue.value = targetValue.value === "selected" ? "results" : "selected";
+      syncContentRunTarget();
+    }
+  );
+  syncContentRunTarget();
+
+  const syncContentResultsRunnerFromDocument = (doc) => {
+    const currentDetails = document.querySelector(".content-results-runner-details");
+    const incomingDetails = doc.querySelector(".content-results-runner-details");
+    if (currentDetails && incomingDetails) currentDetails.hidden = incomingDetails.hidden;
+    if (!contentResultsRunnerForm) return;
+    const incomingForm = doc.querySelector("form.content-results-runner-form");
+    if (!incomingForm) return;
+    contentResultsRunnerForm.querySelectorAll("[data-run-filter]").forEach((input) => input.remove());
+    incomingForm.querySelectorAll("[data-run-filter]").forEach((input) => {
+      contentResultsRunnerForm.appendChild(input.cloneNode(true));
+    });
+    const targetToggle = contentResultsRunnerForm.querySelector("[data-run-target-toggle]");
+    const incomingToggle = incomingForm.querySelector("[data-run-target-toggle]");
+    if (targetToggle && incomingToggle) {
+      targetToggle.dataset.resultCount = incomingToggle.dataset.resultCount || "0";
+      targetToggle.dataset.selectedCount = incomingToggle.dataset.selectedCount || "0";
+    }
+    const runButton = contentResultsRunnerForm.querySelector(".collection-run-button");
+    const incomingButton = incomingForm.querySelector(".collection-run-button");
+    if (runButton && incomingButton) {
+      runButton.dataset.runRunning = incomingButton.dataset.runRunning || "false";
+    }
+    syncContentRunTarget();
+  };
+
   const paperTableBody = document.getElementById("paper-table-body");
-  if (paperTableBody) {
+  if (paperTableBody && !document.querySelector(".selected-content-dock")) {
     const hiddenInput = document.getElementById("selected-paper-ids");
     const status = document.getElementById("paper-selection-status");
     const runLabel = document.getElementById("collection-run-label");
     const clear = document.getElementById("clear-paper-selection");
-    const persistentDock = document.querySelector(".selected-content-dock");
-    if (persistentDock) {
-      const selectedIds = Array.from(
-        persistentDock.querySelectorAll(".paper-select-toggle:checked")
-      ).map((checkbox) => String(checkbox.value));
-      if (hiddenInput) hiddenInput.value = selectedIds.join(",");
-      if (clear) clear.hidden = true;
-      if (runLabel && selectedIds.length) {
-        runLabel.textContent = `Run on ${selectedIds.length} selected paper${selectedIds.length === 1 ? "" : "s"}`;
-      }
-      if (status) {
-        status.textContent = selectedIds.length
-          ? "The persistent selection is used. Change it with the first column or the selected-content panel."
-          : "No papers are persistently selected; the run uses the visible paper results.";
-      }
-    } else {
     const selectionKey = "paperwatch-selected-papers";
     let selected = new Set();
     try {
@@ -373,7 +472,6 @@
     });
     if (clear) clear.addEventListener("click", () => { selected.clear(); updateSelection(); });
     updateSelection();
-    }
   }
 
   const paperJobs = document.getElementById("paper-jobs");
@@ -652,24 +750,33 @@
     select.dataset.searchSelectReady = "true";
     const multiple = select.multiple;
     const enabledOptions = Array.from(select.options).filter((option) => !option.disabled);
+    const currentEnabledOptions = () => Array.from(select.options).filter((option) => !option.disabled);
     const cycle = !multiple && enabledOptions.length > 0 && enabledOptions.length <= 5;
+    const wrapCycle = cycle && select.hasAttribute("data-wrap-cycle");
     const form = select.form || select.closest("form");
     const autoApply = () => {
       if (form && (form.method || "get").toLocaleLowerCase() === "get") form.requestSubmit();
     };
     const wrapper = document.createElement("div");
-    wrapper.className = `search-select${multiple ? " search-select-multiple" : ""}${cycle ? " search-select-cycle" : ""}`;
-    const input = document.createElement("input");
-    input.type = "search";
-    input.className = "search-select-input";
-    input.autocomplete = "off";
+    wrapper.className = `search-select${multiple ? " search-select-multiple" : ""}${cycle ? " search-select-cycle" : ""}${wrapCycle ? " search-select-wrap-cycle" : ""}`;
+    const floatingOptions = Boolean(
+      select.matches("[data-model-picker]") && select.closest(".content-results-runner-row")
+    );
+    const input = document.createElement(wrapCycle ? "button" : "input");
+    if (wrapCycle) input.type = "button";
+    else input.type = "search";
+    input.className = `search-select-input${wrapCycle ? " search-select-wrap-button" : ""}`;
+    if (!wrapCycle) input.autocomplete = "off";
     input.setAttribute("role", "combobox");
-    input.setAttribute("aria-autocomplete", "list");
+    input.setAttribute("aria-autocomplete", cycle ? "none" : "list");
     input.setAttribute("aria-expanded", "false");
-    input.placeholder = select.dataset.searchPlaceholder || (multiple ? "Type to filter choices" : "Type to filter");
-    if (cycle) input.readOnly = true;
+    if (!wrapCycle) {
+      input.placeholder = select.dataset.searchPlaceholder || (multiple ? "Type to filter choices" : "Type to filter");
+      if (cycle) input.readOnly = true;
+    }
     const list = document.createElement("div");
     list.className = "search-select-options";
+    if (floatingOptions) list.classList.add("search-select-options-floating");
     list.id = `search-select-options-${index}`;
     list.setAttribute("role", "listbox");
     if (multiple) list.setAttribute("aria-multiselectable", "true");
@@ -680,15 +787,38 @@
     if (!multiple) chips.hidden = true;
     wrapper.append(input, chips, list);
     select.before(wrapper);
+    if (floatingOptions) document.body.appendChild(list);
     select.classList.add("search-select-native");
     select.setAttribute("aria-hidden", "true");
     select.tabIndex = -1;
 
     let active = -1;
     const normalized = (value) => String(value || "").trim().toLocaleLowerCase();
+    const displayValue = () => wrapCycle ? input.textContent || "" : input.value;
+    const setDisplayValue = (value) => {
+      if (wrapCycle) input.textContent = value;
+      else input.value = value;
+    };
     const maxRenderedOptions = 80;
     let optionRows = [];
     let renderOptionRows = () => {};
+    const positionFloatingOptions = () => {
+      if (!floatingOptions || list.hidden) return;
+      const rect = input.getBoundingClientRect();
+      const viewportPadding = 8;
+      const gap = 5;
+      const width = Math.min(rect.width, window.innerWidth - (viewportPadding * 2));
+      const left = Math.max(
+        viewportPadding,
+        Math.min(rect.left, window.innerWidth - width - viewportPadding)
+      );
+      list.style.left = `${left}px`;
+      list.style.right = "auto";
+      list.style.width = `${width}px`;
+      list.style.top = "auto";
+      list.style.bottom = `${window.innerHeight - rect.top + gap}px`;
+      list.style.maxHeight = `${Math.max(80, Math.min(280, rect.top - gap - viewportPadding))}px`;
+    };
     const visibleRows = () => optionRows;
     const setActive = (rowIndex) => {
       const visible = visibleRows();
@@ -708,7 +838,7 @@
     const selectedOptions = () => Array.from(select.selectedOptions);
     const syncInput = (force = false) => {
       if (!multiple && (force || cycle || document.activeElement !== input)) {
-        input.value = select.selectedIndex >= 0 ? select.options[select.selectedIndex].textContent || "" : "";
+        setDisplayValue(select.selectedIndex >= 0 ? select.options[select.selectedIndex].textContent || "" : "");
       }
       chips.replaceChildren();
       if (multiple) {
@@ -741,6 +871,7 @@
       if (open && !select.disabled) {
         list.hidden = false;
         input.setAttribute("aria-expanded", "true");
+        positionFloatingOptions();
       }
       setActive(0);
     };
@@ -750,7 +881,7 @@
       active = -1;
       optionRows.forEach((row) => row.classList.remove("active"));
       if (!multiple) syncInput();
-      else input.value = "";
+      else setDisplayValue("");
     };
     const choose = (row) => {
       const optionIndex = Number(row.dataset.optionIndex);
@@ -774,15 +905,16 @@
         const emptyOption = Array.from(select.options).find((candidate) => candidate.value === "");
         if (emptyOption) emptyOption.selected = true;
         else select.selectedIndex = -1;
-        input.value = "";
+        setDisplayValue("");
       } else {
         select.selectedIndex = optionIndex;
-        input.value = option.textContent || option.value;
+        if (wrapCycle) setDisplayValue(option.textContent || option.value);
+        else input.value = option.textContent || option.value;
       }
       select.dispatchEvent(new Event("change", { bubbles: true }));
       syncInput(true);
       if (multiple) {
-        input.value = "";
+        setDisplayValue("");
         refresh(true);
         input.focus();
       } else {
@@ -792,7 +924,7 @@
       autoApply();
     };
     renderOptionRows = () => {
-      const term = normalized(input.value);
+      const term = normalized(displayValue());
       const fragment = document.createDocumentFragment();
       const rows = [];
       let matches = 0;
@@ -832,8 +964,9 @@
     input.addEventListener("click", (event) => {
       if (cycle) {
         event.preventDefault();
-        const current = enabledOptions.indexOf(select.options[select.selectedIndex]);
-        const next = enabledOptions[(current + 1 + enabledOptions.length) % enabledOptions.length];
+        const options = currentEnabledOptions();
+        const current = options.indexOf(select.options[select.selectedIndex]);
+        const next = options[(current + 1 + options.length) % options.length];
         if (!next) return;
         select.value = next.value;
         select.dispatchEvent(new Event("change", { bubbles: true }));
@@ -843,8 +976,8 @@
       }
       if (!multiple && select.selectedIndex >= 0) {
         const selectedText = select.options[select.selectedIndex].textContent || "";
-        if (input.value === selectedText) {
-          input.value = "";
+        if (displayValue() === selectedText) {
+          setDisplayValue("");
           refresh(true);
         }
       }
@@ -854,9 +987,10 @@
       const visible = visibleRows();
       if (cycle && ["ArrowDown", "ArrowUp", "Enter", " "].includes(event.key)) {
         event.preventDefault();
-        const current = enabledOptions.indexOf(select.options[select.selectedIndex]);
+        const options = currentEnabledOptions();
+        const current = options.indexOf(select.options[select.selectedIndex]);
         const direction = event.key === "ArrowUp" ? -1 : 1;
-        const next = enabledOptions[(current + direction + enabledOptions.length) % enabledOptions.length];
+        const next = options[(current + direction + options.length) % options.length];
         if (next) {
           select.value = next.value;
           select.dispatchEvent(new Event("change", { bubbles: true }));
@@ -879,7 +1013,7 @@
         const row = visibleRows()[active >= 0 ? active : 0];
         if (row) {
           const option = select.options[Number(row.dataset.optionIndex)];
-          if (option && !multiple && !option.selected) input.value = option.textContent || option.value;
+          if (option && !multiple && !option.selected) setDisplayValue(option.textContent || option.value);
           choose(row);
         }
       } else if (event.key === "Escape") {
@@ -888,8 +1022,15 @@
       }
     });
     document.addEventListener("click", (event) => {
-      if (!wrapper.contains(event.target)) close();
+      if (!wrapper.contains(event.target) && !list.contains(event.target)) close();
     });
+    if (floatingOptions) {
+      window.addEventListener("resize", positionFloatingOptions);
+      window.addEventListener("scroll", positionFloatingOptions, { passive: true });
+      select.closest(".content-results-runner-row")?.addEventListener(
+        "scroll", positionFloatingOptions, { passive: true }
+      );
+    }
     const observer = new MutationObserver(syncInput);
     observer.observe(select, { attributes: true, attributeFilter: ["disabled"] });
     select.addEventListener("change", () => syncInput(true));
@@ -935,13 +1076,30 @@
   });
 
   const queryKindInput = document.querySelector('input[name="query_kind"][data-cycle-value]');
-  const classificationSettings = document.querySelector("[data-classification-settings]");
-  if (queryKindInput && classificationSettings) {
-    const updateClassificationSettings = () => {
-      classificationSettings.hidden = queryKindInput.value !== "classification";
+  const tagQuerySettings = document.querySelector("[data-tag-query-settings], [data-classification-settings]");
+  if (queryKindInput) {
+    const updateQueryKindSettings = () => {
+      const kind = queryKindInput.value;
+      if (tagQuerySettings) tagQuerySettings.hidden = kind === "summary";
+      document.querySelectorAll("[data-classification-help]").forEach((item) => {
+        item.hidden = kind !== "classification";
+      });
+      document.querySelectorAll("[data-regexp-tag-help]").forEach((item) => {
+        item.hidden = kind !== "regexp";
+      });
+      document.querySelectorAll("[data-llm-query-setting]").forEach((item) => {
+        const hidden = kind === "regexp";
+        item.hidden = hidden;
+        item.querySelectorAll("input, textarea, select, button").forEach((control) => {
+          control.disabled = hidden;
+        });
+      });
+      document.querySelector("select[data-model-picker]")?.dispatchEvent(
+        new Event("change", { bubbles: true })
+      );
     };
-    queryKindInput.addEventListener("change", updateClassificationSettings);
-    updateClassificationSettings();
+    queryKindInput.addEventListener("change", updateQueryKindSettings);
+    updateQueryKindSettings();
   }
 
   document.querySelectorAll("[data-dialog-open]").forEach((button) => {
@@ -1082,6 +1240,7 @@
     const response = await fetch(url, { headers: { "X-Paperwatch-Partial": "1" } });
     if (!response.ok) throw new Error(`Request failed with HTTP ${response.status}`);
     const doc = parseHtml(await response.text());
+    syncContentResultsRunnerFromDocument(doc);
     const incomingResults = doc.querySelector("#content-results-root");
     const currentResults = document.querySelector("#content-results-root");
     if (!incomingResults || !currentResults) return false;
@@ -1096,8 +1255,9 @@
     const currentSearch = document.querySelector('input[name="q"][form="content-column-filters"]');
     if (incomingSearch && currentSearch) currentSearch.value = incomingSearch.value;
     initializeDynamicSelects(incomingResults);
-    const finalUrl = new URL(url, window.location.href).toString();
+    const finalUrl = new URL(response.url || url, window.location.href).toString();
     if (push) window.history.pushState({}, "", finalUrl);
+    else if (response.redirected) window.history.replaceState({}, "", finalUrl);
     rememberContentUrl(finalUrl);
     return true;
   };
@@ -1230,6 +1390,10 @@
       event.preventDefault();
       try {
         const payload = await postAsync(form);
+        if (document.querySelector("#content-page-root")) {
+          await refreshContentPage(window.location.href, false);
+          return;
+        }
         if ("starred" in payload) {
           const input = form.querySelector('input[name="starred"]');
           const button = form.querySelector(".star-button");
@@ -1259,8 +1423,15 @@
     }
     if (form.matches("[data-async-action]")) {
       event.preventDefault();
+      const refreshContentResults = Boolean(
+        document.querySelector("#content-page-root") && form.closest("#content-results-root")
+      );
       try {
         await postAsync(form);
+        if (refreshContentResults) {
+          await refreshContentPage(window.location.href, false);
+          return;
+        }
         if (form.closest(".selected-content-dock")) updateRowsForBulkAction(form);
         const selector = form.dataset.refreshSelector;
         if (selector) await refreshSelector(selector);

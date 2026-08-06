@@ -987,3 +987,36 @@ def test_ollama_structured_output_retries_twice_with_larger_output_budget(analys
     assert limits == sorted(limits)
     assert limits[0] < limits[-1]
     assert sum("larger output budget" in value for kind, value in progress if kind == "message") == 2
+
+
+def test_openai_strict_schema_requires_every_object_property():
+    from paperwatch.models import BATCH_QUERY_JSON_SCHEMA
+
+    llm = OpenAIClient(
+        model="m",
+        base_url="https://api.test",
+        api_key="key",
+        timeout_seconds=1,
+        client=httpx.Client(),
+    )
+    payload = llm._request_payload(
+        "x", schema=BATCH_QUERY_JSON_SCHEMA, schema_name="paper_collection_query"
+    )
+    strict_schema = payload["text"]["format"]["schema"]
+
+    def assert_strict(value):
+        if isinstance(value, dict):
+            assert "default" not in value
+            properties = value.get("properties")
+            if isinstance(properties, dict):
+                assert value["required"] == list(properties)
+                assert value["additionalProperties"] is False
+            for child in value.values():
+                assert_strict(child)
+        elif isinstance(value, list):
+            for child in value:
+                assert_strict(child)
+
+    assert_strict(strict_schema)
+    assert "blog_entry_id" in strict_schema["$defs"]["BatchQueryItem"]["required"]
+    llm.close()

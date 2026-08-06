@@ -366,7 +366,9 @@ def test_paper_async_jobs_saved_prompt_and_no_reload_ui(
         db.add_author(author_candidate)
         paper_id, _ = db.upsert_paper(paper_record)
         query_id = db.create_saved_query(
-            name="Saved critique", source_type="papers", search_query="", prompt="Critique"
+            name="Saved critique", source_type="papers", search_query="", prompt="Critique",
+            model_profiles=("default",), paper_source_scope="fulltext",
+            pdf_strategy="direct",
         )
         failed = db.create_analysis_tasks(
             batch_id="old", paper_id=paper_id, scope="abstract",
@@ -399,9 +401,13 @@ def test_paper_async_jobs_saved_prompt_and_no_reload_ui(
     )
     page = client.get(f"/papers/{paper_id}")
     assert 'data-paper-job="analysis"' not in page.text
-    assert 'data-paper-job="query"' in page.text
+    assert 'data-paper-job="query"' not in page.text
+    assert 'data-query-defaults-form' not in page.text
     assert "Saved critique" in page.text
     assert "Saved result" in page.text and "Critical result" in page.text
+    results_page = client.get("/")
+    assert 'class="collection-runner-row content-results-runner-row"' in results_page.text
+    assert 'data-query-defaults-form' in results_page.text
     assert "old failure" not in page.text
 
     response = client.post(
@@ -412,11 +418,35 @@ def test_paper_async_jobs_saved_prompt_and_no_reload_ui(
     assert response.status_code == 200 and response.json()["batch_id"] == "analysis-web"
     response = client.post(
         f"/papers/{paper_id}/prompt",
-        data={"query_id": query_id, "model": "default", "context_window_tokens": 4096},
+        data={
+            "query_id": query_id,
+            "model": "missing",
+            "source_scope": "abstract",
+            "pdf_strategy": "auto",
+            "context_window_tokens": 4096,
+        },
         headers={"X-Paperwatch-Async": "1"},
     )
     assert response.status_code == 200 and response.json()["batch_id"] == "query-web"
+    assert query.calls[-1][:3] == (query_id, ("default",), config.llm.context_window_tokens)
     assert query.calls[-1][3]["paper_ids"] == [paper_id]
+    assert query.calls[-1][4:] == ("fulltext", "direct")
+
+    response = client.post(
+        f"/papers/{paper_id}/prompt",
+        data={
+            "query_id": query_id,
+            "override_query_defaults": "1",
+            "model": "default",
+            "source_scope": "abstract",
+            "pdf_strategy": "auto",
+            "context_window_tokens": 4096,
+        },
+        headers={"X-Paperwatch-Async": "1"},
+    )
+    assert response.status_code == 200 and response.json()["batch_id"] == "query-web"
+    assert query.calls[-1][:3] == (query_id, ("default",), 4096)
+    assert query.calls[-1][4:] == ("abstract", "auto")
     assert client.post("/api/analysis-cancel").json()["ok"] is True
     assert client.post("/api/query-cancel").json()["ok"] is True
 
@@ -821,7 +851,11 @@ def test_web_async_validation_and_busy_responses(config_path, paper_record):
     ).status_code == 400
     assert client.post(
         f"/papers/{paper_id}/prompt",
-        data={"query_id": query_id, "model": "missing"}, headers=headers,
+        data={
+            "query_id": query_id,
+            "override_query_defaults": "1",
+            "model": "missing",
+        }, headers=headers,
     ).status_code == 400
     assert client.post("/api/analysis-cancel").status_code == 409
     assert client.post("/api/query-cancel").status_code == 409

@@ -70,26 +70,6 @@
 {% if paper.abstract %}<section class="panel prose"><div class="panel-heading"><h2>Source abstract</h2></div><p>{{ paper.abstract }}</p></section>{% endif %}
 <section class="panel object-notes-panel inline-notes-panel" data-inline-notes><div class="panel-heading">{% if not paper.notes %}<div><h2>Notes</h2><p>Private Markdown notes for this paper.</p></div>{% else %}<span></span>{% endif %}<button class="button button-small" type="button" data-notes-edit>{{ 'Edit' if paper.notes else 'Add notes' }}</button></div><div data-notes-display>{% if paper.notes %}<article class="prose notes-rendered">{{ paper.notes|markdown|safe }}</article>{% else %}<p class="muted">No notes.</p>{% endif %}</div><form method="post" action="/notes/paper/{{ paper.id }}" data-async-action data-refresh-selector=".object-notes-panel" data-notes-form hidden><textarea name="notes" rows="8" maxlength="200000" placeholder="Markdown notes">{{ paper.notes or '' }}</textarea><div class="button-group"><button class="button button-primary" type="submit">Save notes</button><button class="button" type="button" data-notes-cancel>Cancel</button></div></form></section>
 
-<section class="panel model-runner">
-  <div class="panel-heading"><div><h2>Run saved prompt</h2><p>Choose the prompt, models, source, PDF handling, and context for this run.</p></div>{% if query_state.running and query_state.paper_id == paper.id %}<span class="status status-running">running</span>{% endif %}</div>
-  {% if saved_queries and model_profiles and (paper.abstract or paper.pdf_url or paper.local_pdf_path) %}
-  <form id="saved-prompt-form" data-paper-job="query" method="post" action="/papers/{{ paper.id }}/prompt" class="collection-runner-form paper-saved-prompt-form" data-profile-controls>
-    <label><span>Saved query</span><select name="query_id" required>{% for query in saved_queries %}<option value="{{ query.id }}">{{ query.name }}</option>{% endfor %}</select><small>Uses this paper only.</small></label>
-    <label><span>Models</span><select name="model" multiple size="5" required data-model-picker data-search-placeholder="Search model profiles">{% for profile in model_profiles %}<option value="{{ profile.profile }}" {% if loop.first %}selected{% endif %} data-provider="{{ profile.provider }}" data-context-window="{{ profile.context_window_tokens or '' }}" data-pdf-strategy="{{ profile.pdf_analysis_strategy or 'auto' }}">{{ profile.profile }} · {{ profile.model }}{% if profile.reasoning_effort %} · {{ profile.reasoning_effort }}{% endif %}</option>{% endfor %}</select><small>Select one or more configured profiles.</small></label>
-    <label><span>Source</span><select name="source_scope" data-source-scope>{% if paper.pdf_url or paper.local_pdf_path %}<option value="fulltext">Full paper PDF</option>{% endif %}{% if paper.abstract %}<option value="abstract">Abstract</option>{% endif %}</select><small>Codex and Claude Code use the original PDF.</small></label>
-    <label><span>PDF strategy</span><select name="pdf_strategy" data-pdf-strategy><option value="chunked">Chunk + merge</option><option value="auto">Auto</option><option value="direct">Direct</option></select><small>Locked to the profile setting for native PDF providers.</small></label>
-    <label><span>Context window tokens</span><input type="number" name="context_window_tokens" min="512" max="1000000" value="16384" data-context-window><small>Locked to the selected native profile when applicable.</small></label>
-    <button class="button button-primary" type="submit" {% if query_state.running %}disabled{% endif %}>Run saved prompt</button>
-  </form>
-  {% elif not saved_queries %}<p class="form-help">Create a reusable prompt on <a href="/queries">Queries</a>.</p>
-  {% elif not model_profiles %}<p class="muted">No active LLM profiles are configured.</p>
-  {% else %}<p class="muted">No abstract or PDF is available.</p>{% endif %}
-  <div id="paper-jobs" class="live-job" data-paper-id="{{ paper.id }}" hidden>
-    <div class="live-job-heading"><div><strong id="job-stage">Starting</strong><small id="job-message"></small></div><button id="job-cancel" class="button button-small button-danger" type="button">Stop</button></div>
-    <pre id="job-output" aria-live="polite"></pre>
-  </div>
-</section>
-
 <div id="paper-results">
 <details class="panel"><summary>Source metadata</summary><pre>{{ metadata|prettyjson }}</pre></details>
 

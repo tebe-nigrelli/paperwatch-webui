@@ -177,11 +177,60 @@ def regexp_result(
     )
 
 
+def regexp_tag_result(
+    documents: list[dict[str, Any]], values: list[dict[str, str]]
+) -> BatchQueryResult:
+    items: list[dict[str, Any]] = []
+    counts: dict[str, int] = {}
+    compiled = [
+        (item["value"], re.compile(item["pattern"], re.MULTILINE))
+        for item in values
+    ]
+    for document in documents:
+        content = next(
+            (
+                str(document[key])
+                for key in ("fulltext", "abstract", "content", "content_excerpt")
+                if document.get(key) not in (None, "")
+            ),
+            "",
+        )
+        for value, expression in compiled:
+            match = expression.search(content)
+            if match is None:
+                continue
+            counts[value] = counts.get(value, 0) + 1
+            items.append(
+                {
+                    "paper_id": document.get("paper_id"),
+                    "blog_entry_id": document.get("blog_entry_id"),
+                    "content_type": document.get("content_type", "paper"),
+                    "title": str(document.get("title") or "Untitled record"),
+                    "output": match.group(0),
+                }
+            )
+            break
+    summary = ", ".join(f"{value}: {count}" for value, count in counts.items())
+    return BatchQueryResult.model_validate(
+        {
+            "title": "Regexp tags",
+            "summary": summary or "No regexp tags matched.",
+            "items": items,
+        }
+    )
+
+
 def _selection_search_args(selection: dict[str, Any] | None) -> dict[str, Any]:
     selection = selection or {}
     return {
         "query": str(selection.get("query") or ""),
+        "title_query": str(selection.get("title_query") or ""),
         "author_id": str(selection.get("author_id") or ""),
+        "author_ids": tuple(
+            str(value)
+            for value in selection.get("author_ids", ())
+            if str(value).strip()
+        ) if isinstance(selection.get("author_ids"), (list, tuple)) else (),
         "author_tags": tuple(
             str(tag)
             for tag in selection.get("author_tags", ())
@@ -193,6 +242,11 @@ def _selection_search_args(selection: dict[str, Any] | None) -> dict[str, Any]:
             if str(tag).strip()
         ) if isinstance(selection.get("content_tags"), (list, tuple)) else (),
         "topic_id": str(selection.get("topic_id") or ""),
+        "topic_ids": tuple(
+            str(value)
+            for value in selection.get("topic_ids", ())
+            if str(value).strip()
+        ) if isinstance(selection.get("topic_ids"), (list, tuple)) else (),
         "paper_kind": str(selection.get("paper_kind") or ""),
         "scope": str(selection.get("scope") or ""),
         "has_pdf": selection.get("has_pdf") if isinstance(selection.get("has_pdf"), bool) else None,
@@ -250,6 +304,7 @@ def _selected_blog_entries(db: Database, selection: dict[str, Any] | None) -> li
         read=args["read"] if isinstance(args["read"], bool) else None,
         analyzed=args["analyzed"] if isinstance(args["analyzed"], bool) else None,
         notes=args["notes"] if isinstance(args["notes"], bool) else None,
+        show_stubs=bool((selection or {}).get("display_stubs")),
         query_view=True,
     )
 
@@ -293,6 +348,7 @@ def validate_query_sources(
                 notes=(selection or {}).get("notes")
                 if isinstance((selection or {}).get("notes"), bool)
                 else None,
+                show_stubs=bool((selection or {}).get("display_stubs")),
             )
         )
         if not count:
@@ -319,10 +375,12 @@ def validate_query_sources(
         source_label = "an abstract or PDF"
     elif source_scope == "abstract":
         if pdf_strategy != "auto":
-            raise ValueError("PDF strategy only applies when the source is Full paper PDF")
+            raise ValueError("PDF strategy only applies when the source is full paper text")
         missing = [row for row in papers if not str(row["abstract"] or "").strip()]
         source_label = "an abstract"
     else:
+        if source_scope == "pdf" and pdf_strategy != "auto":
+            raise ValueError("PDF strategy does not apply when uploading the whole PDF")
         missing = []
         for row in papers:
             pdf_url = str(row["pdf_url"] or "").strip()
@@ -764,17 +822,22 @@ def run_query_batch(
             regexp_pattern = str(query["regexp_pattern"] or "")
             regexp_radius = int(query["regexp_radius"] or 0)
             regexp_mode = str(query["regexp_mode"] or "query")
+            query_kind = str(query["query_kind"] or "summary")
+            label_values = Database._decoded_label_values(query["label_values_json"])
             native_profiles = {
                 name
                 for name in profile_names
-                if name in profiles and profiles[name].provider in {"codex", "claude-code"}
+                if name in profiles and profiles[name].provider == "claude-code"
             }
-            native_pdf_only = bool(profile_names) and native_profiles == set(profile_names)
+            native_pdf_only = (
+                source_scope == "pdf"
+                or (bool(profile_names) and native_profiles == set(profile_names))
+            )
             native_papers: list[Any] = []
             if (
                 native_pdf_only
                 and content_type == "papers"
-                and source_scope == "fulltext"
+                and source_scope in {"fulltext", "pdf"}
                 and not regexp_pattern
             ):
                 native_papers = _selected_papers(db, selection)
@@ -805,7 +868,8 @@ def run_query_batch(
                 run_id = int(row["id"])
                 profile = profiles.get(profile_name)
                 local_print = regexp_mode == "print" and bool(regexp_pattern)
-                if profile is None and not local_print:
+                local_regexp_tags = query_kind == "regexp"
+                if profile is None and not (local_print or local_regexp_tags):
                     db.finish_query_run(
                         run_id, matched_count=len(documents), input_chars=0,
                         error=f"Configured LLM profile {profile_name!r} is no longer available",
@@ -828,6 +892,24 @@ def run_query_batch(
                 llm: LLMClient | None = None
                 try:
                     publish(progress, "reset_output", "")
+                    if local_regexp_tags:
+                        result = regexp_tag_result(documents, label_values)
+                        output = result.model_dump()
+                        db.finish_query_run(
+                            run_id,
+                            matched_count=len(documents),
+                            input_chars=sum(
+                                len(str(item.get("content") or item.get("abstract") or item.get("fulltext") or ""))
+                                for item in documents
+                            ),
+                            output=output,
+                        )
+                        db.apply_query_classifications(query_id, run_id, output)
+                        completed += 1
+                        progress_done += 1
+                        publish(progress, "message", "Applied regexp tags")
+                        publish(progress, "progress", f"{progress_done}/{len(runs)}")
+                        continue
                     if local_print:
                         result = regexp_result(documents, regexp_pattern, regexp_matches)
                         db.finish_query_run(
@@ -856,12 +938,12 @@ def run_query_batch(
                         else context_window_tokens
                     )
                     configure_context_window(llm, effective_context)
-                    if (
-                        profile.provider in {"codex", "claude-code"}
-                        and content_type == "papers"
-                        and source_scope == "fulltext"
-                        and not regexp_pattern
-                    ):
+                    native_pdf = (
+                        profile.provider == "codex" and source_scope == "pdf"
+                    ) or (
+                        profile.provider == "claude-code" and source_scope == "fulltext"
+                    )
+                    if native_pdf and content_type == "papers" and not regexp_pattern:
                         if not native_papers:
                             native_papers = _selected_papers(db, selection)
                         result, _usage, input_chars = run_query_for_native_pdfs(
@@ -964,9 +1046,9 @@ class QueryController:
                 selection["content_type"] = "blogs"
             else:
                 selection.pop("content_type", None)
-                if source_scope not in {"abstract", "fulltext", "auto"}:
+                if source_scope not in {"abstract", "fulltext", "auto", "pdf"}:
                     raise ValueError(
-                        "Query source must be abstract or fulltext; automatic runs may use auto"
+                        "Query source must be abstract or fulltext, or whole-PDF upload; automatic runs may use auto"
                     )
             if pdf_strategy not in {"auto", "direct", "chunked"}:
                 raise ValueError("PDF strategy must be auto, direct, or chunked")
@@ -987,9 +1069,10 @@ class QueryController:
                     str(query["regexp_mode"] or "query") == "print"
                     and bool(str(query["regexp_pattern"] or "").strip())
                 )
+                local_regexp_tags = str(query["query_kind"] or "summary") == "regexp"
                 selected = (
                     ("regexp",)
-                    if local_print
+                    if local_print or local_regexp_tags
                     else tuple(dict.fromkeys(profiles))
                 )
                 if not selected:
@@ -1001,16 +1084,18 @@ class QueryController:
                     )
                 configured_profiles = [available[name] for name in selected if name in available]
                 if (
-                    content_type == "papers"
-                    and len(configured_profiles) == 1
+                    len(configured_profiles) == 1
                     and configured_profiles[0].provider in {"codex", "claude-code"}
                 ):
-                    native_profile = configured_profiles[0]
-                    source_scope = "fulltext"
-                    pdf_strategy = native_profile.pdf_analysis_strategy or "direct"
-                    context_window_tokens = native_profile.context_window_tokens
-                    selection["source_scope"] = source_scope
-                    selection["pdf_strategy"] = pdf_strategy
+                    context_window_tokens = configured_profiles[0].context_window_tokens
+                if source_scope == "pdf":
+                    if local_print or local_regexp_tags:
+                        raise ValueError("Local regexp queries cannot upload a whole PDF")
+                    if len(configured_profiles) != 1 or configured_profiles[0].provider != "codex":
+                        raise ValueError("Whole-PDF upload requires exactly one Codex model")
+                    if str(query["regexp_pattern"] or "").strip():
+                        raise ValueError("Regexp preprocessing is unavailable for whole-PDF upload")
+                    context_window_tokens = configured_profiles[0].context_window_tokens
                 validate_query_sources(
                     db,
                     selection=selection,
@@ -1052,6 +1137,146 @@ class QueryController:
             )
             self._thread.start()
             return batch_id
+
+    def start_on_results(
+        self,
+        query_id: int,
+        profiles: tuple[str, ...],
+        context_window_tokens: int,
+        *,
+        targets: tuple[tuple[str, dict[str, Any]], ...],
+        source_scope: str = "abstract",
+        pdf_strategy: str = "auto",
+    ) -> tuple[str, ...] | None:
+        """Run one saved query over every supported result type in sequence."""
+        with self._lock:
+            if self._snapshot.running:
+                return None
+            if not 512 <= context_window_tokens <= 1_000_000:
+                raise ValueError("Context window must be between 512 and 1000000 tokens")
+            ordered_targets: list[tuple[str, dict[str, Any]]] = []
+            seen_targets: set[str] = set()
+            for content_type, raw_selection in targets:
+                content_type = str(content_type)
+                if content_type not in {"papers", "blogs"}:
+                    raise ValueError("Content type must be papers or blogs")
+                if content_type not in seen_targets:
+                    ordered_targets.append((content_type, dict(raw_selection)))
+                    seen_targets.add(content_type)
+            if not ordered_targets:
+                raise ValueError("No search results were selected")
+            if "papers" in seen_targets and source_scope not in {
+                "abstract", "fulltext", "auto", "pdf"
+            }:
+                raise ValueError(
+                    "Query source must be abstract or fulltext, or whole-PDF upload; automatic runs may use auto"
+                )
+            if pdf_strategy not in {"auto", "direct", "chunked"}:
+                raise ValueError("PDF strategy must be auto, direct, or chunked")
+
+            config = load_config(self.config_path)
+            available = {item.profile: item for item in config.available_llms}
+            jobs: list[tuple[str, int, tuple[str, ...]]] = []
+            active_types: list[str] = []
+            with Database(config.paths.database) as db:
+                query = db.get_saved_query(query_id)
+                if query is None:
+                    raise ValueError("Saved query not found")
+                supported = str(query["content_scope"] or "both")
+                local_print = (
+                    str(query["regexp_mode"] or "query") == "print"
+                    and bool(str(query["regexp_pattern"] or "").strip())
+                )
+                local_regexp_tags = str(query["query_kind"] or "summary") == "regexp"
+                selected = (
+                    ("regexp",)
+                    if local_print or local_regexp_tags
+                    else tuple(dict.fromkeys(profiles))
+                )
+                if not selected:
+                    raise ValueError("Select at least one configured model")
+                unknown = [name for name in selected if name not in available and name != "regexp"]
+                if unknown:
+                    raise ValueError(
+                        f"Unknown configured model profile(s): {', '.join(unknown)}"
+                    )
+                configured_profiles = [available[name] for name in selected if name in available]
+                if (
+                    len(configured_profiles) == 1
+                    and configured_profiles[0].provider in {"codex", "claude-code"}
+                ):
+                    context_window_tokens = configured_profiles[0].context_window_tokens
+                if "papers" in seen_targets and source_scope == "pdf":
+                    if local_print or local_regexp_tags:
+                        raise ValueError("Local regexp queries cannot upload a whole PDF")
+                    if len(configured_profiles) != 1 or configured_profiles[0].provider != "codex":
+                        raise ValueError("Whole-PDF upload requires exactly one Codex model")
+                    if str(query["regexp_pattern"] or "").strip():
+                        raise ValueError("Regexp preprocessing is unavailable for whole-PDF upload")
+                    context_window_tokens = configured_profiles[0].context_window_tokens
+
+                for content_type, raw_selection in ordered_targets:
+                    if supported not in {"both", content_type}:
+                        continue
+                    selection = dict(raw_selection)
+                    if content_type == "blogs":
+                        selection["content_type"] = "blogs"
+                        target_source = "blog"
+                        target_pdf_strategy = "auto"
+                        if not _selected_blog_entries(db, selection):
+                            continue
+                    else:
+                        selection.pop("content_type", None)
+                        target_source = source_scope
+                        target_pdf_strategy = pdf_strategy
+                        if not _selected_papers(db, selection):
+                            continue
+                    selection["source_scope"] = target_source
+                    selection["pdf_strategy"] = target_pdf_strategy
+                    validate_query_sources(
+                        db,
+                        selection=selection,
+                        source_scope=target_source,
+                        pdf_strategy=target_pdf_strategy,
+                    )
+                    batch_id = secrets.token_hex(10)
+                    db.create_query_runs(
+                        batch_id=batch_id,
+                        query_id=query_id,
+                        profiles=[
+                            (name, "local", "regexp")
+                            if name == "regexp"
+                            else (name, available[name].provider, available[name].model)
+                            for name in selected
+                        ],
+                        context_window_tokens=context_window_tokens,
+                        selection=selection,
+                    )
+                    jobs.append((batch_id, query_id, selected))
+                    active_types.append(content_type)
+            if not jobs:
+                raise ValueError("No records match the current search results")
+
+            self._cancel_event = threading.Event()
+            self._active_llm = None
+            self._snapshot = QueryBatchSnapshot(
+                running=True,
+                batch_id=jobs[0][0],
+                query_id=query_id,
+                content_type="results" if len(jobs) > 1 else active_types[0],
+                profiles=jobs[0][2],
+                stage="Queued",
+                message=f"Preparing saved prompt for {len(jobs)} result set(s)",
+                progress_total=len(jobs),
+            )
+            self._thread = threading.Thread(
+                target=self._work_many,
+                args=(tuple(jobs), context_window_tokens),
+                name="paperwatch-query-results",
+                daemon=True,
+            )
+            self._thread.start()
+            return tuple(job[0] for job in jobs)
 
     def start_many(
         self,
@@ -1103,7 +1328,8 @@ class QueryController:
                         str(query["regexp_mode"] or "query") == "print"
                         and bool(str(query["regexp_pattern"] or "").strip())
                     )
-                    selected = ("regexp",) if local_print else (profile,)
+                    local_regexp_tags = str(query["query_kind"] or "summary") == "regexp"
+                    selected = ("regexp",) if local_print or local_regexp_tags else (profile,)
                     if selected != ("regexp",) and profile not in available:
                         raise ValueError(f"Unknown configured model profile: {profile}")
                     batch_id = secrets.token_hex(10)

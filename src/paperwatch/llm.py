@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 from dataclasses import dataclass
 import json
 from pathlib import Path
@@ -641,6 +642,22 @@ class OpenAIClient:
     def _request_payload(
         self, prompt: str, *, schema: dict[str, Any], schema_name: str
     ) -> dict[str, Any]:
+        strict_schema = copy.deepcopy(schema)
+
+        def normalize(value: Any) -> None:
+            if isinstance(value, dict):
+                value.pop("default", None)
+                properties = value.get("properties")
+                if isinstance(properties, dict):
+                    value["required"] = list(properties)
+                    value["additionalProperties"] = False
+                for child in value.values():
+                    normalize(child)
+            elif isinstance(value, list):
+                for child in value:
+                    normalize(child)
+
+        normalize(strict_schema)
         payload: dict[str, Any] = {
             "model": self.model,
             "input": prompt,
@@ -650,7 +667,7 @@ class OpenAIClient:
                     "type": "json_schema",
                     "name": schema_name,
                     "description": "Structured JSON response",
-                    "schema": schema,
+                    "schema": strict_schema,
                     "strict": True,
                 }
             },

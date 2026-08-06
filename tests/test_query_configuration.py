@@ -195,6 +195,7 @@ def test_query_page_stores_one_model_and_uses_config_context(config_path):
         assert row["paper_source_scope"] == "fulltext"
         assert row["pdf_strategy"] == "chunked"
 
+
     selected = client.post(
         "/queries/automatic",
         data={
@@ -258,6 +259,30 @@ def test_query_page_stores_one_model_and_uses_config_context(config_path):
     assert "Run backward" not in table.text
     assert "Save selections" not in table.text
     assert "Changes save automatically" in table.text
+
+
+def test_collection_runner_places_override_and_options_after_query(
+    config_path, paper_record
+):
+    config = load_config(config_path)
+    with Database(config.paths.database) as db:
+        db.upsert_paper(paper_record)
+
+    page = _client(config_path).get("/")
+    assert page.status_code == 200
+    runner = page.text.split('id="collection-runner-form"', 1)[1].split("</form>", 1)[0]
+    assert 'class="collection-runner-row content-results-runner-row"' in runner
+    assert 'class="collection-defaults-input"' in runner
+    positions = [
+        runner.index('name="query_id"'),
+        runner.index("collection-defaults-toggle"),
+        runner.index('name="model"'),
+        runner.index('name="source_scope"'),
+        runner.index('name="pdf_strategy"'),
+        runner.index('name="context_window_tokens"'),
+        runner.index("collection-run-button"),
+    ]
+    assert positions == sorted(positions)
 
 
 def test_query_execution_validation_and_bulk_targets(config_path):
@@ -373,7 +398,7 @@ def test_schema_25_migrates_saved_query_model_and_removes_context(tmp_path):
         assert "context_window_tokens" not in columns
         assert db.get_saved_query(query_id)["model_profile"] == "secondary"
         assert db.get_query_run(run_id)["context_window_tokens"] == 7777
-        assert db._conn.execute("PRAGMA user_version").fetchone()[0] == 26
+        assert db._conn.execute("PRAGMA user_version").fetchone()[0] == 27
         assert db._conn.execute("PRAGMA foreign_key_check").fetchall() == []
 
 def test_context_window_override_is_local_only(app_config):
@@ -728,3 +753,198 @@ def test_automatic_query_cancellation_marks_run(
         with pytest.raises(JobCancelled):
             app._run_automatic_queries(stats)
         assert db.list_query_runs()[0]["error_text"] == "Cancelled by user"
+
+
+def test_regexp_tagger_can_be_created_from_query_form(config_path):
+    client = _client(config_path)
+    page = client.get("/queries/new")
+    assert "Regexp tagger" in page.text
+    assert "Upload whole PDF (Codex)" in page.text
+    assert "data-codex-only" in page.text
+
+    response = client.post(
+        "/queries",
+        data={
+            "name": "Compact architecture",
+            "query_kind": "regexp",
+            "content_scope": "papers",
+            "label_class": "Architecture",
+            "label_values": r"Compact = (?i)compact\s+agent",
+            "label_debug_text": "A compact agent architecture.",
+            "paper_source_scope": "abstract",
+            "pdf_strategy": "auto",
+        },
+        follow_redirects=False,
+    )
+    assert response.status_code == 303
+    assert "level=success" in response.headers["location"]
+
+    config = load_config(config_path)
+    with Database(config.paths.database) as db:
+        row = next(
+            item
+            for item in db.list_saved_queries()
+            if item["name"] == "Compact architecture"
+        )
+        assert row["query_kind"] == "regexp"
+        assert row["model_profile"] == ""
+        assert row["prompt"] == "Apply regexp tags locally."
+        values = Database._decoded_label_values(row["label_values_json"])
+        assert values == [
+            {"value": "Compact", "pattern": r"(?i)compact\s+agent"}
+        ]
+        assert row["label_debug_text"] == "A compact agent architecture."
+
+    edit_page = client.get(f"/queries/{int(row['id'])}/edit")
+    assert edit_page.status_code == 200
+    assert 'name="label_debug_text"' in edit_page.text
+    assert "A compact agent architecture." in edit_page.text
+
+    updated = client.post(
+        f"/queries/{int(row['id'])}/edit",
+        data={
+            "name": "Compact architecture",
+            "query_kind": "regexp",
+            "content_scope": "papers",
+            "label_class": "Architecture",
+            "label_values": r"Compact = (?i)compact\s+agent",
+            "label_debug_text": "Updated compact agent sample.",
+            "paper_source_scope": "abstract",
+            "pdf_strategy": "auto",
+        },
+        follow_redirects=False,
+    )
+    assert updated.status_code == 303
+    with Database(config.paths.database) as db:
+        assert db.get_saved_query(int(row["id"]))["label_debug_text"] == (
+            "Updated compact agent sample."
+        )
+
+
+def test_regexp_preprocessing_debug_text_is_saved_with_query(config_path):
+    client = _client(config_path)
+    response = client.post(
+        "/queries",
+        data={
+            "name": "Retrieval excerpts",
+            "prompt": "Summarize the matching excerpts.",
+            "model": "default",
+            "paper_source_scope": "auto",
+            "pdf_strategy": "chunked",
+            "regexp_pattern": r"(?i)retrieval|RAG",
+            "regexp_radius": "50",
+            "regexp_mode": "query",
+            "regexp_debug_text": "This RAG system uses retrieval.",
+        },
+        follow_redirects=False,
+    )
+    assert response.status_code == 303
+
+    config = load_config(config_path)
+    with Database(config.paths.database) as db:
+        row = next(
+            item
+            for item in db.list_saved_queries()
+            if item["name"] == "Retrieval excerpts"
+        )
+        assert row["regexp_pattern"] == r"(?i)retrieval|RAG"
+        assert row["regexp_debug_text"] == "This RAG system uses retrieval."
+
+    edit_page = client.get(f"/queries/{int(row['id'])}/edit")
+    assert edit_page.status_code == 200
+    assert 'name="regexp_debug_text"' in edit_page.text
+    assert "This RAG system uses retrieval." in edit_page.text
+
+
+def test_edit_preserves_regexp_debug_text_omitted_by_hidden_controls(config_path):
+    client = _client(config_path)
+    config = load_config(config_path)
+    with Database(config.paths.database) as db:
+        query_id = db.create_saved_query(
+            name="Regexp debug preservation",
+            prompt="Summarize matches.",
+            model_profiles=("default",),
+            regexp_pattern=r"(?i)retrieval|RAG",
+            regexp_radius=25,
+            regexp_debug_text="Stored preprocessing sample.",
+            query_kind="classification",
+            label_class="Decision",
+            label_values=[
+                {"value": "Relevant", "pattern": r"(?i)yes|relevant"},
+                {"value": "Irrelevant", "pattern": r"(?i)no|irrelevant"},
+            ],
+            label_debug_text="Stored classification sample.",
+        )
+
+    response = client.post(
+        f"/queries/{query_id}/edit",
+        data={
+            "name": "Regexp debug preservation",
+            "prompt": "Summarize matches.",
+            "model": "default",
+            "paper_source_scope": "auto",
+            "pdf_strategy": "chunked",
+            "query_kind": "classification",
+            "content_scope": "both",
+            "label_class": "Decision",
+            "label_values": (
+                "Relevant = (?i)yes|relevant\n"
+                "Irrelevant = (?i)no|irrelevant"
+            ),
+            "regexp_pattern": r"(?i)retrieval|RAG",
+            "regexp_radius": "25",
+            "regexp_mode": "query",
+        },
+        follow_redirects=False,
+    )
+    assert response.status_code == 303
+
+    with Database(config.paths.database) as db:
+        row = db.get_saved_query(query_id)
+        assert row["regexp_debug_text"] == "Stored preprocessing sample."
+        assert row["label_debug_text"] == "Stored classification sample."
+
+
+def test_automatic_regexp_tagger_runs_without_llm(app_config, paper_record):
+    class OpenAlex:
+        def close(self):
+            pass
+
+    class NoLLM:
+        provider = "none"
+        model = "none"
+
+        def close(self):
+            pass
+
+    with Database(app_config.paths.database) as db:
+        paper_id, _ = db.upsert_paper(paper_record)
+        query_id = db.create_saved_query(
+            name="Automatic compact tag",
+            prompt="",
+            auto_run_papers=True,
+            query_kind="regexp",
+            content_scope="papers",
+            label_class="Architecture",
+            label_values=[
+                {"value": "Compact", "pattern": r"(?i)compact\s+agent"},
+            ],
+            paper_source_scope="abstract",
+        )
+        app = PaperWatch(
+            app_config,
+            db=db,
+            openalex=OpenAlex(),
+            arxiv=None,
+            llm=NoLLM(),
+            pdf_client=httpx.Client(),
+        )
+        stats = RunStats(run_id=db.start_run(), new_paper_ids=[paper_id])
+        app._run_automatic_queries(stats)
+
+        run = next(row for row in db.list_query_runs() if row["query_id"] == query_id)
+        assert run["status"] == "success"
+        assert run["provider"] == "local"
+        tags = db.classification_results_for_content("paper", paper_id)
+        assert tags[0]["tag_name"] == "Architecture: Compact"
+        assert stats.errors_count == 0

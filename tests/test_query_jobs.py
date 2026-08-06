@@ -172,6 +172,14 @@ def test_collect_documents_uses_recent_page_selection(
     assert args["has_pdf"] is None
     assert args["analyzed"] is None
     assert args["author_tags"] == ()
+    exact = _selection_search_args({
+        "title_query": "Exact title",
+        "author_ids": ["A123", ""],
+        "topic_ids": ["T100", ""],
+    })
+    assert exact["title_query"] == "Exact title"
+    assert exact["author_ids"] == ("A123",)
+    assert exact["topic_ids"] == ("T100",)
     assert _selection_search_args({"author_tags": "theory"})["author_tags"] == ()
     assert _selection_search_args(None)["sort"] == "newest"
 
@@ -411,7 +419,7 @@ def test_native_pdf_query_single_multi_and_provider_validation(monkeypatch):
         )
 
 
-def test_native_pdf_batch_and_controller_force_fulltext(
+def test_native_pdf_batch_and_controller_preserve_codex_source(
     config_path, paper_record, monkeypatch
 ):
     import paperwatch.query_jobs as query_jobs
@@ -434,8 +442,8 @@ def test_native_pdf_batch_and_controller_force_fulltext(
             context_window_tokens=400000,
             selection={
                 "paper_ids": [paper_id],
-                "source_scope": "fulltext",
-                "pdf_strategy": "direct",
+                "source_scope": "pdf",
+                "pdf_strategy": "auto",
             },
         )
 
@@ -509,8 +517,8 @@ def test_native_pdf_batch_and_controller_force_fulltext(
     with Database(config.paths.database) as db:
         row = db.query_runs_for_batch(batch_id)[0]
         selection = __import__("json").loads(row["selection_json"])
-        assert selection["source_scope"] == "fulltext"
-        assert selection["pdf_strategy"] == "direct"
+        assert selection["source_scope"] == "abstract"
+        assert selection["pdf_strategy"] == "auto"
 
 
 def test_query_batch_persists_success_and_failure(
@@ -1419,3 +1427,114 @@ def test_run_query_batch_cancels_all_pending_runs_before_model(
         rows = db.query_runs_for_batch(batch_id)
         assert all(row["status"] == "failed" for row in rows)
         assert all(row["error_text"] == "Cancelled by user" for row in rows)
+
+
+def test_regexp_tag_query_runs_locally_and_applies_tag(config_path, paper_record):
+    config = load_config(config_path)
+    with Database(config.paths.database) as db:
+        paper_id, _ = db.upsert_paper(paper_record)
+        query_id = db.create_saved_query(
+            name="Compact architecture tag",
+            prompt="",
+            query_kind="regexp",
+            content_scope="papers",
+            label_class="Architecture",
+            label_values=[
+                {"value": "Compact", "pattern": r"(?i)compact\s+agent"},
+            ],
+            paper_source_scope="abstract",
+        )
+        query = db.get_saved_query(query_id)
+        assert query["model_profile"] == ""
+
+    controller = QueryController(config_path)
+    batch_id = controller.start(
+        query_id,
+        (),
+        2048,
+        selection={"paper_ids": [paper_id]},
+        source_scope="abstract",
+        pdf_strategy="auto",
+    )
+    assert batch_id is not None
+    controller.wait()
+
+    with Database(config.paths.database) as db:
+        run = db.query_runs_for_batch(batch_id)[0]
+        assert run["status"] == "success"
+        assert run["profile"] == "regexp"
+        tags = db.classification_results_for_content("paper", paper_id)
+        assert len(tags) == 1
+        assert tags[0]["tag_name"] == "Architecture: Compact"
+        assert "compact agent" in tags[0]["raw_output"].lower()
+
+
+def test_query_controller_runs_one_query_on_all_matching_result_types(
+    config_path, author_candidate, paper_record
+):
+    config = load_config(config_path)
+    with Database(config.paths.database) as db:
+        db.add_author(author_candidate)
+        paper_id, _ = db.upsert_paper(paper_record)
+        blog_id = db.add_author_blog(
+            author_candidate.openalex_id,
+            "https://example.test/results-blog",
+            label="Results blog",
+        )
+        blog_entry_id = db.save_blog_entry(
+            blog_id=blog_id,
+            title="Matching result note",
+            content_sha256="matching-result-note",
+            normalized_text="A matching result for the saved query.",
+            diff_text="",
+            change_kind="changed",
+            previous_entry_id=None,
+            entry_kind="rss",
+            external_id="matching-result-note",
+            source_url="https://example.test/results-blog/note",
+        )
+        query_id = db.create_saved_query(
+            name="Review all results",
+            prompt="Review every matching result.",
+            content_scope="both",
+            paper_source_scope="abstract",
+        )
+
+    runner_calls: list[tuple[str, int, tuple[str, ...], int]] = []
+
+    def runner(path, batch, query, profiles, context):
+        runner_calls.append((batch, query, profiles, context))
+        return {"completed": 1, "failed": 0}
+
+    controller = QueryController(config_path, runner=runner)
+    batch_ids = controller.start_on_results(
+        query_id,
+        ("default",),
+        2048,
+        targets=(
+            ("papers", {"title_query": "Minimal"}),
+            ("blogs", {"title_query": "Matching result", "display_stubs": False}),
+        ),
+        source_scope="abstract",
+        pdf_strategy="auto",
+    )
+    assert batch_ids is not None
+    assert len(batch_ids) == 2
+    controller.wait()
+    assert [call[0] for call in runner_calls] == list(batch_ids)
+    assert controller.snapshot().content_type == "results"
+
+    with Database(config.paths.database) as db:
+        paper_run = db.query_runs_for_batch(batch_ids[0])[0]
+        blog_run = db.query_runs_for_batch(batch_ids[1])[0]
+        paper_selection = __import__("json").loads(paper_run["selection_json"])
+        blog_selection = __import__("json").loads(blog_run["selection_json"])
+        assert paper_selection["title_query"] == "Minimal"
+        assert paper_selection["source_scope"] == "abstract"
+        assert "content_type" not in paper_selection
+        assert blog_selection["title_query"] == "Matching result"
+        assert blog_selection["content_type"] == "blogs"
+        assert blog_selection["source_scope"] == "blog"
+        assert blog_selection["pdf_strategy"] == "auto"
+        assert db.get_paper(paper_id) is not None
+        assert db.get_blog_entry(blog_entry_id) is not None

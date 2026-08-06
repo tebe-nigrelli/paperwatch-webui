@@ -754,6 +754,7 @@ def _query_view(row: Any, config: AppConfig) -> dict[str, Any]:
     query["pdf_strategy"] = str(query.get("pdf_strategy") or "chunked")
     query["regexp_pattern"] = str(query.get("regexp_pattern") or "")
     query["regexp_radius"] = int(query.get("regexp_radius") or 0)
+    query["regexp_debug_text"] = str(query.get("regexp_debug_text") or "")
     query["regexp_mode"] = str(query.get("regexp_mode") or "query")
     query["content_scope"] = str(query.get("content_scope") or "both")
     query["query_kind"] = str(query.get("query_kind") or "summary")
@@ -772,8 +773,10 @@ def _query_view(row: Any, config: AppConfig) -> dict[str, Any]:
     query["label_values_text"] = "\n".join(
         f"{item['value']} = {item['pattern']}" for item in query["label_values"]
     )
+    query["label_debug_text"] = str(query.get("label_debug_text") or "")
     query["local_regexp"] = bool(
-        query["regexp_pattern"] and query["regexp_mode"] == "print"
+        query["query_kind"] == "regexp"
+        or (query["regexp_pattern"] and query["regexp_mode"] == "print")
     )
     return query
 
@@ -791,8 +794,23 @@ def _classification_form_values(value: str) -> list[dict[str, str]]:
     return values
 
 
-def _query_execution_form(form: Any, config: AppConfig) -> dict[str, Any]:
+def _query_execution_form(
+    form: Any,
+    config: AppConfig,
+    *,
+    existing_query: Any | None = None,
+) -> dict[str, Any]:
     available = {item.profile: item for item in config.available_llms}
+
+    def saved_text(name: str) -> str:
+        if name in form:
+            return str(form.get(name, ""))
+        if existing_query is None:
+            return ""
+        try:
+            return str(existing_query[name] or "")
+        except (KeyError, TypeError, IndexError):
+            return str(getattr(existing_query, name, "") or "")
     profiles = tuple(dict.fromkeys(
         str(value).strip() for value in form.getlist("model") if str(value).strip()
     ))
@@ -805,33 +823,94 @@ def _query_execution_form(form: Any, config: AppConfig) -> dict[str, Any]:
         profiles = (next(iter(available)),)
     source_scope = str(form.get("paper_source_scope", "auto"))
     pdf_strategy = str(form.get("pdf_strategy", "chunked"))
-    if source_scope == "abstract":
+    if source_scope in {"abstract", "pdf"}:
         pdf_strategy = "auto"
     regexp_radius = _int_or_none(form.get("regexp_radius"))
     if regexp_radius is None:
         regexp_radius = 0
     query_kind = str(form.get("query_kind", "summary"))
+    if query_kind == "regexp":
+        profiles = ()
+        regexp_pattern = ""
+        regexp_radius = 0
+        regexp_mode = "query"
+    else:
+        regexp_pattern = str(form.get("regexp_pattern", ""))
+        regexp_mode = str(form.get("regexp_mode", "query"))
+    if source_scope == "pdf":
+        profile = available.get(profiles[0]) if profiles else None
+        if profile is None or profile.provider != "codex":
+            raise ValueError("Whole-PDF upload requires a Codex model")
     return {
         "model_profiles": profiles,
         "paper_source_scope": source_scope,
         "pdf_strategy": pdf_strategy,
-        "regexp_pattern": str(form.get("regexp_pattern", "")),
+        "regexp_pattern": regexp_pattern,
         "regexp_radius": regexp_radius,
-        "regexp_mode": str(form.get("regexp_mode", "query")),
+        "regexp_debug_text": saved_text("regexp_debug_text"),
+        "regexp_mode": regexp_mode,
         "content_scope": str(form.get("content_scope", "both")),
         "query_kind": query_kind,
         "label_class": str(form.get("label_class", "")),
         "label_values": (
             _classification_form_values(str(form.get("label_values", "")))
-            if query_kind == "classification"
+            if query_kind in {"classification", "regexp"}
             else []
         ),
+        "label_debug_text": saved_text("label_debug_text"),
     }
 
 
 def _query_supports(query: Any, content_type: str) -> bool:
     scope = str(query.get("content_scope", "both") if isinstance(query, dict) else query["content_scope"] or "both")
     return scope == "both" or scope == content_type
+
+
+def _saved_query_run_options(
+    form: Any,
+    query: Any,
+    config: AppConfig,
+    *,
+    content_type: str,
+) -> tuple[dict[str, Any], tuple[str, ...], int, str, str]:
+    """Resolve a saved query's defaults unless this run explicitly overrides them."""
+    query_view = _query_view(query, config)
+    override_defaults = str(form.get("override_query_defaults", "")) in {
+        "1", "true", "on"
+    }
+    if override_defaults:
+        profiles = tuple(dict.fromkeys(
+            str(value).strip()
+            for value in form.getlist("model")
+            if str(value).strip()
+        ))
+        requested_context = _int_or_none(form.get("context_window_tokens"))
+        source_scope = str(
+            form.get("source_scope", query_view["paper_source_scope"])
+        )
+        pdf_strategy = str(form.get("pdf_strategy", query_view["pdf_strategy"]))
+    else:
+        profiles = tuple(query_view["model_profiles"])
+        requested_context = None
+        source_scope = str(query_view["paper_source_scope"])
+        pdf_strategy = str(query_view["pdf_strategy"])
+
+    if content_type == "blogs":
+        source_scope = "blog"
+        pdf_strategy = "auto"
+    elif content_type != "papers":
+        raise ValueError("Content type must be papers or blogs")
+
+    local_regexp = bool(query_view["local_regexp"])
+    if local_regexp:
+        profiles = ()
+    available_profiles = {item.profile for item in config.available_llms}
+    if not local_regexp and (
+        not profiles or any(name not in available_profiles for name in profiles)
+    ):
+        raise ValueError("Select a configured model.")
+    context = _configured_context_window(config, profiles, requested_context)
+    return query_view, profiles, context, source_scope, pdf_strategy
 
 
 def _analysis_view(row: Any) -> dict[str, Any]:
@@ -1658,6 +1737,7 @@ def create_app(
             records=records,
             selected_records=selected_records,
             selected_count=selected_paper_total + selected_blog_total,
+            selected_paper_count=selected_paper_total,
             selected_blog_count=selected_blog_total,
             selected_visible_count=len(selected_records),
             selected_matching_count=selected_matching_papers + selected_matching_blogs,
@@ -1678,8 +1758,7 @@ def create_app(
             content_tags=content_tag_rows,
             topics=topic_rows,
             saved_queries=saved_queries,
-            paper_queries=[query for query in saved_queries if _query_supports(query, "papers")],
-            blog_queries=[query for query in saved_queries if _query_supports(query, "blogs")],
+            result_queries=saved_queries,
             selected_query_id=selected_query_id,
             model_profiles=config.available_llms,
             total=unselected_total,
@@ -2439,10 +2518,6 @@ def create_app(
     def blog_entry(request: Request, entry_id: int) -> HTMLResponse:
         with Database(config.paths.database) as db:
             entry = db.get_blog_entry(entry_id)
-            saved_queries = [
-                query for row in db.list_saved_queries()
-                if _query_supports(query := _query_view(row, config), "blogs")
-            ]
             prompt_runs = [
                 _query_output(row) for row in db.query_runs_for_blog_entry(entry_id)
             ]
@@ -2469,9 +2544,7 @@ def create_app(
             request,
             "blog_detail.html",
             entry=entry_view,
-            saved_queries=saved_queries,
             prompt_runs=prompt_runs,
-            model_profiles=config.available_llms,
             entry_tags=entry_tags,
             content_tags=content_tags,
             classifications=classifications,
@@ -2495,8 +2568,6 @@ def create_app(
         async_request = request.headers.get("x-paperwatch-async") == "1"
         form = await request.form()
         query_id = _int_or_none(form.get("query_id"))
-        profiles = tuple(str(value) for value in form.getlist("model") if str(value))
-        requested_context = _int_or_none(form.get("context_window_tokens"))
         with Database(config.paths.database) as db:
             entry = db.get_blog_entry(entry_id)
             query = db.get_saved_query(query_id) if query_id is not None else None
@@ -2513,7 +2584,11 @@ def create_app(
         if query is None:
             return failure("Select a saved prompt.")
         try:
-            context = _configured_context_window(config, profiles, requested_context)
+            query_view, profiles, context, source_scope, pdf_strategy = (
+                _saved_query_run_options(
+                    form, query, config, content_type="blogs"
+                )
+            )
         except ValueError as exc:
             return failure(str(exc))
         try:
@@ -2526,15 +2601,16 @@ def create_app(
                     "blog_entry_ids": [entry_id],
                     "labels": [f"Blog entry: {entry['title']}"],
                 },
-                source_scope="blog",
-                pdf_strategy="auto",
+                source_scope=source_scope,
+                pdf_strategy=pdf_strategy,
                 content_type="blogs",
             )
         except ValueError as exc:
             return failure(str(exc))
         if batch_id is None:
             return failure("Another saved prompt is already running.", status_code=409)
-        message = f"Started {query['name']} with {len(set(profiles))} model(s)."
+        runner = "local regexp" if query_view["local_regexp"] else f"{len(set(profiles))} model(s)"
+        message = f"Started {query['name']} with {runner}."
         if async_request:
             return JSONResponse({"ok": True, "batch_id": batch_id, "message": message})
         return RedirectResponse(_notice_url(f"/blogs/{entry_id}", message), status_code=303)
@@ -2935,10 +3011,6 @@ def create_app(
                 dict(row) for row in db.visible_analysis_tasks_for_paper(paper_id)
             ]
             analyses = [_analysis_view(row) for row in db.paper_analyses(paper_id)]
-            saved_queries = [
-                query for row in db.list_saved_queries()
-                if _query_supports(query := _query_view(row, config), "papers")
-            ]
             prompt_runs = [
                 _query_output(row) for row in db.query_runs_for_paper(paper_id)
             ]
@@ -2954,9 +3026,7 @@ def create_app(
             topics=topic_rows,
             analysis_tasks=analysis_tasks,
             analyses=analyses,
-            saved_queries=saved_queries,
             prompt_runs=prompt_runs,
-            model_profiles=config.available_llms,
             metadata=_json_value(paper["metadata_json"], {}),
             paper_tags=paper_tags,
             content_tags=content_tags,
@@ -3100,10 +3170,6 @@ def create_app(
         async_request = request.headers.get("x-paperwatch-async") == "1"
         form = await request.form()
         query_id = _int_or_none(form.get("query_id"))
-        profiles = tuple(str(value) for value in form.getlist("model") if str(value))
-        requested_context = _int_or_none(form.get("context_window_tokens"))
-        source_scope = str(form.get("source_scope", "abstract"))
-        pdf_strategy = str(form.get("pdf_strategy", "auto"))
         with Database(config.paths.database) as db:
             paper = db.get_paper(paper_id)
             query = db.get_saved_query(query_id) if query_id is not None else None
@@ -3120,13 +3186,13 @@ def create_app(
         if query is None:
             return failure("Select a saved prompt.")
         try:
-            context = _configured_context_window(config, profiles, requested_context)
+            query_view, profiles, context, source_scope, pdf_strategy = (
+                _saved_query_run_options(
+                    form, query, config, content_type="papers"
+                )
+            )
         except ValueError as exc:
             return failure(str(exc))
-        if source_scope == "abstract" and not paper["abstract"]:
-            return failure("This paper has no abstract to analyze.")
-        if source_scope == "fulltext" and not (paper["pdf_url"] or paper["local_pdf_path"]):
-            return failure("This paper has no PDF available for full-text analysis.")
         try:
             batch_id = collection_controller.start(
                 int(query["id"]),
@@ -3145,7 +3211,8 @@ def create_app(
             return RedirectResponse(
                 _notice_url(f"/papers/{paper_id}", message, level="warning"), status_code=303
             )
-        message = f"Started {query['name']} with {len(set(profiles))} model(s)."
+        runner = "local regexp" if query_view["local_regexp"] else f"{len(set(profiles))} model(s)"
+        message = f"Started {query['name']} with {runner}."
         if async_request:
             return JSONResponse({"ok": True, "batch_id": batch_id, "message": message})
         return RedirectResponse(
@@ -3435,6 +3502,7 @@ def create_app(
             "pdf_strategy": "chunked",
             "regexp_pattern": "",
             "regexp_radius": 0,
+            "regexp_debug_text": "",
             "regexp_mode": "query",
             "content_scope": "both",
             "query_kind": "summary",
@@ -3444,6 +3512,7 @@ def create_app(
                 r"Relevant = (?i)\b(relevant|yes|include)\b" "\n"
                 r"Not relevant = (?i)\b(not relevant|no|exclude)\b"
             ),
+            "label_debug_text": "",
             "local_regexp": False,
         }
         return render(
@@ -3496,7 +3565,6 @@ def create_app(
     async def edit_query(request: Request, query_id: int) -> RedirectResponse:
         form = await request.form()
         try:
-            execution = _query_execution_form(form, config)
             legacy_target_form = not any(
                 key in form
                 for key in (
@@ -3505,6 +3573,14 @@ def create_app(
                 )
             )
             with Database(config.paths.database) as db:
+                existing_query = db.get_saved_query(query_id)
+                if existing_query is None:
+                    raise HTTPException(404, "Saved query not found")
+                execution = _query_execution_form(
+                    form,
+                    config,
+                    existing_query=existing_query,
+                )
                 changed = db.update_saved_query(
                     query_id,
                     name=str(form.get("name", "")),
@@ -3630,31 +3706,108 @@ def create_app(
     async def run_filtered_query(request: Request) -> RedirectResponse:
         form = await request.form()
         query_id = _int_or_none(form.get("query_id"))
-        profiles = tuple(str(value) for value in form.getlist("model") if str(value))
-        try:
-            context = _configured_context_window(
-                config, profiles, _int_or_none(form.get("context_window_tokens"))
-            )
-        except ValueError as exc:
-            return RedirectResponse(
-                _notice_url("/", str(exc), level="error"), status_code=303
-            )
-        source_scope = str(form.get("source_scope", "abstract"))
-        pdf_strategy = str(form.get("pdf_strategy", "auto"))
         if query_id is None:
             return RedirectResponse(
                 _notice_url("/", "Select a saved query.", level="error"), status_code=303
             )
+        override_defaults = str(form.get("override_query_defaults", "")) in {
+            "1", "true", "on"
+        }
+        run_selected = str(form.get("selection_mode", "")) == "selected"
         filters = _parse_filter_values(form)
+        content_filter = _content_kind(str(form.get("content") or "all"), "all")
+        blog_compatible_filters = not (
+            filters.topic_id
+            or filters.topic_ids
+            or filters.paper_kind
+            or filters.scope
+            or filters.has_pdf is True
+        )
+        paper_filter_args = {
+            "query": filters.query,
+            "title_query": filters.title_query,
+            "author_id": filters.author_id,
+            "author_ids": filters.author_ids,
+            "author_tags": filters.author_tags,
+            "content_tags": filters.content_tags,
+            "topic_id": filters.topic_id,
+            "topic_ids": filters.topic_ids,
+            "paper_kind": filters.paper_kind,
+            "scope": filters.scope,
+            "has_pdf": filters.has_pdf,
+            "analyzed": filters.analyzed,
+            "starred": filters.starred,
+            "read": filters.read,
+            "notes": filters.notes,
+            "date_from": filters.date_from,
+            "date_to": filters.date_to,
+            "sort": filters.sort,
+        }
+        blog_filter_args = {
+            "query": filters.query,
+            "title_query": filters.title_query,
+            "tags": filters.content_tags,
+            "author_id": filters.author_id,
+            "author_ids": filters.author_ids,
+            "author_tags": filters.author_tags,
+            "date_from": filters.date_from,
+            "date_to": filters.date_to,
+            "starred": filters.starred,
+            "read": filters.read,
+            "notes": filters.notes,
+            "analyzed": filters.analyzed,
+            "show_stubs": filters.display_stubs,
+        }
         with Database(config.paths.database) as db:
             stored_query = db.get_saved_query(query_id)
-            local_regexp = bool(
-                stored_query
-                and str(stored_query["regexp_pattern"] or "").strip()
-                and str(stored_query["regexp_mode"] or "query") == "print"
-            )
+            if stored_query is None:
+                return RedirectResponse(
+                    _notice_url("/", "Saved query not found.", level="error"), status_code=303
+                )
+            query = _query_view(stored_query, config)
             authors_for_labels = db.list_authors_with_tags(tracked_only=True)
             topics_for_labels = db.list_topics()
+            paper_match_count = 0
+            blog_match_count = 0
+            selected_paper_ids: list[int] = []
+            selected_blog_ids: list[int] = []
+            if run_selected:
+                selected_papers, _ = db.search_papers(
+                    selected=True, limit=None, offset=0
+                )
+                selected_paper_ids = [int(row["id"]) for row in selected_papers]
+                selected_blogs = db.list_blog_entries(
+                    selected=True, show_stubs=True, limit=None, query_view=True
+                )
+                selected_blog_ids = [int(row["id"]) for row in selected_blogs]
+            else:
+                if content_filter != "blogs":
+                    _, paper_match_count = db.search_papers(
+                        **paper_filter_args, limit=0, offset=0
+                    )
+                if (
+                    content_filter != "papers"
+                    and blog_compatible_filters
+                    and db.has_visible_blog_entries()
+                ):
+                    blog_match_count = db.count_blog_entries(**blog_filter_args)
+
+        if override_defaults:
+            profiles = tuple(
+                str(value) for value in form.getlist("model") if str(value).strip()
+            )
+            source_scope = str(form.get("source_scope", "abstract"))
+            pdf_strategy = str(form.get("pdf_strategy", "auto"))
+            requested_context = _int_or_none(form.get("context_window_tokens"))
+        else:
+            profiles = tuple(query["model_profiles"])
+            source_scope = str(query["paper_source_scope"] or "auto")
+            pdf_strategy = str(query["pdf_strategy"] or "chunked")
+            requested_context = None
+
+        local_regexp = bool(query["local_regexp"])
+        if local_regexp:
+            profiles = ()
         available_profiles = {item.profile for item in config.available_llms}
         if not local_regexp and (
             not profiles or any(name not in available_profiles for name in profiles)
@@ -3662,38 +3815,92 @@ def create_app(
             return RedirectResponse(
                 _notice_url("/", "Select a configured model.", level="error"), status_code=303
             )
-        selection = _selection_with_labels(
-            filters, authors=authors_for_labels, topics=topics_for_labels
-        )
-        selected_ids: list[int] = []
-        raw_ids = str(form.get("paper_ids", ""))
-        for value in raw_ids.split(","):
-            paper_id = _int_or_none(value.strip())
-            if paper_id is not None and paper_id > 0:
-                selected_ids.append(paper_id)
-        if selected_ids:
-            selected_ids = list(dict.fromkeys(selected_ids))[:5000]
-            selection["paper_ids"] = selected_ids
-            selection["labels"] = [f"Selected papers: {len(selected_ids)}"]
         try:
-            batch_id = collection_controller.start(
-                query_id,
-                profiles,
-                context,
-                selection=selection,
-                source_scope=source_scope,
-                pdf_strategy=pdf_strategy,
+            context = _configured_context_window(config, profiles, requested_context)
+        except ValueError as exc:
+            return RedirectResponse(
+                _notice_url("/", str(exc), level="error"), status_code=303
             )
+
+        targets: list[tuple[str, dict[str, Any]]] = []
+        if run_selected:
+            if selected_paper_ids and _query_supports(query, "papers"):
+                targets.append(
+                    (
+                        "papers",
+                        {
+                            "paper_ids": selected_paper_ids,
+                            "labels": [f"Selected papers: {len(selected_paper_ids)}"],
+                        },
+                    )
+                )
+            if selected_blog_ids and _query_supports(query, "blogs"):
+                targets.append(
+                    (
+                        "blogs",
+                        {
+                            "blog_entry_ids": selected_blog_ids,
+                            "labels": [
+                                f"Selected blog entries: {len(selected_blog_ids)}"
+                            ],
+                        },
+                    )
+                )
+        else:
+            base_selection = _selection_with_labels(
+                filters, authors=authors_for_labels, topics=topics_for_labels
+            )
+            if paper_match_count and _query_supports(query, "papers"):
+                targets.append(("papers", dict(base_selection)))
+            if blog_match_count and _query_supports(query, "blogs"):
+                targets.append(("blogs", dict(base_selection)))
+        if not targets:
+            unsupported_target = "selected content" if run_selected else "current search results"
+            return RedirectResponse(
+                _notice_url(
+                    "/",
+                    f"This saved query does not support the {unsupported_target}.",
+                    level="error",
+                ),
+                status_code=303,
+            )
+
+        try:
+            if len(targets) == 1:
+                content_type, selection = targets[0]
+                kwargs: dict[str, Any] = {
+                    "selection": selection,
+                    "source_scope": "blog" if content_type == "blogs" else source_scope,
+                    "pdf_strategy": "auto" if content_type == "blogs" else pdf_strategy,
+                }
+                if "content_type" in inspect.signature(collection_controller.start).parameters:
+                    kwargs["content_type"] = content_type
+                batch_result: str | tuple[str, ...] | None = collection_controller.start(
+                    query_id, profiles, context, **kwargs
+                )
+            else:
+                batch_result = collection_controller.start_on_results(
+                    query_id,
+                    profiles,
+                    context,
+                    targets=tuple(targets),
+                    source_scope=source_scope,
+                    pdf_strategy=pdf_strategy,
+                )
         except ValueError as exc:
             return RedirectResponse(_notice_url("/", str(exc), level="error"), status_code=303)
-        if batch_id is None:
+        if batch_result is None:
             return RedirectResponse(
                 _notice_url("/", "Another collection query is already running.", level="warning"),
                 status_code=303,
             )
         target = _notice_url(
             f"/queries?focus={query_id}",
-            f"Started saved query with {len(set(profiles))} model(s).",
+            (
+                "Started saved query on selected content."
+                if run_selected
+                else "Started saved query on all matching search results."
+            ),
         )
         return RedirectResponse(f"{target}#query-{query_id}", status_code=303)
 

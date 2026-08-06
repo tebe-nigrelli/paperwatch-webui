@@ -46,16 +46,19 @@
   <details class="advanced-filters collection-runner-details">
     <summary id="collection-run-label">Run on these {{ total }} papers</summary>
     {% if saved_queries %}
-    <form id="collection-runner-form" method="post" action="/queries/run-filtered" class="collection-runner-form" data-profile-controls>
+    <form id="collection-runner-form" method="post" action="/queries/run-filtered" class="collection-runner-form" data-profile-controls data-query-defaults-form>
       <div class="collection-runner-summary"><small id="paper-selection-status">Select rows to run on only those papers. Selections persist across searches.</small><button id="clear-paper-selection" class="link-button" type="button" hidden>Clear selection</button></div>
-      <label><span>Saved query</span><select name="query_id" required>{% for query in saved_queries %}<option value="{{ query.id }}" {% if selected_query_id == query.id %}selected{% endif %}>{{ query.name }}{% if query.local_regexp %} · local regexp{% endif %}</option>{% endfor %}</select></label>
-      <label class="collection-models"><span>Models</span><select name="model" multiple size="5" required data-model-picker data-search-placeholder="Search model profiles">{% for profile in model_profiles %}<option value="{{ profile.profile }}" {% if loop.first %}selected{% endif %} data-provider="{{ profile.provider }}" data-context-window="{{ profile.context_window_tokens or '' }}" data-pdf-strategy="{{ profile.pdf_analysis_strategy or 'auto' }}">{{ profile.profile }} · {{ profile.model }}</option>{% endfor %}</select></label>
-      <label><span>Source</span><select name="source_scope" data-source-scope><option value="fulltext">Full paper PDF</option><option value="abstract">Abstract</option></select></label>
-      <label><span>PDF strategy</span><select name="pdf_strategy" data-pdf-strategy><option value="chunked">Chunk + merge</option><option value="auto">Auto</option><option value="direct">Direct</option></select></label>
-      <label><span>Context window tokens</span><input type="number" name="context_window_tokens" min="512" max="1000000" value="16384" data-context-window><small>Available for local models; online profiles use their configured value.</small></label>
+      <div class="collection-runner-row">
+        <label class="collection-query-control"><span>Saved query</span><select name="query_id" required data-query-defaults>{% for query in saved_queries %}<option value="{{ query.id }}" {% if selected_query_id == query.id %}selected{% endif %} data-model="{{ query.model_profiles[0] if query.model_profiles else '' }}" data-source="{{ query.paper_source_scope }}" data-pdf-strategy="{{ query.pdf_strategy }}" data-local="{{ 'true' if query.local_regexp else 'false' }}">{{ query.name }}{% if query.local_regexp %} · local regexp{% endif %}</option>{% endfor %}</select></label>
+        <label class="button collection-defaults-toggle"><input class="collection-defaults-input" type="checkbox" name="override_query_defaults" value="1" data-query-defaults-toggle><span>Override Defaults</span></label>
+        <label class="collection-models"><span>Models</span><select name="model" multiple size="5" required data-model-picker data-search-placeholder="Search model profiles">{% for profile in model_profiles %}<option value="{{ profile.profile }}" {% if loop.first %}selected{% endif %} data-provider="{{ profile.provider }}" data-context-window="{{ profile.context_window_tokens or '' }}" data-pdf-strategy="{{ profile.pdf_analysis_strategy or 'auto' }}">{{ profile.profile }} · {{ profile.model }}</option>{% endfor %}</select></label>
+        <label><span>Source</span><select name="source_scope" data-source-scope data-wrap-cycle><option value="auto">Auto: paper text, then abstract</option><option value="fulltext">Full paper text</option><option value="abstract">Abstract</option><option value="pdf" data-codex-only>Upload whole PDF (Codex)</option></select></label>
+        <label><span>PDF strategy</span><select name="pdf_strategy" data-pdf-strategy><option value="chunked">Chunk + merge</option><option value="auto">Auto</option><option value="direct">Direct</option></select></label>
+        <label><span>Context window tokens</span><input type="number" name="context_window_tokens" min="512" max="1000000" value="16384" data-context-window><small>Codex uses its configured context window.</small></label>
+        <button class="button button-primary collection-run-button" type="submit" {% if query_state.running or total == 0 %}disabled{% endif %}>Run saved prompt</button>
+      </div>
       {% for key, value in filters.selection_items() %}<input type="hidden" name="{{ key }}" value="{{ value }}">{% endfor %}
       <input id="selected-paper-ids" type="hidden" name="paper_ids" value="">
-      <button class="button button-primary" type="submit" {% if query_state.running or total == 0 %}disabled{% endif %}>Run saved prompt</button>
     </form>
     {% else %}<div class="collection-empty"><span>No saved queries.</span><a class="button button-small" href="/queries">Create one</a></div>{% endif %}
   </details>

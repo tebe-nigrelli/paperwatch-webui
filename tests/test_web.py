@@ -213,8 +213,13 @@ def test_dashboard_assets_and_security_headers(config_path, seeded_web):
     assert "Discover" in response.text
     assert "Diagnostics" not in response.text
     assert "broken PDF" not in response.text
-    assert response.text.index("content-column-filters") < response.text.index("Run on these 2 papers")
-    assert '<details class="advanced-filters collection-runner-details">' in response.text
+    assert response.text.index("content-column-filters") < response.text.index(
+        'id="collection-run-label"'
+    )
+    assert (
+        '<details class="advanced-filters collection-runner-details '
+        'content-results-runner-details">'
+    ) in response.text
     assert response.headers["x-frame-options"] == "DENY"
     assert "default-src 'self'" in response.headers["content-security-policy"]
     assert client.get("/static/app.css").status_code == 200
@@ -364,7 +369,13 @@ def test_paper_detail_and_exports(config_path, seeded_web):
     assert "Recent tasks" in response.text
     assert f'href="/analyses/{analysis_id}"' in response.text
     assert response.text.index("Source metadata") < response.text.index("Recent tasks")
-    assert "Run saved prompt" in response.text
+    assert "Run saved prompt" not in response.text
+    assert "Override Defaults" not in response.text
+    assert 'data-query-defaults-form' not in response.text
+    results_page = client.get("/")
+    assert "Run saved prompt" in results_page.text
+    assert "Override Defaults" in results_page.text
+    assert "Upload whole PDF (Codex)" in results_page.text
     assert "Run additional models" not in response.text
     assert "Google Scholar" in response.text
     assert "OpenAlex" in response.text
@@ -849,7 +860,11 @@ def test_manual_pdf_import_behaves_like_fetched_paper(config_path, seeded_web):
     assert "A Manually Imported Paper" in detail.text
     assert "Open PDF" in detail.text
     assert "Run selected models" not in detail.text
-    assert "Run saved prompt" in detail.text
+    assert "Run saved prompt" not in detail.text
+    assert "Override Defaults" not in detail.text
+    results_page = client.get("/")
+    assert "Run saved prompt" in results_page.text
+    assert "Override Defaults" in results_page.text
     assert "Manual Proceedings" in detail.text
     assert client.get(f"/papers/{paper_id}/pdf").status_code == 200
     exported = client.get(f"/papers/{paper_id}/export.json").json()
