@@ -402,7 +402,8 @@ def test_paper_detail_and_exports(config_path, seeded_web):
     assert response.text.index("DOI") < response.text.index("External links")
     assert response.text.index("External links") < response.text.index("Paper actions")
     assert "Track author" in response.text
-    assert "/?author=A123" in response.text
+    assert "/?content=papers&amp;author=A123" in response.text
+    assert "/?content=blogs&amp;author=A123" in response.text
     assert "https://openalex.org/authors/a123" in response.text
     assert "https://scholar.google.com/scholar?q=author%3A%22Ada+Lovelace%22" in response.text
     assert "https://arxiv.org/search/?query=Ada+Lovelace&amp;searchtype=author" in response.text

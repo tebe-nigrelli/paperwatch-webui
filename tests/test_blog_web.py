@@ -64,7 +64,7 @@ def test_manual_author_and_blog_management_ui(config_path):
     )[0]
     assert 'class="inline-blog-csv-form"' in csv_row
     assert "Create missing authors" in csv_row
-    assert "Fetch new papers, download available PDFs" in page.text
+    assert "Fetch new papers, download PDFs when enabled under Data" in page.text
     assert 'href="/" data-content-home-link>Content</a>' in page.text
 
     response = client.post(
@@ -135,7 +135,8 @@ def test_manual_author_and_blog_management_ui(config_path):
     assert "Direct author" in manage.text
     assert f'action="/authors/{manual_id}/blogs/' in manage.text
     assert 'title="Edit the URL and press Enter"' in manage.text
-    assert "Mark broken" in manage.text
+    assert ">⏸<" in manage.text
+    assert ">Remove<" in manage.text
     authors = client.get("/authors")
     assert "1 · Manage" in authors.text
     assert "Blog-only" in authors.text
@@ -169,7 +170,7 @@ def test_manual_author_and_blog_management_ui(config_path):
         assert all(int(row["id"]) != blog_id for row in db.list_enabled_blogs())
     broken_page = client.get(f"/authors/{manual_id}/blogs")
     assert "blog-source-broken" in broken_page.text
-    assert "Restore" in broken_page.text
+    assert ">▶<" in broken_page.text
 
     restored = client.post(
         f"/authors/{manual_id}/blogs/{blog_id}/availability",

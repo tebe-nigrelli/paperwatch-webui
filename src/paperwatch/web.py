@@ -60,7 +60,14 @@ from .models import (
     short_openalex_id,
     strip_doi,
 )
-from .pdfs import PDFError, download_pdf, pdf_sha256, safe_pdf_name, validate_pdf_file
+from .pdfs import (
+    PDFError,
+    download_pdf,
+    pdf_page_count,
+    pdf_sha256,
+    safe_pdf_name,
+    validate_pdf_file,
+)
 from .query_jobs import QueryController
 from .sources.arxiv import ArxivClient, ArxivEntry
 from .sources.openalex import OpenAlexClient
@@ -102,7 +109,7 @@ class PaperFilters:
     starred: bool | None = None
     read: bool | None = None
     notes: bool | None = None
-    display_stubs: bool = False
+    stub: bool | None = False
     date_from: str = ""
     date_to: str = ""
     sort: str = "newest"
@@ -126,7 +133,9 @@ class PaperFilters:
             "starred": self.starred,
             "read": self.read,
             "notes": self.notes,
-            "display_stubs": self.display_stubs,
+            "stub": self.stub,
+            # Compatibility for saved selections written before the tri-state stub filter.
+            "display_stubs": self.stub is None,
             "date_from": self.date_from,
             "date_to": self.date_to,
             "sort": self.sort,
@@ -147,7 +156,7 @@ class PaperFilters:
             ("starred", _bool_query(self.starred)),
             ("read", _bool_query(self.read)),
             ("notes", _bool_query(self.notes)),
-            ("display_stubs", "yes" if self.display_stubs else ""),
+            ("stub", "yes" if self.stub is True else ("all" if self.stub is None else "")),
             ("date_from", self.date_from),
             ("date_to", self.date_to),
             ("sort", self.sort if self.sort != "newest" else ""),
@@ -169,7 +178,7 @@ class PaperFilters:
             ("starred", _bool_query(self.starred)),
             ("read", _bool_query(self.read)),
             ("notes", _bool_query(self.notes)),
-            ("display_stubs", "yes" if self.display_stubs else ""),
+            ("stub", "yes" if self.stub is True else ("all" if self.stub is None else "")),
             ("date_from", self.date_from),
             ("date_to", self.date_to),
             ("sort", self.sort if self.sort != "newest" else ""),
@@ -177,6 +186,11 @@ class PaperFilters:
             ("page", str(page if page is not None else self.page)),
         ]
         return [(key, value) for key, value in items if value and value != "1"]
+
+    @property
+    def display_stubs(self) -> bool:
+        """Compatibility view of the old include-stubs flag."""
+        return self.stub is None
 
     @property
     def query_string(self) -> str:
@@ -407,6 +421,19 @@ def _parse_tristate(value: str | None) -> bool | None:
     if value in {"no", "false", "0"}:
         return False
     return None
+
+
+def _format_word_count(value: object) -> str:
+    """Format blog word counts compactly, using Kw from one thousand words."""
+    try:
+        count = max(0, int(value))
+    except (TypeError, ValueError):
+        return "—"
+    if count < 1000:
+        return f"{count}w"
+    kilo = count / 1000
+    rendered = f"{kilo:.1f}".rstrip("0").rstrip(".")
+    return f"{rendered}Kw"
 
 
 def _valid_date(value: str | None) -> str:
@@ -650,7 +677,15 @@ def _parse_filter_values(params: Any) -> PaperFilters:
         starred=_parse_tristate(params.get("starred")),
         read=_parse_tristate(params.get("read")),
         notes=_parse_tristate(params.get("notes")),
-        display_stubs=_parse_tristate(params.get("display_stubs")) is True,
+        stub=(
+            None
+            if str(params.get("stub", "")).strip().lower() in {"all", "any", "either"}
+            else _parse_tristate(params.get("stub"))
+            if params.get("stub") is not None
+            else None
+            if _parse_tristate(params.get("display_stubs")) is True
+            else False
+        ),
         date_from=_valid_date(params.get("date_from")),
         date_to=_valid_date(params.get("date_to")),
         sort=sort,
@@ -1572,9 +1607,14 @@ def _author_view(row: Any) -> dict[str, Any]:
         {
             "author_id": author_id,
             "papers_url": (
-                f"/?author={quote_plus(author_id)}"
+                f"/?content=papers&author={quote_plus(author_id)}"
                 if author_id
-                else f"/?q={encoded_name}"
+                else f"/?content=papers&q={encoded_name}"
+            ),
+            "blogs_url": (
+                f"/?content=blogs&author={quote_plus(author_id)}"
+                if author_id
+                else f"/?content=blogs&q={encoded_name}"
             ),
             "author_url": f"/authors/{quote_plus(author_id)}/blogs" if author_id else "/authors",
             "google_scholar_url": f"https://scholar.google.com/scholar?q={scholar_query}",
@@ -1670,6 +1710,17 @@ def _paper_pdf_state(
 
 def _paper_table_view(db: Database, row: Any) -> dict[str, Any]:
     data = _paper_pdf_state(db, _paper_view(row), verify_hash=False)
+    page_count = data.get("pdf_page_count")
+    local_pdf = str(data.get("local_pdf_path") or "").strip()
+    if page_count is None and local_pdf and not data.get("pdf_missing_on_disk"):
+        try:
+            page_count = pdf_page_count(Path(local_pdf).expanduser())
+        except PDFError:
+            page_count = None
+        if page_count is not None:
+            db.set_paper_pdf_page_count(int(data["id"]), int(page_count))
+            data["pdf_page_count"] = int(page_count)
+    data["content_extent"] = int(page_count) if page_count is not None else None
     tracked = _json_value(data.get("tracked_authors_json"), [])
     if not isinstance(tracked, list):
         tracked = []
@@ -1877,6 +1928,11 @@ def create_app(
     try:
         with analysis_lock(config.paths.database):
             with Database(config.paths.database) as recovery_db:
+                if recovery_db.was_created:
+                    model_profile = (
+                        config.available_llms[0].profile if config.available_llms else ""
+                    )
+                    add_default_queries(recovery_db, model_profile)
                 recovery_db.fail_incomplete_query_runs(
                     "Interrupted because the web application restarted"
                 )
@@ -1982,7 +2038,7 @@ def create_app(
             "read": filters.read,
             "notes": filters.notes,
             "analyzed": filters.analyzed,
-            "show_stubs": filters.display_stubs,
+            "stub": filters.stub,
         }
         blog_compatible_filters = not (
             filters.topic_id
@@ -2000,7 +2056,7 @@ def create_app(
             selected_matching_papers = 0
             selected_matching_blogs = 0
             has_blog_entries = db.has_visible_blog_entries()
-            if content_filter != "blogs":
+            if content_filter != "blogs" and filters.stub is not True:
                 paper_rows, paper_total = db.search_papers(
                     **paper_filters,
                     selected=False,
@@ -2085,9 +2141,14 @@ def create_app(
             if content_type == "paper":
                 item["record_date"] = item.get("publication_date") or item.get("discovered_at") or ""
                 item["record_fetched"] = item.get("fetched_at") or item.get("discovered_at") or ""
+                extent = item.get("content_extent")
+                item["content_extent_label"] = (
+                    f"{int(extent)}p" if extent is not None else "—"
+                )
             else:
                 item["record_date"] = item.get("published_at") or item.get("fetched_at") or ""
                 item["record_fetched"] = item.get("fetched_at") or ""
+                item["content_extent_label"] = _format_word_count(item.get("content_extent"))
             return item
 
         records = [prepare_record(item, "paper") for item in paper_views]
@@ -2180,6 +2241,26 @@ def create_app(
             return JSONResponse({"ok": True, "starred": starred})
         return RedirectResponse(_request_return_path(request), status_code=303)
 
+    @app.post("/content/{content_type}/{record_id}/stub")
+    async def set_content_stub(
+        request: Request, content_type: str, record_id: int
+    ) -> Response:
+        if content_type.strip().lower() not in {"blog", "blogs", "blog_entry"}:
+            raise HTTPException(400, "Only blog entries can be marked as stubs")
+        form = await request.form()
+        state = str(form.get("stub_state", "auto")).strip().lower()
+        try:
+            with Database(config.paths.database) as db:
+                if not db.set_blog_entry_stub_state(record_id, state):
+                    raise HTTPException(404, "Content not found")
+                row = db.get_blog_entry(record_id)
+        except ValueError as exc:
+            raise HTTPException(400, str(exc)) from exc
+        effective = bool(row["is_stub"]) if row is not None else False
+        if request.headers.get("X-Paperwatch-Async") == "1":
+            return JSONResponse({"ok": True, "stub_state": state, "is_stub": effective})
+        return RedirectResponse(_request_return_path(request), status_code=303)
+
     @app.post("/content/{content_type}/{record_id}/read")
     async def read_content(
         request: Request, content_type: str, record_id: int
@@ -2247,7 +2328,7 @@ def create_app(
             "notes": filters.notes,
             "selected": target_state,
             "analyzed": filters.analyzed,
-            "show_stubs": filters.display_stubs,
+            "stub": filters.stub,
         }
         blog_compatible = not (
             filters.topic_id
@@ -2259,7 +2340,11 @@ def create_app(
         with Database(config.paths.database) as db:
             changed = db.bulk_set_filtered_content_selected(
                 selected=selected,
-                paper_filters=(paper_filters if content_filter != "blogs" else None),
+                paper_filters=(
+                    paper_filters
+                    if content_filter != "blogs" and filters.stub is not True
+                    else None
+                ),
                 blog_filters=(
                     blog_filters
                     if content_filter != "papers" and blog_compatible
@@ -2362,7 +2447,10 @@ def create_app(
     @app.get("/exports/authors.csv")
     def export_authors_csv() -> Response:
         output = io.StringIO(newline="")
-        fields = ["Author Name", "Institution", "OpenAlex ID", "Starred", "Enabled", "Tags", "Notes"]
+        fields = [
+            "Author Name", "Institution", "OpenAlex ID", "Starred", "Enabled",
+            "Download Papers", "Tags", "Notes",
+        ]
         writer = csv.DictWriter(output, fieldnames=fields)
         writer.writeheader()
         with Database(config.paths.database) as db:
@@ -2373,6 +2461,7 @@ def create_app(
                     "OpenAlex ID": "" if str(row["openalex_id"]).startswith("LOCAL-") else row["openalex_id"],
                     "Starred": "yes" if row["starred"] else "no",
                     "Enabled": "yes" if row["enabled"] else "no",
+                    "Download Papers": "yes" if row["download_papers"] else "no",
                     "Tags": row["tags"] or "",
                     "Notes": row["notes"] or "",
                 })
@@ -2426,6 +2515,7 @@ def create_app(
         starred = _parse_tristate(request.query_params.get("starred"))
         notes = _parse_tristate(request.query_params.get("notes"))
         enabled = _parse_tristate(request.query_params.get("enabled"))
+        download_papers = _parse_tristate(request.query_params.get("download_papers"))
         with Database(config.paths.database) as db:
             rows = [dict(row) for row in db.list_authors_with_tags(
                 tracked_only=True,
@@ -2434,6 +2524,7 @@ def create_app(
                 starred=starred,
                 notes=notes,
                 enabled=enabled,
+                download_papers=download_papers,
             )]
             for row in rows:
                 row["is_local"] = str(row["openalex_id"]).startswith("LOCAL-")
@@ -2448,13 +2539,37 @@ def create_app(
             author_starred=starred,
             author_notes=notes,
             author_enabled=enabled,
+            author_download_papers=download_papers,
         )
 
     @app.get("/data", response_class=HTMLResponse)
     def data_management(request: Request) -> HTMLResponse:
         with Database(config.paths.database) as db:
             authors = [dict(row) for row in db.list_authors_with_tags(tracked_only=True)]
-        return render(request, "data_management.html", authors=authors)
+            download_pdfs = db.download_pdfs_enabled()
+        return render(
+            request,
+            "data_management.html",
+            authors=authors,
+            download_pdfs=download_pdfs,
+        )
+
+    @app.post("/data/settings/download-pdfs")
+    async def set_download_pdfs_setting(request: Request) -> RedirectResponse:
+        form = await request.form()
+        enabled = str(form.get("enabled", "")).strip().casefold() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }
+        with Database(config.paths.database) as db:
+            db.set_download_pdfs_enabled(enabled)
+        state = "enabled" if enabled else "disabled"
+        return RedirectResponse(
+            _notice_url("/data", f"Automatic PDF downloads {state}."),
+            status_code=303,
+        )
 
     @app.post("/authors/manual")
     async def add_manual_author(request: Request) -> RedirectResponse:
@@ -2588,6 +2703,10 @@ def create_app(
             )
             starred_column = fields.get("starred")
             enabled_column = fields.get("enabled")
+            download_papers_column = next(
+                (fields[key] for key in ("download papers", "download pdfs") if key in fields),
+                None,
+            )
             tags_column = fields.get("tags")
             notes_column = next((fields[key] for key in ("notes", "comments") if key in fields), None)
             with Database(config.paths.database) as db:
@@ -2623,6 +2742,12 @@ def create_app(
                         db.set_author_enabled(
                             identifier,
                             row.get(enabled_column, "yes").casefold() not in {"0", "false", "no", "off", "disabled"},
+                        )
+                    if identifier and download_papers_column:
+                        db.set_author_download_papers(
+                            identifier,
+                            row.get(download_papers_column, "yes").casefold()
+                            not in {"0", "false", "no", "off", "disabled"},
                         )
                     if identifier:
                         for tag in (*import_tags, *_split_tags(row.get(tags_column, "") if tags_column else "")):
@@ -2783,6 +2908,26 @@ def create_app(
             status_code=303,
         )
 
+    @app.post("/authors/{openalex_id}/blogs/{blog_id}/pause")
+    def pause_author_blog(openalex_id: str, blog_id: int) -> RedirectResponse:
+        with Database(config.paths.database) as db:
+            if not db.set_author_blog_enabled(openalex_id, blog_id, False):
+                raise HTTPException(404, "Blog link not found")
+        return RedirectResponse(
+            _notice_url(f"/authors/{quote_plus(openalex_id)}/blogs", "Blog paused."),
+            status_code=303,
+        )
+
+    @app.post("/authors/{openalex_id}/blogs/{blog_id}/resume")
+    def resume_author_blog(openalex_id: str, blog_id: int) -> RedirectResponse:
+        with Database(config.paths.database) as db:
+            if not db.set_author_blog_enabled(openalex_id, blog_id, True):
+                raise HTTPException(404, "Blog link not found")
+        return RedirectResponse(
+            _notice_url(f"/authors/{quote_plus(openalex_id)}/blogs", "Blog resumed."),
+            status_code=303,
+        )
+
     @app.post("/authors/{openalex_id}/blogs/{blog_id}/availability")
     async def set_author_blog_availability(
         request: Request, openalex_id: str, blog_id: int
@@ -2920,6 +3065,21 @@ def create_app(
             raise HTTPException(404, "Blog update not found")
         entry_view = dict(entry)
         entry_view["diff_text"] = compact_blog_diff(str(entry_view.get("diff_text") or ""))
+        entry_view["diff_lines"] = [
+            {
+                "text": line,
+                "kind": (
+                    "added"
+                    if line.startswith("+") and not line.startswith("+++")
+                    else (
+                        "removed"
+                        if line.startswith("-") and not line.startswith("---")
+                        else "context"
+                    )
+                ),
+            }
+            for line in entry_view["diff_text"].splitlines()
+        ]
         entry_view["tracked_authors"] = [
             {
                 "name": str(author["name"]),
@@ -2928,6 +3088,7 @@ def create_app(
             }
             for author in tracked_authors
         ]
+        author_rows = [_author_view(author) for author in tracked_authors]
         entry_view["display_html"] = str(entry["rendered_html"] or "") or _render_stored_markdown(
             str(entry["normalized_text"] or "")
         )
@@ -2939,6 +3100,8 @@ def create_app(
             entry_tags=entry_tags,
             content_tags=content_tags,
             classifications=classifications,
+            authors=author_rows,
+            default_author_index=0,
         )
 
     @app.post("/blogs/{entry_id}/delete")
@@ -3122,6 +3285,21 @@ def create_app(
                 raise HTTPException(404, "Author not found")
         if request.headers.get("X-Paperwatch-Async") == "1":
             return JSONResponse({"ok": True, "starred": starred})
+        return RedirectResponse(_request_return_path(request, "/authors"), status_code=303)
+
+    @app.post("/authors/{openalex_id}/download-papers")
+    async def set_author_download_papers(
+        request: Request, openalex_id: str
+    ) -> Response:
+        form = await request.form()
+        enabled = str(form.get("enabled", "")).strip().casefold() in {
+            "1", "true", "yes", "on"
+        }
+        with Database(config.paths.database) as db:
+            if not db.set_author_download_papers(openalex_id, enabled):
+                raise HTTPException(404, "Author not found")
+        if _async_request(request):
+            return JSONResponse({"ok": True, "download_papers": enabled})
         return RedirectResponse(_request_return_path(request, "/authors"), status_code=303)
 
     @app.post("/authors/{openalex_id}/disable")
@@ -4494,7 +4672,7 @@ def create_app(
             "read": filters.read,
             "notes": filters.notes,
             "analyzed": filters.analyzed,
-            "show_stubs": filters.display_stubs,
+            "stub": filters.stub,
         }
         with Database(config.paths.database) as db:
             stored_query = db.get_saved_query(query_id)
@@ -4519,7 +4697,7 @@ def create_app(
                 )
                 selected_blog_ids = [int(row["id"]) for row in selected_blogs]
             else:
-                if content_filter != "blogs":
+                if content_filter != "blogs" and filters.stub is not True:
                     _, paper_match_count = db.search_papers(
                         **paper_filter_args, limit=0, offset=0
                     )

@@ -415,8 +415,12 @@ def test_display_stubs_toggle_controls_blog_results(config_path, author_candidat
     assert "Jeremy Rack" not in hidden.text
     shown = web.get("/?content=blogs&display_stubs=yes")
     assert "Jeremy Rack" in shown.text
-    toggle = BeautifulSoup(shown.text, "html.parser").select_one("[data-display-stubs]")
-    assert toggle is not None and toggle.has_attr("checked")
+    toggle = BeautifulSoup(shown.text, "html.parser").select_one(
+        '[data-filter-name="stub"]'
+    )
+    assert toggle is not None and toggle.get("data-filter-state") == "all"
+    only_stubs = web.get("/?content=blogs&stub=yes")
+    assert "Jeremy Rack" in only_stubs.text
 
 
 def test_schema_21_backfills_arxiv_blog_paper_links(
@@ -444,7 +448,7 @@ def test_schema_21_backfills_arxiv_blog_paper_links(
         db._conn.execute("PRAGMA user_version=20")
         db._conn.commit()
     with Database(path) as db:
-        assert SCHEMA_VERSION == 27
+        assert SCHEMA_VERSION == 30
         assert db.get_blog_entry(entry_id)["linked_paper_id"] == paper_id
 
 
@@ -503,7 +507,7 @@ def test_dropdown_and_delete_layout_assets(config_path):
     assert "enabledOptions.length <= 5" in script
     assert "form.requestSubmit()" in script
     assert "refresh(true);\n            autoApply();" in script
-    assert "data-display-stubs" in script
+    assert 'stub: "Stub filter"' in script
     assert "search-select-cycle" in script
     runs = web.get("/data")
     assert "delete-record-grid" in runs.text

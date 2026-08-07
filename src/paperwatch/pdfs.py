@@ -86,6 +86,19 @@ def validate_pdf_file(path: Path) -> None:
         raise PDFError(f"Uploaded file is not a readable PDF: {exc}") from exc
 
 
+def pdf_page_count(path: Path) -> int:
+    """Return the number of pages in a readable local PDF."""
+    try:
+        reader = PdfReader(str(path), strict=False)
+        if reader.is_encrypted and reader.decrypt("") == 0:
+            raise PDFError("PDF is encrypted")
+        return len(reader.pages)
+    except PDFError:
+        raise
+    except Exception as exc:
+        raise PDFError(f"Could not read PDF page count: {exc}") from exc
+
+
 def _known_pdf_variants(url: str) -> tuple[str, ...]:
     parsed = urlsplit(url)
     host = (parsed.hostname or "").lower()

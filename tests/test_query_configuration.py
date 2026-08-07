@@ -268,12 +268,18 @@ def test_default_query_installer_and_actions_column_deletion(config_path):
     assert 'action="/data/queries/defaults"' in data_page.text
     assert "Add default queries" in data_page.text
 
+    config = load_config(config_path)
+    with Database(config.paths.database) as db:
+        initial_optional = [
+            row for row in db.list_saved_queries() if not bool(row["is_builtin"])
+        ]
+        assert len(initial_optional) == 30
+
     installed = client.post("/data/queries/defaults", follow_redirects=False)
     assert installed.status_code == 303
     assert installed.headers["location"].startswith("/queries?")
-    assert "Added+30+default+queries" in installed.headers["location"]
+    assert "All+default+queries+are+already+present" in installed.headers["location"]
 
-    config = load_config(config_path)
     with Database(config.paths.database) as db:
         rows = db.list_saved_queries()
         optional = [row for row in rows if not bool(row["is_builtin"])]
@@ -466,7 +472,7 @@ def test_schema_25_migrates_saved_query_model_and_removes_context(tmp_path):
         assert "context_window_tokens" not in columns
         assert db.get_saved_query(query_id)["model_profile"] == "secondary"
         assert db.get_query_run(run_id)["context_window_tokens"] == 7777
-        assert db._conn.execute("PRAGMA user_version").fetchone()[0] == 27
+        assert db._conn.execute("PRAGMA user_version").fetchone()[0] == 30
         assert db._conn.execute("PRAGMA foreign_key_check").fetchall() == []
 
 def test_context_window_override_is_local_only(app_config):

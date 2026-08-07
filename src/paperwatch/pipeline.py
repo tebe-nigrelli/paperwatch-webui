@@ -34,6 +34,7 @@ from .pdfs import (
     download_pdf,
     extract_pdf_text,
     is_complete_pdf,
+    pdf_page_count,
     resolve_pdf_url,
     safe_pdf_name,
     pdf_sha256,
@@ -1370,7 +1371,10 @@ class PaperWatch:
         paper: PaperRecord,
         analyze: bool,
         analyze_new_downloads: bool,
+        force_download: bool = False,
     ) -> None:
+        if not force_download and not self.db.download_pdfs_enabled():
+            return
         # Fetches are archival: once a paper exposes a valid PDF, keep a local copy.
         # Landing pages and Scholar result links are resolved only when the direct
         # OpenAlex/arXiv URL is absent or fails PDF validation.
@@ -1411,7 +1415,18 @@ class PaperWatch:
             )
         if downloaded:
             stats.pdfs_downloaded += 1
-        self.db.set_local_pdf(paper_id, str(destination), pdf_sha256(destination))
+        try:
+            page_count = pdf_page_count(destination)
+        except PDFError:
+            # A successfully downloaded PDF should remain usable even when its
+            # page tree cannot be parsed for this optional display metadata.
+            page_count = None
+        self.db.set_local_pdf(
+            paper_id,
+            str(destination),
+            pdf_sha256(destination),
+            page_count=page_count,
+        )
         stats._downloaded_paper_ids.add(paper_id)
         stats.papers_downloaded = len(stats._downloaded_paper_ids)
         self._publish_run_stats(stats)
@@ -1459,6 +1474,7 @@ class PaperWatch:
         *,
         analyze: bool,
         auto_analyze: bool,
+        download_pdf_for_author: bool = True,
     ) -> None:
         try:
             paper = self._enrich_from_arxiv(paper)
@@ -1504,13 +1520,14 @@ class PaperWatch:
                 )
 
         try:
-            self._process_pdf(
-                stats,
-                paper_id=paper_id,
-                paper=paper,
-                analyze=analysis_allowed,
-                analyze_new_downloads=analyze,
-            )
+            if download_pdf_for_author:
+                self._process_pdf(
+                    stats,
+                    paper_id=paper_id,
+                    paper=paper,
+                    analyze=analysis_allowed,
+                    analyze_new_downloads=analyze,
+                )
         except JobCancelled:
             raise
         except Exception as exc:
@@ -1678,6 +1695,7 @@ class PaperWatch:
                     paper=paper,
                     analyze=False,
                     analyze_new_downloads=False,
+                    force_download=True,
                 )
                 stored = self.db.get_paper(paper_id)
                 local_path = Path(str(stored["local_pdf_path"] or "")) if stored else None
@@ -1741,7 +1759,7 @@ class PaperWatch:
         stats.run_id = self.db.start_run()
         self._publish_run_stats(stats)
         current_day = today or datetime.now(timezone.utc).date()
-        seen_papers: set[str] = set()
+        seen_papers: dict[str, bool] = {}
         implicit_analysis = (
             analyze_discovered_papers and not download_only and not historical
         )
@@ -1810,11 +1828,20 @@ class PaperWatch:
                     for paper in papers:
                         check_cancelled(self._cancel_event)
                         run_identity = self._run_identity(paper)
-                        if run_identity in seen_papers:
-                            continue
-                        seen_papers.add(run_identity)
-                        stats.papers_found += 1
-                        self._publish_run_stats(stats)
+                        download_for_author = bool(author["download_papers"])
+                        prior_download = seen_papers.get(run_identity)
+                        if prior_download is not None:
+                            if not download_for_author or prior_download:
+                                continue
+                            # The paper was first encountered through an author who
+                            # opts out of PDFs. Reprocess it once when another linked
+                            # author opts in so shared papers follow the permissive
+                            # per-author preference.
+                            seen_papers[run_identity] = True
+                        else:
+                            seen_papers[run_identity] = download_for_author
+                            stats.papers_found += 1
+                            self._publish_run_stats(stats)
                         try:
                             self._process_paper(
                                 stats,
@@ -1822,6 +1849,7 @@ class PaperWatch:
                                 paper,
                                 analyze=implicit_analysis,
                                 auto_analyze=not historical,
+                                download_pdf_for_author=download_for_author,
                             )
                         except JobCancelled:
                             raise

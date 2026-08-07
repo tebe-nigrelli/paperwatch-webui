@@ -213,7 +213,8 @@ def test_paper_author_picker_and_chunked_multi_model_request(
     client = make_app(config_path, analysis=analysis)
     page = client.get(f"/papers/{paper_id}")
     assert 'id="author-picker"' in page.text
-    assert 'id="author-local"' in page.text
+    assert 'id="author-local-papers"' in page.text
+    assert 'id="author-local-blogs"' in page.text
     assert 'id="author-track-form"' in page.text
     assert "Run saved prompt" not in page.text
     assert 'id="saved-prompt-form"' not in page.text
@@ -569,7 +570,8 @@ def test_paper_author_picker_defaults_to_first_tracked_author_and_marks_it(
     page = make_app(config_path).get(f"/papers/{paper_id}")
     assert page.status_code == 200
     assert '<option value="1" selected class="tracked-author-option"' in page.text
-    assert 'href="/?author=A999"' in page.text
+    assert 'href="/?content=papers&amp;author=A999"' in page.text
+    assert 'href="/?content=blogs&amp;author=A999"' in page.text
     assert 'class="tag author-chip author-chip-tracked"' in page.text
     assert 'data-author-index="1" aria-pressed="true">Alan Turing</button>' in page.text
     assert 'data-author-index="0" aria-pressed="false">Ada Lovelace</button>' in page.text

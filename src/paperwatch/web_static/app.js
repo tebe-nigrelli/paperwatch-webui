@@ -1138,12 +1138,6 @@
 
   document.querySelectorAll("select").forEach((select, index) => enhanceSelect(select, index));
 
-  document.querySelectorAll("[data-display-stubs]").forEach((toggle) => {
-    toggle.addEventListener("change", () => {
-      const form = toggle.form || toggle.closest("form");
-      if (form && (form.method || "get").toLocaleLowerCase() === "get") form.requestSubmit();
-    });
-  });
   document.querySelectorAll("[data-model-picker]").forEach((select) => {
     select.dispatchEvent(new Event("change", { bubbles: true }));
   });
@@ -1241,7 +1235,8 @@
 
   const picker = document.getElementById("author-picker");
   if (picker) {
-    const local = document.getElementById("author-local");
+    const localPapers = document.getElementById("author-local-papers");
+    const localBlogs = document.getElementById("author-local-blogs");
     const scholar = document.getElementById("author-scholar");
     const arxiv = document.getElementById("author-arxiv");
     const openalex = document.getElementById("author-openalex");
@@ -1250,7 +1245,8 @@
     const status = document.getElementById("author-status");
     const update = () => {
       const option = picker.options[picker.selectedIndex];
-      local.href = option.dataset.papers || "#";
+      localPapers.href = option.dataset.papers || "#";
+      localBlogs.href = option.dataset.blogs || "#";
       scholar.href = option.dataset.scholar || "#";
       arxiv.href = option.dataset.arxiv || "#";
       const hasOpenAlex = Boolean(option.dataset.openalex);
@@ -1303,6 +1299,7 @@
     const prefixes = {
       starred: "Star filter",
       content: "Content type",
+      stub: "Stub filter",
       read: "Reading filter",
       notes: "Notes filter",
       enabled: "Fetch state",

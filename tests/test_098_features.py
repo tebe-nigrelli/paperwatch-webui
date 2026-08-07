@@ -82,7 +82,7 @@ def test_schema_content_state_author_star_and_bulk_selection(
     paper_id, entry_id = seed(config_path, author_candidate, paper_record)
     config = load_config(config_path)
     with Database(config.paths.database) as db:
-        assert SCHEMA_VERSION == 27
+        assert SCHEMA_VERSION == 30
         assert db.get_paper(paper_id)["read_at"] is None
         assert db.get_blog_entry(entry_id)["read_at"] is None
         assert db.set_author_starred(author_candidate.openalex_id, True)
@@ -189,7 +189,8 @@ def test_web_star_selection_reading_classifier_and_author_csv_ui(
     assert "Classifier labels" in paper.text
     blog = web.get(f"/blogs/{entry_id}")
     assert 'data-auto-read data-content-type="blog"' in blog.text
-    assert "Local Entries" in blog.text
+    assert "Local papers" in blog.text
+    assert "Local blogs" in blog.text
 
     query_edit = web.get(f"/queries/{query_id}/edit")
     assert 'name="query_kind"' in query_edit.text

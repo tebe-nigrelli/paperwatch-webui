@@ -1,4 +1,5 @@
 {% extends "base.html" %}
+{% from "_author_panel.html" import author_panel %}
 {% block title %}{{ paper.title }} · paperwatch{% endblock %}
 {% block content %}
 <div class="paper-detail-root" data-pdf-drop-target>
@@ -10,24 +11,7 @@
 
 {% if classifications %}<section class="panel classification-panel"><div class="panel-heading"><div><h2>Classifier labels</h2><p>Values are constrained by their saved query. Manual changes remain fixed on later runs.</p></div></div><div class="classification-grid">{% for item in classifications %}<form method="post" action="/content/paper/{{ paper.id }}/classifications/{{ item.query_id }}" class="classification-row" data-async-action data-refresh-selector=".classification-panel"><label><span>{{ item.label_class }}</span><select name="value">{% for choice in item.choices %}<option value="{{ choice }}" {% if choice == item.value %}selected{% endif %}>{{ choice }}</option>{% endfor %}</select></label><button class="button button-small" type="submit">Set</button><a href="/queries#query-{{ item.query_id }}">{{ item.query_name }}</a></form>{% endfor %}</div></section>{% endif %}
 
-<section class="panel author-picker-panel">
-  {% if authors %}
-  {% set default_author = authors[default_author_index] %}
-  {% set default_status = 'tracked' if default_author.is_tracked and default_author.tracked_enabled else ('paused' if default_author.is_tracked else 'not tracked') %}
-  {% set default_track = default_author.author_id and not (default_author.is_tracked and default_author.tracked_enabled) %}
-  <div class="author-picker-toolbar">
-    <label class="grow"><span>Author</span><select id="author-picker">{% for author in authors %}<option value="{{ loop.index0 }}"{% if loop.index0 == default_author_index %} selected{% endif %}{% if author.is_tracked %} class="tracked-author-option"{% endif %} data-papers="{{ author.papers_url }}" data-scholar="{{ author.google_scholar_url }}" data-arxiv="{{ author.arxiv_url }}" data-openalex="{{ author.openalex_url or '' }}" data-track="{% if author.author_id and not (author.is_tracked and author.tracked_enabled) %}/papers/{{ paper.id }}/authors/{{ author.author_id }}/add{% endif %}" data-status="{% if author.is_tracked and author.tracked_enabled %}tracked{% elif author.is_tracked %}paused{% else %}not tracked{% endif %}">{{ author.name }}</option>{% endfor %}</select></label>
-    <span id="author-status" class="status {{ 'status-success' if default_status == 'tracked' else 'status-disabled' }}">{{ default_status }}</span>
-    <a id="author-local" class="button button-primary" href="{{ default_author.papers_url }}">Local papers</a>
-    <a id="author-scholar" class="button" href="{{ default_author.google_scholar_url }}" target="_blank" rel="noreferrer">Scholar</a>
-    <a id="author-arxiv" class="button" href="{{ default_author.arxiv_url }}" target="_blank" rel="noreferrer">arXiv</a>
-    <a id="author-openalex" class="button" href="{{ default_author.openalex_url or '#' }}" {% if not default_author.openalex_url %}hidden{% endif %} target="_blank" rel="noreferrer">OpenAlex</a>
-    <form id="author-track-form" method="post" action="{% if default_track %}/papers/{{ paper.id }}/authors/{{ default_author.author_id }}/add{% endif %}" {% if not default_track %}hidden{% endif %}><button id="author-track" class="button" type="submit" {% if not default_track %}disabled{% endif %}>Track author</button></form>
-  </div>
-  <div class="author-chips">{% for author in authors %}<button class="tag author-chip{% if author.is_tracked %} author-chip-tracked{% endif %}" type="button" data-author-index="{{ loop.index0 }}"{% if loop.index0 == default_author_index %} aria-pressed="true"{% else %} aria-pressed="false"{% endif %}>{{ author.name }}</button>{% endfor %}</div>
-  {% else %}<p class="muted">No author metadata is stored.</p>{% endif %}
-</section>
-
+{{ author_panel(authors, default_author_index, "/papers/" ~ paper.id ~ "/authors") }}
 <section class="panel paper-reference-panel">
   <div class="paper-reference-layout">
     <div class="metadata-grid paper-reference-metadata">

@@ -18,6 +18,7 @@ from .blogs import (
     validate_content_selector,
 )
 from .db import Database
+from .default_queries import add_default_queries
 from .llm import LLMClient, create_llm
 from .pipeline import PaperWatch
 from .sources.arxiv import ArxivClient
@@ -41,9 +42,13 @@ class Services:
 
 
 def build_services(config: AppConfig) -> Services:
+    db = Database(config.paths.database)
+    if db.was_created:
+        model_profile = config.available_llms[0].profile if config.available_llms else ""
+        add_default_queries(db, model_profile)
     return Services(
         config=config,
-        db=Database(config.paths.database),
+        db=db,
         openalex=OpenAlexClient(
             api_key=config.openalex.api_key,
             base_url=config.openalex.base_url,

@@ -274,6 +274,23 @@ def _selected_papers(db: Database, selection: dict[str, Any] | None) -> list[Any
     return papers
 
 
+def _selection_stub_filter(selection: dict[str, Any] | None) -> bool | None:
+    selection = selection or {}
+    if "stub" in selection:
+        value = selection.get("stub")
+        if isinstance(value, bool) or value is None:
+            return value
+        normalized = str(value).strip().lower()
+        if normalized in {"yes", "true", "1", "stub"}:
+            return True
+        if normalized in {"no", "false", "0", "full"}:
+            return False
+        if normalized in {"all", "any", "either", ""}:
+            return None
+    # Older saved selections used display_stubs=yes to mean no stub filtering.
+    return None if bool(selection.get("display_stubs")) else False
+
+
 def _selected_blog_entries(db: Database, selection: dict[str, Any] | None) -> list[Any]:
     selected_ids: list[int] = []
     if selection and isinstance(selection.get("blog_entry_ids"), list):
@@ -304,7 +321,7 @@ def _selected_blog_entries(db: Database, selection: dict[str, Any] | None) -> li
         read=args["read"] if isinstance(args["read"], bool) else None,
         analyzed=args["analyzed"] if isinstance(args["analyzed"], bool) else None,
         notes=args["notes"] if isinstance(args["notes"], bool) else None,
-        show_stubs=bool((selection or {}).get("display_stubs")),
+        stub=_selection_stub_filter(selection),
         query_view=True,
     )
 
@@ -348,7 +365,7 @@ def validate_query_sources(
                 notes=(selection or {}).get("notes")
                 if isinstance((selection or {}).get("notes"), bool)
                 else None,
-                show_stubs=bool((selection or {}).get("display_stubs")),
+                stub=_selection_stub_filter(selection),
             )
         )
         if not count:

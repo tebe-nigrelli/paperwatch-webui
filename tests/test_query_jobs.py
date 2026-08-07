@@ -1102,7 +1102,11 @@ def test_query_source_edge_cases_cover_blog_fallback_and_auto_missing(
         all_blog_docs = collect_query_documents(
             db,
             "blog",
-            selection={"content_type": "blogs", "blog_entry_ids": ["invalid"]},
+            selection={
+                "content_type": "blogs",
+                "blog_entry_ids": ["invalid"],
+                "display_stubs": True,
+            },
         )
         assert [item["blog_entry_id"] for item in all_blog_docs] == [entry_id]
 

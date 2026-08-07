@@ -21,7 +21,7 @@ from .models import (
 )
 
 
-SCHEMA_VERSION = 27
+SCHEMA_VERSION = 30
 BLOG_SOURCE_MODES = {
     "auto",
     "feed",
@@ -43,6 +43,40 @@ DEFAULT_SUMMARY_QUERY_PROMPT = (
 )
 
 BLOG_STUB_MAX_CHARS = 500
+BLOG_STUB_DIFF_MAX_WORDS = 20
+DOWNLOAD_PDFS_SETTING = "download_pdfs"
+BLOG_FETCH_APPEND_MARKERS = (
+    "\n\nWebsite content:\n",
+    "\n\nImported page content:\n",
+)
+
+
+def _diff_word_count(diff_text: str | None, prefix: str) -> int:
+    count = 0
+    for raw_line in str(diff_text or "").splitlines():
+        if not raw_line.startswith(prefix) or raw_line.startswith(prefix * 3):
+            continue
+        count += len(re.findall(r"\S+", raw_line[1:]))
+    return count
+
+
+def _blog_entry_word_count(
+    normalized_text: str | None,
+    diff_text: str | None,
+    previous_entry_id: int | None,
+) -> int:
+    """Return the display word count for a blog entry.
+
+    Normal revisions show only added words.  When a fetched webpage has been
+    appended to an existing feed/stub record, however, the row represents the
+    complete accumulated document and should show its full word count.
+    """
+    text = str(normalized_text or "")
+    if any(marker in text for marker in BLOG_FETCH_APPEND_MARKERS):
+        return len(re.findall(r"\S+", text))
+    if previous_entry_id is not None:
+        return _diff_word_count(diff_text, "+")
+    return len(re.findall(r"\S+", text))
 
 
 def _blog_entry_is_stub(
@@ -50,8 +84,16 @@ def _blog_entry_is_stub(
     title: str | None,
     source_url: str | None,
     linked_paper_id: int | None,
+    diff_text: str | None = None,
+    previous_entry_id: int | None = None,
 ) -> int:
-    """Return 1 for short imported-paper or metadata-only blog entries."""
+    """Return 1 for metadata-only entries and updates with only tiny diffs."""
+    if previous_entry_id is not None and str(diff_text or "").strip():
+        changed_words = _diff_word_count(diff_text, "+") + _diff_word_count(
+            diff_text, "-"
+        )
+        if changed_words <= BLOG_STUB_DIFF_MAX_WORDS:
+            return 1
     text = str(normalized_text or "").strip()
     if len(text) > BLOG_STUB_MAX_CHARS:
         return 0
@@ -82,6 +124,19 @@ def _blog_entry_is_stub(
             continue
         meaningful.append(lower)
     return 0 if meaningful else 1
+
+
+def _blog_stub_sql(entry_alias: str = "be", blog_alias: str = "b") -> str:
+    """SQL expression for the effective, manually overridable stub state."""
+    return (
+        f"CASE COALESCE({entry_alias}.stub_state, 'auto') "
+        f"WHEN 'stub' THEN 1 WHEN 'full' THEN 0 ELSE "
+        "paperwatch_blog_stub("
+        f"{entry_alias}.normalized_text, {entry_alias}.title, "
+        f"COALESCE({entry_alias}.source_url, {blog_alias}.url), "
+        f"{entry_alias}.linked_paper_id, {entry_alias}.diff_text, "
+        f"{entry_alias}.previous_entry_id) END"
+    )
 
 
 def _url_search_key(value: object) -> str:
@@ -116,6 +171,7 @@ CREATE TABLE IF NOT EXISTS authors (
     enabled INTEGER NOT NULL DEFAULT 1,
     tracked INTEGER NOT NULL DEFAULT 1,
     starred INTEGER NOT NULL DEFAULT 0,
+    download_papers INTEGER NOT NULL DEFAULT 1,
     notes TEXT NOT NULL DEFAULT '',
     added_at TEXT NOT NULL,
     last_checked_at TEXT,
@@ -140,6 +196,7 @@ CREATE TABLE IF NOT EXISTS papers (
     pdf_sha256 TEXT,
     pdf_size INTEGER,
     pdf_mtime_ns INTEGER,
+    pdf_page_count INTEGER,
     pdf_modified_on_disk INTEGER NOT NULL DEFAULT 0,
     auto_analyze INTEGER NOT NULL DEFAULT 1,
     starred INTEGER NOT NULL DEFAULT 0,
@@ -187,6 +244,12 @@ CREATE TABLE IF NOT EXISTS runs (
     blog_items_available INTEGER NOT NULL DEFAULT 0,
     blog_items_downloaded INTEGER NOT NULL DEFAULT 0,
     error_text TEXT
+);
+
+CREATE TABLE IF NOT EXISTS app_settings (
+    key TEXT PRIMARY KEY,
+    value TEXT NOT NULL,
+    updated_at TEXT NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS run_errors (
@@ -248,6 +311,7 @@ CREATE TABLE IF NOT EXISTS blog_entries (
     starred INTEGER NOT NULL DEFAULT 0,
     read_at TEXT,
     selected INTEGER NOT NULL DEFAULT 0,
+    stub_state TEXT NOT NULL DEFAULT 'auto' CHECK (stub_state IN ('auto', 'stub', 'full')),
     notes TEXT NOT NULL DEFAULT '',
     diff_text TEXT NOT NULL DEFAULT '',
     change_kind TEXT NOT NULL CHECK (change_kind IN ('baseline', 'changed', 'reset')),
@@ -540,13 +604,20 @@ class DeadSourceError(ValueError):
 class Database:
     def __init__(self, path: str | Path):
         self.path = Path(path)
+        self.was_created = not self.path.exists() or self.path.stat().st_size == 0
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self._conn = sqlite3.connect(self.path, timeout=10)
         self._conn.row_factory = sqlite3.Row
         self._conn.create_function(
             "paperwatch_blog_stub",
-            4,
+            6,
             _blog_entry_is_stub,
+            deterministic=True,
+        )
+        self._conn.create_function(
+            "paperwatch_blog_word_count",
+            3,
+            _blog_entry_word_count,
             deterministic=True,
         )
         self._conn.create_function(
@@ -585,6 +656,7 @@ class Database:
         self._conn.executescript(BLOGS_SCHEMA)
         self._ensure_blog_columns()
         self._ensure_extended_metadata_columns()
+        self._ensure_default_settings()
         if version < 17:
             self._promote_initial_blog_items()
         if version < 18:
@@ -596,6 +668,37 @@ class Database:
             self._backfill_paper_topics()
         self._conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
         self._conn.commit()
+
+    def _ensure_default_settings(self) -> None:
+        self._conn.execute(
+            """
+            INSERT OR IGNORE INTO app_settings(key, value, updated_at)
+            VALUES (?, '1', ?)
+            """,
+            (DOWNLOAD_PDFS_SETTING, utcnow()),
+        )
+
+    def download_pdfs_enabled(self) -> bool:
+        row = self._conn.execute(
+            "SELECT value FROM app_settings WHERE key=?",
+            (DOWNLOAD_PDFS_SETTING,),
+        ).fetchone()
+        if row is None:
+            return True
+        return str(row["value"]).strip().casefold() not in {"0", "false", "no", "off"}
+
+    def set_download_pdfs_enabled(self, enabled: bool) -> None:
+        with self.transaction() as conn:
+            conn.execute(
+                """
+                INSERT INTO app_settings(key, value, updated_at)
+                VALUES (?, ?, ?)
+                ON CONFLICT(key) DO UPDATE SET
+                    value=excluded.value,
+                    updated_at=excluded.updated_at
+                """,
+                (DOWNLOAD_PDFS_SETTING, "1" if enabled else "0", utcnow()),
+            )
 
     def _ensure_extended_metadata_columns(self) -> None:
         additions = {
@@ -704,6 +807,7 @@ class Database:
             "starred": "INTEGER NOT NULL DEFAULT 0",
             "read_at": "TEXT",
             "selected": "INTEGER NOT NULL DEFAULT 0",
+            "stub_state": "TEXT NOT NULL DEFAULT 'auto' CHECK (stub_state IN ('auto', 'stub', 'full'))",
         }
         for name, definition in entry_definitions.items():
             if name not in entry_columns:
@@ -793,6 +897,10 @@ class Database:
             self._conn.execute(
                 "ALTER TABLE authors ADD COLUMN starred INTEGER NOT NULL DEFAULT 0"
             )
+        if "download_papers" not in columns:
+            self._conn.execute(
+                "ALTER TABLE authors ADD COLUMN download_papers INTEGER NOT NULL DEFAULT 1"
+            )
 
     def _ensure_paper_columns(self) -> None:
         columns = {
@@ -806,6 +914,7 @@ class Database:
             "starred": "INTEGER NOT NULL DEFAULT 0",
             "read_at": "TEXT",
             "selected": "INTEGER NOT NULL DEFAULT 0",
+            "pdf_page_count": "INTEGER",
         }
         for name, definition in additions.items():
             if name not in columns:
@@ -1232,8 +1341,9 @@ class Database:
             conn.execute(
                 """
                 INSERT INTO authors (
-                    openalex_id, name, institution, enabled, tracked, added_at, metadata_json
-                ) VALUES (?, ?, ?, 0, 1, ?, ?)
+                    openalex_id, name, institution, enabled, tracked, download_papers,
+                    added_at, metadata_json
+                ) VALUES (?, ?, ?, 0, 1, 0, ?, ?)
                 ON CONFLICT(openalex_id) DO UPDATE SET
                     name=excluded.name,
                     institution=excluded.institution,
@@ -1296,6 +1406,15 @@ class Database:
             cur = conn.execute(
                 "UPDATE authors SET starred=? WHERE openalex_id=?",
                 (1 if starred else 0, identifier),
+            )
+        return cur.rowcount > 0
+
+    def set_author_download_papers(self, openalex_id: str, enabled: bool) -> bool:
+        identifier = self._author_id(openalex_id)
+        with self.transaction() as conn:
+            cur = conn.execute(
+                "UPDATE authors SET download_papers=? WHERE openalex_id=? AND tracked=1",
+                (1 if enabled else 0, identifier),
             )
         return cur.rowcount > 0
 
@@ -1397,8 +1516,8 @@ class Database:
             conn.execute(
                 """
                 UPDATE authors
-                SET openalex_id=?, enabled=1, tracked=1, last_checked_at=NULL,
-                    metadata_json=?, notes=?, starred=?, orcid=?, institution=?,
+                SET openalex_id=?, enabled=1, tracked=1, download_papers=1,
+                    last_checked_at=NULL, metadata_json=?, notes=?, starred=?, orcid=?, institution=?,
                     works_count=?, cited_by_count=?, added_at=?
                 WHERE id=?
                 """,
@@ -1665,6 +1784,39 @@ class Database:
                 ),
             )
             conn.execute("DELETE FROM known_blog_articles WHERE blog_id=?", (blog_id,))
+        return True
+
+    def set_author_blog_enabled(
+        self,
+        openalex_id: str,
+        blog_id: int,
+        enabled: bool,
+    ) -> bool:
+        """Pause or resume a linked blog source without deleting history."""
+        identifier = self._author_id(openalex_id)
+        with self.transaction() as conn:
+            linked = conn.execute(
+                """
+                SELECT b.dead
+                FROM authors a
+                JOIN author_blogs ab ON ab.author_id=a.id
+                JOIN blogs b ON b.id=ab.blog_id
+                WHERE a.openalex_id=? AND a.tracked=1 AND ab.blog_id=?
+                """,
+                (identifier, blog_id),
+            ).fetchone()
+            if linked is None:
+                return False
+            if linked["dead"]:
+                return not enabled
+            conn.execute(
+                """
+                UPDATE blogs
+                SET enabled=?, last_error=NULL
+                WHERE id=?
+                """,
+                (1 if enabled else 0, blog_id),
+            )
         return True
 
     def set_author_blog_broken(
@@ -2176,14 +2328,16 @@ class Database:
         selected: bool | None = None,
         analyzed: bool | None = None,
         show_stubs: bool = True,
+        stub: bool | None = None,
     ) -> tuple[str, list[Any]]:
         where = ["be.change_kind != 'baseline'", "b.dead=0"]
         params: list[Any] = []
-        if not show_stubs:
-            where.append(
-                "paperwatch_blog_stub(be.normalized_text, be.title, "
-                "COALESCE(be.source_url, b.url), be.linked_paper_id)=0"
-            )
+        stub_sql = _blog_stub_sql()
+        if stub is not None:
+            where.append(f"({stub_sql})=?")
+            params.append(1 if stub else 0)
+        elif not show_stubs:
+            where.append(f"({stub_sql})=0")
         if query.strip():
             escaped = query.strip().replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
             term = f"%{escaped}%"
@@ -2341,6 +2495,7 @@ class Database:
         selected: bool | None = None,
         analyzed: bool | None = None,
         show_stubs: bool = True,
+        stub: bool | None = None,
         offset: int = 0,
         ids_only: bool = False,
         table_view: bool = False,
@@ -2361,6 +2516,7 @@ class Database:
             selected=selected,
             analyzed=analyzed,
             show_stubs=show_stubs,
+            stub=stub,
         )
         has_summary_sql = (
             "1"
@@ -2386,7 +2542,8 @@ class Database:
             sql = f"""
             SELECT
                 be.id, be.title, be.normalized_text, be.diff_text,
-                be.entry_kind, be.change_kind, be.source_url,
+                be.entry_kind, be.change_kind, be.source_url, be.stub_state,
+                ({_blog_stub_sql()}) AS is_stub,
                 be.published_at, be.fetched_at,
                 b.url, COALESCE(b.title, be.title) AS blog_title,
                 (SELECT group_concat(name, ', ') FROM (
@@ -2403,8 +2560,12 @@ class Database:
             SELECT
                 be.id, be.blog_id, be.previous_entry_id, be.title,
                 be.linked_paper_id, be.starred, be.read_at, be.selected,
+                be.stub_state, ({_blog_stub_sql()}) AS is_stub,
                 be.notes, be.change_kind, be.entry_kind, be.source_url,
                 be.published_at, be.fetched_at,
+                paperwatch_blog_word_count(
+                    be.normalized_text, be.diff_text, be.previous_entry_id
+                ) AS content_extent,
                 b.url, COALESCE(b.title, be.title) AS blog_title,
                 (SELECT group_concat(name, ', ') FROM (
                     SELECT DISTINCT a.name AS name
@@ -2436,7 +2597,8 @@ class Database:
             """
         else:
             sql = f"""
-            SELECT be.*, b.url, COALESCE(b.title, be.title) AS blog_title,
+            SELECT be.*, ({_blog_stub_sql()}) AS is_stub,
+                b.url, COALESCE(b.title, be.title) AS blog_title,
                 (SELECT group_concat(name, ', ') FROM (
                     SELECT DISTINCT a.name AS name
                     FROM author_blogs ab JOIN authors a ON a.id=ab.author_id
@@ -2475,18 +2637,13 @@ class Database:
         """Return recent unexpanded stubs that may point at a full article page."""
         return list(
             self._conn.execute(
-                """
+                f"""
                 SELECT be.*, b.url AS blog_url
                 FROM blog_entries be
                 JOIN blogs b ON b.id=be.blog_id
                 WHERE be.change_kind != 'baseline'
                   AND b.dead=0
-                  AND paperwatch_blog_stub(
-                      be.normalized_text,
-                      be.title,
-                      COALESCE(be.source_url, b.url),
-                      be.linked_paper_id
-                  )=1
+                  AND ({_blog_stub_sql()})=1
                   AND be.normalized_text NOT LIKE '%Imported page content:%'
                 ORDER BY COALESCE(be.published_at, be.fetched_at) DESC, be.id DESC
                 LIMIT ?
@@ -2573,8 +2730,9 @@ class Database:
 
     def get_blog_entry(self, entry_id: int) -> sqlite3.Row | None:
         return self._conn.execute(
-            """
-            SELECT be.*, b.url, COALESCE(b.title, be.title) AS blog_title,
+            f"""
+            SELECT be.*, ({_blog_stub_sql()}) AS is_stub,
+                b.url, COALESCE(b.title, be.title) AS blog_title,
                 (SELECT group_concat(name, ', ') FROM (
                     SELECT DISTINCT a.name AS name
                     FROM author_blogs ab JOIN authors a ON a.id=ab.author_id
@@ -2601,7 +2759,8 @@ class Database:
         return list(
             self._conn.execute(
                 """
-                SELECT a.openalex_id, a.name
+                SELECT a.openalex_id, a.name,
+                       a.enabled AS tracked_enabled, a.tracked AS is_tracked
                 FROM author_blogs ab JOIN authors a ON a.id=ab.author_id
                 WHERE ab.blog_id=? ORDER BY a.name COLLATE NOCASE
                 """,
@@ -2617,6 +2776,17 @@ class Database:
         if normalized in {"blog", "blogs", "blog_entry"}:
             return "blog_entries", "blog"
         raise ValueError("Content type must be paper or blog")
+
+    def set_blog_entry_stub_state(self, entry_id: int, state: str) -> bool:
+        normalized = str(state or "").strip().lower()
+        if normalized not in {"auto", "stub", "full"}:
+            raise ValueError("Stub state must be auto, stub, or full")
+        with self.transaction() as conn:
+            cur = conn.execute(
+                "UPDATE blog_entries SET stub_state=? WHERE id=?",
+                (normalized, int(entry_id)),
+            )
+        return cur.rowcount > 0
 
     def set_content_starred(self, content_type: str, record_id: int, starred: bool) -> bool:
         table, _ = self._content_table(content_type)
@@ -2940,7 +3110,12 @@ class Database:
         return paper_id, is_new
 
     def set_local_pdf(
-        self, paper_id: int, path: str, pdf_sha256: str | None = None
+        self,
+        paper_id: int,
+        path: str,
+        pdf_sha256: str | None = None,
+        *,
+        page_count: int | None = None,
     ) -> None:
         candidate = Path(path).expanduser()
         size: int | None = None
@@ -2953,9 +3128,18 @@ class Database:
             pass
         with self.transaction() as conn:
             conn.execute(
-                "UPDATE papers SET local_pdf_path=?, pdf_sha256=?, pdf_size=?, pdf_mtime_ns=?, pdf_modified_on_disk=0 WHERE id=?",
-                (path, pdf_sha256, size, mtime_ns, paper_id),
+                "UPDATE papers SET local_pdf_path=?, pdf_sha256=?, pdf_size=?, pdf_mtime_ns=?, "
+                "pdf_page_count=?, pdf_modified_on_disk=0 WHERE id=?",
+                (path, pdf_sha256, size, mtime_ns, page_count, paper_id),
             )
+
+    def set_paper_pdf_page_count(self, paper_id: int, page_count: int | None) -> bool:
+        with self.transaction() as conn:
+            cur = conn.execute(
+                "UPDATE papers SET pdf_page_count=? WHERE id=?",
+                (page_count, paper_id),
+            )
+        return cur.rowcount > 0
 
     def set_paper_pdf_hash(
         self, paper_id: int, pdf_sha256: str | None, *,
@@ -3049,9 +3233,22 @@ class Database:
         return list(
             self._conn.execute(
                 """
-                SELECT * FROM papers
-                WHERE dead=0 AND COALESCE(publication_date, discovered_at) >= ?
-                ORDER BY COALESCE(publication_date, discovered_at) DESC, id DESC
+                SELECT p.* FROM papers p
+                WHERE p.dead=0 AND COALESCE(p.publication_date, p.discovered_at) >= ?
+                  AND (
+                    NOT EXISTS (
+                        SELECT 1 FROM paper_authors pa0
+                        JOIN authors a0 ON a0.id=pa0.tracked_author_id
+                        WHERE pa0.paper_id=p.id AND a0.tracked=1
+                    )
+                    OR EXISTS (
+                        SELECT 1 FROM paper_authors pa1
+                        JOIN authors a1 ON a1.id=pa1.tracked_author_id
+                        WHERE pa1.paper_id=p.id AND a1.tracked=1
+                          AND a1.download_papers=1
+                    )
+                  )
+                ORDER BY COALESCE(p.publication_date, p.discovered_at) DESC, p.id DESC
                 """,
                 (since,),
             ).fetchall()
@@ -3346,7 +3543,7 @@ class Database:
         paper_columns = (
             "p.id, p.openalex_id, p.doi, p.arxiv_id, p.title, "
             "p.publication_date, p.venue, p.publication_url, p.pdf_url, "
-            "p.local_pdf_path, p.pdf_sha256, p.pdf_size, p.pdf_mtime_ns, "
+            "p.local_pdf_path, p.pdf_sha256, p.pdf_size, p.pdf_mtime_ns, p.pdf_page_count, "
             "p.pdf_modified_on_disk, p.starred, p.read_at, p.selected, "
             "p.notes, p.abstract_source, p.pdf_source, p.discovered_at, p.fetched_at"
             if table_view else "p.*"
@@ -3766,6 +3963,7 @@ class Database:
         starred: bool | None = None,
         notes: bool | None = None,
         enabled: bool | None = None,
+        download_papers: bool | None = None,
     ) -> list[sqlite3.Row]:
         where = ["a.tracked=1"] if tracked_only else []
         params: list[Any] = []
@@ -3817,6 +4015,9 @@ class Database:
         if enabled is not None:
             where.append("a.enabled=?")
             params.append(1 if enabled else 0)
+        if download_papers is not None:
+            where.append("a.download_papers=?")
+            params.append(1 if download_papers else 0)
         where_sql = " WHERE " + " AND ".join(where) if where else ""
         return list(
             self._conn.execute(
@@ -4382,6 +4583,9 @@ class Database:
             if not bool(raw.get("enabled", 1)):
                 self.set_author_enabled(identifier, False)
             self.set_author_starred(identifier, bool(raw.get("starred", 0)))
+            self.set_author_download_papers(
+                identifier, bool(raw.get("download_papers", 1))
+            )
             for tag in raw.get("tags", ()) if isinstance(raw.get("tags"), list) else ():
                 self.add_author_tag(identifier, str(tag))
             author_row = self.get_author(identifier)

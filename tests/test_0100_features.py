@@ -101,7 +101,7 @@ def test_schema_25_pdf_fingerprint_persists_modified_state(
     with Database(config.paths.database) as db:
         db.set_local_pdf(paper_id, str(pdf), expected)
         row = dict(db.get_paper(paper_id))
-        assert SCHEMA_VERSION == 27
+        assert SCHEMA_VERSION == 30
         assert "pdf_modified_on_disk" in row
         assert _paper_pdf_state(db, row)["pdf_modified"] is False
 
@@ -131,7 +131,7 @@ def test_content_detail_data_and_query_layouts(
     for value in (
         "Search all stored text",
         "Reset search options",
-        "Star · Type",
+        "Star · Stub · Type",
         "content-star-type",
         "content-global-search-row",
     ):
@@ -255,7 +255,7 @@ def test_blog_results_runner_accepts_multiple_queries_and_one_model(
     assert 'action="/content/selected/read"' in headers[2]
     assert re.search(r">○</button>", headers[2])
     assert headers[2].count("<form") == 1
-    assert "Remove all tags" in headers[6]
+    assert "Remove all tags" in headers[7]
     assert "Undo tag action" not in headers[6]
     selected_tools = content.text.split('class="selected-content-tools"', 1)[1].split("</div>", 1)[0]
     assert selected_tools.index("Add tag and press Enter") < selected_tools.index("Remove tag and press Enter")
@@ -303,7 +303,7 @@ def test_authors_table_restores_columns_and_places_notes_below_row(
     notes_row = response.text.split('class="author-notes-row"', 1)[1].split(
         "</tr>", 1
     )[0]
-    assert 'colspan="9"' in notes_row
+    assert 'colspan="10"' in notes_row
     assert "Visible author note" in notes_row
     assert 'data-filter-name="starred"' in response.text
     assert 'data-filter-name="notes"' in response.text
@@ -377,8 +377,9 @@ def test_static_assets_use_partial_updates_and_requested_layout():
     assert '.filter-word-button[data-filter-state="yes"]' in css
     assert ".selected-content-tools{display:grid;grid-template-columns:220px 220px auto" in css
     assert ".regexp-editor-grid" in css
-    assert "table:not(.unified-content-table):not(.saved-query-table):not(.author-table){min-width:max-content}" in css
+    assert "table:not(.unified-content-table):not(.saved-query-table):not(.author-table):not(.author-blog-table){min-width:max-content}" in css
     assert ".table-wrap>.author-table{width:100%;min-width:900px;table-layout:fixed" in css
-    assert ".author-table col.author-col-name{width:25%}" in css
-    assert ".author-table col.author-col-openalex{width:13%}" in css
+    assert ".author-table col.author-col-name{width:24%}" in css
+    assert ".author-table col.author-col-openalex{width:12%}" in css
+    assert ".author-table col.author-col-download{width:5%}" in css
     assert '<colgroup class="author-table-columns">' in authors_template
