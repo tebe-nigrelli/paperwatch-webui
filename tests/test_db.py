@@ -987,3 +987,106 @@ def test_author_openalex_id_update_reclaims_archived_id(
             "https://example.test/shared",
         }
         assert blogs["https://example.test/shared"]["label"] == "Current shared"
+
+
+def test_url_search_key_and_stub_detection_defensive_edges():
+    from paperwatch.db import _blog_entry_is_stub, _url_search_key
+
+    assert _url_search_key(None) == ""
+    assert _url_search_key("WWW.Example.COM//blog///post/") == "example.com/blog/post"
+    assert _url_search_key("https://example.com/") == "example.com"
+    # Invalid bracketed hosts exercise the parser fallback.
+    assert _url_search_key("https://[broken") == "https://[broken"
+
+    assert _blog_entry_is_stub("x" * 501, "Title", "https://example.com", None) == 0
+    assert _blog_entry_is_stub("anything", "Title", "https://example.com", 4) == 1
+    metadata = (
+        'Title: Example\nURL: https://example.com/post\nPublished: today\n'
+        'Outbound links:\n- Paper -> https://example.org/paper\n'
+    )
+    assert _blog_entry_is_stub(metadata, "Example", "https://example.com/post", None) == 1
+    assert _blog_entry_is_stub(metadata + "Substantive claim", "Example", "https://example.com/post", None) == 0
+
+
+def test_classification_value_validation_and_decoding_edges():
+    assert Database._decoded_label_values(None) == []
+    assert Database._decoded_label_values("not json") == []
+    assert Database._decoded_label_values('{"value":"x"}') == []
+    assert Database._decoded_label_values('[null, {"value":"", "pattern":"x"}, {"value":"A", "pattern":""}, {"value":"A", "pattern":"a"}]') == [
+        {"value": "A", "pattern": "a"}
+    ]
+
+    with pytest.raises(ValueError, match="Query type"):
+        Database._classification_values("unknown", "Class", [])
+    with pytest.raises(ValueError, match="needs a regexp"):
+        Database._classification_values("regexp", "Class", [{"value": "One", "pattern": ""}])
+    with pytest.raises(ValueError, match="Invalid classification regexp"):
+        Database._classification_values("regexp", "Class", [{"value": "One", "pattern": "["}])
+    with pytest.raises(ValueError, match="tag class"):
+        Database._classification_values("regexp", "", [{"value": "One", "pattern": "one"}])
+    with pytest.raises(ValueError, match="at least two"):
+        Database._classification_values("classification", "Class", [{"value": "One", "pattern": "one"}])
+    kind, label_class, encoded = Database._classification_values(
+        "regexp",
+        "  Topic  Class ",
+        [
+            {"value": " One ", "pattern": "one"},
+            {"value": "one", "pattern": "ignored duplicate"},
+            {"value": "", "pattern": "ignored"},
+        ],
+    )
+    assert (kind, label_class) == ("regexp", "Topic Class")
+    assert Database._decoded_label_values(encoded) == [{"value": "One", "pattern": "one"}]
+    assert Database._classification_values("summary", "ignored", [{"value": "x", "pattern": "x"}])[:2] == (
+        "summary",
+        "",
+    )
+
+
+def test_apply_query_classifications_ignores_bad_items_updates_and_preserves_manual_edits(
+    tmp_path, paper_record
+):
+    with Database(tmp_path / "classification-edges.sqlite") as db:
+        paper_id, _ = db.upsert_paper(paper_record)
+        query_id = db.create_saved_query(
+            name="Edge classifier",
+            prompt="Classify records",
+            query_kind="classification",
+            label_class="Fit",
+            label_values=[
+                {"value": "Yes", "pattern": r"(?i)\byes\b"},
+                {"value": "No", "pattern": r"(?i)\bno\b"},
+            ],
+        )
+        run_id = db.create_query_runs(
+            batch_id="classification-edges",
+            query_id=query_id,
+            profiles=[("default", "ollama", "model")],
+            context_window_tokens=2048,
+        )[0]
+
+        assert db.apply_query_classifications(query_id, run_id, {"items": "bad"}) == 0
+        assert db.apply_query_classifications(
+            query_id,
+            run_id,
+            {
+                "items": [
+                    "not-a-record",
+                    {"paper_id": paper_id, "output": "undetermined"},
+                    {"output": "yes"},
+                    {"paper_id": paper_id, "output": "yes"},
+                ]
+            },
+        ) == 1
+        assert db.apply_query_classifications(
+            query_id, run_id, {"items": [{"paper_id": paper_id, "output": "no"}]}
+        ) == 1
+        assert db.classification_results_for_content("paper", paper_id)[0]["value"] == "No"
+
+        assert db.set_content_classification(query_id, "paper", paper_id, "Yes")
+        assert db.apply_query_classifications(
+            query_id, run_id, {"items": [{"paper_id": paper_id, "output": "no"}]}
+        ) == 0
+        result = db.classification_results_for_content("paper", paper_id)[0]
+        assert result["value"] == "Yes"
+        assert result["manually_modified"] == 1

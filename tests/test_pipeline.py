@@ -1650,3 +1650,57 @@ def test_pdf_candidate_collection_includes_openalex_locations(paper_record):
         "https://primary.test/article",
         "https://other.test/file.pdf",
     ]
+
+
+def test_stub_article_url_and_candidate_edge_cases():
+    from paperwatch.pipeline import _stub_link_candidates, _stub_link_is_article
+
+    assert not _stub_link_is_article("not a url")
+    assert not _stub_link_is_article("https://arxiv.org/abs/2601.00001")
+    assert not _stub_link_is_article("https://example.com/file.pdf")
+    assert not _stub_link_is_article("https://example.com/")
+    assert not _stub_link_is_article("https://example.com/about/team")
+    assert not _stub_link_is_article("https://example.com/research")
+    assert _stub_link_is_article("https://example.com/posts/2026/result")
+    assert _stub_link_is_article(
+        "https://example.com/2026/result",
+        blog_url="not a blog url",
+    )
+    assert not _stub_link_is_article(
+        "https://example.com/2026/result",
+        blog_url="https://example.com/2026/result",
+    )
+
+    entry = {
+        "source_url": "https://example.com/posts/2026/result.",
+        "normalized_text": (
+            "https://example.com/posts/2026/result; "
+            "https://example.com/about https://example.com/posts/2026/second! "
+            "http://localhost/private"
+        ),
+        "blog_url": "https://example.com/blog",
+    }
+    assert _stub_link_candidates(entry) == (
+        "https://example.com/posts/2026/result",
+        "https://example.com/posts/2026/second",
+    )
+
+
+def test_arxiv_fallback_date_parses_both_formats_and_invalid_values():
+    from paperwatch.blogs import ArticleItem
+    from paperwatch.pipeline import PaperWatch
+
+    def article(text):
+        return ArticleItem(
+            external_id="x",
+            title="Paper",
+            url="https://arxiv.org/abs/1",
+            text=text,
+            sha256="sha",
+        )
+
+    assert PaperWatch._arxiv_fallback_date(None) is None
+    assert PaperWatch._arxiv_fallback_date(article("Submitted on 7 Aug 2026")) == "2026-08-07"
+    assert PaperWatch._arxiv_fallback_date(article("[v1] Fri, 8 Aug 2025")) == "2025-08-08"
+    assert PaperWatch._arxiv_fallback_date(article("Submitted on 99 Aug 2026")) is None
+    assert PaperWatch._arxiv_fallback_date(article("No date")) is None

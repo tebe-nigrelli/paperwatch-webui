@@ -612,3 +612,124 @@ def test_schema_10_blog_tables_migrate_for_rss(tmp_path):
         }
         assert {"feed_url", "feed_initialized", "last_fetch_method"} <= blog_columns
         assert {"entry_kind", "external_id", "source_url", "published_at"} <= entry_columns
+
+
+def test_html_date_handles_malformed_metadata_nested_json_and_visible_fallback():
+    assert blogs._html_first_date(
+        """<html><head>
+        <meta name="description" content="2020-01-01">
+        <meta name="date" content="not-a-date">
+        <script type="application/ld+json">not json</script>
+        <script type="application/ld+json">[{"nested":{"dateCreated":"2023-02-04"}}]</script>
+        </head><body><time>n/a</time></body></html>"""
+    ) == "2023-02-04"
+    assert blogs._html_first_date("<p>Published September 14, 2022</p>") == "2022-09-14"
+    assert blogs._html_first_date("<p>No publication date here</p>") is None
+
+
+def test_link_label_inline_markdown_and_clean_lines_edge_cases():
+    class Broken:
+        pass
+
+    assert blogs._link_label(Broken()) == ""
+    soup = blogs.BeautifulSoup(
+        '<div><a aria-label="Fallback label"></a><a title="avatar icon"></a></div>',
+        "html.parser",
+    )
+    anchors = soup.find_all("a")
+    assert blogs._link_label(anchors[0]) == "Fallback label"
+    assert blogs._link_label(anchors[1]) == ""
+
+    tag = blogs.BeautifulSoup(
+        '<p>Hello <a href="https://example.com"><img src="https://example.com/a.png" alt=" Plot "></a>'
+        '<img src="https://example.com/b.png" alt=" Figure "> '
+        '<a href="https://example.com/read"> Read more </a><br>next , line</p>',
+        "html.parser",
+    ).p
+    rendered = blogs._inline_markdown(tag)
+    assert "![Plot](https://example.com/a.png)" in rendered
+    assert "![Figure](https://example.com/b.png)" in rendered
+    assert "[Read more](https://example.com/read)" in rendered
+    assert "\nnext, line" in rendered
+
+    assert blogs._clean_lines(" one  two \n one two \n three ") == "one two\nthree"
+    with pytest.raises(ValueError, match="readable text"):
+        blogs._clean_lines(" \n \t")
+
+
+def test_article_candidate_filtering_pattern_external_and_deduplication():
+    root = blogs.BeautifulSoup(
+        """<main>
+        <article><a href="/posts/2026/good">Good post</a><p>Published 2026-04-03. Useful summary.</p></article>
+        <article><a href="/posts/2026/good">Duplicate post</a></article>
+        <a href="/about">About us</a>
+        <a href="https://other.example/posts/remote">Remote post</a>
+        <a href="https://doi.org/10.1000/example">Paper DOI</a>
+        <a href="/plain">Plain link</a>
+        </main>""",
+        "html.parser",
+    )
+    normal = blogs._article_candidates(root, base_url="https://example.com/blog")
+    assert [item.url for item in normal] == ["https://example.com/posts/2026/good"]
+
+    external = blogs._article_candidates(
+        root,
+        base_url="https://example.com/blog",
+        allow_external=True,
+        pattern=r"(?:remote|doi\.org)",
+    )
+    assert {item.url for item in external} == {
+        "https://other.example/posts/remote",
+        "https://doi.org/10.1000/example",
+    }
+
+    assert blogs._should_crawl_article_index(
+        configured_mode="article_index", page_url="https://example.com/post/x", pattern=None, candidates=()
+    )
+    assert not blogs._should_crawl_article_index(
+        configured_mode="auto", page_url="https://example.com/post/x", pattern=None, candidates=()
+    )
+    candidate = normal[:1]
+    assert blogs._should_crawl_article_index(
+        configured_mode="feed", page_url="https://example.com/post/x", pattern=None, candidates=candidate
+    )
+    assert not blogs._should_crawl_article_index(
+        configured_mode="article", page_url="https://example.com/blog", pattern=None, candidates=candidate
+    )
+    assert blogs._should_crawl_article_index(
+        configured_mode="auto", page_url="https://example.com/post/x", pattern=r"post", candidates=candidate
+    )
+    assert blogs._should_crawl_article_index(
+        configured_mode="auto", page_url="https://example.com/blog", pattern=None, candidates=candidate
+    )
+
+
+def test_snapshot_and_meaningful_link_change_modes_cover_semantic_edges():
+    content, links = blogs._split_snapshot(
+        "URL: https://example.com/direct\nBody\nOutbound links:\n"
+        "- Docs -> https://example.com/docs\n"
+        "bad line\n- Empty -> \n- Docs -> https://example.com/docs/v2"
+    )
+    assert content == ["URL: https://example.com/direct", "Body"]
+    assert links == {
+        "docs": frozenset({"https://example.com/docs", "https://example.com/docs/v2"}),
+        "__direct__": frozenset({"https://example.com/direct"}),
+    }
+    assert blogs._split_snapshot("Body only") == (["Body only"], None)
+
+    old = {"docs": frozenset({"a"})}
+    same_urls_different_labels = {"other": frozenset({"a"})}
+    assert not blogs._meaningful_link_change(old, same_urls_different_labels, source_mode="auto", content_changed=False)
+    assert blogs._meaningful_link_change(old, {"docs": frozenset({"b"})}, source_mode="article", content_changed=False)
+    assert not blogs._meaningful_link_change(old, {"new": frozenset({"b"})}, source_mode="docs", content_changed=False)
+    assert blogs._meaningful_link_change(
+        old,
+        {"new": frozenset({"b", "c", "d"})},
+        source_mode="docs",
+        content_changed=False,
+    )
+    assert not blogs._meaningful_link_change(old, {"new": frozenset({"b"})}, source_mode="publications", content_changed=False)
+    assert blogs._meaningful_link_change(old, {"new": frozenset({"b"})}, source_mode="publications", content_changed=True)
+    assert not blogs._meaningful_link_change({}, {"new": frozenset({"b"})}, source_mode="auto", content_changed=False)
+    assert blogs._meaningful_link_change(old, {"new": frozenset({"b", "c"})}, source_mode="auto", content_changed=False)
+    assert not blogs._meaningful_link_change(None, {"x": frozenset({"a"})}, source_mode="auto", content_changed=True)

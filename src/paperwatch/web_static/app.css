@@ -425,7 +425,7 @@ label.control-disabled{opacity:.68}
 @media(max-width:650px){.blog-results-runner{grid-template-columns:1fr}}
 
 /* 0.10.2 follow-up: fixed-width author grid with notes beneath each author */
-.table-wrap>.author-table{width:100%;min-width:1020px;table-layout:auto}
+.table-wrap>.author-table{width:100%;min-width:1020px;table-layout:fixed}
 .author-table .author-main-row>td{min-width:0;overflow-wrap:anywhere}
 .author-table .author-notes-row>td{width:auto;max-width:none;padding:0 9px 10px}
 .author-table .author-notes-row .row-notes-editor{min-width:0;max-width:100%;margin:0}

@@ -1538,3 +1538,239 @@ def test_query_controller_runs_one_query_on_all_matching_result_types(
         assert blog_selection["pdf_strategy"] == "auto"
         assert db.get_paper(paper_id) is not None
         assert db.get_blog_entry(blog_entry_id) is not None
+
+
+def test_query_controller_start_validation_edges(config_path, paper_record):
+    config = load_config(config_path)
+    with Database(config.paths.database) as db:
+        paper_id, _ = db.upsert_paper(paper_record)
+        query_id = db.create_saved_query(
+            name="Validation query",
+            prompt="Review it",
+            content_scope="papers",
+            paper_source_scope="abstract",
+        )
+
+    controller = QueryController(config_path, runner=lambda *_args, **_kwargs: {"completed": 1, "failed": 0})
+    with pytest.raises(ValueError, match="Context window"):
+        controller.start(query_id, ("default",), 128)
+    with pytest.raises(ValueError, match="Content type"):
+        controller.start(query_id, ("default",), 2048, content_type="other")
+    with pytest.raises(ValueError, match="Query source"):
+        controller.start(query_id, ("default",), 2048, source_scope="bad")
+    with pytest.raises(ValueError, match="PDF strategy"):
+        controller.start(query_id, ("default",), 2048, pdf_strategy="bad")
+    with pytest.raises(ValueError, match="Saved query not found"):
+        controller.start(999999, ("default",), 2048)
+    with pytest.raises(ValueError, match="Select at least one"):
+        controller.start(query_id, (), 2048)
+    with pytest.raises(ValueError, match="Whole-PDF upload requires exactly one Codex"):
+        controller.start(
+            query_id,
+            ("default",),
+            2048,
+            selection={"paper_ids": [paper_id]},
+            source_scope="pdf",
+        )
+
+
+def test_query_controller_start_tracks_malformed_selected_ids(config_path, paper_record):
+    config = load_config(config_path)
+    with Database(config.paths.database) as db:
+        db.upsert_paper(paper_record)
+        query_id = db.create_saved_query(
+            name="Malformed selection query",
+            prompt="Review it",
+            content_scope="both",
+            paper_source_scope="abstract",
+        )
+
+    blocker = threading.Event()
+
+    def runner(*_args, **_kwargs):
+        blocker.wait(0.05)
+        return {"completed": 1, "failed": 0}
+
+    controller = QueryController(config_path, runner=runner)
+    batch_id = controller.start(
+        query_id,
+        ("default",),
+        2048,
+        selection={"paper_ids": ["bad"], "blog_entry_ids": [object()]},
+    )
+    assert batch_id
+    snapshot = controller.snapshot()
+    assert snapshot.paper_id is None
+    assert snapshot.blog_entry_id is None
+    assert controller.start(query_id, ("default",), 2048) is None
+    blocker.set()
+    controller.wait()
+
+
+def test_query_controller_start_on_results_validation_and_empty_matches(
+    config_path, paper_record
+):
+    config = load_config(config_path)
+    with Database(config.paths.database) as db:
+        paper_id, _ = db.upsert_paper(paper_record)
+        papers_only = db.create_saved_query(
+            name="Papers only",
+            prompt="Review papers",
+            content_scope="papers",
+            paper_source_scope="abstract",
+        )
+
+    controller = QueryController(config_path, runner=lambda *_args, **_kwargs: {"completed": 1, "failed": 0})
+    with pytest.raises(ValueError, match="Context window"):
+        controller.start_on_results(papers_only, ("default",), 100, targets=(("papers", {}),))
+    with pytest.raises(ValueError, match="Content type"):
+        controller.start_on_results(papers_only, ("default",), 2048, targets=(("other", {}),))
+    with pytest.raises(ValueError, match="No search results"):
+        controller.start_on_results(papers_only, ("default",), 2048, targets=())
+    with pytest.raises(ValueError, match="Query source"):
+        controller.start_on_results(
+            papers_only,
+            ("default",),
+            2048,
+            targets=(("papers", {"paper_ids": [paper_id]}),),
+            source_scope="bad",
+        )
+    with pytest.raises(ValueError, match="PDF strategy"):
+        controller.start_on_results(
+            papers_only,
+            ("default",),
+            2048,
+            targets=(("papers", {"paper_ids": [paper_id]}),),
+            pdf_strategy="bad",
+        )
+    with pytest.raises(ValueError, match="Saved query not found"):
+        controller.start_on_results(999999, ("default",), 2048, targets=(("papers", {}),))
+    with pytest.raises(ValueError, match="Select at least one"):
+        controller.start_on_results(
+            papers_only,
+            (),
+            2048,
+            targets=(("papers", {"paper_ids": [paper_id]}),),
+        )
+    with pytest.raises(ValueError, match="No records match"):
+        controller.start_on_results(
+            papers_only,
+            ("default",),
+            2048,
+            targets=(
+                ("blogs", {"title_query": "none"}),
+                ("blogs", {"title_query": "duplicate ignored"}),
+            ),
+        )
+    with pytest.raises(ValueError, match="No records match"):
+        controller.start_on_results(
+            papers_only,
+            ("default",),
+            2048,
+            targets=(("papers", {"title_query": "definitely absent"}),),
+        )
+
+
+def test_query_controller_start_on_results_single_target_and_busy_state(
+    config_path, paper_record
+):
+    config = load_config(config_path)
+    with Database(config.paths.database) as db:
+        paper_id, _ = db.upsert_paper(paper_record)
+        query_id = db.create_saved_query(
+            name="One result set",
+            prompt="Review papers",
+            content_scope="both",
+            paper_source_scope="abstract",
+        )
+
+    blocker = threading.Event()
+
+    def runner(*_args, **_kwargs):
+        blocker.wait(0.05)
+        return {"completed": 1, "failed": 0}
+
+    controller = QueryController(config_path, runner=runner)
+    batch_ids = controller.start_on_results(
+        query_id,
+        ("default",),
+        2048,
+        targets=(
+            ("papers", {"paper_ids": [paper_id]}),
+            ("papers", {"paper_ids": [paper_id]}),
+        ),
+    )
+    assert batch_ids and len(batch_ids) == 1
+    assert controller.snapshot().content_type == "papers"
+    assert controller.start_on_results(
+        query_id,
+        ("default",),
+        2048,
+        targets=(("papers", {"paper_ids": [paper_id]}),),
+    ) is None
+    blocker.set()
+    controller.wait()
+
+
+def test_query_controller_pdf_validation_and_codex_context_edges(config_path, paper_record):
+    _add_codex_profile(config_path)
+    config = load_config(config_path)
+    with Database(config.paths.database) as db:
+        paper_id, _ = db.upsert_paper(paper_record)
+        regexp_query = db.create_saved_query(
+            name="Regexp PDF guard",
+            prompt="Find terms",
+            query_kind="summary",
+            content_scope="papers",
+            regexp_pattern="agent",
+            regexp_mode="query",
+            paper_source_scope="pdf",
+        )
+        plain_query = db.create_saved_query(
+            name="Codex context",
+            prompt="Review it",
+            content_scope="papers",
+            paper_source_scope="abstract",
+        )
+
+    controller = QueryController(
+        config_path, runner=lambda *_args, **_kwargs: {"completed": 1, "failed": 0}
+    )
+    selection = {"paper_ids": [paper_id]}
+    with pytest.raises(ValueError, match="Unknown configured model"):
+        controller.start(plain_query, ("missing",), 2048, selection=selection)
+    with pytest.raises(ValueError, match="Regexp preprocessing"):
+        controller.start(
+            regexp_query,
+            ("codex-review",),
+            2048,
+            selection=selection,
+            source_scope="pdf",
+        )
+    with pytest.raises(ValueError, match="Unknown configured model"):
+        controller.start_on_results(
+            plain_query,
+            ("missing",),
+            2048,
+            targets=(("papers", selection),),
+        )
+    with pytest.raises(ValueError, match="Regexp preprocessing"):
+        controller.start_on_results(
+            regexp_query,
+            ("codex-review",),
+            2048,
+            targets=(("papers", selection),),
+            source_scope="pdf",
+        )
+
+    batch_ids = controller.start_on_results(
+        plain_query,
+        ("codex-review",),
+        2048,
+        targets=(("papers", selection),),
+    )
+    assert batch_ids and len(batch_ids) == 1
+    with Database(config.paths.database) as db:
+        run = db.query_runs_for_batch(batch_ids[0])[0]
+        assert run["context_window_tokens"] == 400000
+    controller.wait()

@@ -252,3 +252,134 @@ def test_compaction_removes_short_list_items_when_strings_cannot_shrink():
     compact = _compact_note_dict(raw, 260)
     assert len(compact["values"]) < len(raw["values"])
     assert len(json.dumps(compact, ensure_ascii=False)) <= 300
+
+
+def test_usage_reduction_and_compaction_failure_edges(analysis_result):
+    from paperwatch.chunking import _sum_usage
+
+    usage = {"eval_count": 2, "label": "first", "mixed": "text"}
+    _sum_usage(usage, {"eval_count": 3, "prompt_count": 4, "label": "second", "mixed": 7})
+    assert usage == {"eval_count": 5, "label": "first", "mixed": "text", "prompt_count": 4}
+
+    minimal = ChunkNotes(
+        section="S",
+        substantive_content="content",
+        definitions=[],
+        methods=[],
+        results=[],
+        assumptions=[],
+        evidence=[],
+        limitations=[],
+        bibliography_titles=[],
+    )
+    with pytest.raises(LLMError, match="Could not compact"):
+        _reduce_to_budget(FakeChunkLLM(analysis_result), [minimal], 100, {})
+
+
+def test_chunked_analysis_reports_prompt_and_context_budget_failures(
+    config_path, paper_record, analysis_result, tmp_path
+):
+    config = load_config(config_path)
+    profile = replace(config.llm, model="chunk-model")
+    llm = FakeChunkLLM(analysis_result)
+    with Database(config.paths.database) as db:
+        paper_id, _ = db.upsert_paper(paper_record)
+        with pytest.raises(LLMError, match="Cannot read prompt template"):
+            analyze_chunked_text(
+                db=db,
+                prompt_path=tmp_path / "missing.txt",
+                llm_config=profile,
+                llm=llm,
+                paper_id=paper_id,
+                paper=paper_record,
+                text="source text " * 100,
+                context_window_tokens=2048,
+            )
+
+        with pytest.raises(LLMError, match="strict final summary prompt"):
+            analyze_chunked_text(
+                db=db,
+                prompt_path=config.paths.prompt,
+                llm_config=profile,
+                llm=llm,
+                paper_id=paper_id,
+                paper=paper_record,
+                text="source text " * 100,
+                context_window_tokens=512,
+            )
+
+        tiny_source = replace(profile, max_input_chars=400)
+        with pytest.raises(LLMError, match="chunk summarization"):
+            analyze_chunked_text(
+                db=db,
+                prompt_path=config.paths.prompt,
+                llm_config=tiny_source,
+                llm=llm,
+                paper_id=paper_id,
+                paper=paper_record,
+                text="source text " * 100,
+                context_window_tokens=2048,
+            )
+
+
+def test_chunked_analysis_reuses_chunk_cache_when_final_cache_is_missing(
+    config_path, paper_record, analysis_result
+):
+    config = load_config(config_path)
+    profile = replace(config.llm, model="chunk-model", max_input_chars=5000)
+    text = ("Cached chunk material. " * 300).strip()
+    first_llm = FakeChunkLLM(analysis_result)
+    with Database(config.paths.database) as db:
+        paper_id, _ = db.upsert_paper(paper_record)
+        first = analyze_chunked_text(
+            db=db,
+            prompt_path=config.paths.prompt,
+            llm_config=profile,
+            llm=first_llm,
+            paper_id=paper_id,
+            paper=paper_record,
+            text=text,
+            context_window_tokens=1024,
+        )
+        assert first.chunk_count > 1
+        db._conn.execute("DELETE FROM analyses")
+        db._conn.commit()
+
+        second_llm = FakeChunkLLM(analysis_result)
+        second = analyze_chunked_text(
+            db=db,
+            prompt_path=config.paths.prompt,
+            llm_config=profile,
+            llm=second_llm,
+            paper_id=paper_id,
+            paper=paper_record,
+            text=text,
+            context_window_tokens=1024,
+        )
+        assert second.outcome.created
+        assert [prompt for prompt in second_llm.chunk_calls if "--- BEGIN CHUNK ---" in prompt] == []
+        assert len(second_llm.analysis_calls) == 1
+
+
+def test_chunked_analysis_rejects_oversized_reduced_notes(
+    config_path, paper_record, analysis_result, monkeypatch
+):
+    import paperwatch.chunking as chunking
+
+    config = load_config(config_path)
+    profile = replace(config.llm, model="chunk-model", max_input_chars=100_000)
+    llm = FakeChunkLLM(analysis_result)
+    monkeypatch.setattr(chunking, "_reduce_to_budget", lambda *_a, **_k: "x" * 50_000)
+    with Database(config.paths.database) as db:
+        paper_id, _ = db.upsert_paper(paper_record)
+        with pytest.raises(LLMError, match="reduced chunk notes still exceed"):
+            analyze_chunked_text(
+                db=db,
+                prompt_path=config.paths.prompt,
+                llm_config=profile,
+                llm=llm,
+                paper_id=paper_id,
+                paper=paper_record,
+                text="source text " * 300,
+                context_window_tokens=1024,
+            )

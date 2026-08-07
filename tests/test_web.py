@@ -1822,3 +1822,429 @@ def test_import_paper_search_results_are_clickable(config_path, seeded_web, pape
     assert selected.status_code == 200
     assert paper_record.title in selected.text
     assert f'name="remote_reference" value="{paper_record.openalex_id}"' in selected.text
+
+
+def test_discover_paper_import_api_covers_validation_existing_busy_and_status_states(
+    config_path, seeded_web
+):
+    config, paper_id, *_ = seeded_web
+    client, _ = make_client(config_path)
+    assert client.post("/api/discover/paper-import", data={"work_id": "bad"}).status_code == 400
+    assert client.get("/api/discover/paper-import-status?work_id=bad").status_code == 400
+
+    imported = client.post("/api/discover/paper-import", data={"work_id": "W456"})
+    assert imported.json() == {"state": "imported", "paper_id": paper_id, "url": f"/papers/{paper_id}"}
+    assert client.get("/api/discover/paper-import-status?work_id=W456").json()["state"] == "imported"
+
+    same = StubController(snapshot=RunSnapshot(running=True, mode="download", query="W777"))
+    same_client, _ = make_client(config_path, controller=same)
+    assert same_client.post("/api/discover/paper-import", data={"work_id": "W777"}).status_code == 202
+
+    busy = StubController(snapshot=RunSnapshot(running=True, mode="run", query=None))
+    busy_client, _ = make_client(config_path, controller=busy)
+    assert busy_client.post("/api/discover/paper-import", data={"work_id": "W777"}).status_code == 409
+
+    refused = StubController(starts=[False])
+    refused_client, _ = make_client(config_path, controller=refused)
+    assert refused_client.post("/api/discover/paper-import", data={"work_id": "W777"}).status_code == 409
+
+    class InvalidStart(StubController):
+        def start(self, mode="run", query=None):
+            raise ValueError("invalid download")
+
+    invalid_client, _ = make_client(config_path, controller=InvalidStart())
+    response = invalid_client.post("/api/discover/paper-import", data={"work_id": "W777"})
+    assert response.status_code == 400
+    assert response.json()["error"] == "invalid download"
+
+    failed = StubController(
+        snapshot=RunSnapshot(
+            running=False,
+            mode="download",
+            query="W777",
+            status="failed",
+            error="network failed",
+        )
+    )
+    failed_client, _ = make_client(config_path, controller=failed)
+    assert failed_client.get("/api/discover/paper-import-status?work_id=W777").json() == {
+        "state": "failed",
+        "error": "network failed",
+    }
+    idle_client, _ = make_client(config_path, controller=StubController())
+    assert idle_client.get("/api/discover/paper-import-status?work_id=W777").json() == {"state": "idle"}
+
+
+def test_discover_paper_preview_reports_invalid_ids_and_client_failures(config_path):
+    client, _ = make_client(config_path)
+    assert client.get("/discover/paper?work_id=nope").status_code == 400
+
+    class FailingWorkClient(FakeAuthorClient):
+        def get_work(self, _work_id):
+            raise RuntimeError("work vanished")
+
+    failing, instances = make_client(config_path, fake=FailingWorkClient())
+    response = failing.get("/discover/paper?work_id=W777")
+    assert response.status_code == 404
+    assert "work vanished" in response.text
+    assert instances[0].closed
+
+
+def test_blog_preview_and_discovered_import_cover_duplicates_and_metadata(
+    config_path, seeded_web, monkeypatch
+):
+    from paperwatch.blogs import ArticleItem, ArticleLink
+    from paperwatch.web import _blog_preview_entries
+
+    article = ArticleItem(
+        external_id="article-1",
+        title="Full article",
+        url="https://example.com/blog/post-1",
+        text="Full article body",
+        sha256="article-sha",
+        rendered_html="<p>Full article body</p>",
+        published_at="2026-08-01",
+    )
+    second_article = ArticleItem(
+        external_id="article-2",
+        title="Second article",
+        url="https://example.com/blog/post-2",
+        text="Second body",
+        sha256="second-sha",
+    )
+    fetched = BlogFetch(
+        method="rss",
+        title="Example blog",
+        status_code=200,
+        feed_url="https://example.com/blog/feed.xml",
+        discovery_checked=True,
+        feed_items=(
+            FeedItem(
+                external_id="feed-1",
+                title="Feed title",
+                url=article.url,
+                published_at="2026-07-31",
+                text="Feed excerpt",
+                sha256="feed-sha",
+            ),
+            FeedItem(
+                external_id="feed-duplicate-url",
+                title="Duplicate URL",
+                url=article.url,
+                published_at=None,
+                text="Ignored duplicate preview",
+                sha256="duplicate-sha",
+            ),
+        ),
+        article_items=(article, second_article),
+        discovered_articles=(
+            ArticleLink("Already fetched", second_article.url, "duplicate"),
+            ArticleLink("Third article", "https://example.com/blog/post-3", "Third summary"),
+        ),
+        source_mode="feed",
+        diagnostics=("feed chosen",),
+        article_cursor_next=4,
+    )
+    previews = _blog_preview_entries(fetched, "https://example.com/blog")
+    assert [item["url"] for item in previews] == [
+        article.url,
+        second_article.url,
+        "https://example.com/blog/post-3",
+    ]
+    assert previews[0]["title"] == "Full article"
+    assert previews[0]["summary"] == "Full article body"
+
+    monkeypatch.setattr("paperwatch.web._fetch_blog_preview", lambda *_args, **_kwargs: fetched)
+
+    class Closable:
+        def __init__(self):
+            self.closed = False
+
+        def close(self):
+            self.closed = True
+
+    clients = []
+
+    def blog_factory(_config):
+        item = Closable()
+        clients.append(item)
+        return item
+
+    client, _ = make_client(config_path, blog_factory=blog_factory)
+    form = {
+        "source": "https://example.com/blog",
+        "scope": "whole",
+        "author_openalex_id": "A123",
+        "label": "Imported blog",
+        "relationship": "author",
+        "tags": "research, ai",
+        "notes": "Imported from Discover",
+    }
+    first = client.post("/discover/blog/import", data=form, follow_redirects=False)
+    assert first.status_code == 303
+    assert "stored+4+entries" in first.headers["location"]
+    second = client.post("/discover/blog/import", data=form, follow_redirects=False)
+    assert second.status_code == 303
+    assert "stored+0+entries" in second.headers["location"]
+    assert clients and all(item.closed for item in clients)
+
+    config = __import__("paperwatch.config", fromlist=["load_config"]).load_config(config_path)
+    with Database(config.paths.database) as db:
+        sources = db.author_blogs("A123")
+        imported = next(row for row in sources if row["url"] == "https://example.com/blog")
+        assert imported["label"] == "Imported blog"
+        assert {row["name"] for row in db.blog_source_tags(int(imported["id"]))} == {"research", "ai"}
+        assert imported["notes"] == "Imported from Discover"
+
+
+def test_blog_import_form_and_post_validation_paths(config_path, seeded_web, monkeypatch):
+    client, _ = make_client(config_path)
+    assert client.get("/discover/blog/import").status_code == 400
+    assert client.get("/discover/blog/import?source=http://localhost/blog").status_code == 400
+
+    monkeypatch.setattr("paperwatch.web._fetch_blog_preview", lambda *_a, **_k: (_ for _ in ()).throw(RuntimeError("preview failed")))
+    response = client.get("/discover/blog/import?source=https://example.com/blog")
+    assert response.status_code == 200
+    assert "preview failed" in response.text
+
+    cases = [
+        {"source": "https://example.com/blog", "scope": "bad", "author_openalex_id": "A123"},
+        {"source": "https://example.com/blog", "scope": "entry", "author_openalex_id": "A123"},
+        {"source": "https://example.com/blog", "scope": "whole"},
+        {"source": "https://example.com/blog", "scope": "whole", "author_openalex_id": "A404"},
+    ]
+    for form in cases:
+        result = client.post("/discover/blog/import", data=form, follow_redirects=False)
+        assert result.status_code == 303
+        assert "level=error" in result.headers["location"]
+
+
+def test_web_helper_edge_cases_for_arxiv_preview_query_and_progress(config_path, paper_record):
+    from starlette.datastructures import FormData
+    from paperwatch.config import load_config
+    from paperwatch.web import PaperFilters, _blog_preview_entries, _query_execution_form, _search_arxiv_identifier
+
+    filters = PaperFilters(query="agents", author_ids=("A1", "A2"), page=3, page_size=50, read=False)
+    assert "q=agents" in filters.query_string
+    assert "author=A1" in filters.query_string and "page=3" in filters.query_string
+
+    controller = RunController(config_path, runner=lambda *_args: {})
+    controller._progress("run_stats", "not json")
+    controller._progress("run_stats", "[]")
+    controller._progress("run_stats", '{"run_id":"7","papers_found":3,"ignored":"x"}')
+    snapshot = controller.snapshot()
+    assert snapshot.run_id == 7
+    assert snapshot.stats == {"papers_found": 3}
+
+    class OA:
+        def __init__(self):
+            self.searches = []
+
+        def search_works(self, query, limit=10):
+            self.searches.append((query, limit))
+            return [paper_record]
+
+        def get_work_by_doi(self, _doi):
+            raise RuntimeError("not linked")
+
+    class AX:
+        def __init__(self, entry):
+            self.entry = entry
+
+        def by_id(self, _identifier):
+            return self.entry
+
+    oa = OA()
+    assert _search_arxiv_identifier("plain title", openalex=oa, arxiv=AX(None), limit=4) == [paper_record]
+    assert _search_arxiv_identifier("2411.00678", openalex=oa, arxiv=AX(None), limit=4) == []
+    entry = ArxivEntry(
+        arxiv_id="2411.00678",
+        title="Resolved title",
+        abstract="a",
+        authors=("Ada",),
+        published="2024-11-01",
+        updated=None,
+        doi=None,
+        abstract_url="https://arxiv.org/abs/2411.00678",
+        pdf_url="https://arxiv.org/pdf/2411.00678.pdf",
+    )
+
+    class OAFails(OA):
+        def search_works(self, query, limit=10):
+            raise RuntimeError("search failed")
+
+    assert _search_arxiv_identifier("2411.00678", openalex=OAFails(), arxiv=AX(entry), limit=4) == []
+
+    empty_preview = _blog_preview_entries(
+        BlogFetch(method="html", title="Snapshot", status_code=200, snapshot_text=" Snapshot body "),
+        "https://example.com/blog",
+    )
+    assert empty_preview[0]["title"] == "Snapshot"
+
+    config = load_config(config_path)
+    with pytest.raises(ValueError, match="only one model"):
+        _query_execution_form(FormData([("model", "default"), ("model", "second")]), replace(config, llm_profiles=(replace(config.llm, profile="second"),)))
+    with pytest.raises(ValueError, match="Whole-PDF upload requires a Codex model"):
+        _query_execution_form(FormData([("paper_source_scope", "pdf"), ("model", "default")]), config)
+
+
+def test_author_csv_import_exercises_optional_identity_state_tags_and_notes(
+    config_path, seeded_web
+):
+    client, _ = make_client(config_path)
+    payload = (
+        "Author Name,Institution,OpenAlex ID,Starred,Enabled,Tags,Notes\n"
+        "CSV OpenAlex,Lab,A987654321,yes,no,vision; ml,Known identity\n"
+        "CSV Manual,Independent,,no,yes,systems,Local identity\n"
+        ",Ignored,,,,,\n"
+    ).encode()
+    response = client.post(
+        "/authors/import",
+        files={"csv_file": ("authors.csv", payload, "text/csv")},
+        data={"import_tags": "imported"},
+        follow_redirects=False,
+    )
+    assert response.status_code == 303
+    assert "Imported+2+author+rows" in response.headers["location"]
+
+    config = __import__("paperwatch.config", fromlist=["load_config"]).load_config(config_path)
+    with Database(config.paths.database) as db:
+        known = db.get_author("A987654321")
+        assert known is not None and known["starred"] == 1 and known["enabled"] == 0
+        assert known["notes"] == "Known identity"
+        assert set(db.list_authors_with_tags(query="A987654321")[0]["tags"].split(", ")) == {"vision", "ml", "imported"}
+        manual = db.find_authors_by_name("CSV Manual")[0]
+        assert str(manual["openalex_id"]).startswith("LOCAL-")
+        assert manual["enabled"] == 1
+        assert manual["notes"] == "Local identity"
+
+
+def test_query_classification_delete_and_content_action_response_modes(
+    config_path, seeded_web
+):
+    config, paper_id, *_ = seeded_web
+    with Database(config.paths.database) as db:
+        query_id = db.create_saved_query(
+            name="Disposable labels",
+            prompt="Classify",
+            query_kind="classification",
+            content_scope="papers",
+            label_class="Fit",
+            label_values=[
+                {"value": "Yes", "pattern": "yes"},
+                {"value": "No", "pattern": "no"},
+            ],
+        )
+    client, _ = make_client(config_path)
+    missing = client.post("/queries/999999/classifications/delete", follow_redirects=False)
+    assert missing.status_code == 404
+    deleted = client.post(f"/queries/{query_id}/classifications/delete", follow_redirects=False)
+    assert deleted.status_code == 303
+    assert "Removed+0+classification+results" in deleted.headers["location"]
+
+    async_read = client.post(
+        f"/content/paper/{paper_id}/read",
+        data={"read": "1"},
+        headers={"X-Paperwatch-Async": "1"},
+    )
+    assert async_read.json() == {"ok": True, "read": True}
+    select_results = client.post(
+        "/content/select-results",
+        data={"content": "papers", "selected": "1"},
+        follow_redirects=False,
+    )
+    assert select_results.status_code == 303
+    selected_update = client.post("/content/selected/read", follow_redirects=False)
+    assert selected_update.status_code == 303
+
+
+def test_upload_staging_and_saved_query_form_defensive_edges(config_path, tmp_path):
+    import asyncio
+    from starlette.datastructures import FormData, UploadFile
+    from paperwatch.config import load_config
+    from paperwatch.web import _query_execution_form, _saved_query_run_options, _stage_uploaded_pdf
+
+    with pytest.raises(Exception, match="PDF file is empty"):
+        asyncio.run(
+            _stage_uploaded_pdf(
+                UploadFile(file=io.BytesIO(b""), filename="empty.pdf"),
+                directory=tmp_path,
+                max_bytes=10,
+            )
+        )
+    with pytest.raises(Exception, match="exceeds maximum size"):
+        asyncio.run(
+            _stage_uploaded_pdf(
+                UploadFile(file=io.BytesIO(b"123456"), filename="large.pdf"),
+                directory=tmp_path,
+                max_bytes=5,
+            )
+        )
+
+    config = load_config(config_path)
+
+    class Existing:
+        regexp_debug_text = "saved regexp debug"
+        label_debug_text = "saved label debug"
+
+    values = _query_execution_form(FormData(), config, existing_query=Existing())
+    assert values["regexp_debug_text"] == "saved regexp debug"
+    assert values["label_debug_text"] == "saved label debug"
+
+    with Database(config.paths.database) as db:
+        query_id = db.create_saved_query(
+            name="Local regexp",
+            prompt="",
+            query_kind="regexp",
+            content_scope="papers",
+            label_class="Topic",
+            label_values=[{"value": "Match", "pattern": "match"}],
+        )
+        query = db.get_saved_query(query_id)
+    resolved = _saved_query_run_options(FormData(), query, config, content_type="papers")
+    assert resolved[1] == ()
+    with pytest.raises(ValueError, match="Content type must be papers or blogs"):
+        _saved_query_run_options(FormData(), query, config, content_type="other")
+
+
+def test_run_pipeline_search_and_unknown_modes_close_services(config_path, monkeypatch):
+    from types import SimpleNamespace
+    from paperwatch.web import _run_pipeline
+
+    closed = []
+
+    class FakeStats:
+        run_id = 12
+        status = "success"
+
+        def as_dict(self):
+            return {"papers_found": 1}
+
+    class FakeWatch:
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        def fetch_title(self, query):
+            assert query == "target"
+            return FakeStats(), 44
+
+        def close(self):
+            closed.append("watch")
+
+    services = SimpleNamespace(
+        db=object(),
+        openalex=object(),
+        arxiv=object(),
+        llm=object(),
+        close=lambda: closed.append("services"),
+    )
+    monkeypatch.setattr("paperwatch.cli.build_services", lambda _config: services)
+    monkeypatch.setattr("paperwatch.pipeline.PaperWatch", FakeWatch)
+    result = _run_pipeline(config_path, "search", "target")
+    assert result["paper_id"] == 44 and result["run_id"] == 12
+    assert closed == ["watch", "services"]
+
+    closed.clear()
+    with pytest.raises(ValueError, match="Unknown run mode"):
+        _run_pipeline(config_path, "invalid")
+    assert closed == ["watch", "services"]

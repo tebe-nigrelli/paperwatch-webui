@@ -395,3 +395,101 @@ def test_get_work_fetches_exact_openalex_record(openalex_work_json):
     assert seen["path"] == "/works/W456"
     with pytest.raises(OpenAlexError, match="Invalid OpenAlex work id"):
         api.get_work("A123")
+
+
+def test_work_search_falls_back_when_direct_identifiers_are_missing(openalex_work_json):
+    calls = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(request.url)
+        if "/works/https://doi.org/" in request.url.path:
+            return httpx.Response(404, json={"error": "missing"})
+        return httpx.Response(200, json={"results": [openalex_work_json]})
+
+    api = OpenAlexClient(
+        api_key="secret",
+        base_url="https://openalex.test",
+        client=httpx.Client(transport=httpx.MockTransport(handler)),
+        max_retries=0,
+    )
+    assert api.search_works("arXiv:2607.12345", limit=2)[0].openalex_id == "W456"
+    assert api.search_works("10.1000/example", limit=2)[0].openalex_id == "W456"
+    assert any(url.params.get("search") == "2607.12345" for url in calls)
+    assert any(url.params.get("search") == "10.1000/example" for url in calls)
+
+
+def test_work_text_search_skips_sparse_records_and_rejects_malformed_results(openalex_work_json):
+    responses = iter(
+        [
+            {"results": [None, {}, openalex_work_json]},
+            {"results": {"not": "a list"}},
+        ]
+    )
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json=next(responses))
+
+    api = OpenAlexClient(
+        api_key="secret",
+        base_url="https://openalex.test",
+        client=httpx.Client(transport=httpx.MockTransport(handler)),
+    )
+    assert [paper.openalex_id for paper in api.search_works("ordinary title")] == ["W456"]
+    with pytest.raises(OpenAlexError, match="work results are malformed"):
+        api.search_works("another title")
+
+
+def test_search_author_and_doi_validation_edges():
+    api = OpenAlexClient(
+        api_key="secret",
+        base_url="https://openalex.test",
+        client=httpx.Client(transport=httpx.MockTransport(lambda _r: httpx.Response(200, json={}))),
+    )
+    with pytest.raises(OpenAlexError, match="cannot be empty"):
+        api.search_authors("   ")
+    with pytest.raises(OpenAlexError, match="positive"):
+        api.search_authors("Ada", limit=0)
+    with pytest.raises(OpenAlexError, match="Invalid DOI"):
+        api.get_work_by_doi("not-a-doi")
+
+
+def test_recent_works_paginates_skips_sparse_rows_and_stops(openalex_work_json):
+    second = dict(openalex_work_json)
+    second["id"] = "https://openalex.org/W999"
+    second["display_name"] = "Second work"
+    payloads = iter(
+        [
+            {"results": [{}, openalex_work_json], "meta": {"next_cursor": "next"}},
+            {"results": [None, second], "meta": {"next_cursor": None}},
+        ]
+    )
+    seen = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request)
+        return httpx.Response(200, json=next(payloads))
+
+    api = OpenAlexClient(
+        api_key="secret",
+        base_url="https://openalex.test",
+        client=httpx.Client(transport=httpx.MockTransport(handler)),
+    )
+    records = api.recent_works("A123", since="2026-01-01", max_results=3)
+    assert [record.openalex_id for record in records] == ["W456", "W999"]
+    assert [request.url.params["cursor"] for request in seen] == ["*", "next"]
+
+
+def test_recent_works_validation_and_malformed_batch():
+    api = OpenAlexClient(
+        api_key="secret",
+        base_url="https://openalex.test",
+        client=httpx.Client(
+            transport=httpx.MockTransport(lambda _r: httpx.Response(200, json={"results": {}}))
+        ),
+    )
+    with pytest.raises(OpenAlexError, match="Invalid OpenAlex author id"):
+        api.recent_works("", since="2026-01-01")
+    with pytest.raises(OpenAlexError, match="positive"):
+        api.recent_works("A1", since="2026-01-01", max_results=0)
+    with pytest.raises(OpenAlexError, match="work results are malformed"):
+        api.recent_works("A1", since="2026-01-01")
