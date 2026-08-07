@@ -1363,7 +1363,8 @@ def test_local_pdf_opens_with_system_application(config_path, seeded_web, monkey
     monkeypatch.setattr("paperwatch.web.shutil.which", lambda command: None)
     missing = client.get(f"/papers/{paper_id}/pdf/open")
     assert missing.status_code == 503
-    assert "xdg-open is not available" in missing.text
+    assert "Desktop opener" in missing.text
+    assert "xdg-open" in missing.text
 
     monkeypatch.setattr("paperwatch.web.shutil.which", lambda command: "/usr/bin/xdg-open")
 
@@ -1374,6 +1375,20 @@ def test_local_pdf_opens_with_system_application(config_path, seeded_web, monkey
     failed = client.get(f"/papers/{paper_id}/pdf/open")
     assert failed.status_code == 500
     assert "desktop launcher failed" in failed.text
+
+
+def test_macos_desktop_opener(monkeypatch):
+    looked_up = []
+
+    def which(command):
+        looked_up.append(command)
+        return "/usr/bin/open"
+
+    monkeypatch.setattr("paperwatch.web.shutil.which", which)
+    from paperwatch.web import _desktop_opener
+
+    assert _desktop_opener("darwin") == "/usr/bin/open"
+    assert looked_up == ["open"]
 
 
 def test_nav_order_runs_copy_and_builtin_query_protection(config_path, seeded_web):

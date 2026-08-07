@@ -38,7 +38,9 @@ Failures are isolated per author, paper, PDF, model, or saved query. Cross-proce
 - Ollama, an OpenAI API key, or metadata-only mode
 - Optional OpenAI Codex API or locally authenticated Claude Code model access
 
-## Install on Arch Linux
+## Install
+
+On Arch Linux:
 
 ```bash
 sudo pacman -S python
@@ -48,6 +50,21 @@ python -m venv .venv
 .venv/bin/paperwatch init config.toml
 export OPENALEX_API_KEY='...'
 ```
+
+On macOS (with [Homebrew](https://brew.sh/)):
+
+```bash
+brew install python
+cd paperwatch
+python3 -m venv .venv
+.venv/bin/pip install -e '.[dev]'
+.venv/bin/paperwatch init config.toml
+export OPENALEX_API_KEY='...'
+```
+
+The application code supports Linux and macOS. The optional unit files in
+`systemd/` are Linux-only; on macOS, run the CLI manually or configure the same
+`paperwatch run` and `paperwatch web` commands as `launchd` jobs.
 
 For Ollama:
 
@@ -95,7 +112,7 @@ The home page is a newest-first unified table for papers and blog entries. Paper
 - shared paper/blog tags;
 - direct links to local PDFs or original blog pages.
 
-Tracked author names link directly to the same table filtered to that author. Every native select is enhanced with a text field: typing filters option labels and values, and Enter inserts the highlighted choice. Search, exact author, searchable multi-select author tags, shared content tags, topic, date, PDF, and analysis filters stay on this page. Checkboxes select exact paper or blog subsets for saved prompts. The table supports page sizes up to 1000 records. Local PDF links ask the desktop through `xdg-open`, so on Arch Linux/KDE they use the configured system PDF application.
+Tracked author names link directly to the same table filtered to that author. Every native select is enhanced with a text field: typing filters option labels and values, and Enter inserts the highlighted choice. Search, exact author, searchable multi-select author tags, shared content tags, topic, date, PDF, and analysis filters stay on this page. Checkboxes select exact paper or blog subsets for saved prompts. The table supports page sizes up to 1000 records. Local PDF links use the operating system's desktop opener (`xdg-open` on Linux and `open` on macOS), so they launch the configured PDF application.
 
 Blog detail pages preserve sanitized article structure and show remote HTTP(S) images or GIFs only while the page is open. Paperwatch stores their URLs in article text but never downloads the media into its data directory. Back, original-source, and icon-only copy controls stay on one line.
 
@@ -137,7 +154,7 @@ Authors can also be created manually. Supplying an OpenAlex author ID enables pa
 
 ### Blog updates
 
-Blogs are fetched during every normal paper run, so the systemd timer and manual `paperwatch run` command use one shared interval. Each source can use `auto`, `feed`, `article_index`, `article`, `docs`, `publications`, `github`, or `video` mode. Auto-discovered feeds are scored against the configured author/category URL to avoid silently selecting a company-wide feed. Duplicate or homepage-only feed IDs are replaced with stable article identities. Article indexes retain discovered child pages and recheck older pages after they leave the front page. CSS selectors and article-URL patterns can narrow dynamic sites. RSS entries and their fetched website pages are stored separately. Fetched pages retain a sanitized HTML representation for readable headings, paragraphs, lists, tables, code, and inline links, while normalized text remains available for searching and model input. The detail page can copy the complete normalized text to the clipboard. A manual import form creates the complete tracked-author → source → entry relationship. The first synchronization remains a hidden baseline; later meaningful item, body, or outbound-link changes become updates, while counters, avatars, navigation, social links, and tracking parameters are suppressed. Shared URLs are fetched once even when linked to several authors.
+Blogs are fetched during every normal paper run, so scheduled and manual `paperwatch run` commands use one shared interval. Each source can use `auto`, `feed`, `article_index`, `article`, `docs`, `publications`, `github`, or `video` mode. Auto-discovered feeds are scored against the configured author/category URL to avoid silently selecting a company-wide feed. Duplicate or homepage-only feed IDs are replaced with stable article identities. Article indexes retain discovered child pages and recheck older pages after they leave the front page. CSS selectors and article-URL patterns can narrow dynamic sites. RSS entries and their fetched website pages are stored separately. Fetched pages retain a sanitized HTML representation for readable headings, paragraphs, lists, tables, code, and inline links, while normalized text remains available for searching and model input. The detail page can copy the complete normalized text to the clipboard. A manual import form creates the complete tracked-author → source → entry relationship. The first synchronization remains a hidden baseline; later meaningful item, body, or outbound-link changes become updates, while counters, avatars, navigation, social links, and tracking parameters are suppressed. Shared URLs are fetched once even when linked to several authors.
 
 ### Discover and import
 
@@ -461,7 +478,7 @@ paperwatch --config config.toml runs
 paperwatch --config config.toml web --host 127.0.0.1 --port 8765
 ```
 
-## Daily systemd timer
+## Daily systemd timer (Linux)
 
 The supplied units expect the project at `~/.local/share/paperwatch`:
 

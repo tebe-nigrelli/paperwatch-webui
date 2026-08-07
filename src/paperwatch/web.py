@@ -13,6 +13,7 @@ import json
 import re
 import shutil
 import subprocess
+import sys
 import threading
 import uuid
 from dataclasses import asdict, dataclass
@@ -76,6 +77,12 @@ SORTS = ("newest", "oldest", "discovered", "title")
 PAGE_SIZES = (25, 100, 250, 500, 1000)
 DEFAULT_PAGE_SIZE = 25
 SELECTED_CONTENT_PREVIEW_LIMIT = 25
+
+
+def _desktop_opener(platform: str | None = None) -> str | None:
+    """Return the native desktop opener for supported Unix platforms."""
+    command = "open" if (platform or sys.platform) == "darwin" else "xdg-open"
+    return shutil.which(command)
 
 
 @dataclass(frozen=True, slots=True)
@@ -3975,9 +3982,10 @@ def create_app(
     @app.get("/papers/{paper_id}/pdf/open")
     def open_local_pdf(paper_id: int) -> Response:
         path = local_pdf_path(paper_id)
-        opener = shutil.which("xdg-open")
+        opener = _desktop_opener()
         if opener is None:
-            raise HTTPException(503, "xdg-open is not available")
+            command = "open" if sys.platform == "darwin" else "xdg-open"
+            raise HTTPException(503, f"Desktop opener {command!r} is not available")
         try:
             subprocess.Popen(
                 [opener, str(path)],

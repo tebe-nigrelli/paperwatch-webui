@@ -45,8 +45,8 @@ try:
     from reportlab.pdfgen.canvas import Canvas
 except ImportError as exc:  # pragma: no cover - dependency check
     print(
-        "Missing ReportLab. On Arch Linux install it with:\n"
-        "  sudo pacman -S python-reportlab",
+        "Missing ReportLab. Install it in the active Python environment with:\n"
+        "  python -m pip install reportlab",
         file=sys.stderr,
     )
     raise SystemExit(2) from exc
@@ -816,6 +816,8 @@ def register_fonts(args: argparse.Namespace) -> Fonts:
         args.font,
         "Noto Sans:style=Regular",
         (
+            "/Library/Fonts/Arial Unicode.ttf",
+            "/System/Library/Fonts/Supplemental/Arial.ttf",
             "/usr/share/fonts/truetype/noto/NotoSans-Regular.ttf",
             "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
             "/usr/share/fonts/truetype/liberation2/LiberationSans-Regular.ttf",
@@ -825,6 +827,7 @@ def register_fonts(args: argparse.Namespace) -> Fonts:
         args.bold_font,
         "Noto Sans:style=Bold",
         (
+            "/System/Library/Fonts/Supplemental/Arial Bold.ttf",
             "/usr/share/fonts/truetype/noto/NotoSans-Bold.ttf",
             "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
             "/usr/share/fonts/truetype/liberation2/LiberationSans-Bold.ttf",
@@ -834,6 +837,8 @@ def register_fonts(args: argparse.Namespace) -> Fonts:
         args.mono_font,
         "Noto Sans Mono:style=Regular",
         (
+            "/System/Library/Fonts/Supplemental/Andale Mono.ttf",
+            "/System/Library/Fonts/Supplemental/Courier New.ttf",
             "/usr/share/fonts/truetype/noto/NotoSansMono-Regular.ttf",
             "/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf",
             "/usr/share/fonts/truetype/liberation2/LiberationMono-Regular.ttf",

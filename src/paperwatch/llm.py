@@ -192,7 +192,7 @@ class OllamaClient:
         except httpx.ConnectError as exc:
             raise LLMError(
                 f"Cannot connect to Ollama at {self.base_url}. Start it with `ollama serve` "
-                "or enable its systemd service, then retry."
+                "or your operating system's service manager, then retry."
             ) from exc
         except (httpx.HTTPError, ValueError) as exc:
             raise LLMError(f"Ollama readiness check failed: {exc}") from exc
@@ -543,7 +543,7 @@ class OllamaClient:
         except httpx.ConnectError as exc:
             raise LLMError(
                 f"Cannot connect to Ollama at {self.base_url}. Start it with `ollama serve` "
-                "or enable its systemd service, then retry."
+                "or your operating system's service manager, then retry."
             ) from exc
         except (httpx.HTTPError, ValueError) as exc:
             check_cancelled(self._cancel_event)

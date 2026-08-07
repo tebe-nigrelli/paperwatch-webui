@@ -40,9 +40,9 @@ Release result:
 | Paper UI | Consolidated identifier/external/action metadata panel, author picker state, model reruns, saved prompts, 16384-token default context input, no-reload fragment refresh, scroll preservation, live output, cancellation, stale-attempt recovery, analysis rendering, exports |
 | Discovery/author/query UI | Mutually exclusive Paper/Author OpenAlex discovery modes, review-before-download, manual PDF import/backfill, table-based author filtering, Enter-to-tag, icon pause/resume/archive controls, protected Summarize prompt, prompt-only query CRUD, runtime source/strategy/context/model controls, persisted selections/outputs/errors |
 | Static resilience | System/light/dark preference cycle, hidden-state CSS precedence, no CDN dependency, responsive templates |
-| Web security | CSP with explicit remote image allowance, sanitized stored HTML/markdown, rejection of non-HTTP media links, frame denial, MIME-sniff prevention, same-origin referrer policy, protected local-PDF paths, safe `xdg-open` invocation without a shell, guarded destructive/import actions, localhost default |
+| Web security | CSP with explicit remote image allowance, sanitized stored HTML/markdown, rejection of non-HTTP media links, frame denial, MIME-sniff prevention, same-origin referrer policy, protected local-PDF paths, safe native desktop opener invocation without a shell (`xdg-open` on Linux, `open` on macOS), guarded destructive/import actions, localhost default |
 | Data management | Delete authors/papers/blog entries/generated summaries/query definitions/query history/fetch history, constrained PDF cleanup, author/blog JSON round trip, full SQLite/PDF ZIP round trip, archive validation, unsafe-path rejection, active-job blocking |
-| CLI/systemd | CLI commands, web invocation, daily timer, web service files, archive wording |
+| CLI/Linux service files | CLI commands, web invocation, daily systemd timer, web service files, archive wording |
 | Packaging | Prompt/config/templates/assets/new modules included in wheel; installed command/server smoke tests |
 
 ## Test layers
@@ -76,7 +76,7 @@ The release audit then verifies:
 7. an installed-package chunk/map/reduce run persists expected rows and reuses its chunk/final caches;
 8. a repeated identical run uses caches where applicable;
 9. `PRAGMA integrity_check` returns `ok`;
-10. `systemd-analyze verify` accepts all supplied units;
+10. on Linux, `systemd-analyze verify` accepts all supplied units;
 11. release SHA-256 checksums match.
 
 ## Deliberately excluded live tests
