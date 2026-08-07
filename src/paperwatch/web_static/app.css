@@ -136,28 +136,28 @@
 @media(max-width:650px){.collection-runner-details .collection-runner-summary{align-items:flex-start;flex-direction:column}}
 
 /* 0.8.5 author table and layout refinements */
-.author-table{min-width:1120px}
-.author-table .author-blogs-column,.author-table .author-blogs-cell{width:92px;max-width:92px;white-space:nowrap}
-.author-openalex-cell{min-width:190px}
+.author-table .author-blogs-column,.author-table .author-blogs-cell{white-space:nowrap}
 .author-openalex-form{display:flex;align-items:center;gap:6px;margin:0}
 .author-openalex-form input{width:120px;min-width:0}
 .author-openalex-form .button{flex:0 0 auto}
 
 /* 0.8.6 compact author editing and editable blog sources */
-.author-table{min-width:1020px}
-.author-table th,.author-table td{padding:10px 9px}
-.author-table th.author-name-column{width:27%}
-.author-table th.author-openalex-column{width:150px}
-.author-table th.author-papers-column{width:7%}
-.author-table .author-blogs-column,.author-table .author-blogs-cell{width:88px;max-width:88px;white-space:nowrap}
-.author-table th.author-sources-column{width:19%}
-.author-table th.author-tags-column{width:14%}
-.author-table th.author-state-column{width:11%}
-.author-table th.author-remove-column{width:7%}
+.author-table th,.author-table td{padding:7px 6px}
+.author-table col.author-col-name{width:25%}
+.author-table col.author-col-star{width:6%}
+.author-table col.author-col-openalex{width:13%}
+.author-table col.author-col-papers{width:6%}
+.author-table col.author-col-blogs{width:8%}
+.author-table col.author-col-sources{width:16%}
+.author-table col.author-col-tags{width:13%}
+.author-table col.author-col-state{width:6%}
+.author-table col.author-col-remove{width:7%}
+.author-table .author-blogs-cell{white-space:nowrap}
+.author-table .tag-entry-form input{width:100%;min-width:0}
 .author-table-heading-actions{display:flex;align-items:center;gap:12px;white-space:nowrap}
 .author-openalex-cell{min-width:0}
 .author-openalex-form{display:block;margin:0}
-.author-openalex-form input{width:138px;min-width:0;padding:6px 8px;font-size:.82rem;font-family:ui-monospace,SFMono-Regular,Menlo,monospace}
+.author-openalex-form input{width:100%;min-width:0;padding:6px 7px;font-size:.82rem;font-family:ui-monospace,SFMono-Regular,Menlo,monospace}
 .author-blog-table{min-width:1120px;table-layout:fixed}
 .author-blog-table th:nth-child(1){width:35%}
 .author-blog-table th:nth-child(2){width:12%}
@@ -277,7 +277,6 @@
 .info-dialog table{margin-bottom:14px}
 @media(max-width:900px){.author-manual-form{grid-template-columns:1fr 1fr}.author-manual-form .button{grid-column:1/-1}.classification-row{grid-template-columns:1fr auto}}
 @media(max-width:650px){.author-manual-form,.classification-row{grid-template-columns:1fr}.author-csv-import-row{align-items:stretch;flex-direction:column}.selected-content-actions{justify-content:flex-start}}
-.author-table th.author-star-column{width:5%}
 
 /* 0.9.9 metadata, column filters, PDF integrity and safe inline editing */
 .content-star-cell{display:flex;align-items:center;justify-content:center;gap:5px}
@@ -356,7 +355,7 @@ body.dialog-open{overflow:hidden}.dialog-close-button{display:grid!important;pla
 
 /* 0.10.0 detail layouts, data workspace, and responsive regexp editors */
 .table-wrap{overflow-x:auto;max-width:none}
-table:not(.unified-content-table):not(.saved-query-table){min-width:max-content}
+table:not(.unified-content-table):not(.saved-query-table):not(.author-table){min-width:max-content}
 .paper-reference-layout{grid-template-columns:minmax(0,.75fr) minmax(420px,1.25fr);gap:26px}
 .paper-reference-metadata{grid-column:auto;grid-template-columns:repeat(2,minmax(0,1fr))}
 .paper-link-groups{padding-left:26px}
@@ -425,9 +424,9 @@ label.control-disabled{opacity:.68}
 @media(max-width:650px){.blog-results-runner{grid-template-columns:1fr}}
 
 /* 0.10.2 follow-up: fixed-width author grid with notes beneath each author */
-.table-wrap>.author-table{width:100%;min-width:1020px;table-layout:fixed}
+.table-wrap>.author-table{width:100%;min-width:900px;table-layout:fixed;font-size:.84rem}
 .author-table .author-main-row>td{min-width:0;overflow-wrap:anywhere}
-.author-table .author-notes-row>td{width:auto;max-width:none;padding:0 9px 10px}
+.author-table .author-notes-row>td{width:auto;max-width:none;padding:0 6px 8px}
 .author-table .author-notes-row .row-notes-editor{min-width:0;max-width:100%;margin:0}
 .author-table .author-notes-row .row-notes-editor[open]{padding:12px;border:1px solid var(--line);border-radius:8px;background:var(--surface-2)}
 .author-table .author-notes-row textarea{width:100%;min-width:0;max-width:100%;min-height:120px}

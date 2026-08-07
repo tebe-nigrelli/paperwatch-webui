@@ -87,6 +87,8 @@ def test_content_type_filter_and_version_brand(
     assert 'data-filter-name="content" data-filter-values="all|papers|blogs"' in page.text
     assert 'data-filter-labels="Both|Papers|Blogs"' in page.text
     assert "paperwatch</span><small>v0.10.2</small>" in page.text
+    assert "/static/app.css?v=0.10.2-" in page.text
+    assert "/static/app.js?v=0.10.2-" in page.text
 
     papers = client.get("/?content=papers")
     assert paper_record.title in papers.text

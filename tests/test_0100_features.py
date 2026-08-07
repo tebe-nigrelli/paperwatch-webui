@@ -359,6 +359,7 @@ def test_static_assets_use_partial_updates_and_requested_layout():
     root = Path(__file__).parents[1] / "src" / "paperwatch"
     script = (root / "web_static" / "app.js").read_text()
     css = (root / "web_static" / "app.css").read_text()
+    authors_template = (root / "web_templates" / "authors.html").read_text()
     assert "paperwatch-content-url" in script
     assert "#content-results-root" in script
     assert "syncSelectionRow" in script
@@ -376,4 +377,8 @@ def test_static_assets_use_partial_updates_and_requested_layout():
     assert '.filter-word-button[data-filter-state="yes"]' in css
     assert ".selected-content-tools{display:grid;grid-template-columns:220px 220px auto" in css
     assert ".regexp-editor-grid" in css
-    assert ".table-wrap>.author-table{width:100%;min-width:1020px;table-layout:fixed}" in css
+    assert "table:not(.unified-content-table):not(.saved-query-table):not(.author-table){min-width:max-content}" in css
+    assert ".table-wrap>.author-table{width:100%;min-width:900px;table-layout:fixed" in css
+    assert ".author-table col.author-col-name{width:25%}" in css
+    assert ".author-table col.author-col-openalex{width:13%}" in css
+    assert '<colgroup class="author-table-columns">' in authors_template

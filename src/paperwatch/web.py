@@ -1879,6 +1879,11 @@ def create_app(
     except AnalysisAlreadyInProgress:
         pass
     package_dir = Path(__file__).resolve().parent
+    static_dir = package_dir / "web_static"
+    asset_digest = hashlib.sha256()
+    for asset_name in ("app.css", "app.js"):
+        asset_digest.update((static_dir / asset_name).read_bytes())
+    asset_version = f"{__version__}-{asset_digest.hexdigest()[:12]}"
     templates = Jinja2Templates(directory=str(package_dir / "web_templates"))
     templates.env.filters["fromjson"] = lambda value: _json_value(value, {})
     templates.env.filters["prettyjson"] = lambda value: json.dumps(
@@ -1894,13 +1899,14 @@ def create_app(
     app.state.query_controller = collection_controller
     app.state.author_client_factory = client_factory
     app.state.blog_client_factory = blog_factory
-    app.mount("/static", StaticFiles(directory=str(package_dir / "web_static")), name="static")
+    app.mount("/static", StaticFiles(directory=str(static_dir)), name="static")
 
     def render(request: Request, template: str, **context: Any) -> HTMLResponse:
         base = {
             "request": request,
             "config": config,
-            "asset_version": __version__,
+            "app_version": __version__,
+            "asset_version": asset_version,
             "run_state": controller.snapshot(),
             "analysis_state": model_controller.snapshot(),
             "query_state": collection_controller.snapshot(),
