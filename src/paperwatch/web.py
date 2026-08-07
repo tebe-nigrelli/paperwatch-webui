@@ -21,6 +21,7 @@ from pathlib import Path
 from typing import Any, Callable, Iterable
 from urllib.parse import quote_plus, urlencode, urlparse
 
+import httpx
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, RedirectResponse, Response
 from fastapi.staticfiles import StaticFiles
@@ -33,8 +34,11 @@ from .analysis_jobs import AnalysisController
 from .blog_import import import_blog_links
 from .blogs import (
     SOURCE_MODES,
+    BlogFetch,
     blog_diff,
     compact_blog_diff,
+    fetch_blog,
+    infer_source_mode,
     normalize_blog_url,
     normalize_source_mode,
     validate_article_url_pattern,
@@ -51,11 +55,13 @@ from .models import (
     PaperRecord,
     clean_text,
     extract_arxiv_id,
+    normalize_title,
     short_openalex_id,
     strip_doi,
 )
 from .pdfs import PDFError, download_pdf, pdf_sha256, safe_pdf_name, validate_pdf_file
 from .query_jobs import QueryController
+from .sources.arxiv import ArxivClient, ArxivEntry
 from .sources.openalex import OpenAlexClient
 
 PAPER_KINDS = (
@@ -510,6 +516,21 @@ def _manual_paper_record(values: dict[str, str], *, filename: str) -> PaperRecor
             "imported_at": _utcnow(),
         },
     )
+
+
+def _paper_import_values(paper: PaperRecord) -> dict[str, str]:
+    return {
+        "title": paper.title,
+        "authors": "\n".join(author.name for author in paper.authors),
+        "source_link": paper.publication_url or "",
+        "abstract": paper.abstract or "",
+        "publication_date": paper.publication_date or "",
+        "venue": paper.venue or "",
+        "doi": paper.doi or "",
+        "arxiv_id": paper.arxiv_id or "",
+        "tags": "",
+        "notes": "",
+    }
 
 
 async def _stage_uploaded_pdf(
@@ -1183,6 +1204,357 @@ def _author_client(config: AppConfig) -> OpenAlexClient:
     )
 
 
+def _arxiv_client(config: AppConfig) -> ArxivClient:
+    return ArxivClient(
+        base_url=config.arxiv.base_url,
+        timeout_seconds=config.arxiv.timeout_seconds,
+        title_match_threshold=config.arxiv.title_match_threshold,
+        min_interval_seconds=config.arxiv.min_interval_seconds,
+    )
+
+
+def _blog_client(_config: AppConfig) -> httpx.Client:
+    return httpx.Client(
+        timeout=60,
+        follow_redirects=True,
+        headers={"User-Agent": "paperwatch/0.10.2 (+local discovery)"},
+    )
+
+
+def _paper_from_arxiv(entry: ArxivEntry) -> PaperRecord:
+    authors = [
+        PaperAuthor(
+            openalex_id=None,
+            name=name,
+            position=(
+                "first"
+                if index == 0
+                else "last"
+                if index == len(entry.authors) - 1
+                else "middle"
+            ),
+        )
+        for index, name in enumerate(entry.authors)
+    ]
+    return PaperRecord(
+        openalex_id=None,
+        doi=entry.doi,
+        arxiv_id=entry.arxiv_id,
+        title=entry.title,
+        abstract=entry.abstract,
+        publication_date=entry.published,
+        updated_date=entry.updated,
+        venue="arXiv",
+        publication_url=entry.abstract_url,
+        pdf_url=entry.pdf_url,
+        abstract_source="arxiv",
+        pdf_source="arxiv" if entry.pdf_url else None,
+        authors=authors,
+        metadata={"arxiv_search": True},
+    )
+
+
+def _search_arxiv_identifier(
+    query: str,
+    *,
+    openalex: OpenAlexClient,
+    arxiv: ArxivClient,
+    limit: int,
+) -> list[PaperRecord]:
+    arxiv_id = extract_arxiv_id(query)
+    if not arxiv_id:
+        return openalex.search_works(query, limit=limit)
+
+    # OpenAlex documents DOI, rather than arXiv id, as a singleton external
+    # work identifier. Try the arXiv-issued DataCite DOI first.
+    try:
+        return [openalex.get_work_by_doi(f"10.48550/arXiv.{arxiv_id}")]
+    except Exception:
+        pass
+
+    entry = arxiv.by_id(arxiv_id)
+    if entry is None:
+        return []
+
+    # Older or not-yet-linked OpenAlex records may not resolve via the arXiv
+    # DOI. Use arXiv only to resolve the identifier to a title, then search
+    # OpenAlex by that title. Prefer an exact title match if one exists.
+    try:
+        candidates = openalex.search_works(entry.title, limit=limit)
+    except Exception:
+        candidates = []
+    target = normalize_title(entry.title)
+    exact = [paper for paper in candidates if normalize_title(paper.title) == target]
+    if exact:
+        others = [paper for paper in candidates if normalize_title(paper.title) != target]
+        return [*exact, *others]
+    # Discover is intentionally an OpenAlex search surface. arXiv resolves the
+    # user's identifier to metadata, but only OpenAlex work records are shown.
+    return candidates
+
+
+def _discover_paper_result(db: Database, paper: PaperRecord) -> dict[str, Any]:
+    stored = db.find_paper(paper)
+    stored_id = int(stored["id"]) if stored is not None else None
+    local_path = str(stored["local_pdf_path"] or "").strip() if stored is not None else ""
+    downloaded = bool(local_path and Path(local_path).expanduser().is_file())
+    return {
+        "paper": paper,
+        "openalex_id": paper.openalex_id or "",
+        "stored_id": stored_id,
+        "downloaded": downloaded,
+        "local_url": f"/papers/{stored_id}" if downloaded and stored_id is not None else "",
+    }
+
+
+def _blog_preview_entries(fetched: BlogFetch, source_url: str) -> list[dict[str, Any]]:
+    entries: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    articles = {item.url: item for item in fetched.article_items}
+
+    for item in fetched.feed_items:
+        url = item.url or source_url
+        if url in seen:
+            continue
+        seen.add(url)
+        article = articles.get(url)
+        text = article.text if article is not None else item.text
+        entries.append(
+            {
+                "title": article.title if article is not None else item.title,
+                "url": url,
+                "published_at": (
+                    article.published_at if article is not None else item.published_at
+                ),
+                "summary": clean_text(text)[:700] if text else "",
+            }
+        )
+
+    for item in fetched.article_items:
+        if item.url in seen:
+            continue
+        seen.add(item.url)
+        entries.append(
+            {
+                "title": item.title,
+                "url": item.url,
+                "published_at": item.published_at,
+                "summary": clean_text(item.text)[:700],
+            }
+        )
+
+    for item in fetched.discovered_articles:
+        if item.url in seen:
+            continue
+        seen.add(item.url)
+        entries.append(
+            {
+                "title": item.title,
+                "url": item.url,
+                "published_at": item.published_at,
+                "summary": clean_text(item.summary)[:700],
+            }
+        )
+
+    if not entries and fetched.snapshot_text:
+        entries.append(
+            {
+                "title": fetched.title or source_url,
+                "url": source_url,
+                "published_at": fetched.snapshot_published_at,
+                "summary": clean_text(fetched.snapshot_text)[:700],
+            }
+        )
+    return entries
+
+
+def _fetch_blog_preview(client: httpx.Client, url: str, *, source_mode: str = "auto") -> BlogFetch:
+    normalized = normalize_blog_url(url)
+    return fetch_blog(
+        client,
+        {
+            "url": normalized,
+            "title": normalized,
+            "source_mode": source_mode,
+            "feed_url": None,
+            "feed_etag": None,
+            "feed_last_modified": None,
+            "feed_discovery_checked": False,
+            "content_selector": None,
+            "article_url_pattern": None,
+            "article_cursor": 0,
+            "_known_article_urls": (),
+            "_aggressive_discovery": source_mode != "article",
+            "_feed_candidate_limit": 16,
+            "_article_fetch_limit": 24,
+        },
+    )
+
+
+def _save_discovered_blog_fetch(
+    db: Database,
+    *,
+    author_openalex_id: str,
+    source_url: str,
+    fetched: BlogFetch,
+    label: str = "",
+    relationship: str = "",
+    tags: tuple[str, ...] = (),
+    notes: str = "",
+) -> tuple[int, int]:
+    normalized_source = normalize_blog_url(source_url)
+    blog_id = db.add_author_blog(
+        author_openalex_id,
+        normalized_source,
+        label=label or fetched.title,
+        relationship=relationship,
+        source_mode=fetched.source_mode or infer_source_mode(normalized_source),
+    )
+    for tag in tags:
+        db.add_blog_source_tag(blog_id, tag)
+    if notes.strip():
+        db.set_object_notes("blog_source", blog_id, notes)
+
+    saved = 0
+    seen_urls: set[str] = set()
+    article_by_url = {item.url: item for item in fetched.article_items}
+    for item in fetched.feed_items:
+        article = article_by_url.get(item.url or "")
+        text = article.text if article is not None else item.text
+        rendered_html = article.rendered_html if article is not None else item.rendered_html
+        sha256 = article.sha256 if article is not None else item.sha256
+        published_at = article.published_at if article is not None else item.published_at
+        source = item.url or normalized_source
+        previous = db.latest_blog_entry(
+            blog_id, entry_kind="rss", external_id=item.external_id
+        )
+        if previous is not None and str(previous["content_sha256"]) == sha256:
+            seen_urls.add(source)
+            continue
+        db.save_blog_entry(
+            blog_id=blog_id,
+            title=item.title,
+            content_sha256=sha256,
+            normalized_text=text,
+            diff_text="",
+            change_kind="changed",
+            previous_entry_id=int(previous["id"]) if previous is not None else None,
+            entry_kind="rss",
+            external_id=item.external_id,
+            source_url=source,
+            published_at=published_at,
+            rendered_html=rendered_html,
+        )
+        seen_urls.add(source)
+        saved += 1
+
+    for item in fetched.article_items:
+        if item.url in seen_urls:
+            continue
+        previous = db.latest_blog_entry_for_source(
+            blog_id, entry_kind="snapshot", source_url=item.url
+        )
+        if previous is not None and str(previous["content_sha256"]) == item.sha256:
+            continue
+        db.save_blog_entry(
+            blog_id=blog_id,
+            title=item.title,
+            content_sha256=item.sha256,
+            normalized_text=item.text,
+            diff_text="",
+            change_kind="changed",
+            previous_entry_id=int(previous["id"]) if previous is not None else None,
+            entry_kind="snapshot",
+            external_id=item.external_id,
+            source_url=item.url,
+            published_at=item.published_at,
+            rendered_html=item.rendered_html,
+        )
+        seen_urls.add(item.url)
+        saved += 1
+
+    fetched_urls = {item.url for item in fetched.article_items}
+    for item in fetched.discovered_articles:
+        if item.url in seen_urls or item.url in fetched_urls:
+            continue
+        external_id = hashlib.sha256(
+            f"discover-blog\0{item.url}".encode("utf-8")
+        ).hexdigest()
+        previous = db.latest_blog_entry(
+            blog_id, entry_kind="rss", external_id=external_id
+        )
+        if previous is not None:
+            continue
+        text = "\n".join(
+            value
+            for value in (
+                f"Title: {item.title}",
+                f"URL: {item.url}",
+                item.summary,
+            )
+            if value
+        )
+        db.save_blog_entry(
+            blog_id=blog_id,
+            title=item.title,
+            content_sha256=hashlib.sha256(text.encode("utf-8")).hexdigest(),
+            normalized_text=text,
+            diff_text="",
+            change_kind="changed",
+            previous_entry_id=None,
+            entry_kind="rss",
+            external_id=external_id,
+            source_url=item.url,
+            published_at=item.published_at,
+        )
+        saved += 1
+
+    if not fetched.feed_items and not fetched.article_items and fetched.snapshot_text:
+        sha256 = fetched.snapshot_sha256 or hashlib.sha256(
+            fetched.snapshot_text.encode("utf-8")
+        ).hexdigest()
+        external_id = hashlib.sha256(
+            f"discover-snapshot\0{normalized_source}".encode("utf-8")
+        ).hexdigest()
+        previous = db.latest_blog_entry(
+            blog_id, entry_kind="snapshot", external_id=external_id
+        )
+        if previous is None or str(previous["content_sha256"]) != sha256:
+            db.save_blog_entry(
+                blog_id=blog_id,
+                title=fetched.title or normalized_source,
+                content_sha256=sha256,
+                normalized_text=fetched.snapshot_text,
+                diff_text="",
+                change_kind="changed",
+                previous_entry_id=int(previous["id"]) if previous is not None else None,
+                entry_kind="snapshot",
+                external_id=external_id,
+                source_url=normalized_source,
+                published_at=fetched.snapshot_published_at,
+                rendered_html=fetched.snapshot_rendered_html,
+            )
+            saved += 1
+
+    db.mark_blog_checked(
+        blog_id,
+        status=fetched.status_code,
+        etag=fetched.etag,
+        last_modified=fetched.last_modified,
+        title=fetched.title,
+        error=None,
+        fetch_method=fetched.method,
+        feed_url=fetched.feed_url,
+        feed_initialized=True if fetched.method == "rss" else None,
+        feed_discovery_checked=fetched.discovery_checked,
+        article_initialized=True if fetched.article_items else None,
+        article_cursor=fetched.article_cursor_next,
+        diagnostics=json.dumps(fetched.diagnostics),
+        item_stream_mode=fetched.source_mode,
+    )
+    return blog_id, saved
+
+
 def _author_view(row: Any) -> dict[str, Any]:
     data = _row_dict(row)
     name = str(data.get("name") or "Unknown author")
@@ -1485,12 +1857,16 @@ def create_app(
     analysis_controller: AnalysisController | None = None,
     query_controller: QueryController | None = None,
     author_client_factory: Callable[[AppConfig], Any] | None = None,
+    arxiv_client_factory: Callable[[AppConfig], Any] | None = None,
+    blog_client_factory: Callable[[AppConfig], Any] | None = None,
 ) -> FastAPI:
     config = load_config(config_path)
     controller = run_controller or RunController(config.config_path)
     model_controller = analysis_controller or AnalysisController(config.config_path)
     collection_controller = query_controller or QueryController(config.config_path)
     client_factory = author_client_factory or _author_client
+    arxiv_factory = arxiv_client_factory or _arxiv_client
+    blog_factory = blog_client_factory or _blog_client
     try:
         with analysis_lock(config.paths.database):
             with Database(config.paths.database) as recovery_db:
@@ -1517,6 +1893,7 @@ def create_app(
     app.state.analysis_controller = model_controller
     app.state.query_controller = collection_controller
     app.state.author_client_factory = client_factory
+    app.state.blog_client_factory = blog_factory
     app.mount("/static", StaticFiles(directory=str(package_dir / "web_static")), name="static")
 
     def render(request: Request, template: str, **context: Any) -> HTMLResponse:
@@ -2774,13 +3151,74 @@ def create_app(
             return JSONResponse({"ok": True, "tag": tag})
         return RedirectResponse(_notice_url("/authors", f"Removed tag {tag}."), status_code=303)
 
+    def load_remote_paper(reference: str) -> PaperRecord:
+        value = reference.strip()
+        if not value:
+            raise ValueError("Remote paper reference is required")
+        arxiv_id = extract_arxiv_id(value)
+        if arxiv_id:
+            arxiv_client = arxiv_factory(config)
+            try:
+                entry = arxiv_client.by_id(arxiv_id)
+            finally:
+                arxiv_client.close()
+            if entry is None:
+                raise ValueError(f"arXiv paper {arxiv_id} was not found")
+            return _paper_from_arxiv(entry)
+        openalex_id = short_openalex_id(value)
+        client = client_factory(config)
+        try:
+            if openalex_id and openalex_id.startswith("W"):
+                return client.get_work(openalex_id)
+            doi = strip_doi(value)
+            if doi and re.fullmatch(r"10\.\d{4,9}/\S+", doi, re.I):
+                return client.get_work_by_doi(doi)
+        finally:
+            client.close()
+        raise ValueError("Use an arXiv link/ID, DOI, or OpenAlex work ID")
+
     @app.get("/papers/import", response_class=HTMLResponse)
     def import_paper_form(request: Request) -> HTMLResponse:
+        search_query = request.query_params.get("q", "").strip()[:500]
+        selected_reference = request.query_params.get("source", "").strip()[:500]
+        paper_results: list[PaperRecord] = []
+        selected_paper: PaperRecord | None = None
+        import_error = ""
+        if selected_reference:
+            try:
+                selected_paper = load_remote_paper(selected_reference)
+            except Exception as exc:
+                import_error = str(exc)
+        elif search_query:
+            try:
+                if extract_arxiv_id(search_query):
+                    selected_paper = load_remote_paper(search_query)
+                    selected_reference = search_query
+                else:
+                    openalex_id = short_openalex_id(search_query)
+                    doi = strip_doi(search_query)
+                    if (openalex_id and openalex_id.startswith("W")) or (
+                        doi and re.fullmatch(r"10\.\d{4,9}/\S+", doi, re.I)
+                    ):
+                        selected_paper = load_remote_paper(search_query)
+                        selected_reference = search_query
+                    else:
+                        client = client_factory(config)
+                        try:
+                            paper_results = client.search_works(search_query, limit=25)
+                        finally:
+                            client.close()
+            except Exception as exc:
+                import_error = str(exc)
         return render(
             request,
             "import_paper.html",
-            import_values={},
-            import_error="",
+            import_values=_paper_import_values(selected_paper) if selected_paper else {},
+            import_error=import_error,
+            search_query=search_query,
+            paper_results=paper_results,
+            selected_paper=selected_paper,
+            remote_reference=selected_reference,
         )
 
     @app.post("/papers/import", response_class=HTMLResponse)
@@ -2790,10 +3228,12 @@ def create_app(
         backup: Path | None = None
         destination: Path | None = None
         upload: UploadFile | None = None
+        remote_reference = ""
+        selected_paper: PaperRecord | None = None
         try:
             form = await request.form(
                 max_files=1,
-                max_fields=20,
+                max_fields=24,
                 max_part_size=config.fetch.max_pdf_bytes,
             )
             values = {
@@ -2811,16 +3251,42 @@ def create_app(
                     "notes",
                 )
             }
+            remote_reference = str(form.get("remote_reference", "")).strip()[:500]
             form_upload = form.get("pdf")
-            if not isinstance(form_upload, UploadFile) or not form_upload.filename:
-                raise ValueError("PDF file is required")
-            upload = form_upload
-            paper = _manual_paper_record(values, filename=upload.filename)
-            staged = await _stage_uploaded_pdf(
-                upload,
-                directory=config.paths.pdf_dir,
-                max_bytes=config.fetch.max_pdf_bytes,
-            )
+            if isinstance(form_upload, UploadFile) and form_upload.filename:
+                upload = form_upload
+                paper = _manual_paper_record(values, filename=upload.filename)
+                staged = await _stage_uploaded_pdf(
+                    upload,
+                    directory=config.paths.pdf_dir,
+                    max_bytes=config.fetch.max_pdf_bytes,
+                )
+            else:
+                if not remote_reference:
+                    source_link = values.get("source_link", "")
+                    source_doi = strip_doi(source_link)
+                    if extract_arxiv_id(source_link) or (
+                        source_doi
+                        and re.fullmatch(r"10\.\d{4,9}/\S+", source_doi, re.I)
+                    ):
+                        remote_reference = source_link
+                    else:
+                        raise ValueError("PDF file is required")
+                paper = selected_paper = load_remote_paper(remote_reference)
+                if not paper.pdf_url:
+                    raise ValueError("The selected paper has no downloadable PDF")
+                paper.metadata = {
+                    **paper.metadata,
+                    "manual_import": True,
+                    "remote_reference": remote_reference,
+                    "imported_at": _utcnow(),
+                }
+                staged = config.paths.pdf_dir / f".remote-import-{uuid.uuid4().hex}.pdf"
+                download_pdf(
+                    paper.pdf_url,
+                    staged,
+                    max_bytes=config.fetch.max_pdf_bytes,
+                )
             with Database(config.paths.database) as db:
                 paper_id, _ = db.upsert_paper(paper, auto_analyze=True)
                 stored = db.get_paper(paper_id)
@@ -2861,8 +3327,14 @@ def create_app(
             response = render(
                 request,
                 "import_paper.html",
-                import_values=values,
+                import_values=(
+                    _paper_import_values(selected_paper) if selected_paper else values
+                ),
                 import_error=str(exc),
+                search_query="",
+                paper_results=[],
+                selected_paper=selected_paper,
+                remote_reference=remote_reference,
             )
             response.status_code = 400
             return response
@@ -2879,26 +3351,47 @@ def create_app(
         requested_mode = request.query_params.get("mode", "").strip().lower()
         legacy_paper_query = request.query_params.get("paper_q", "").strip()[:500]
         legacy_author_query = request.query_params.get("author_q", "").strip()[:200]
-        if requested_mode not in {"paper", "author"}:
+        if requested_mode not in {"paper", "author", "blog"}:
             requested_mode = "author" if legacy_author_query and not legacy_paper_query else "paper"
-        query_limit = 500 if requested_mode == "paper" else 200
+        query_limit = 2000 if requested_mode == "blog" else 500 if requested_mode == "paper" else 200
         query = request.query_params.get("q", "").strip()[:query_limit]
         if not query:
-            query = legacy_paper_query if requested_mode == "paper" else legacy_author_query
+            query = legacy_paper_query if requested_mode == "paper" else legacy_author_query if requested_mode == "author" else ""
         paper_query = query if requested_mode == "paper" else ""
         author_query = query if requested_mode == "author" else ""
+        blog_query = query if requested_mode == "blog" else ""
         limit = _int_or_none(request.query_params.get("limit")) or 100
         limit = min(max(limit, 1), 100)
-        paper_results: list[PaperRecord] = []
+        paper_results: list[dict[str, Any]] = []
         author_results: list[AuthorCandidate] = []
+        blog_results: list[dict[str, Any]] = []
+        blog_fetch: BlogFetch | None = None
         paper_error = ""
         author_error = ""
+        blog_error = ""
         if paper_query or author_query:
             client = client_factory(config)
             try:
                 if paper_query:
                     try:
-                        paper_results = client.search_works(paper_query, limit=limit)
+                        arxiv_id = extract_arxiv_id(paper_query)
+                        if arxiv_id:
+                            arxiv_client = arxiv_factory(config)
+                            try:
+                                records = _search_arxiv_identifier(
+                                    paper_query,
+                                    openalex=client,
+                                    arxiv=arxiv_client,
+                                    limit=limit,
+                                )
+                            finally:
+                                arxiv_client.close()
+                        else:
+                            records = client.search_works(paper_query, limit=limit)
+                        with Database(config.paths.database) as db:
+                            paper_results = [
+                                _discover_paper_result(db, paper) for paper in records
+                            ]
                     except Exception as exc:
                         paper_error = str(exc)
                 if author_query:
@@ -2908,6 +3401,20 @@ def create_app(
                         author_error = str(exc)
             finally:
                 client.close()
+        if blog_query:
+            blog_client = blog_factory(config)
+            try:
+                try:
+                    normalized = normalize_blog_url(blog_query)
+                    blog_fetch = _fetch_blog_preview(blog_client, normalized)
+                    blog_results = _blog_preview_entries(blog_fetch, normalized)
+                    blog_query = normalized
+                except Exception as exc:
+                    blog_error = str(exc)
+            finally:
+                close = getattr(blog_client, "close", None)
+                if callable(close):
+                    close()
         return render(
             request,
             "discover.html",
@@ -2915,11 +3422,227 @@ def create_app(
             discover_query=query,
             paper_query=paper_query,
             author_query=author_query,
+            blog_query=blog_query,
             search_limit=limit,
             paper_results=paper_results,
             author_results=author_results,
+            blog_results=blog_results,
+            blog_fetch=blog_fetch,
             paper_error=paper_error,
             author_error=author_error,
+            blog_error=blog_error,
+        )
+
+    @app.get("/discover/paper", response_class=HTMLResponse)
+    def discover_paper_preview(request: Request) -> HTMLResponse:
+        work_id = short_openalex_id(request.query_params.get("work_id", ""))
+        query = request.query_params.get("q", "").strip()[:500]
+        if not work_id or not work_id.startswith("W"):
+            raise HTTPException(400, "OpenAlex work ID is required")
+        client = client_factory(config)
+        try:
+            paper = client.get_work(work_id)
+        except Exception as exc:
+            raise HTTPException(404, f"Could not load paper: {exc}") from exc
+        finally:
+            client.close()
+        with Database(config.paths.database) as db:
+            result = _discover_paper_result(db, paper)
+        return render(
+            request,
+            "discover_paper.html",
+            result=result,
+            paper=paper,
+            paper_query=query,
+        )
+
+    @app.post("/api/discover/paper-import")
+    async def discover_paper_import(request: Request) -> JSONResponse:
+        form = await request.form()
+        work_id = short_openalex_id(str(form.get("work_id", "")))
+        if not work_id or not work_id.startswith("W"):
+            return JSONResponse({"error": "OpenAlex work ID is required"}, status_code=400)
+        with Database(config.paths.database) as db:
+            stored = db.get_paper_by_openalex_id(work_id)
+            if stored is not None:
+                local_path = str(stored["local_pdf_path"] or "").strip()
+                if local_path and Path(local_path).expanduser().is_file():
+                    return JSONResponse(
+                        {
+                            "state": "imported",
+                            "paper_id": int(stored["id"]),
+                            "url": f"/papers/{int(stored['id'])}",
+                        }
+                    )
+        snapshot = controller.snapshot()
+        if snapshot.running:
+            same_work = snapshot.mode == "download" and (
+                not snapshot.query or snapshot.query == work_id
+            )
+            if same_work:
+                return JSONResponse({"state": "importing"}, status_code=202)
+            return JSONResponse(
+                {"error": "Another fetch is already running."}, status_code=409
+            )
+        parameters = inspect.signature(controller.start).parameters
+        try:
+            if "query" in parameters:
+                started = controller.start("download", query=work_id)
+            else:
+                started = controller.start("download")
+        except ValueError as exc:
+            return JSONResponse({"error": str(exc)}, status_code=400)
+        if not started:
+            return JSONResponse(
+                {"error": "Another fetch is already running."}, status_code=409
+            )
+        return JSONResponse({"state": "importing"}, status_code=202)
+
+    @app.get("/api/discover/paper-import-status")
+    def discover_paper_import_status(request: Request) -> JSONResponse:
+        work_id = short_openalex_id(request.query_params.get("work_id", ""))
+        if not work_id or not work_id.startswith("W"):
+            return JSONResponse({"error": "OpenAlex work ID is required"}, status_code=400)
+        with Database(config.paths.database) as db:
+            stored = db.get_paper_by_openalex_id(work_id)
+            if stored is not None:
+                local_path = str(stored["local_pdf_path"] or "").strip()
+                if local_path and Path(local_path).expanduser().is_file():
+                    return JSONResponse(
+                        {
+                            "state": "imported",
+                            "paper_id": int(stored["id"]),
+                            "url": f"/papers/{int(stored['id'])}",
+                        }
+                    )
+        snapshot = controller.snapshot()
+        if snapshot.running and snapshot.mode == "download" and (
+            not snapshot.query or snapshot.query == work_id
+        ):
+            return JSONResponse({"state": "importing"})
+        if (
+            not snapshot.running
+            and snapshot.mode == "download"
+            and snapshot.query == work_id
+            and snapshot.status == "failed"
+        ):
+            return JSONResponse(
+                {"state": "failed", "error": snapshot.error or snapshot.message or "Import failed"}
+            )
+        return JSONResponse({"state": "idle"})
+
+    @app.get("/discover/blog/import", response_class=HTMLResponse)
+    def discover_blog_import_form(request: Request) -> HTMLResponse:
+        source = request.query_params.get("source", "").strip()[:2000]
+        entry = request.query_params.get("entry", "").strip()[:2000]
+        if not source:
+            raise HTTPException(400, "Blog source URL is required")
+        try:
+            source = normalize_blog_url(source)
+            target = normalize_blog_url(entry) if entry else source
+        except ValueError as exc:
+            raise HTTPException(400, str(exc)) from exc
+        blog_client = blog_factory(config)
+        try:
+            try:
+                fetched = _fetch_blog_preview(
+                    blog_client, target, source_mode="article" if entry else "auto"
+                )
+                preview_entries = _blog_preview_entries(fetched, target)
+                fetch_error = ""
+            except Exception as exc:
+                fetched = None
+                preview_entries = []
+                fetch_error = str(exc)
+        finally:
+            close = getattr(blog_client, "close", None)
+            if callable(close):
+                close()
+        with Database(config.paths.database) as db:
+            authors = [dict(row) for row in db.list_authors(tracked_only=True)]
+        return render(
+            request,
+            "discover_blog_import.html",
+            source_url=source,
+            entry_url=target if entry else "",
+            import_scope="entry" if entry else "whole",
+            fetched=fetched,
+            preview_entries=preview_entries,
+            fetch_error=fetch_error,
+            authors=authors,
+        )
+
+    @app.post("/discover/blog/import")
+    async def discover_blog_import(request: Request) -> RedirectResponse:
+        form = await request.form()
+        source = str(form.get("source", "")).strip()[:2000]
+        entry = str(form.get("entry", "")).strip()[:2000]
+        scope = str(form.get("scope", "whole")).strip().lower()
+        author_openalex_id = str(form.get("author_openalex_id", "")).strip()
+        new_author_name = clean_text(str(form.get("new_author_name", ""))) or ""
+        label = clean_text(str(form.get("label", ""))) or ""
+        relationship = clean_text(str(form.get("relationship", ""))) or ""
+        tags = _split_tags(str(form.get("tags", "")))
+        notes = str(form.get("notes", ""))
+        target = "/discover?mode=blog"
+        if source:
+            target += f"&q={quote_plus(source)}"
+        try:
+            normalized_source = normalize_blog_url(source)
+            normalized_entry = normalize_blog_url(entry) if entry else ""
+            if scope not in {"whole", "entry"}:
+                raise ValueError("Unknown blog import scope")
+            if scope == "entry" and not normalized_entry:
+                raise ValueError("Blog entry URL is required")
+            with Database(config.paths.database) as db:
+                if new_author_name:
+                    db.add_manual_author(new_author_name)
+                    matches = db.find_authors_by_name(new_author_name)
+                    if not matches:
+                        raise ValueError("Could not create author")
+                    author_openalex_id = str(matches[0]["openalex_id"])
+                elif not author_openalex_id:
+                    raise ValueError("Choose an author or enter a new author name")
+                else:
+                    author = db.get_author(author_openalex_id)
+                    if author is None or not author["tracked"]:
+                        raise ValueError("Author not found")
+
+            fetch_url = normalized_entry if scope == "entry" else normalized_source
+            blog_client = blog_factory(config)
+            try:
+                fetched = _fetch_blog_preview(
+                    blog_client,
+                    fetch_url,
+                    source_mode="article" if scope == "entry" else "auto",
+                )
+            finally:
+                close = getattr(blog_client, "close", None)
+                if callable(close):
+                    close()
+            with Database(config.paths.database) as db:
+                _, saved = _save_discovered_blog_fetch(
+                    db,
+                    author_openalex_id=author_openalex_id,
+                    source_url=fetch_url,
+                    fetched=fetched,
+                    label=label,
+                    relationship=relationship,
+                    tags=tags,
+                    notes=notes,
+                )
+        except Exception as exc:
+            return RedirectResponse(
+                _notice_url(target, f"Could not import blog: {exc}", level="error"),
+                status_code=303,
+            )
+        kind = "page" if scope == "entry" else "blog source"
+        return RedirectResponse(
+            _notice_url(
+                "/blogs",
+                f"Imported {kind} and stored {saved} entr{'y' if saved == 1 else 'ies'}.",
+            ),
+            status_code=303,
         )
 
     @app.get("/search")

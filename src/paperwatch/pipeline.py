@@ -236,35 +236,71 @@ def _stub_link_candidates(entry: Any) -> tuple[str, ...]:
     return tuple(candidates)
 
 
-def _stub_with_imported_page(
+def _stub_arxiv_candidates(entry: Any) -> tuple[str, ...]:
+    values = [str(entry["source_url"] or "")]
+    values.extend(_STUB_URL_RE.findall(str(entry["normalized_text"] or "")))
+    candidates: list[str] = []
+    seen_ids: set[str] = set()
+    for raw in values:
+        raw = raw.rstrip(".,;:!?")
+        arxiv_id = extract_arxiv_id(raw)
+        if not arxiv_id or arxiv_id in seen_ids:
+            continue
+        seen_ids.add(arxiv_id)
+        candidates.append(raw)
+    return tuple(candidates)
+
+
+def _stub_with_imported_pages(
     base_text: str,
     base_html: str | None,
-    article: ArticleItem,
+    articles: tuple[ArticleItem, ...],
 ) -> tuple[str, str | None, str]:
-    """Append a fetched article to a metadata-only record without duplicating it."""
     clean_base = base_text.split(IMPORTED_PAGE_MARKER, 1)[0].rstrip()
-    imported_text = article.text.strip()
-    combined_text = (
-        f"{clean_base}{IMPORTED_PAGE_MARKER}{imported_text}"[:1_000_000]
-    )
+    sections: list[str] = []
+    html_sections: list[str] = []
+    for article in articles:
+        imported_text = article.text.strip()
+        if imported_text:
+            sections.append(imported_text)
+        article_html = article.rendered_html or ""
+        source_link = (
+            '<p class="rss-source-link"><a href="'
+            + html.escape(article.url, quote=True)
+            + '" target="_blank" rel="noreferrer">Open imported page</a></p>'
+        )
+        html_sections.append(
+            '<section class="stub-imported-page-item">'
+            f"<h3>{html.escape(article.title)}</h3>{source_link}{article_html}</section>"
+        )
+    combined_text = clean_base
+    if sections:
+        combined_text = (
+            f"{clean_base}{IMPORTED_PAGE_MARKER}" + "\n\n".join(sections)
+        )[:1_000_000]
     clean_html = IMPORTED_PAGE_HTML.sub("", base_html or "").rstrip()
-    article_html = article.rendered_html or ""
-    source_link = (
-        '<p class="rss-source-link"><a href="'
-        + html.escape(article.url, quote=True)
-        + '" target="_blank" rel="noreferrer">Open imported page</a></p>'
-    )
-    imported_html = source_link + article_html
+    imported_html = "".join(html_sections)
     combined_html = (
         f'{clean_html}{"<hr>" if clean_html else ""}'
         f'<section class="stub-imported-page"><h2>Imported page content</h2>'
         f"{imported_html}</section>"
+        if imported_html
+        else (clean_html or None)
     )
     return (
         combined_text,
         combined_html,
         hashlib.sha256(combined_text.encode("utf-8")).hexdigest(),
     )
+
+
+def _stub_with_imported_page(
+    base_text: str,
+    base_html: str | None,
+    article: ArticleItem,
+) -> tuple[str, str | None, str]:
+    """Append one fetched article to a metadata-only record."""
+    return _stub_with_imported_pages(base_text, base_html, (article,))
 
 
 class PaperWatch:
@@ -457,17 +493,38 @@ class PaperWatch:
         )
 
     def _enrich_linked_blog_stubs(self, stats: RunStats) -> None:
-        """Expand recent metadata-only entries by fetching one article-like link."""
+        """Import every arXiv and article-like link from recent metadata stubs."""
         fetches = 0
         for entry in self.db.list_blog_stubs_for_enrichment():
             check_cancelled(self._cancel_event)
+            linked_paper_id = (
+                int(entry["linked_paper_id"])
+                if entry["linked_paper_id"] is not None
+                else None
+            )
+            linked_arxiv_id: str | None = None
+            if linked_paper_id is not None:
+                linked_paper = self.db.get_paper(linked_paper_id)
+                if linked_paper is not None:
+                    linked_arxiv_id = str(linked_paper["arxiv_id"] or "") or None
+
+            first_paper_id = linked_paper_id
+            for candidate in _stub_arxiv_candidates(entry):
+                candidate_arxiv_id = extract_arxiv_id(candidate)
+                if linked_arxiv_id and candidate_arxiv_id == linked_arxiv_id:
+                    continue
+                paper_id = self._import_arxiv_feed_item(
+                    stats, candidate, feed_title=str(entry["title"] or "")
+                )
+                if first_paper_id is None and paper_id is not None:
+                    first_paper_id = paper_id
+                    self.db.link_blog_entry_to_paper(int(entry["id"]), paper_id)
+
             candidates = _stub_link_candidates(entry)
-            if not candidates:
-                continue
-            article: ArticleItem | None = None
+            articles: list[ArticleItem] = []
             for candidate in candidates:
                 if fetches >= MAX_STUB_LINK_FETCHES:
-                    return
+                    break
                 fetches += 1
                 try:
                     article = self._fetch_stub_link(candidate, str(entry["title"] or ""))
@@ -476,13 +533,13 @@ class PaperWatch:
                 except (httpx.HTTPError, ValueError):
                     continue
                 if article is not None:
-                    break
-            if article is None:
+                    articles.append(article)
+            if not articles:
                 continue
-            combined_text, combined_html, combined_sha256 = _stub_with_imported_page(
+            combined_text, combined_html, combined_sha256 = _stub_with_imported_pages(
                 str(entry["normalized_text"] or ""),
                 str(entry["rendered_html"] or "") or None,
-                article,
+                tuple(articles),
             )
             self.db.update_blog_entry_content(
                 int(entry["id"]),
@@ -491,7 +548,7 @@ class PaperWatch:
                 rendered_html=combined_html,
                 published_at=article.published_at,
             )
-            stats.blog_items_downloaded += 1
+            stats.blog_items_downloaded += len(articles)
             self._publish_run_stats(stats)
 
     @staticmethod
@@ -560,10 +617,17 @@ class PaperWatch:
             parsed = httpx.URL(url)
         except (TypeError, ValueError):
             return None
-        if parsed.host not in {"arxiv.org", "www.arxiv.org", "export.arxiv.org"}:
-            return None
         arxiv_id = extract_arxiv_id(url)
         if not arxiv_id:
+            return None
+        if parsed.host not in {
+            "arxiv.org",
+            "www.arxiv.org",
+            "export.arxiv.org",
+            "doi.org",
+            "www.doi.org",
+            "dx.doi.org",
+        }:
             return None
 
         entry = None

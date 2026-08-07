@@ -8,6 +8,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 import re
 from typing import Any, Iterable, Iterator
+from urllib.parse import urlsplit
 
 from .models import (
     AuthorCandidate,
@@ -81,6 +82,22 @@ def _blog_entry_is_stub(
             continue
         meaningful.append(lower)
     return 0 if meaningful else 1
+
+
+def _url_search_key(value: object) -> str:
+    raw = str(value or "").strip().casefold()
+    if not raw:
+        return ""
+    candidate = raw if "://" in raw else f"https://{raw}"
+    try:
+        parsed = urlsplit(candidate)
+    except ValueError:
+        return raw.rstrip("/")
+    host = (parsed.hostname or "").removeprefix("www.").rstrip(".")
+    if not host:
+        return raw.rstrip("/")
+    path = re.sub(r"/+", "/", parsed.path or "").rstrip("/")
+    return f"{host}{path}"
 
 
 def utcnow() -> str:
@@ -530,6 +547,12 @@ class Database:
             "paperwatch_blog_stub",
             4,
             _blog_entry_is_stub,
+            deterministic=True,
+        )
+        self._conn.create_function(
+            "paperwatch_url_key",
+            1,
+            _url_search_key,
             deterministic=True,
         )
         self._conn.execute("PRAGMA foreign_keys = ON")
@@ -2771,6 +2794,18 @@ class Database:
             ).fetchone()
         return None
 
+    def find_paper(self, paper: PaperRecord) -> sqlite3.Row | None:
+        row = self._find_existing_paper(paper)
+        return row if row is not None and not row["dead"] else None
+
+    def get_paper_by_openalex_id(self, openalex_id: str) -> sqlite3.Row | None:
+        identifier = short_openalex_id(openalex_id)
+        if not identifier or not identifier.startswith("W"):
+            return None
+        return self._conn.execute(
+            "SELECT * FROM papers WHERE openalex_id=? AND dead=0", (identifier,)
+        ).fetchone()
+
     def upsert_paper(
         self, paper: PaperRecord, *, auto_analyze: bool = True
     ) -> tuple[int, bool]:
@@ -3761,9 +3796,15 @@ class Database:
                 "OR EXISTS (SELECT 1 FROM author_tag_links atl3 "
                 "JOIN author_tags at3 ON at3.id=atl3.tag_id "
                 "WHERE atl3.author_id=a.id "
-                "AND at3.name LIKE ? ESCAPE '\\' COLLATE NOCASE))"
+                "AND at3.name LIKE ? ESCAPE '\\' COLLATE NOCASE) "
+                "OR EXISTS (SELECT 1 FROM author_blogs abq "
+                "JOIN blogs bq ON bq.id=abq.blog_id "
+                "WHERE abq.author_id=a.id AND bq.dead=0 AND ("
+                "bq.url LIKE ? ESCAPE '\\' COLLATE NOCASE "
+                "OR paperwatch_url_key(bq.url) LIKE '%' || paperwatch_url_key(?) || '%' "
+                "OR paperwatch_url_key(?) LIKE '%' || paperwatch_url_key(bq.url) || '%')))"
             )
-            params.extend([term, term, term, term, term])
+            params.extend([term, term, term, term, term, term, query, query])
         if starred is not None:
             where.append("a.starred=?")
             params.append(1 if starred else 0)
@@ -3792,7 +3833,10 @@ class Database:
                      FROM paper_authors pa
                      WHERE pa.tracked_author_id=a.id) AS paper_count,
                     (SELECT count(*) FROM author_blogs ab
-                     WHERE ab.author_id=a.id) AS blog_count
+                     WHERE ab.author_id=a.id) AS blog_count,
+                    COALESCE((SELECT group_concat(b.url, ' ') FROM author_blogs ab4
+                        JOIN blogs b ON b.id=ab4.blog_id
+                        WHERE ab4.author_id=a.id AND b.dead=0), '') AS blog_urls
                 FROM authors a
                 {where_sql}
                 ORDER BY a.name COLLATE NOCASE

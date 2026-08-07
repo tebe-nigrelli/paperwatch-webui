@@ -11,8 +11,10 @@ from fastapi.testclient import TestClient
 from pypdf import PdfWriter
 
 from paperwatch.analysis_jobs import AnalysisBatchSnapshot
+from paperwatch.blogs import BlogFetch, FeedItem
 from paperwatch.db import Database
 from paperwatch.models import AuthorCandidate, PaperRecord, stable_hash
+from paperwatch.sources.arxiv import ArxivEntry
 from paperwatch.web import (
     RunController,
     RunSnapshot,
@@ -62,7 +64,7 @@ class StubController:
         self.modes: list[str] = []
         self.state = snapshot or RunSnapshot()
 
-    def start(self, mode: str = "run") -> bool:
+    def start(self, mode: str = "run", query: str | None = None) -> bool:
         self.modes.append(mode)
         value = self.starts[min(self.calls, len(self.starts) - 1)]
         self.calls += 1
@@ -70,6 +72,7 @@ class StubController:
             self.state = RunSnapshot(
                 running=True,
                 mode=mode,
+                query=query,
                 started_at="2026-07-25T10:00:00+00:00",
                 status="running",
             )
@@ -182,7 +185,15 @@ def valid_pdf_bytes() -> bytes:
     return stream.getvalue()
 
 
-def make_client(config_path, *, controller=None, analysis_controller=None, fake=None):
+def make_client(
+    config_path,
+    *,
+    controller=None,
+    analysis_controller=None,
+    fake=None,
+    arxiv=None,
+    blog_factory=None,
+):
     instances = []
 
     def factory(_config):
@@ -195,6 +206,8 @@ def make_client(config_path, *, controller=None, analysis_controller=None, fake=
         run_controller=controller or StubController(),
         analysis_controller=analysis_controller or StubAnalysisController(),
         author_client_factory=factory,
+        arxiv_client_factory=(lambda _config: arxiv) if arxiv is not None else None,
+        blog_client_factory=blog_factory,
     )
     return TestClient(app), instances
 
@@ -1014,8 +1027,16 @@ def test_recent_search_lists_matches_before_download(
     assert "Find on OpenAlex" in discover.text
     assert 'class="discover-mode-option active" href="/discover?mode=paper"' in discover.text
     assert 'class="discover-mode-option" href="/discover?mode=author"' in discover.text
-    assert "Import PDF" in discover.text
+    assert 'class="discover-mode-option" href="/discover?mode=blog"' in discover.text
+    assert "Import PDF" not in discover.text
     assert "Backfill 1 year" in discover.text
+    nav = discover.text.split('<nav aria-label="Primary navigation">', 1)[1].split("</nav>", 1)[0]
+    assert nav.index('href="/"') < nav.index('href="/authors"')
+    assert nav.index('href="/authors"') < nav.index('href="/queries"')
+    assert nav.index('href="/queries"') < nav.index('href="/discover"')
+    assert nav.index('href="/discover"') < nav.index('href="/runs"')
+    assert nav.index('href="/runs"') < nav.index('href="/data"')
+    assert '>Run</a>' in nav
 
     response = client.get(
         "/discover",
@@ -1024,9 +1045,72 @@ def test_recent_search_lists_matches_before_download(
     assert response.status_code == 200
     assert fake.work_searches == [("Minimal Agents for Reliable Machine Learning", 100)]
     assert paper_record.title in response.text
-    assert 'method="post" action="/actions/download"' in response.text
-    assert f'name="work_id" value="{paper_record.openalex_id}"' in response.text
+    assert "Open imported source" in response.text
+    assert f'/papers/{seeded_web[1]}' in response.text
+    assert "discover-paper-downloaded" in response.text
     assert controller.modes == []
+
+
+@pytest.mark.parametrize(
+    "query",
+    [
+        "2411.00678",
+        "arXiv:2411.00678v3",
+        "https://arxiv.org/abs/2411.00678",
+        "https://arxiv.org/pdf/2411.00678v3.pdf",
+        "https://doi.org/10.48550/arXiv.2411.00678",
+        "10.48550/arXiv.2411.00678",
+    ],
+)
+def test_discover_resolves_arxiv_formats_via_arxiv_then_openalex(
+    config_path, seeded_web, paper_record, query
+):
+    class PaperSearchClient(FakeAuthorClient):
+        def __init__(self):
+            super().__init__()
+            self.doi_lookups = []
+            self.work_searches = []
+
+        def get_work_by_doi(self, doi):
+            self.doi_lookups.append(doi)
+            raise RuntimeError("not indexed by arXiv DOI")
+
+        def search_works(self, value, limit=10):
+            self.work_searches.append((value, limit))
+            return [paper_record]
+
+    class FakeArxivClient:
+        def __init__(self):
+            self.ids = []
+            self.closed = False
+
+        def by_id(self, arxiv_id):
+            self.ids.append(arxiv_id)
+            return ArxivEntry(
+                arxiv_id=arxiv_id,
+                title=paper_record.title,
+                abstract=paper_record.abstract or "Abstract",
+                authors=[author.name for author in paper_record.authors],
+                published=paper_record.publication_date,
+                updated=paper_record.updated_date,
+                abstract_url=f"https://arxiv.org/abs/{arxiv_id}",
+                pdf_url=f"https://arxiv.org/pdf/{arxiv_id}",
+            )
+
+        def close(self):
+            self.closed = True
+
+    openalex = PaperSearchClient()
+    arxiv = FakeArxivClient()
+    client, _ = make_client(config_path, fake=openalex, arxiv=arxiv)
+    response = client.get("/discover", params={"mode": "paper", "q": query})
+
+    assert response.status_code == 200
+    assert paper_record.title in response.text
+    assert openalex.doi_lookups == ["10.48550/arXiv.2411.00678"]
+    assert openalex.work_searches == [(paper_record.title, 100)]
+    assert arxiv.ids == ["2411.00678"]
+    assert arxiv.closed is True
 
 
 def test_paper_search_error_and_empty_query(config_path, seeded_web):
@@ -1485,3 +1569,256 @@ def test_fetch_button_toggles_to_cancel_and_running_page_is_live(config_path):
     assert response.headers["location"] == "/"
     assert controller.cancelled is True
     assert "Fetch cancellation requested" not in client.get("/").text
+
+
+def test_discover_paper_preview_and_async_import_state(
+    config_path, seeded_web, paper_record
+):
+    novel = replace(
+        paper_record,
+        openalex_id="W888",
+        doi="10.1000/novel",
+        arxiv_id=None,
+        title="A Novel Discover Preview Paper",
+    )
+
+    class PaperDiscoveryClient(FakeAuthorClient):
+        def search_works(self, query, limit=10):
+            assert query == "Novel preview"
+            return [novel]
+
+        def get_work(self, work_id):
+            assert work_id == "W888"
+            return novel
+
+    controller = StubController()
+    client, _ = make_client(
+        config_path, controller=controller, fake=PaperDiscoveryClient()
+    )
+    results = client.get("/discover", params={"mode": "paper", "q": "Novel preview"})
+    assert results.status_code == 200
+    assert "/discover/paper?work_id=W888" in results.text
+    assert 'action="/api/discover/paper-import"' in results.text
+    assert ">Import</button>" in results.text
+
+    preview = client.get(
+        "/discover/paper", params={"work_id": "W888", "q": "Novel preview"}
+    )
+    assert preview.status_code == 200
+    assert "OpenAlex preview" in preview.text
+    assert novel.abstract in preview.text
+    assert 'action="/api/discover/paper-import"' in preview.text
+
+    started = client.post("/api/discover/paper-import", data={"work_id": "W888"})
+    assert started.status_code == 202
+    assert started.json() == {"state": "importing"}
+    assert controller.state.query == "W888"
+    assert client.get(
+        "/api/discover/paper-import-status", params={"work_id": "W888"}
+    ).json() == {"state": "importing"}
+
+    config = seeded_web[0]
+    pdf = config.paths.pdf_dir / "discover-novel.pdf"
+    pdf.write_bytes(valid_pdf_bytes())
+    with Database(config.paths.database) as db:
+        paper_id, _ = db.upsert_paper(novel)
+        db.set_local_pdf(paper_id, str(pdf))
+    controller.state = RunSnapshot(
+        running=False,
+        mode="download",
+        query="W888",
+        paper_id=paper_id,
+        status="success",
+    )
+    finished = client.get(
+        "/api/discover/paper-import-status", params={"work_id": "W888"}
+    )
+    assert finished.json() == {
+        "state": "imported",
+        "paper_id": paper_id,
+        "url": f"/papers/{paper_id}",
+    }
+
+    refreshed = client.get(
+        "/discover", params={"mode": "paper", "q": "Novel preview"}
+    )
+    assert "discover-paper-downloaded" in refreshed.text
+    assert "Open imported source" in refreshed.text
+
+
+def test_discover_blog_previews_and_imports_source_or_single_page(
+    config_path, seeded_web, monkeypatch
+):
+    source_url = "https://example.com/blog"
+    post_url = "https://example.com/blog/post-one"
+    feed_item = FeedItem(
+        external_id="post-one",
+        title="Post One",
+        url=post_url,
+        published_at="2026-08-01",
+        text="A useful preview of the first post.",
+        sha256=stable_hash("A useful preview of the first post."),
+    )
+
+    def fake_fetch_blog(_client, row):
+        if row["source_mode"] == "article":
+            text = f"Title: Post One\nURL: {post_url}\n\nComplete post body."
+            return BlogFetch(
+                method="snapshot",
+                title="Post One",
+                status_code=200,
+                snapshot_text=text,
+                snapshot_sha256=stable_hash(text),
+                snapshot_published_at="2026-08-01",
+                source_mode="article",
+            )
+        return BlogFetch(
+            method="rss",
+            title="Example Blog",
+            status_code=200,
+            feed_url="https://example.com/feed.xml",
+            discovery_checked=True,
+            feed_items=(feed_item,),
+            source_mode="feed",
+        )
+
+    class DummyBlogClient:
+        def close(self):
+            pass
+
+    monkeypatch.setattr("paperwatch.web.fetch_blog", fake_fetch_blog)
+    client, _ = make_client(
+        config_path, blog_factory=lambda _config: DummyBlogClient()
+    )
+
+    preview = client.get("/discover", params={"mode": "blog", "q": source_url})
+    assert preview.status_code == 200
+    assert 'href="/discover?mode=blog"' in preview.text
+    assert "Example Blog" in preview.text
+    assert "Post One" in preview.text
+    assert "Import whole blog" in preview.text
+    assert "Review &amp; import" in preview.text
+
+    whole_form = client.get("/discover/blog/import", params={"source": source_url})
+    assert whole_form.status_code == 200
+    assert "Import whole blog" in whole_form.text
+    assert "Ada Lovelace" in whole_form.text
+
+    whole_import = client.post(
+        "/discover/blog/import",
+        data={
+            "source": source_url,
+            "scope": "whole",
+            "author_openalex_id": "A123",
+            "label": "Example research blog",
+            "tags": "research, example",
+        },
+        follow_redirects=False,
+    )
+    assert whole_import.status_code == 303
+    assert whole_import.headers["location"].startswith("/blogs?")
+    with Database(seeded_web[0].paths.database) as db:
+        blogs = db.author_blogs("A123")
+        assert any(row["url"] == source_url for row in blogs)
+        assert db.count_blog_entries() >= 1
+
+    entry_form = client.get(
+        "/discover/blog/import", params={"source": source_url, "entry": post_url}
+    )
+    assert entry_form.status_code == 200
+    assert "Import page" in entry_form.text
+    assert "Complete post body" in entry_form.text
+
+    entry_import = client.post(
+        "/discover/blog/import",
+        data={
+            "source": source_url,
+            "entry": post_url,
+            "scope": "entry",
+            "new_author_name": "Example Team",
+            "notes": "Imported from Discover",
+        },
+        follow_redirects=False,
+    )
+    assert entry_import.status_code == 303
+    with Database(seeded_web[0].paths.database) as db:
+        created = db.find_authors_by_name("Example Team")
+        assert created
+        blogs = db.author_blogs(str(created[0]["openalex_id"]))
+        assert any(row["url"] == post_url for row in blogs)
+
+
+def test_import_paper_accepts_arxiv_link_and_downloads_pdf(
+    config_path, seeded_web, monkeypatch
+):
+    class FakeArxivClient:
+        def __init__(self):
+            self.ids: list[str] = []
+            self.closed = False
+
+        def by_id(self, arxiv_id: str):
+            self.ids.append(arxiv_id)
+            return ArxivEntry(
+                arxiv_id=arxiv_id,
+                title="Direct arXiv Import",
+                abstract="Imported from an arXiv URL.",
+                authors=["Ada Lovelace", "Grace Hopper"],
+                published="2026-07-01",
+                updated="2026-07-02",
+                abstract_url=f"https://arxiv.org/abs/{arxiv_id}",
+                pdf_url=f"https://arxiv.org/pdf/{arxiv_id}",
+            )
+
+        def close(self):
+            self.closed = True
+
+    arxiv = FakeArxivClient()
+    client, _ = make_client(config_path, arxiv=arxiv)
+    source = "https://arxiv.org/abs/2607.12345v2"
+    selected = client.get("/papers/import", params={"q": source})
+    assert selected.status_code == 200
+    assert "Direct arXiv Import" in selected.text
+    assert f'name="remote_reference" value="{source}"' in selected.text
+
+    def fake_download(url, destination, **_kwargs):
+        assert url == "https://arxiv.org/pdf/2607.12345"
+        destination.write_bytes(valid_pdf_bytes())
+        return True
+
+    monkeypatch.setattr("paperwatch.web.download_pdf", fake_download)
+    imported = client.post(
+        "/papers/import",
+        data={"remote_reference": source, "tags": "linked"},
+        follow_redirects=False,
+    )
+    assert imported.status_code == 303
+    paper_id = int(imported.headers["location"].split("/papers/", 1)[1].split("?", 1)[0])
+    with Database(seeded_web[0].paths.database) as db:
+        paper = db.get_paper(paper_id)
+        assert paper["arxiv_id"] == "2607.12345"
+        assert Path(paper["local_pdf_path"]).is_file()
+        assert "linked" in {row["name"] for row in db.paper_tags(paper_id)}
+    assert arxiv.ids == ["2607.12345", "2607.12345"]
+    assert arxiv.closed is True
+
+
+def test_import_paper_search_results_are_clickable(config_path, seeded_web, paper_record):
+    class PaperImportClient(FakeAuthorClient):
+        def search_works(self, query, limit=10):
+            assert query == "Minimal Agents"
+            assert limit == 25
+            return [paper_record]
+
+        def get_work(self, work_id):
+            assert work_id == paper_record.openalex_id
+            return paper_record
+
+    client, _ = make_client(config_path, fake=PaperImportClient())
+    results = client.get("/papers/import", params={"q": "Minimal Agents"})
+    assert results.status_code == 200
+    target = f"/papers/import?source={paper_record.openalex_id}"
+    assert target in results.text
+    selected = client.get(target)
+    assert selected.status_code == 200
+    assert paper_record.title in selected.text
+    assert f'name="remote_reference" value="{paper_record.openalex_id}"' in selected.text

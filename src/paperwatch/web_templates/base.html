@@ -15,10 +15,10 @@
     <nav aria-label="Primary navigation">
       <a href="/" data-content-home-link>Content</a>
       <a href="/authors">Authors</a>
-      <a href="/data">Data</a>
-      <a href="/discover">Discover</a>
       <a href="/queries">Queries</a>
-      <a href="/runs">Runs</a>
+      <a href="/discover">Discover</a>
+      <a href="/runs">Run</a>
+      <a href="/data">Data</a>
     </nav>
     <form method="post" action="/actions/run" class="header-fetch-form">
       <button class="button {{ 'button-danger' if run_state.running else 'button-primary' }} button-small" type="submit" title="{{ 'Request cancellation after the current fetch or model step.' if run_state.running else 'Fetch new papers, download available PDFs, retry recent missing PDFs, and check linked RSS/Atom feeds and blog snapshots. Models run only for queries checked under New papers or New blog entries. Click again while running to stop.' }}" aria-label="{{ 'Stop fetch: request cancellation after the current step' if run_state.running else 'Fetch now: papers, PDFs, and blogs; run only selected automatic queries' }}">{{ 'Stop fetch' if run_state.running else 'Fetch now' }}</button>

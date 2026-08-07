@@ -42,6 +42,63 @@ def test_search_and_get_author_use_api_key(openalex_author_json):
     assert seen[0].url.params["search"] == "Ada Lovelace"
 
 
+@pytest.mark.parametrize(
+    "query",
+    [
+        "10.1000/example",
+        "doi:10.1000/example",
+        "https://doi.org/10.1000/example",
+    ],
+)
+def test_work_search_resolves_doi_formats_directly(query, openalex_work_json):
+    seen = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request)
+        return httpx.Response(200, json=openalex_work_json)
+
+    api = OpenAlexClient(
+        api_key="secret",
+        base_url="https://openalex.test",
+        client=httpx.Client(transport=httpx.MockTransport(handler)),
+    )
+    assert api.search_works(query)[0].openalex_id == "W456"
+    assert len(seen) == 1
+    assert seen[0].url.path.endswith("/works/https://doi.org/10.1000/example")
+
+
+@pytest.mark.parametrize(
+    "query",
+    [
+        "2411.00678",
+        "arXiv:2411.00678v3",
+        "https://arxiv.org/abs/2411.00678",
+        "https://arxiv.org/pdf/2411.00678v3.pdf",
+        "https://doi.org/10.48550/arXiv.2411.00678",
+        "10.48550/arXiv.2411.00678",
+    ],
+)
+def test_work_search_resolves_arxiv_formats_via_canonical_doi(
+    query, openalex_work_json
+):
+    seen = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request)
+        return httpx.Response(200, json=openalex_work_json)
+
+    api = OpenAlexClient(
+        api_key="secret",
+        base_url="https://openalex.test",
+        client=httpx.Client(transport=httpx.MockTransport(handler)),
+    )
+    assert api.search_works(query)[0].openalex_id == "W456"
+    assert len(seen) == 1
+    assert seen[0].url.path.endswith(
+        "/works/https://doi.org/10.48550/arXiv.2411.00678"
+    )
+
+
 def test_recent_works_pages_and_passes_date(openalex_work_json):
     requests = []
 

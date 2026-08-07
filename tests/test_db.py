@@ -410,6 +410,20 @@ def test_author_tags_filter_suggestions_and_cleanup(tmp_path, author_candidate):
         assert [row["name"] for row in db.list_authors_with_tags(query="theory")] == [
             "Ada Lovelace"
         ]
+        db.add_author_blog("A123", "https://www.example.com/research/blog/")
+        assert [
+            row["name"]
+            for row in db.list_authors_with_tags(query="example.com/research/blog")
+        ] == ["Ada Lovelace"]
+        assert [
+            row["name"]
+            for row in db.list_authors_with_tags(
+                query="https://example.com/research/blog/posts/new-result?ref=feed"
+            )
+        ] == ["Ada Lovelace"]
+        assert "example.com/research/blog" in db.list_authors_with_tags(query="Ada")[0][
+            "blog_urls"
+        ]
         assert db.list_authors_with_tags(query="100%_missing") == []
         tags = {row["name"]: row["author_count"] for row in db.list_tags()}
         assert tags == {"ML": 2, "theory": 1}

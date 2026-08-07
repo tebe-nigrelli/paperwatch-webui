@@ -1,0 +1,23 @@
+{% extends "base.html" %}
+{% block title %}{{ paper.title }} · Discover · paperwatch{% endblock %}
+{% block content %}
+<section class="page-heading split">
+  <div><p><a href="/discover?mode=paper{% if paper_query %}&q={{ paper_query|urlencode }}{% endif %}">← Back to paper results</a></p><h1>{{ paper.title }}</h1><p>{{ paper.venue or 'Venue unavailable' }}{% if paper.publication_date %} · {{ paper.publication_date }}{% endif %}</p></div>
+  <div class="button-group" data-discover-preview-actions>
+    {% if result.downloaded %}<a class="button button-primary" href="{{ result.local_url }}">Open imported source</a>
+    {% else %}<form method="post" action="/api/discover/paper-import" data-discover-paper-import data-work-id="{{ result.openalex_id }}"><input type="hidden" name="work_id" value="{{ result.openalex_id }}"><button class="button button-primary" type="submit" {% if run_state.running and run_state.mode == 'download' and run_state.query == result.openalex_id %}disabled{% endif %}>{% if run_state.running and run_state.mode == 'download' and run_state.query == result.openalex_id %}Importing…{% else %}Import{% endif %}</button><small class="discover-import-error" data-import-error></small></form>{% endif %}
+  </div>
+</section>
+
+<section class="panel discover-paper-preview">
+  <div class="panel-heading"><div><h2>OpenAlex preview</h2><p>{{ paper.openalex_id }}</p></div><div class="external-links">{% if paper.publication_url %}<a href="{{ paper.publication_url }}" target="_blank" rel="noreferrer">Publication</a>{% endif %}{% if paper.pdf_url %}<a href="{{ paper.pdf_url }}" target="_blank" rel="noreferrer">PDF</a>{% endif %}<a href="https://openalex.org/works/{{ paper.openalex_id|lower }}" target="_blank" rel="noreferrer">OpenAlex</a></div></div>
+  <dl class="metadata-grid">
+    <div><dt>Authors</dt><dd>{% for author in paper.authors %}{{ author.name }}{% if not loop.last %}, {% endif %}{% else %}Unknown{% endfor %}</dd></div>
+    <div><dt>DOI</dt><dd>{{ paper.doi or '—' }}</dd></div>
+    <div><dt>arXiv</dt><dd>{{ paper.arxiv_id or '—' }}</dd></div>
+    <div><dt>Published</dt><dd>{{ paper.publication_date or '—' }}</dd></div>
+  </dl>
+  <div class="prose"><h3>Abstract</h3>{% if paper.abstract %}<p>{{ paper.abstract }}</p>{% else %}<p class="muted">OpenAlex does not provide an abstract for this result.</p>{% endif %}</div>
+  {% if paper.topics %}<div><h3>Topics</h3><div class="tag-list">{% for topic in paper.topics %}<span class="tag">{{ topic.name }}</span>{% endfor %}</div></div>{% endif %}
+</section>
+{% endblock %}

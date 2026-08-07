@@ -27,6 +27,46 @@ def test_identifier_normalization():
     assert extract_arxiv_id("arXiv:cs/0701001v3") == "cs/0701001"
 
 
+@pytest.mark.parametrize(
+    "value, expected",
+    [
+        ("2411.00678", "2411.00678"),
+        ("2411.00678v3", "2411.00678"),
+        ("arXiv:2411.00678", "2411.00678"),
+        ("https://arxiv.org/abs/2411.00678", "2411.00678"),
+        ("https://www.arxiv.org/abs/2411.00678v3", "2411.00678"),
+        ("https://export.arxiv.org/abs/2411.00678", "2411.00678"),
+        ("https://arxiv.org/pdf/2411.00678.pdf", "2411.00678"),
+        ("https://arxiv.org/pdf/2411.00678v3.pdf", "2411.00678"),
+        ("https://arxiv.org/html/2411.00678", "2411.00678"),
+        ("https://doi.org/10.48550/arXiv.2411.00678", "2411.00678"),
+        ("doi:10.48550/arXiv.2411.00678", "2411.00678"),
+        ("10.48550/arXiv.2411.00678", "2411.00678"),
+        ("hep-th/9901001", "hep-th/9901001"),
+        ("arXiv:hep-th/9901001v2", "hep-th/9901001"),
+        ("https://arxiv.org/abs/math.GT/0309136", "math.GT/0309136"),
+        ("10.48550/arXiv.math.GT/0309136", "math.GT/0309136"),
+    ],
+)
+def test_arxiv_identifier_formats(value, expected):
+    assert extract_arxiv_id(value) == expected
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "10.1000/Example",
+        "doi:10.1000/Example",
+        "DOI 10.1000/Example",
+        "https://doi.org/10.1000/Example",
+        "http://dx.doi.org/10.1000/Example",
+        "https://www.doi.org/10.1000/Example",
+    ],
+)
+def test_doi_identifier_formats(value):
+    assert strip_doi(value) == "10.1000/Example"
+
+
 def test_title_normalization():
     assert normalize_title("  Minimal—Agents: Reliable ML! ") == "minimal agents reliable ml"
 

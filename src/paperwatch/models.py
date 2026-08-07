@@ -13,10 +13,17 @@ from pydantic import AfterValidator, BaseModel, ConfigDict, Field, field_validat
 
 SPACE_RE = re.compile(r"\s+")
 NON_WORD_RE = re.compile(r"[\W_]+", re.UNICODE)
+ARXIV_ID_PATTERN = r"(?:[a-z][a-z0-9.\-]*/\d{7}|\d{4}\.\d{4,5})"
 ARXIV_RE = re.compile(
-    r"(?:arxiv\.org/(?:abs|pdf)/|arxiv:)([a-z-]+(?:\.[A-Z]{2})?/\d{7}|\d{4}\.\d{4,5})(?:v\d+)?",
+    rf"(?:"
+    rf"(?:https?://)?(?:www\.|export\.)?arxiv\.org/(?:abs|pdf|html|format)/"
+    rf"|arxiv\s*:\s*"
+    rf"|10\.48550/arxiv\."
+    rf"|arxiv\."
+    rf")({ARXIV_ID_PATTERN})(?:v\d+)?(?:\.pdf)?",
     re.I,
 )
+BARE_ARXIV_RE = re.compile(rf"^({ARXIV_ID_PATTERN})(?:v\d+)?(?:\.pdf)?$", re.I)
 
 
 def clean_text(value: str | None) -> str | None:
@@ -40,17 +47,33 @@ def short_openalex_id(value: str | None) -> str | None:
 def strip_doi(value: str | None) -> str | None:
     if not value:
         return None
-    cleaned = value.strip()
-    cleaned = re.sub(r"^https?://(?:dx\.)?doi\.org/", "", cleaned, flags=re.I)
-    cleaned = re.sub(r"^doi:\s*", "", cleaned, flags=re.I)
-    return cleaned.strip() or None
+    cleaned = value.strip().strip("<>[]{}")
+    cleaned = re.sub(
+        r"^https?://(?:(?:dx|www)\.)?doi\.org/", "", cleaned, flags=re.I
+    )
+    cleaned = re.sub(r"^doi\s*:?\s*", "", cleaned, flags=re.I)
+    return cleaned.strip().rstrip(".,;") or None
 
 
 def extract_arxiv_id(*values: str | None) -> str | None:
     for value in values:
         if not value:
             continue
-        match = ARXIV_RE.search(value)
+        cleaned = value.strip().strip("<>[]{}")
+        # An arXiv-issued DataCite DOI is just another representation of the
+        # arXiv identifier. Normalizing the DOI first also handles doi: and
+        # doi.org URL prefixes.
+        doi = strip_doi(cleaned)
+        candidates = [cleaned]
+        if doi and doi != cleaned:
+            candidates.append(doi)
+        match = None
+        for candidate in candidates:
+            match = ARXIV_RE.search(candidate)
+            if match is not None:
+                break
+        if match is None:
+            match = BARE_ARXIV_RE.fullmatch(cleaned)
         if match:
             return re.sub(r"v\d+$", "", match.group(1), flags=re.I)
     return None

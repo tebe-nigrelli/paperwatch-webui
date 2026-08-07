@@ -1,0 +1,28 @@
+{% extends "base.html" %}
+{% block title %}Import blog content · paperwatch{% endblock %}
+{% block content %}
+<section class="page-heading"><p><a href="/discover?mode=blog&q={{ source_url|urlencode }}">← Back to blog preview</a></p><h1>{% if import_scope == 'entry' %}Import page{% else %}Import whole blog{% endif %}</h1><p>Review the source and choose who it belongs to before importing.</p></section>
+
+{% if fetch_error %}<div class="notice notice-error">Could not preview this source: {{ fetch_error }}</div>{% endif %}
+
+<section class="panel">
+  <div class="panel-heading"><div><h2>{{ fetched.title if fetched else (entry_url or source_url) }}</h2><p>{{ entry_url or source_url }}</p></div></div>
+  {% if preview_entries %}<div class="discover-blog-import-preview">{% for item in preview_entries[:8] %}<article><h3>{{ item.title }}</h3><p class="muted">{{ item.published_at or 'Date unavailable' }} · {{ item.url }}</p>{% if item.summary %}<p>{{ item.summary }}</p>{% endif %}</article>{% endfor %}</div>{% endif %}
+</section>
+
+<section class="panel">
+  <div class="panel-heading"><div><h2>Import details</h2><p>Choose an existing tracked author or enter a new blog-only author.</p></div></div>
+  <form method="post" action="/discover/blog/import" class="stacked-form">
+    <input type="hidden" name="source" value="{{ source_url }}">
+    <input type="hidden" name="entry" value="{{ entry_url }}">
+    <input type="hidden" name="scope" value="{{ import_scope }}">
+    <label><span>Existing author</span><select name="author_openalex_id"><option value="">Choose an author</option>{% for author in authors %}<option value="{{ author.openalex_id }}">{{ author.name }}{% if author.institution %} · {{ author.institution }}{% endif %}</option>{% endfor %}</select></label>
+    <label><span>Or create blog-only author</span><input name="new_author_name" maxlength="300" placeholder="Author or organization name"></label>
+    <label><span>Label</span><input name="label" maxlength="300" value="{{ fetched.title if fetched else '' }}" placeholder="Optional source label"></label>
+    <label><span>Relationship</span><input name="relationship" maxlength="300" placeholder="Personal blog, lab news, publications…"></label>
+    <label><span>Tags</span><input name="tags" placeholder="Comma-separated tags"></label>
+    <label><span>Notes</span><textarea name="notes" rows="4" maxlength="200000"></textarea></label>
+    <div class="button-group"><button class="button button-primary" type="submit" {% if fetch_error %}disabled{% endif %}>{% if import_scope == 'entry' %}Import page{% else %}Import whole blog{% endif %}</button><a class="button" href="/discover?mode=blog&q={{ source_url|urlencode }}">Cancel</a></div>
+  </form>
+</section>
+{% endblock %}

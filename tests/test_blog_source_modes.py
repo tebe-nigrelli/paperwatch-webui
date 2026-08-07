@@ -348,6 +348,42 @@ def test_article_index_publications_docs_and_selector_fetch(monkeypatch):
         "https://doi.org/10.1/paper"
     ]
 
+
+def test_aggressive_auto_blog_discovery_crawls_non_index_page_and_more_articles():
+    links = "".join(
+        f"<article><a href='/writing/post-{index}'>Research note number {index}</a>"
+        f"<p>Detailed research update {index}</p></article>"
+        for index in range(12)
+    )
+    listing = f"<html><head><title>Alice</title></head><body><main>{links}</main></body></html>"
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/alice":
+            return httpx.Response(200, headers={"content-type": "text/html"}, text=listing)
+        if request.url.path.startswith("/writing/post-"):
+            return httpx.Response(
+                200,
+                headers={"content-type": "text/html"},
+                text=f"<article><h1>{request.url.path}</h1><p>Complete article body.</p></article>",
+            )
+        return httpx.Response(404, headers={"content-type": "text/html"}, text="missing")
+
+    with httpx.Client(transport=httpx.MockTransport(handler)) as client:
+        fetched = blogs.fetch_blog(
+            client,
+            {
+                "url": "https://example.com/alice",
+                "source_mode": "auto",
+                "_aggressive_discovery": True,
+                "_feed_candidate_limit": 16,
+                "_article_fetch_limit": 24,
+            },
+        )
+
+    assert fetched.source_mode == "article_index"
+    assert len(fetched.discovered_articles) == 12
+    assert len(fetched.article_items) == 12
+
     with httpx.Client(
         transport=httpx.MockTransport(
             lambda request: httpx.Response(

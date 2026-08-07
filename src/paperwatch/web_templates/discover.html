@@ -2,32 +2,34 @@
 {% block title %}Discover · paperwatch{% endblock %}
 {% block content %}
 <section class="page-heading split">
-  <div><h1>Discover</h1><p>Find papers and authors on OpenAlex, import a local PDF, or backfill the previous year.</p></div>
+  <div><h1>Discover</h1><p>Search OpenAlex papers and authors, or discover and import blog sources.</p></div>
   <div class="button-group">
-    <a class="button button-primary" href="/papers/import">Import PDF</a>
     <form method="post" action="/actions/backfill" data-confirm="Fetch the previous 365 days and download every available open PDF? Historical papers will not be summarized automatically."><button class="button" type="submit" {% if run_state.running %}disabled{% endif %}>Backfill 1 year</button></form>
   </div>
 </section>
 
 <nav class="discover-mode-switch" aria-label="Discovery search type">
   <a class="discover-mode-option{% if discover_mode == 'paper' %} active{% endif %}" href="/discover?mode=paper" aria-current="{{ 'page' if discover_mode == 'paper' else 'false' }}">
-    <strong>Paper</strong><span>Search by title</span>
+    <strong>Paper</strong><span>OpenAlex papers</span>
   </a>
   <a class="discover-mode-option{% if discover_mode == 'author' %} active{% endif %}" href="/discover?mode=author" aria-current="{{ 'page' if discover_mode == 'author' else 'false' }}">
     <strong>Author</strong><span>Find on OpenAlex</span>
+  </a>
+  <a class="discover-mode-option{% if discover_mode == 'blog' %} active{% endif %}" href="/discover?mode=blog" aria-current="{{ 'page' if discover_mode == 'blog' else 'false' }}">
+    <strong>Blog</strong><span>Preview a source</span>
   </a>
 </nav>
 
 <section class="panel discover-search-panel">
   {% if discover_mode == 'paper' %}
-  <div class="panel-heading"><div><h2>Search papers by title</h2><p>Review OpenAlex matches before choosing a paper to download.</p></div></div>
+  <div class="panel-heading"><div><h2>Search papers by title</h2><p>Titles, DOI links/IDs, arXiv links/IDs, and OpenAlex work IDs are accepted.</p></div></div>
   <form class="inline-search-row" method="get" action="/discover">
     <input type="hidden" name="mode" value="paper">
-    <input name="q" value="{{ discover_query }}" placeholder="Paper title" aria-label="Paper title" required autofocus>
+    <input name="q" value="{{ discover_query }}" placeholder="Title, DOI, arXiv, or OpenAlex ID" aria-label="Paper search" required autofocus>
     <input type="hidden" name="limit" value="{{ search_limit }}">
     <button class="button button-primary" type="submit">Search</button>
   </form>
-  {% else %}
+  {% elif discover_mode == 'author' %}
   <div class="panel-heading"><div><h2>Find an author on OpenAlex</h2><p>Review matches before adding an author to tracking.</p></div></div>
   <form class="inline-search-row" method="get" action="/discover">
     <input type="hidden" name="mode" value="author">
@@ -35,22 +37,52 @@
     <input type="hidden" name="limit" value="{{ search_limit }}">
     <button class="button button-primary" type="submit">Search</button>
   </form>
+  {% else %}
+  <div class="panel-heading"><div><h2>Preview a blog</h2><p>Enter a blog, feed, publications page, or article-index URL to inspect the posts paperwatch can discover.</p></div></div>
+  <form class="inline-search-row discover-blog-search" method="get" action="/discover" data-blog-discover-form>
+    <input type="hidden" name="mode" value="blog">
+    <input name="q" value="{{ discover_query }}" placeholder="https://example.com/blog" aria-label="Blog URL" required autofocus data-blog-url-input>
+    <button class="button button-primary" type="submit">Preview</button>
+    <button class="button" type="button" data-blog-import-whole {% if not blog_query %}disabled{% endif %}>Import whole blog</button>
+  </form>
   {% endif %}
 </section>
 
 {% if discover_mode == 'paper' and paper_query %}
 <section class="panel">
-  <div class="panel-heading"><div><h2>Paper matches</h2><p>Showing up to {{ search_limit }} results for “{{ paper_query }}”.</p></div><a href="/discover?mode=paper">Clear</a></div>
+  <div class="panel-heading"><div><h2>Paper matches</h2><p>Showing up to {{ search_limit }} results for “{{ paper_query }}”. Click a title to preview the OpenAlex record before importing.</p></div><a href="/discover?mode=paper">Clear</a></div>
   {% if paper_error %}<div class="notice notice-error">{{ paper_error }}</div>{% endif %}
-  {% if not paper_error %}<div class="table-wrap search-results-table"><table class="paper-search-table"><thead><tr><th>Paper</th><th>Authors</th><th>Published</th><th>PDF</th><th></th></tr></thead><tbody>
-  {% for item in paper_results %}<tr>
-    <td class="paper-search-title"><strong>{{ item.title }}</strong><small>{% if item.venue %}{{ item.venue }}{% elif item.doi %}doi:{{ item.doi }}{% else %}{{ item.openalex_id }}{% endif %}</small></td>
-    <td>{% for author in item.authors[:4] %}{{ author.name }}{% if not loop.last %}, {% endif %}{% endfor %}{% if item.authors|length > 4 %}<span class="muted"> +{{ item.authors|length - 4 }}</span>{% endif %}</td>
-    <td>{{ item.publication_date or 'Unknown' }}</td>
-    <td>{% if item.pdf_url %}<span class="file-status file-source">Available</span>{% else %}<span class="file-status file-missing">Not listed</span>{% endif %}</td>
-    <td class="paper-search-action">{% if item.openalex_id %}<form method="post" action="/actions/download"><input type="hidden" name="work_id" value="{{ item.openalex_id }}"><input type="hidden" name="title" value="{{ item.title }}"><input type="hidden" name="q" value="{{ paper_query }}"><button class="button button-primary button-small" type="submit" {% if run_state.running %}disabled{% endif %}>Fetch now</button></form>{% endif %}</td>
-  </tr>{% else %}<tr><td colspan="5" class="empty">No matching papers found.</td></tr>{% endfor %}
+  {% if not paper_error %}<div class="table-wrap search-results-table"><table class="paper-search-table"><thead><tr><th>Paper</th><th>Authors</th><th>Published</th><th>Source</th><th></th></tr></thead><tbody>
+  {% for item in paper_results %}{% set paper = item.paper %}<tr class="discover-paper-row{% if item.downloaded %} discover-paper-downloaded{% endif %}">
+    <td class="paper-search-title">
+      {% if item.downloaded %}<a href="{{ item.local_url }}"><strong>{{ paper.title }}</strong></a>{% elif item.openalex_id %}<a href="/discover/paper?work_id={{ item.openalex_id|urlencode }}&q={{ paper_query|urlencode }}"><strong>{{ paper.title }}</strong></a>{% else %}<strong>{{ paper.title }}</strong>{% endif %}
+      <small>{% if paper.venue %}{{ paper.venue }}{% elif paper.doi %}doi:{{ paper.doi }}{% else %}{{ paper.openalex_id }}{% endif %}</small>
+      {% if paper.abstract %}<p class="discover-paper-abstract">{{ paper.abstract[:340] }}{% if paper.abstract|length > 340 %}…{% endif %}</p>{% endif %}
+    </td>
+    <td>{% for author in paper.authors[:4] %}{{ author.name }}{% if not loop.last %}, {% endif %}{% endfor %}{% if paper.authors|length > 4 %}<span class="muted"> +{{ paper.authors|length - 4 }}</span>{% endif %}</td>
+    <td>{{ paper.publication_date or 'Unknown' }}</td>
+    <td>{% if item.downloaded %}<span class="file-status file-source">Downloaded</span>{% elif paper.pdf_url %}<span class="file-status file-source">PDF available</span>{% else %}<span class="file-status file-missing">PDF not listed</span>{% endif %}</td>
+    <td class="paper-search-action">
+      {% if item.downloaded %}<a class="button button-small" href="{{ item.local_url }}">Open imported source</a>
+      {% elif item.openalex_id %}<form method="post" action="/api/discover/paper-import" data-discover-paper-import data-work-id="{{ item.openalex_id }}"><input type="hidden" name="work_id" value="{{ item.openalex_id }}"><button class="button button-primary button-small" type="submit" {% if run_state.running and run_state.mode == 'download' and run_state.query == item.openalex_id %}disabled{% endif %}>{% if run_state.running and run_state.mode == 'download' and run_state.query == item.openalex_id %}Importing…{% else %}Import{% endif %}</button><small class="discover-import-error" data-import-error></small></form>{% endif %}
+    </td>
+  </tr>{% else %}<tr><td colspan="5" class="empty">No matching OpenAlex papers found.</td></tr>{% endfor %}
   </tbody></table></div>{% endif %}
+</section>
+{% endif %}
+
+{% if discover_mode == 'blog' and blog_query %}
+<section class="panel">
+  <div class="panel-heading"><div><h2>{{ blog_fetch.title if blog_fetch else 'Blog preview' }}</h2><p>{{ blog_results|length }} discovered entr{{ 'y' if blog_results|length == 1 else 'ies' }} from {{ blog_query }}.</p></div><a href="/discover?mode=blog">Clear</a></div>
+  {% if blog_error %}<div class="notice notice-error">{{ blog_error }}</div>{% endif %}
+  {% if not blog_error %}
+  <div class="discover-blog-results">
+    {% for item in blog_results %}<article class="discover-blog-card">
+      <div class="discover-blog-card-copy"><h3><a href="{{ item.url }}" target="_blank" rel="noreferrer">{{ item.title }}</a></h3><p class="muted">{{ item.published_at or 'Date unavailable' }} · {{ item.url }}</p>{% if item.summary %}<p>{{ item.summary }}</p>{% endif %}</div>
+      <a class="button button-small" href="/discover/blog/import?source={{ blog_query|urlencode }}&entry={{ item.url|urlencode }}">Review &amp; import</a>
+    </article>{% else %}<p class="empty">No posts were discovered at this URL.</p>{% endfor %}
+  </div>
+  {% endif %}
 </section>
 {% endif %}
 

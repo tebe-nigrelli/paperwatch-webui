@@ -541,3 +541,95 @@ def test_small_helper_and_paper_query_result_link(
         )
     detail = web_client(config_path).get(f"/queries/runs/{run_id}")
     assert f'<a href="/papers/{paper_id}">Paper: {paper_record.title}</a>' in detail.text
+
+
+def test_stub_imports_every_arxiv_and_blog_link(config_path, author_candidate):
+    config = load_config(config_path)
+    requested: list[str] = []
+    article_urls = (
+        "https://example.org/blog/first-result",
+        "https://example.org/blog/second-result",
+    )
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requested.append(str(request.url))
+        slug = request.url.path.rsplit("/", 1)[-1]
+        return httpx.Response(
+            200,
+            headers={"content-type": "text/html"},
+            text=(
+                f"<html><head><title>{slug}</title></head><body><main>"
+                f"<h1>{slug}</h1><p>Complete linked article for {slug} with enough detail.</p>"
+                "</main></body></html>"
+            ),
+        )
+
+    class MultiArxiv:
+        def __init__(self):
+            self.calls: list[str] = []
+
+        def by_id(self, arxiv_id: str):
+            self.calls.append(arxiv_id)
+            return ArxivEntry(
+                arxiv_id=arxiv_id,
+                title=f"Linked paper {arxiv_id}",
+                abstract=f"Abstract for {arxiv_id}",
+                authors=["Ada Lovelace"],
+                published="2026-07-01",
+                updated="2026-07-02",
+                abstract_url=f"https://arxiv.org/abs/{arxiv_id}",
+                pdf_url=None,
+            )
+
+    client = httpx.Client(transport=httpx.MockTransport(handler))
+    arxiv = MultiArxiv()
+    with Database(config.paths.database) as db:
+        db.add_author(author_candidate)
+        db.add_author_blog(
+            author_candidate.openalex_id,
+            "https://example.test/publications",
+            source_mode="publications",
+        )
+        blog_id = int(db.author_blogs(author_candidate.openalex_id)[0]["id"])
+        text = (
+            "Title: Weekly links\nURL: https://example.test/publications\n"
+            "Outbound links:\n"
+            f"- First: {article_urls[0]}\n"
+            "- Paper one: https://arxiv.org/abs/2607.11111\n"
+            f"- Second: {article_urls[1]}\n"
+            "- Paper two: https://doi.org/10.48550/arXiv.2607.22222"
+        )
+        entry_id = db.save_blog_entry(
+            blog_id=blog_id,
+            title="Weekly links",
+            content_sha256=hashlib.sha256(text.encode()).hexdigest(),
+            normalized_text=text,
+            diff_text="",
+            change_kind="changed",
+            previous_entry_id=None,
+            entry_kind="rss",
+            external_id="weekly-links",
+            source_url="https://example.test/publications",
+        )
+        app = PaperWatch(
+            config,
+            db=db,
+            openalex=NoPapers(),
+            arxiv=arxiv,
+            llm=NoLLM(),
+            pdf_client=client,
+        )
+        stats = RunStats(run_id=db.start_run())
+        app._enrich_linked_blog_stubs(stats)
+
+        entry = db.get_blog_entry(entry_id)
+        assert entry is not None
+        assert "Complete linked article for first-result" in entry["normalized_text"]
+        assert "Complete linked article for second-result" in entry["normalized_text"]
+        assert set(requested) == set(article_urls)
+        assert stats.blog_items_downloaded == 2
+        papers, total = db.search_papers(query="Linked paper", limit=None, offset=0)
+        assert total == 2
+        assert {row["arxiv_id"] for row in papers} == {"2607.11111", "2607.22222"}
+        assert arxiv.calls == ["2607.11111", "2607.22222"]
+    client.close()

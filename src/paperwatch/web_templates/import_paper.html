@@ -1,22 +1,35 @@
 {% extends "base.html" %}
-{% block title %}Import PDF · paperwatch{% endblock %}
+{% block title %}Import paper · paperwatch{% endblock %}
 {% block content %}
 <section class="page-heading split import-heading">
   <div>
-    <h1>Import a PDF paper</h1>
-    <p>Add a local paper with the same detail, analysis, query, export, and PDF actions as fetched papers.</p>
+    <h1>Import a paper</h1>
+    <p>Import from arXiv/OpenAlex/DOI, or upload a local PDF with manual metadata.</p>
   </div>
   <a class="button" href="/discover">Back to Discover</a>
 </section>
 
 <section class="panel">
+  <div class="panel-heading"><div><h2>Find remote paper</h2><p>Paste an arXiv link/ID, DOI, OpenAlex work ID, or search by title.</p></div></div>
+  <form method="get" action="/papers/import" class="inline-search-row">
+    <input name="q" value="{{ search_query or '' }}" placeholder="arXiv, DOI, OpenAlex ID, or title" aria-label="Remote paper search">
+    <button class="button button-primary" type="submit">Search</button>
+  </form>
+  {% if paper_results %}<div class="table-wrap search-results-table"><table class="paper-search-table"><thead><tr><th>Paper</th><th>Authors</th><th>Published</th><th></th></tr></thead><tbody>
+  {% for item in paper_results %}<tr><td><strong>{{ item.title }}</strong><small>{{ item.venue or item.openalex_id }}</small></td><td>{% for author in item.authors[:4] %}{{ author.name }}{% if not loop.last %}, {% endif %}{% endfor %}</td><td>{{ item.publication_date or 'Unknown' }}</td><td>{% if item.openalex_id %}<a class="button button-small" href="/papers/import?source={{ item.openalex_id|urlencode }}">Select</a>{% endif %}</td></tr>{% endfor %}
+  </tbody></table></div>{% endif %}
+</section>
+
+<section class="panel">
   {% if import_error %}<div class="notice notice-error" role="alert">{{ import_error }}</div>{% endif %}
+  {% if selected_paper %}<div class="notice notice-success"><strong>Remote paper selected:</strong> {{ selected_paper.title }}{% if selected_paper.pdf_url %} · PDF available{% endif %}</div>{% endif %}
   <form method="post" action="/papers/import" enctype="multipart/form-data" class="import-paper-form">
+    <input type="hidden" name="remote_reference" value="{{ remote_reference or '' }}">
     <div class="import-grid">
-      <label class="full"><span>PDF file</span><input type="file" name="pdf" accept="application/pdf,.pdf" required><small>Maximum size: {{ (config.fetch.max_pdf_bytes / 1000000)|round(1) }} MB</small></label>
-      <label class="full"><span>Title</span><input name="title" value="{{ import_values.get('title', '') }}" maxlength="1000" required autofocus></label>
-      <label class="full"><span>Authors</span><textarea name="authors" rows="3" required placeholder="One author per line, or separate authors with semicolons">{{ import_values.get('authors', '') }}</textarea><small>Use semicolons when an author name itself contains a comma.</small></label>
-      <label class="full"><span>Source link</span><input type="url" name="source_link" value="{{ import_values.get('source_link', '') }}" maxlength="2000" placeholder="https://example.org/paper" required></label>
+      <label class="full"><span>PDF file{% if selected_paper %} (optional for selected remote paper){% endif %}</span><input type="file" name="pdf" accept="application/pdf,.pdf" {% if not selected_paper %}required{% endif %}><small>Maximum size: {{ (config.fetch.max_pdf_bytes / 1000000)|round(1) }} MB</small></label>
+      <label class="full"><span>Title</span><input name="title" value="{{ import_values.get('title', '') }}" maxlength="1000" {% if not selected_paper %}required{% endif %} autofocus></label>
+      <label class="full"><span>Authors</span><textarea name="authors" rows="3" {% if not selected_paper %}required{% endif %} placeholder="One author per line, or separate authors with semicolons">{{ import_values.get('authors', '') }}</textarea><small>Use semicolons when an author name itself contains a comma.</small></label>
+      <label class="full"><span>Source link</span><input type="url" name="source_link" value="{{ import_values.get('source_link', '') }}" maxlength="2000" placeholder="https://example.org/paper" {% if not selected_paper %}required{% endif %}></label>
       <label><span>Publication date</span><input type="date" name="publication_date" value="{{ import_values.get('publication_date', '') }}"></label>
       <label><span>Venue or journal</span><input name="venue" value="{{ import_values.get('venue', '') }}" maxlength="500"></label>
       <label><span>DOI</span><input name="doi" value="{{ import_values.get('doi', '') }}" placeholder="10.1234/example"></label>

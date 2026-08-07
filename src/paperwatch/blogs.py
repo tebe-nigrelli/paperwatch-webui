@@ -28,6 +28,8 @@ MAX_DIFF_CHARS = 200_000
 MAX_FEED_ITEMS = 200
 MAX_FEED_CANDIDATES = 8
 MAX_ARTICLE_FETCHES = 8
+AGGRESSIVE_FEED_CANDIDATES = 16
+AGGRESSIVE_ARTICLE_FETCHES = 24
 BLOG_REQUEST_TIMEOUT = 20.0
 YOUTUBE_PLAYLIST_LIMIT = 20
 YOUTUBE_REQUEST_TIMEOUT = 90.0
@@ -1536,16 +1538,20 @@ def _fetch_article_pages(
     known_urls: tuple[str, ...],
     cursor: int,
     selector: str | None,
+    limit: int | None = None,
 ) -> tuple[tuple[ArticleItem, ...], int, tuple[str, ...]]:
+    if limit is None:
+        limit = MAX_ARTICLE_FETCHES
     current = {item.url: item for item in candidates}
     new_urls = [url for url in current if url not in known_urls]
     rotating = [url for url in known_urls if url not in new_urls]
-    selected = new_urls[:MAX_ARTICLE_FETCHES]
-    remaining = max(0, MAX_ARTICLE_FETCHES - len(selected))
+    limit = max(1, min(int(limit), MAX_FEED_ITEMS))
+    selected = new_urls[:limit]
+    remaining = max(0, limit - len(selected))
     if rotating and remaining:
         start = cursor % len(rotating)
         selected.extend((rotating * 2)[start : start + remaining])
-    selected = list(dict.fromkeys(selected))[:MAX_ARTICLE_FETCHES]
+    selected = list(dict.fromkeys(selected))[:limit]
     next_cursor = (cursor + max(1, remaining)) % max(len(rotating), 1)
     items: list[ArticleItem] = []
     diagnostics: list[str] = []
@@ -1652,6 +1658,7 @@ def _follow_feed_articles(
         known_urls=known_urls,
         cursor=int(_row_value(row, "article_cursor", 0) or 0),
         selector=None,
+        limit=int(_row_value(row, "_article_fetch_limit", MAX_ARTICLE_FETCHES) or MAX_ARTICLE_FETCHES),
     )
     return discovered, article_items, cursor_next, diagnostics
 
@@ -1840,8 +1847,18 @@ def _fetch_page(
             )
 
     diagnostics: list[str] = []
+    aggressive = bool(_row_value(row, "_aggressive_discovery", False))
+    feed_limit = int(
+        _row_value(
+            row,
+            "_feed_candidate_limit",
+            AGGRESSIVE_FEED_CANDIDATES if aggressive else MAX_FEED_CANDIDATES,
+        )
+        or MAX_FEED_CANDIDATES
+    )
+    feed_limit = max(1, min(feed_limit, MAX_FEED_ITEMS))
     feed_candidates = list(discover_feed_urls(response.text, url))
-    if mode in {"feed", "video"}:
+    if mode in {"feed", "video"} or aggressive:
         for candidate in _conventional_feed_urls(url):
             if candidate not in feed_candidates:
                 feed_candidates.append(candidate)
@@ -1850,11 +1867,11 @@ def _fetch_page(
         if youtube and youtube not in feed_candidates:
             feed_candidates.insert(0, youtube)
     if mode in {"auto", "feed", "video"}:
-        if len(feed_candidates) > MAX_FEED_CANDIDATES:
+        if len(feed_candidates) > feed_limit:
             diagnostics.append(
-                f"Limited feed discovery to {MAX_FEED_CANDIDATES} candidates"
+                f"Limited feed discovery to {feed_limit} candidates"
             )
-        for candidate in feed_candidates[:MAX_FEED_CANDIDATES]:
+        for candidate in feed_candidates[:feed_limit]:
             if candidate == skip_feed_url:
                 continue
             score = feed_scope_score(url, candidate)
@@ -1893,7 +1910,7 @@ def _fetch_page(
             root,
             base_url=url,
             pattern=pattern,
-            allow_external=mode == "publications",
+            allow_external=mode == "publications" or aggressive,
         )
         diagnostics.append(f"Discovered {len(candidates)} candidate content links")
         crawl_index = _should_crawl_article_index(
@@ -1902,6 +1919,8 @@ def _fetch_page(
             pattern=pattern,
             candidates=candidates,
         )
+        if aggressive and candidates:
+            crawl_index = True
         if crawl_index:
             effective_mode = "publications" if mode == "publications" else "article_index"
             discovered = candidates
@@ -1915,6 +1934,14 @@ def _fetch_page(
                 known_urls=known_urls,
                 cursor=int(_row_value(row, "article_cursor", 0) or 0),
                 selector=selector,
+                limit=int(
+                    _row_value(
+                        row,
+                        "_article_fetch_limit",
+                        AGGRESSIVE_ARTICLE_FETCHES if aggressive else MAX_ARTICLE_FETCHES,
+                    )
+                    or MAX_ARTICLE_FETCHES
+                ),
             )
             diagnostics.extend(child_diagnostics)
         elif mode in {"auto", "feed", "video"}:

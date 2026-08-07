@@ -475,8 +475,107 @@
   }
 
   const paperJobs = document.getElementById("paper-jobs");
-  if (document.body.dataset.runRunning === "true" && !paperJobs) {
+  const discoverPaperImports = Array.from(document.querySelectorAll("form[data-discover-paper-import]"));
+  if (document.body.dataset.runRunning === "true" && !paperJobs && discoverPaperImports.length === 0) {
     window.setTimeout(() => window.location.reload(), 5000);
+  }
+
+  if (discoverPaperImports.length) {
+    const markImported = (form, url) => {
+      const button = form.querySelector("button[type=submit]");
+      if (!button) return;
+      form.dataset.importedUrl = url;
+      button.disabled = false;
+      button.textContent = "Open imported source";
+      button.classList.remove("button-primary");
+      const error = form.querySelector("[data-import-error]");
+      if (error) error.textContent = "";
+    };
+
+    const markIdle = (form, message = "") => {
+      const button = form.querySelector("button[type=submit]");
+      if (!button) return;
+      button.disabled = false;
+      button.textContent = "Import";
+      const error = form.querySelector("[data-import-error]");
+      if (error) error.textContent = message;
+    };
+
+    const pollImport = async (form) => {
+      const workId = form.dataset.workId || "";
+      try {
+        const response = await fetch(`/api/discover/paper-import-status?work_id=${encodeURIComponent(workId)}`, { cache: "no-store" });
+        const payload = await response.json();
+        if (payload.state === "imported" && payload.url) {
+          markImported(form, payload.url);
+          return;
+        }
+        if (payload.state === "failed") {
+          markIdle(form, payload.error || "Import failed");
+          return;
+        }
+        if (payload.state === "idle") {
+          markIdle(form);
+          return;
+        }
+      } catch (_error) {
+        markIdle(form, "Could not check import status");
+        return;
+      }
+      window.setTimeout(() => pollImport(form), 700);
+    };
+
+    discoverPaperImports.forEach((form) => {
+      const button = form.querySelector("button[type=submit]");
+      form.addEventListener("submit", async (event) => {
+        event.preventDefault();
+        if (form.dataset.importedUrl) {
+          window.location.assign(form.dataset.importedUrl);
+          return;
+        }
+        if (!button || button.disabled) return;
+        button.disabled = true;
+        button.textContent = "Importing…";
+        const error = form.querySelector("[data-import-error]");
+        if (error) error.textContent = "";
+        try {
+          const response = await fetch(form.action, {
+            method: "POST",
+            body: new FormData(form),
+            headers: { Accept: "application/json" },
+          });
+          const payload = await response.json();
+          if (payload.state === "imported" && payload.url) {
+            markImported(form, payload.url);
+            return;
+          }
+          if (!response.ok) {
+            markIdle(form, payload.error || "Could not start import");
+            return;
+          }
+          pollImport(form);
+        } catch (_error) {
+          markIdle(form, "Could not start import");
+        }
+      });
+      if (button?.disabled && button.textContent.includes("Importing")) pollImport(form);
+    });
+  }
+
+  const blogDiscoverForm = document.querySelector("[data-blog-discover-form]");
+  if (blogDiscoverForm) {
+    const input = blogDiscoverForm.querySelector("[data-blog-url-input]");
+    const importWhole = blogDiscoverForm.querySelector("[data-blog-import-whole]");
+    const syncBlogImport = () => {
+      if (importWhole) importWhole.disabled = !input?.value.trim();
+    };
+    input?.addEventListener("input", syncBlogImport);
+    importWhole?.addEventListener("click", () => {
+      const source = input?.value.trim() || "";
+      if (!source) return;
+      window.location.assign(`/discover/blog/import?source=${encodeURIComponent(source)}`);
+    });
+    syncBlogImport();
   }
 
   document.querySelectorAll("form[data-confirm]").forEach((form) => {

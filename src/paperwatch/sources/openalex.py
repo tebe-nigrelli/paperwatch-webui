@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 import time
 from typing import Any, Callable
 
@@ -150,9 +151,38 @@ class OpenAlexClient:
     def search_works(self, title: str, limit: int = 10) -> list[PaperRecord]:
         query = clean_text(title)
         if not query:
-            raise OpenAlexError("Paper title cannot be empty")
+            raise OpenAlexError("Paper search cannot be empty")
         if limit < 1:
             raise OpenAlexError("Paper search limit must be positive")
+
+        openalex_id = short_openalex_id(query)
+        if openalex_id and re.fullmatch(r"W\d+", openalex_id):
+            try:
+                return [self.get_work(openalex_id)]
+            except OpenAlexError:
+                pass
+
+        arxiv_id = extract_arxiv_id(query)
+        if arxiv_id:
+            # OpenAlex documents DOI as a direct external-id lookup, not arXiv
+            # IDs. arXiv assigns DataCite DOIs in this canonical form.
+            try:
+                return [self.get_work_by_doi(f"10.48550/arXiv.{arxiv_id}")]
+            except OpenAlexError:
+                # The web discovery layer can resolve the arXiv record and use
+                # its title if this work is not indexed under its arXiv DOI.
+                return self._search_works_text(arxiv_id, limit)
+
+        doi = strip_doi(query)
+        if doi and re.fullmatch(r"10\.\d{4,9}/\S+", doi, re.I):
+            try:
+                return [self.get_work_by_doi(doi)]
+            except OpenAlexError:
+                return self._search_works_text(doi, limit)
+
+        return self._search_works_text(query, limit)
+
+    def _search_works_text(self, query: str, limit: int) -> list[PaperRecord]:
         payload = self._get(
             "/works",
             {
@@ -175,6 +205,12 @@ class OpenAlexClient:
                 if str(exc) != "Work record is missing title":
                     raise
         return papers
+
+    def get_work_by_doi(self, doi: str) -> PaperRecord:
+        identifier = strip_doi(doi)
+        if not identifier or not re.fullmatch(r"10\.\d{4,9}/\S+", identifier, re.I):
+            raise OpenAlexError("Invalid DOI")
+        return self.parse_work(self._get(f"/works/https://doi.org/{identifier}", {}))
 
     def get_work(self, work_id: str) -> PaperRecord:
         identifier = short_openalex_id(clean_text(work_id))
