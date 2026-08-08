@@ -22,7 +22,7 @@ from .models import (
 )
 
 
-SCHEMA_VERSION = 31
+SCHEMA_VERSION = 32
 BLOG_SOURCE_MODES = {
     "auto",
     "feed",
@@ -50,6 +50,21 @@ BLOG_FETCH_APPEND_MARKERS = (
     "\n\nWebsite content:\n",
     "\n\nImported page content:\n",
 )
+
+
+def _regexp_alternation(patterns: Iterable[str]) -> str:
+    """Combine independently valid regexps without breaking leading inline flags."""
+    parts: list[str] = []
+    for raw in patterns:
+        pattern = str(raw).strip()
+        if not pattern:
+            continue
+        flags = re.match(r"^\(\?([aiLmsux]+)\)", pattern)
+        if flags is not None:
+            parts.append(f"(?{flags.group(1)}:{pattern[flags.end():]})")
+        else:
+            parts.append(f"(?:{pattern})")
+    return "|".join(parts)
 
 
 def _diff_word_count(diff_text: str | None, prefix: str) -> int:
@@ -144,11 +159,15 @@ def _blog_stub_sql(entry_alias: str = "be", blog_alias: str = "b") -> str:
     return (
         f"CASE COALESCE({entry_alias}.stub_state, 'auto') "
         f"WHEN 'stub' THEN 1 WHEN 'full' THEN 0 ELSE "
-        "paperwatch_blog_stub("
+        "CASE WHEN EXISTS ("
+        "SELECT 1 FROM query_classification_results qcr_stub "
+        f"WHERE qcr_stub.blog_entry_id={entry_alias}.id "
+        "AND qcr_stub.value='STUB' COLLATE NOCASE"
+        ") THEN 1 ELSE paperwatch_blog_stub("
         f"{entry_alias}.normalized_text, {entry_alias}.title, "
         f"COALESCE({entry_alias}.source_url, {blog_alias}.url), "
         f"{entry_alias}.linked_paper_id, {entry_alias}.diff_text, "
-        f"{entry_alias}.previous_entry_id) END"
+        f"{entry_alias}.previous_entry_id) END END"
     )
 
 
@@ -501,7 +520,6 @@ CREATE TABLE IF NOT EXISTS saved_queries (
     is_builtin INTEGER NOT NULL DEFAULT 0,
     auto_run_papers INTEGER NOT NULL DEFAULT 0,
     auto_run_blogs INTEGER NOT NULL DEFAULT 0,
-    model_profile TEXT NOT NULL DEFAULT '',
     paper_source_scope TEXT NOT NULL DEFAULT 'auto'
         CHECK (paper_source_scope IN ('auto', 'abstract', 'fulltext', 'pdf')),
     pdf_strategy TEXT NOT NULL DEFAULT 'chunked'
@@ -532,6 +550,8 @@ CREATE TABLE IF NOT EXISTS query_runs (
     status TEXT NOT NULL CHECK (status IN ('queued', 'running', 'success', 'failed')),
     context_window_tokens INTEGER NOT NULL,
     selection_json TEXT NOT NULL DEFAULT '{}',
+    paper_id INTEGER REFERENCES papers(id) ON DELETE CASCADE,
+    blog_entry_id INTEGER REFERENCES blog_entries(id) ON DELETE CASCADE,
     matched_count INTEGER NOT NULL DEFAULT 0,
     input_chars INTEGER NOT NULL DEFAULT 0,
     output_json TEXT,
@@ -539,7 +559,7 @@ CREATE TABLE IF NOT EXISTS query_runs (
     started_at TEXT,
     finished_at TEXT,
     error_text TEXT,
-    UNIQUE (batch_id, profile)
+    CHECK (paper_id IS NULL OR blog_entry_id IS NULL)
 );
 CREATE INDEX IF NOT EXISTS idx_query_runs_query ON query_runs(query_id, id DESC);
 CREATE INDEX IF NOT EXISTS idx_query_runs_batch ON query_runs(batch_id, id);
@@ -573,6 +593,11 @@ CREATE INDEX IF NOT EXISTS idx_query_classification_tag
 ON query_classification_results(tag_name COLLATE NOCASE);
 """
 
+QUERY_RUN_CONTENT_INDEXES = """
+CREATE INDEX IF NOT EXISTS idx_query_runs_paper ON query_runs(paper_id, id DESC);
+CREATE INDEX IF NOT EXISTS idx_query_runs_blog ON query_runs(blog_entry_id, id DESC);
+"""
+
 TOPICS_SCHEMA = """
 CREATE TABLE IF NOT EXISTS topics (
     openalex_id TEXT PRIMARY KEY,
@@ -603,7 +628,7 @@ CREATE INDEX IF NOT EXISTS idx_paper_topics_paper ON paper_topics(paper_id, topi
 
 SCHEMA = (
     COMMON_SCHEMA + ANALYSES_SCHEMA + ANALYSIS_TASKS_SCHEMA + EXTRA_SCHEMA
-    + TOPICS_SCHEMA + BLOGS_SCHEMA
+    + QUERY_RUN_CONTENT_INDEXES + TOPICS_SCHEMA + BLOGS_SCHEMA
 )
 
 
@@ -676,7 +701,10 @@ class Database:
         self._ensure_analysis_columns()
         self._conn.executescript(EXTRA_SCHEMA)
         self._migrate_saved_queries_v25()
+        self._migrate_saved_queries_v32()
         self._ensure_query_columns()
+        self._migrate_query_runs_v32()
+        self._conn.executescript(QUERY_RUN_CONTENT_INDEXES)
         self._ensure_default_saved_queries()
         self._conn.executescript(TOPICS_SCHEMA)
         self._conn.executescript(BLOGS_SCHEMA)
@@ -1077,8 +1105,7 @@ class Database:
         ).fetchone()
         table_sql = str(table_sql_row["sql"] or "") if table_sql_row is not None else ""
         if (
-            "model_profile" in columns
-            and "model_profiles_json" not in columns
+            "model_profiles_json" not in columns
             and "context_window_tokens" not in columns
             and "'regexp'" in table_sql
             and "'pdf'" in table_sql
@@ -1222,6 +1249,219 @@ class Database:
         if violations:
             raise DatabaseError("Saved-query migration produced foreign-key violations")
 
+    def _migrate_saved_queries_v32(self) -> None:
+        """Stop persisting a model choice and canonicalize paper processing modes."""
+        columns = {
+            row["name"]
+            for row in self._conn.execute("PRAGMA table_info(saved_queries)").fetchall()
+        }
+        if "model_profile" not in columns:
+            return
+
+        rows = [dict(row) for row in self._conn.execute("SELECT * FROM saved_queries")]
+        migrated: list[tuple[Any, ...]] = []
+        for row in rows:
+            if str(row.get("query_kind") or "summary") == "regexp" and not str(
+                row.get("regexp_pattern") or ""
+            ).strip():
+                patterns = [
+                    item["pattern"]
+                    for item in self._decoded_label_values(row.get("label_values_json"))
+                    if item.get("pattern")
+                ]
+                if patterns:
+                    row["regexp_pattern"] = _regexp_alternation(patterns)
+                    row["label_class"] = ""
+                    row["label_values_json"] = "[]"
+            scope = str(row.get("paper_source_scope") or "auto").strip().lower()
+            strategy = str(row.get("pdf_strategy") or "chunked").strip().lower()
+            if scope == "pdf":
+                scope, strategy = "pdf", "auto"
+            elif strategy == "direct":
+                scope, strategy = "fulltext", "direct"
+            else:
+                scope, strategy = "auto", "chunked"
+            migrated.append(
+                (
+                    row["id"], row["name"], row["source_type"], row["search_query"],
+                    row["prompt"], row["is_builtin"], row["auto_run_papers"],
+                    row["auto_run_blogs"], scope, strategy, row["regexp_pattern"],
+                    row["regexp_radius"], row["regexp_debug_text"], row["regexp_mode"],
+                    row["content_scope"], row["query_kind"], row["label_class"],
+                    row["label_values_json"], row["label_debug_text"], row["created_at"],
+                    row["updated_at"], row["last_run_at"],
+                )
+            )
+
+        self._conn.commit()
+        self._conn.execute("PRAGMA foreign_keys = OFF")
+        try:
+            self._conn.execute("BEGIN IMMEDIATE")
+            self._conn.execute("DROP TABLE IF EXISTS saved_queries_v32")
+            self._conn.execute(
+                """
+                CREATE TABLE saved_queries_v32 (
+                    id INTEGER PRIMARY KEY,
+                    name TEXT NOT NULL,
+                    source_type TEXT NOT NULL CHECK (source_type IN ('papers', 'summaries')),
+                    search_query TEXT NOT NULL DEFAULT '',
+                    prompt TEXT NOT NULL,
+                    is_builtin INTEGER NOT NULL DEFAULT 0,
+                    auto_run_papers INTEGER NOT NULL DEFAULT 0,
+                    auto_run_blogs INTEGER NOT NULL DEFAULT 0,
+                    paper_source_scope TEXT NOT NULL DEFAULT 'auto'
+                        CHECK (paper_source_scope IN ('auto', 'abstract', 'fulltext', 'pdf')),
+                    pdf_strategy TEXT NOT NULL DEFAULT 'chunked'
+                        CHECK (pdf_strategy IN ('auto', 'direct', 'chunked')),
+                    regexp_pattern TEXT NOT NULL DEFAULT '',
+                    regexp_radius INTEGER NOT NULL DEFAULT 0,
+                    regexp_debug_text TEXT NOT NULL DEFAULT '',
+                    regexp_mode TEXT NOT NULL DEFAULT 'query'
+                        CHECK (regexp_mode IN ('query', 'print')),
+                    content_scope TEXT NOT NULL DEFAULT 'both'
+                        CHECK (content_scope IN ('both', 'papers', 'blogs')),
+                    query_kind TEXT NOT NULL DEFAULT 'summary'
+                        CHECK (query_kind IN ('summary', 'classification', 'regexp')),
+                    label_class TEXT NOT NULL DEFAULT '',
+                    label_values_json TEXT NOT NULL DEFAULT '[]',
+                    label_debug_text TEXT NOT NULL DEFAULT '',
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    last_run_at TEXT
+                )
+                """
+            )
+            self._conn.executemany(
+                """
+                INSERT INTO saved_queries_v32(
+                    id, name, source_type, search_query, prompt, is_builtin,
+                    auto_run_papers, auto_run_blogs, paper_source_scope, pdf_strategy,
+                    regexp_pattern, regexp_radius, regexp_debug_text, regexp_mode,
+                    content_scope, query_kind, label_class, label_values_json,
+                    label_debug_text, created_at, updated_at, last_run_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                migrated,
+            )
+            self._conn.execute("DROP TABLE saved_queries")
+            self._conn.execute("ALTER TABLE saved_queries_v32 RENAME TO saved_queries")
+            self._conn.commit()
+        except Exception:
+            self._conn.rollback()
+            raise
+        finally:
+            self._conn.execute("PRAGMA foreign_keys = ON")
+
+    def _migrate_query_runs_v32(self) -> None:
+        """Persist one query run per content record and remove batch/profile uniqueness."""
+        columns = {
+            row["name"]
+            for row in self._conn.execute("PRAGMA table_info(query_runs)").fetchall()
+        }
+        table_sql_row = self._conn.execute(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name='query_runs'"
+        ).fetchone()
+        table_sql = str(table_sql_row["sql"] or "") if table_sql_row is not None else ""
+        if (
+            "paper_id" in columns
+            and "blog_entry_id" in columns
+            and "UNIQUE (batch_id, profile)" not in table_sql
+        ):
+            return
+
+        rows = [dict(row) for row in self._conn.execute("SELECT * FROM query_runs")]
+        migrated: list[tuple[Any, ...]] = []
+        for row in rows:
+            paper_id = row.get("paper_id")
+            blog_entry_id = row.get("blog_entry_id")
+            if paper_id is None and blog_entry_id is None:
+                try:
+                    selection = json.loads(str(row.get("selection_json") or "{}"))
+                except (TypeError, json.JSONDecodeError):
+                    selection = {}
+                if isinstance(selection, dict):
+                    paper_ids = selection.get("resolved_paper_ids") or selection.get("paper_ids")
+                    blog_ids = selection.get("resolved_blog_entry_ids") or selection.get("blog_entry_ids")
+                    if isinstance(paper_ids, list) and len(paper_ids) == 1:
+                        try:
+                            paper_id = int(paper_ids[0])
+                        except (TypeError, ValueError):
+                            paper_id = None
+                    if isinstance(blog_ids, list) and len(blog_ids) == 1:
+                        try:
+                            blog_entry_id = int(blog_ids[0])
+                        except (TypeError, ValueError):
+                            blog_entry_id = None
+            migrated.append(
+                (
+                    row["id"], row["batch_id"], row["query_id"], row["profile"],
+                    row["provider"], row["model"], row["status"],
+                    row["context_window_tokens"], row.get("selection_json", "{}"),
+                    paper_id, blog_entry_id, row["matched_count"], row["input_chars"],
+                    row["output_json"], row["created_at"], row["started_at"],
+                    row["finished_at"], row["error_text"],
+                )
+            )
+
+        self._conn.commit()
+        self._conn.execute("PRAGMA foreign_keys = OFF")
+        try:
+            self._conn.execute("BEGIN IMMEDIATE")
+            self._conn.execute("DROP TABLE IF EXISTS query_runs_v32")
+            self._conn.execute(
+                """
+                CREATE TABLE query_runs_v32 (
+                    id INTEGER PRIMARY KEY,
+                    batch_id TEXT NOT NULL,
+                    query_id INTEGER NOT NULL REFERENCES saved_queries(id) ON DELETE CASCADE,
+                    profile TEXT NOT NULL,
+                    provider TEXT NOT NULL,
+                    model TEXT NOT NULL,
+                    status TEXT NOT NULL CHECK (status IN ('queued', 'running', 'success', 'failed')),
+                    context_window_tokens INTEGER NOT NULL,
+                    selection_json TEXT NOT NULL DEFAULT '{}',
+                    paper_id INTEGER REFERENCES papers(id) ON DELETE CASCADE,
+                    blog_entry_id INTEGER REFERENCES blog_entries(id) ON DELETE CASCADE,
+                    matched_count INTEGER NOT NULL DEFAULT 0,
+                    input_chars INTEGER NOT NULL DEFAULT 0,
+                    output_json TEXT,
+                    created_at TEXT NOT NULL,
+                    started_at TEXT,
+                    finished_at TEXT,
+                    error_text TEXT,
+                    CHECK (paper_id IS NULL OR blog_entry_id IS NULL)
+                )
+                """
+            )
+            self._conn.executemany(
+                """
+                INSERT INTO query_runs_v32(
+                    id, batch_id, query_id, profile, provider, model, status,
+                    context_window_tokens, selection_json, paper_id, blog_entry_id,
+                    matched_count, input_chars, output_json, created_at, started_at,
+                    finished_at, error_text
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                migrated,
+            )
+            self._conn.execute("DROP TABLE query_runs")
+            self._conn.execute("ALTER TABLE query_runs_v32 RENAME TO query_runs")
+            self._conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_query_runs_query ON query_runs(query_id, id DESC)"
+            )
+            self._conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_query_runs_batch ON query_runs(batch_id, id)"
+            )
+            self._conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_query_runs_success ON query_runs(id) WHERE status='success'"
+            )
+            self._conn.commit()
+        except Exception:
+            self._conn.rollback()
+            raise
+        finally:
+            self._conn.execute("PRAGMA foreign_keys = ON")
+
     def _ensure_query_columns(self) -> None:
         run_columns = {
             row["name"]
@@ -1231,6 +1471,10 @@ class Database:
             self._conn.execute(
                 "ALTER TABLE query_runs ADD COLUMN selection_json TEXT NOT NULL DEFAULT '{}'"
             )
+        if "paper_id" not in run_columns:
+            self._conn.execute("ALTER TABLE query_runs ADD COLUMN paper_id INTEGER")
+        if "blog_entry_id" not in run_columns:
+            self._conn.execute("ALTER TABLE query_runs ADD COLUMN blog_entry_id INTEGER")
         query_columns = {
             row["name"]
             for row in self._conn.execute("PRAGMA table_info(saved_queries)").fetchall()
@@ -1242,7 +1486,6 @@ class Database:
         query_additions = {
             "auto_run_papers": "INTEGER NOT NULL DEFAULT 0",
             "auto_run_blogs": "INTEGER NOT NULL DEFAULT 0",
-            "model_profile": "TEXT NOT NULL DEFAULT ''",
             "paper_source_scope": "TEXT NOT NULL DEFAULT 'auto'",
             "pdf_strategy": "TEXT NOT NULL DEFAULT 'chunked'",
             "regexp_pattern": "TEXT NOT NULL DEFAULT ''",
@@ -5006,19 +5249,20 @@ class Database:
         model_profiles: Iterable[str],
         paper_source_scope: str,
         pdf_strategy: str,
-    ) -> tuple[str, str, str]:
-        profiles = list(dict.fromkeys(
-            value.strip() for value in model_profiles if value.strip()
-        ))
-        if len(profiles) > 1:
-            raise ValueError("A saved query can use only one model")
+    ) -> tuple[str, str]:
+        # ``model_profiles`` is intentionally ignored for backward-compatible
+        # callers. Saved queries always resolve the default model from config.toml
+        # at execution time.
+        tuple(model_profiles)
         if paper_source_scope not in {"auto", "abstract", "fulltext", "pdf"}:
             raise ValueError("Paper source must be auto, abstract, fulltext, or pdf")
         if pdf_strategy not in {"auto", "direct", "chunked"}:
             raise ValueError("PDF strategy must be auto, direct, or chunked")
-        if paper_source_scope in {"abstract", "pdf"}:
-            pdf_strategy = "auto"
-        return (profiles[0] if profiles else ""), paper_source_scope, pdf_strategy
+        if paper_source_scope == "pdf":
+            return "pdf", "auto"
+        if pdf_strategy == "direct":
+            return "fulltext", "direct"
+        return "auto", "chunked"
 
     @staticmethod
     def _regexp_values(
@@ -5068,15 +5312,21 @@ class Database:
                 raise ValueError(f"Invalid classification regexp for {value}: {exc}") from exc
             seen.add(key)
             values.append({"value": value, "pattern": pattern})
-        if kind in {"classification", "regexp"}:
+        if kind == "classification":
             if not cleaned_class:
                 raise ValueError("Tagging queries need a tag class")
-            if len(values) < (2 if kind == "classification" else 1):
-                raise ValueError(
-                    "Classification queries need at least two label values"
-                    if kind == "classification"
-                    else "Regexp tag queries need at least one tag value"
+            if len(values) < 2:
+                raise ValueError("Classification queries need at least two label values")
+            if "stub" not in seen:
+                values.append(
+                    {
+                        "value": "STUB",
+                        "pattern": r"(?im)^\s*RESULT:\s*STUB\s*$",
+                    }
                 )
+        elif kind == "regexp":
+            cleaned_class = ""
+            values = []
         else:
             cleaned_class = ""
             values = []
@@ -5107,23 +5357,34 @@ class Database:
     ) -> int:
         name = name.strip()
         prompt = prompt.strip()
-        model_profile, scope, strategy = self._query_execution_values(
+        scope, strategy = self._query_execution_values(
             model_profiles=model_profiles,
             paper_source_scope=paper_source_scope,
             pdf_strategy=pdf_strategy,
         )
+        raw_label_values = list(label_values)
+        if str(query_kind).strip().lower() == "regexp" and not str(regexp_pattern).strip():
+            patterns = [
+                str(item.get("pattern") or "").strip()
+                for item in raw_label_values
+                if isinstance(item, dict) and str(item.get("pattern") or "").strip()
+            ]
+            if patterns:
+                regexp_pattern = _regexp_alternation(patterns)
         regexp, radius, regexp_action = self._regexp_values(
             regexp_pattern, regexp_radius, regexp_mode
         )
         regexp_debug = str(regexp_debug_text)[:100000]
         label_debug = str(label_debug_text)[:100000]
         kind, classification_class, classification_values = self._classification_values(
-            query_kind, label_class, label_values
+            query_kind, label_class, raw_label_values
         )
         if kind == "regexp":
-            model_profile = ""
             if scope == "pdf":
                 raise ValueError("Regexp tag queries cannot upload a whole PDF")
+            if not regexp:
+                raise ValueError("Regexp tag queries require a regexp")
+            regexp_action = "query"
         if kind in {"classification", "regexp"} and regexp_action == "print":
             raise ValueError("Tagging queries cannot print regexp excerpts")
         if content_scope not in {"both", "papers", "blogs"}:
@@ -5148,20 +5409,19 @@ class Database:
                 """
                 INSERT INTO saved_queries(
                     name, source_type, search_query, prompt, is_builtin,
-                    auto_run_papers, auto_run_blogs, model_profile,
+                    auto_run_papers, auto_run_blogs,
                     paper_source_scope, pdf_strategy,
                     regexp_pattern, regexp_radius, regexp_debug_text, regexp_mode,
                     content_scope, query_kind, label_class, label_values_json,
                     label_debug_text,
                     created_at, updated_at
-                ) VALUES (?, 'papers', '', ?, 0, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, 'papers', '', ?, 0, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     name[:120],
                     prompt[:10000],
                     1 if auto_run_papers else 0,
                     1 if auto_run_blogs else 0,
-                    model_profile,
                     scope,
                     strategy,
                     regexp,
@@ -5205,23 +5465,34 @@ class Database:
     ) -> bool:
         name = name.strip()
         prompt = prompt.strip()
-        model_profile, scope, strategy = self._query_execution_values(
+        scope, strategy = self._query_execution_values(
             model_profiles=model_profiles,
             paper_source_scope=paper_source_scope,
             pdf_strategy=pdf_strategy,
         )
+        raw_label_values = list(label_values)
+        if str(query_kind).strip().lower() == "regexp" and not str(regexp_pattern).strip():
+            patterns = [
+                str(item.get("pattern") or "").strip()
+                for item in raw_label_values
+                if isinstance(item, dict) and str(item.get("pattern") or "").strip()
+            ]
+            if patterns:
+                regexp_pattern = _regexp_alternation(patterns)
         regexp, radius, regexp_action = self._regexp_values(
             regexp_pattern, regexp_radius, regexp_mode
         )
         regexp_debug = str(regexp_debug_text)[:100000]
         label_debug = str(label_debug_text)[:100000]
         kind, classification_class, classification_values = self._classification_values(
-            query_kind, label_class, label_values
+            query_kind, label_class, raw_label_values
         )
         if kind == "regexp":
-            model_profile = ""
             if scope == "pdf":
                 raise ValueError("Regexp tag queries cannot upload a whole PDF")
+            if not regexp:
+                raise ValueError("Regexp tag queries require a regexp")
+            regexp_action = "query"
         if kind in {"classification", "regexp"} and regexp_action == "print":
             raise ValueError("Tagging queries cannot print regexp excerpts")
         if content_scope not in {"both", "papers", "blogs"}:
@@ -5244,7 +5515,7 @@ class Database:
                     source_type='papers', search_query='', prompt=?,
                     auto_run_papers=CASE WHEN ? IS NULL THEN auto_run_papers ELSE ? END,
                     auto_run_blogs=CASE WHEN ? IS NULL THEN auto_run_blogs ELSE ? END,
-                    model_profile=?, paper_source_scope=?, pdf_strategy=?, regexp_pattern=?,
+                    paper_source_scope=?, pdf_strategy=?, regexp_pattern=?,
                     regexp_radius=?, regexp_debug_text=?, regexp_mode=?, content_scope=?,
                     query_kind=?, label_class=?, label_values_json=?, label_debug_text=?,
                     updated_at=?
@@ -5258,7 +5529,6 @@ class Database:
                     0 if auto_run_papers is None else int(auto_run_papers),
                     None if auto_run_blogs is None else int(auto_run_blogs),
                     0 if auto_run_blogs is None else int(auto_run_blogs),
-                    model_profile,
                     scope,
                     strategy,
                     regexp,
@@ -5349,10 +5619,17 @@ class Database:
             "classification", "regexp"
         }:
             return 0
-        label_class = " ".join(str(query["label_class"] or "").split())
+        query_kind = str(query["query_kind"] or "summary")
+        label_class = (
+            " ".join(str(query["name"] or "").split())
+            if query_kind == "regexp"
+            else " ".join(str(query["label_class"] or "").split())
+        )
         values = self._decoded_label_values(query["label_values_json"])
         items = output.get("items") if isinstance(output, dict) else None
-        if not label_class or not values or not isinstance(items, list):
+        if not label_class or not isinstance(items, list):
+            return 0
+        if query_kind == "classification" and not values:
             return 0
         now = utcnow()
         changed = 0
@@ -5361,14 +5638,17 @@ class Database:
                 if not isinstance(item, dict):
                     continue
                 raw_output = str(item.get("output") or "")
-                selected_value = next(
-                    (
-                        value["value"]
-                        for value in values
-                        if re.search(value["pattern"], raw_output, re.MULTILINE)
-                    ),
-                    None,
-                )
+                if query_kind == "regexp":
+                    selected_value = " ".join(raw_output.split())[:80] or None
+                else:
+                    selected_value = next(
+                        (
+                            value["value"]
+                            for value in values
+                            if re.search(value["pattern"], raw_output, re.MULTILINE)
+                        ),
+                        None,
+                    )
                 if selected_value is None:
                     continue
                 paper_id = item.get("paper_id")
@@ -5446,6 +5726,7 @@ class Database:
         rows = self._conn.execute(
             f"""
             SELECT qcr.*, q.name AS query_name, q.label_class, q.label_values_json
+                 , q.query_kind
             FROM query_classification_results qcr
             JOIN saved_queries q ON q.id=qcr.query_id
             WHERE qcr.{column}=?
@@ -5456,7 +5737,13 @@ class Database:
         result: list[dict[str, Any]] = []
         for row in rows:
             item = dict(row)
-            item["choices"] = [value["value"] for value in self._decoded_label_values(row["label_values_json"])]
+            item["choices"] = [
+                value["value"]
+                for value in self._decoded_label_values(row["label_values_json"])
+            ]
+            item["freeform"] = str(row["query_kind"] or "summary") == "regexp"
+            if item["freeform"]:
+                item["label_class"] = str(row["query_name"] or "Regexp")
             result.append(item)
         return result
 
@@ -5472,15 +5759,28 @@ class Database:
             "classification", "regexp"
         }:
             return False
-        choices = [item["value"] for item in self._decoded_label_values(query["label_values_json"])]
-        selected = next((item for item in choices if item.casefold() == value.strip().casefold()), None)
-        if selected is None:
-            raise ValueError("Classification value is not allowed by this query")
+        query_kind = str(query["query_kind"] or "summary")
+        if query_kind == "regexp":
+            selected = " ".join(value.strip().split())[:80]
+            if not selected:
+                raise ValueError("Regexp tag value cannot be empty")
+            label_class = " ".join(str(query["name"] or "").split())
+        else:
+            choices = [
+                item["value"] for item in self._decoded_label_values(query["label_values_json"])
+            ]
+            selected = next(
+                (item for item in choices if item.casefold() == value.strip().casefold()),
+                None,
+            )
+            if selected is None:
+                raise ValueError("Classification value is not allowed by this query")
+            label_class = " ".join(str(query["label_class"] or "").split())
         _table, normalized = self._content_table(content_type)
         column = "paper_id" if normalized == "paper" else "blog_entry_id"
         other_column = "blog_entry_id" if normalized == "paper" else "paper_id"
         now = utcnow()
-        tag_name = f"{' '.join(str(query['label_class'] or '').split())}: {selected}"[:80]
+        tag_name = f"{label_class}: {selected}"[:80]
         with self.transaction() as conn:
             existing = conn.execute(
                 f"SELECT id FROM query_classification_results WHERE query_id=? AND {column}=?",
@@ -5587,29 +5887,84 @@ class Database:
         selection: dict[str, Any] | None = None,
     ) -> list[int]:
         now = utcnow()
-        selection_json = json_dumps(selection or {})
+        base_selection = dict(selection or {})
+
+        def per_record_selections() -> list[tuple[dict[str, Any], int | None, int | None]]:
+            content_type = str(base_selection.get("content_type") or "papers")
+            if content_type == "blogs":
+                raw_ids = (
+                    base_selection.get("resolved_blog_entry_ids")
+                    if isinstance(base_selection.get("resolved_blog_entry_ids"), list)
+                    else base_selection.get("blog_entry_ids")
+                )
+                key = "blog_entry_ids"
+                resolved_key = "resolved_blog_entry_ids"
+                is_blog = True
+            else:
+                raw_ids = (
+                    base_selection.get("resolved_paper_ids")
+                    if isinstance(base_selection.get("resolved_paper_ids"), list)
+                    else base_selection.get("paper_ids")
+                )
+                key = "paper_ids"
+                resolved_key = "resolved_paper_ids"
+                is_blog = False
+            if not isinstance(raw_ids, list):
+                return [(base_selection, None, None)]
+            ids: list[int] = []
+            for raw in raw_ids:
+                try:
+                    value = int(raw)
+                except (TypeError, ValueError):
+                    continue
+                if value > 0 and value not in ids:
+                    ids.append(value)
+            if not ids:
+                return [(base_selection, None, None)]
+            result: list[tuple[dict[str, Any], int | None, int | None]] = []
+            for record_id in ids:
+                item = dict(base_selection)
+                item[key] = [record_id]
+                item[resolved_key] = [record_id]
+                labels = item.get("labels")
+                if isinstance(labels, list):
+                    item["labels"] = [
+                        label for label in labels
+                        if not str(label).startswith(("Selected papers:", "Selected blog entries:", "New papers:", "New blogs:"))
+                    ]
+                result.append(
+                    (item, None, record_id) if is_blog else (item, record_id, None)
+                )
+            return result
+
+        record_selections = per_record_selections()
         ids: list[int] = []
         with self.transaction() as conn:
-            for profile, provider, model in profiles:
-                cur = conn.execute(
-                    """
-                    INSERT INTO query_runs(
-                        batch_id, query_id, profile, provider, model, status,
-                        context_window_tokens, selection_json, created_at
-                    ) VALUES (?, ?, ?, ?, ?, 'queued', ?, ?, ?)
-                    """,
-                    (
-                        batch_id,
-                        query_id,
-                        profile,
-                        provider,
-                        model,
-                        context_window_tokens,
-                        selection_json,
-                        now,
-                    ),
-                )
-                ids.append(int(cur.lastrowid))
+            for record_selection, paper_id, blog_entry_id in record_selections:
+                selection_json = json_dumps(record_selection)
+                for profile, provider, model in profiles:
+                    cur = conn.execute(
+                        """
+                        INSERT INTO query_runs(
+                            batch_id, query_id, profile, provider, model, status,
+                            context_window_tokens, selection_json, paper_id,
+                            blog_entry_id, created_at
+                        ) VALUES (?, ?, ?, ?, ?, 'queued', ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            batch_id,
+                            query_id,
+                            profile,
+                            provider,
+                            model,
+                            context_window_tokens,
+                            selection_json,
+                            paper_id,
+                            blog_entry_id,
+                            now,
+                        ),
+                    )
+                    ids.append(int(cur.lastrowid))
         return ids
 
     def start_query_run(self, run_id: int) -> None:
@@ -5720,9 +6075,11 @@ class Database:
             return {}
         normalized = content_type.strip().lower()
         if normalized in {"paper", "papers"}:
+            id_column = "paper_id"
             resolved_path = "$.resolved_paper_ids"
             fallback_path = "$.paper_ids"
         elif normalized in {"blog", "blogs", "blog_entry"}:
+            id_column = "blog_entry_id"
             resolved_path = "$.resolved_blog_entry_ids"
             fallback_path = "$.blog_entry_ids"
         else:
@@ -5731,10 +6088,11 @@ class Database:
         status_placeholders = ",".join("?" for _ in statuses)
         rows = self._conn.execute(
             f"""
-            SELECT qr.*, q.name AS query_name, CAST(selected.value AS INTEGER) AS matched_record_id
+            SELECT qr.*, q.name AS query_name,
+                   COALESCE(qr.{id_column}, CAST(selected.value AS INTEGER)) AS matched_record_id
             FROM query_runs qr
             JOIN saved_queries q ON q.id=qr.query_id
-            JOIN json_each(
+            LEFT JOIN json_each(
                 CASE
                     WHEN json_type(qr.selection_json, ?)='array'
                     THEN json_extract(qr.selection_json, ?)
@@ -5743,11 +6101,20 @@ class Database:
             ) selected
             WHERE q.name=? COLLATE NOCASE
               AND qr.status IN ({status_placeholders})
-              AND selected.type IN ('integer', 'text')
-              AND CAST(selected.value AS INTEGER) IN ({id_placeholders})
+              AND (
+                    qr.{id_column} IN ({id_placeholders})
+                    OR (
+                        qr.{id_column} IS NULL
+                        AND selected.type IN ('integer', 'text')
+                        AND CAST(selected.value AS INTEGER) IN ({id_placeholders})
+                    )
+              )
             ORDER BY qr.id DESC
             """,
-            (resolved_path, resolved_path, fallback_path, query_name, *statuses, *ids),
+            (
+                resolved_path, resolved_path, fallback_path, query_name, *statuses,
+                *ids, *ids,
+            ),
         ).fetchall()
         result: dict[int, sqlite3.Row] = {}
         for row in rows:
@@ -5759,9 +6126,25 @@ class Database:
         self, paper_id: int, *, successful_only: bool = True, limit: int = 100
     ) -> list[sqlite3.Row]:
         """Return saved-prompt runs explicitly scoped to one paper."""
+        direct = list(
+            self._conn.execute(
+                """
+                SELECT qr.*, q.name AS query_name
+                FROM query_runs qr JOIN saved_queries q ON q.id=qr.query_id
+                WHERE qr.paper_id=?
+                  AND (?=0 OR qr.status='success')
+                ORDER BY qr.id DESC LIMIT ?
+                """,
+                (paper_id, 1 if successful_only else 0, limit),
+            ).fetchall()
+        )
+        if len(direct) >= limit:
+            return direct
         rows = self.list_query_runs(limit=max(limit * 5, 100))
         matched: list[sqlite3.Row] = []
         for row in rows:
+            if row["paper_id"] is not None:
+                continue
             if successful_only and row["status"] != "success":
                 continue
             try:
@@ -5781,16 +6164,32 @@ class Database:
                 continue
             if paper_id in ids:
                 matched.append(row)
-                if len(matched) >= limit:
+                if len(direct) + len(matched) >= limit:
                     break
-        return matched
+        return [*direct, *matched][:limit]
 
     def query_runs_for_blog_entry(
         self, entry_id: int, *, successful_only: bool = True, limit: int = 100
     ) -> list[sqlite3.Row]:
+        direct = list(
+            self._conn.execute(
+                """
+                SELECT qr.*, q.name AS query_name
+                FROM query_runs qr JOIN saved_queries q ON q.id=qr.query_id
+                WHERE qr.blog_entry_id=?
+                  AND (?=0 OR qr.status='success')
+                ORDER BY qr.id DESC LIMIT ?
+                """,
+                (entry_id, 1 if successful_only else 0, limit),
+            ).fetchall()
+        )
+        if len(direct) >= limit:
+            return direct
         rows = self.list_query_runs(limit=max(limit * 5, 100))
         matched: list[sqlite3.Row] = []
         for row in rows:
+            if row["blog_entry_id"] is not None:
+                continue
             if successful_only and row["status"] != "success":
                 continue
             try:
@@ -5810,9 +6209,9 @@ class Database:
                 continue
             if entry_id in ids:
                 matched.append(row)
-                if len(matched) >= limit:
+                if len(direct) + len(matched) >= limit:
                     break
-        return matched
+        return [*direct, *matched][:limit]
 
     def fail_incomplete_query_runs(self, message: str) -> int:
         with self.transaction() as conn:

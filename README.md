@@ -167,18 +167,18 @@ The Discover page contains the network/import operations that are separate from 
 
 ### Saved collection queries
 
-Saved queries work on both research papers and blog entries. **Summarize** is created automatically, remains first, and cannot be deleted. Query creation has its own page, and each query stores the complete execution policy: one or more configured model profiles, context-window size, paper input (`Auto`, `Abstract`, or `Full paper PDF`), and PDF strategy (`Auto`, `Direct`, or `Chunk + merge`). An optional regexp is applied to each record’s complete selected text before model execution. Only matching records proceed, and the radius setting keeps the requested number of surrounding words around every match. The query can send those excerpts to the configured models or return the excerpts locally without invoking an LLM. Blog runs use the stored feed item or normalized snapshot text and retain any version diff as additional context.
+Saved queries work on both research papers and blog entries. **Summarize** is created automatically, remains first, and cannot be deleted. A saved query does **not** store its default model; it resolves the primary `[llm]` profile from `config.toml` each time it runs. Paper processing has one setting with three choices: **Chunk + merge** (default), **Whole text** (Codex only), or **PDF file** (Codex only). Non-Codex text models always process one text chunk at a time and merge the chunk outputs for that record. Context-window tokens are a chunk-and-merge setting only. An optional regexp can preprocess model input. A regexp tagger can also run with no model: the exact matched text becomes a tag under the query name. Classifier queries always include the special `STUB` value; assigning it makes a blog entry count as a stub unless its stub state is manually overridden.
 
-The Queries table has independent **New papers** and **New blog entries** columns. Saving those checkboxes selects the prompts that run after every normal timer or manual fetch. Each selected query runs only on records created by that fetch and uses its own stored models and settings. Initial blog baselines are excluded. When all boxes are clear, a fetch performs no model preflight and no model inference.
+The Queries table has independent **New papers** and **New blog entries** columns. Saving those checkboxes selects the prompts that run after every normal timer or manual fetch. Each selected query runs only on records created by that fetch and resolves the current default model from `config.toml`. Initial blog baselines are excluded. When all boxes are clear, a fetch performs no model preflight and no model inference.
 
 To run a saved prompt manually:
 
-1. Create or edit the query and choose its models, context, paper source, and PDF strategy.
+1. Create or edit the query and choose its paper processing mode.
 2. Filter Recent or open Blogs and optionally select specific rows.
 3. Choose the saved prompt and run it.
-4. Inspect persistent per-model output on Queries or the individual record page.
+4. Inspect the persistent output for each individual content record on Queries or its detail page.
 
-The Runs page shows active saved prompts with links to explicitly selected papers or blog entries. Every completed query run records its runtime selection, models, context, output, and per-model errors.
+The Runs page shows active saved prompts with links to explicitly selected papers or blog entries. Every content record is persisted as its own query run, with the model actually used, runtime selection, context, output, and error state recorded on that run.
 
 ### Shared content tags
 
@@ -194,7 +194,7 @@ The Web UI follows the operating system’s light or dark preference by default.
 
 ## LLM configuration
 
-The primary `[llm]` profile appears in Web UI model selectors and is used only when a saved query or explicit manual analysis selects it. Fetch-time model execution is controlled by the **New papers** and **New blog entries** columns. The legacy `analyze_abstracts` and `analyze_pdfs` keys remain accepted for compatibility with explicit structured-analysis callers, but normal timer and Fetch now runs do not invoke them. PDF queries default to extracted text with chunk-and-merge; Codex and Claude Code instead read the complete PDF natively. Recent papers without a usable local PDF are retried for `fetch.retry_missing_pdf_days` days (90 by default).
+The primary `[llm]` profile is the runtime default for saved queries and is intentionally not copied into their definitions. Manual collection runs may still choose a configured profile as a one-off override. Fetch-time model execution is controlled by the **New papers** and **New blog entries** columns. The legacy `analyze_abstracts` and `analyze_pdfs` keys remain accepted for compatibility with explicit structured-analysis callers, but normal timer and Fetch now runs do not invoke them. Saved paper queries default to extracted/stored text with chunk-and-merge. Only Codex can opt into sending the whole extracted text in one request or uploading the PDF file directly. Recent papers without a usable local PDF are retried for `fetch.retry_missing_pdf_days` days (90 by default).
 
 ```toml
 [llm]

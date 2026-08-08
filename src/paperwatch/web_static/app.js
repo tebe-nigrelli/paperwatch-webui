@@ -203,14 +203,13 @@
   });
 
   document.querySelectorAll("form[data-profile-controls]").forEach((form) => {
-    const source = form.querySelector("select[data-source-scope]");
-    const strategy = form.querySelector("select[data-pdf-strategy]");
+    const processing = form.querySelector("select[data-paper-processing]");
     const context = form.querySelector("input[data-context-window]");
     const models = form.querySelector("select[data-model-picker]");
     const defaults = form.querySelector("select[data-query-defaults]");
     const defaultsToggle = form.querySelector("input[data-query-defaults-toggle]");
     const queryKind = form.querySelector('input[name="query_kind"][data-cycle-value]');
-    if (!models && !context && !source && !strategy) return;
+    if (!models && !context && !processing) return;
 
     const setLocked = (control, locked) => {
       if (!control) return;
@@ -231,53 +230,31 @@
     const defaultsLocked = () => Boolean(defaultsToggle && !defaultsToggle.checked);
     const localQuery = () => {
       if (queryKind?.value === "regexp") return true;
-      const option = defaults?.selectedOptions[0];
-      return option?.dataset.local === "true";
+      return defaults?.selectedOptions[0]?.dataset.local === "true";
     };
 
     const syncProfileOptions = () => {
       if (syncingProfileOptions) return;
       syncingProfileOptions = true;
-      let selected = selectedModels();
-      const native = selected.find((candidate) =>
-        ["codex", "claude-code"].includes(candidate.dataset.provider || "")
-      );
-      if (native && selected.length > 1 && models) {
-        Array.from(models.options).forEach((candidate) => {
-          candidate.selected = candidate === native;
-        });
-        selected = [native];
-      }
+      const selected = selectedModels();
       const single = selected.length === 1 ? selected[0] : null;
-      const provider = single?.dataset.provider || "";
-      const isClaude = provider === "claude-code";
+      const provider = models
+        ? (single?.dataset.provider || "")
+        : (form.dataset.defaultProvider || "");
       const isCodex = provider === "codex";
       const local = localQuery();
-
-      const codexOnly = source?.querySelector('option[data-codex-only]');
-      if (codexOnly) {
-        codexOnly.disabled = local || !isCodex;
-        if (source?.value === "pdf" && codexOnly.disabled) source.value = "auto";
-      }
-      if (isClaude && source && strategy) {
-        source.value = "fulltext";
-        strategy.value = single?.dataset.pdfStrategy || "direct";
-      }
-      if ((isCodex || isClaude) && context && single?.dataset.contextWindow) {
-        context.value = single.dataset.contextWindow;
+      processing?.querySelectorAll('option[data-codex-only]').forEach((option) => {
+        option.disabled = local || !isCodex;
+      });
+      if (processing && processing.value !== "chunked") {
+        const chosen = processing.selectedOptions[0];
+        if (local || chosen?.disabled) processing.value = "chunked";
       }
 
       const lockedByDefaults = defaultsLocked();
       setLocked(models, lockedByDefaults || local);
-      setLocked(source, lockedByDefaults || isClaude);
-      setLocked(context, lockedByDefaults || local || isCodex || isClaude);
-      if (strategy) {
-        const extractedPdf = source?.value === "fulltext";
-        if (!extractedPdf) strategy.value = "auto";
-        setLocked(strategy, lockedByDefaults || isClaude || !extractedPdf);
-      }
-      source?.dispatchEvent(new Event("change", { bubbles: true }));
-      strategy?.dispatchEvent(new Event("change", { bubbles: true }));
+      setLocked(processing, lockedByDefaults || local);
+      setLocked(context, lockedByDefaults || local || processing?.value !== "chunked");
       syncingProfileOptions = false;
     };
 
@@ -302,13 +279,12 @@
           context.value = selected[0].dataset.contextWindow;
         }
       }
-      if (source && option.dataset.source) source.value = option.dataset.source;
-      if (strategy && option.dataset.pdfStrategy) strategy.value = option.dataset.pdfStrategy;
+      if (processing && option.dataset.processing) processing.value = option.dataset.processing;
       syncProfileOptions();
       models?.dispatchEvent(new Event("change", { bubbles: true }));
     };
 
-    source?.addEventListener("change", syncProfileOptions);
+    processing?.addEventListener("change", syncProfileOptions);
     models?.addEventListener("change", syncProfileOptions);
     defaults?.addEventListener("change", applyQueryDefaults);
     defaultsToggle?.addEventListener("change", () => {
@@ -1172,16 +1148,20 @@
   });
 
   const queryKindInput = document.querySelector('input[name="query_kind"][data-cycle-value]');
-  const tagQuerySettings = document.querySelector("[data-tag-query-settings], [data-classification-settings]");
   if (queryKindInput) {
     const updateQueryKindSettings = () => {
       const kind = queryKindInput.value;
-      if (tagQuerySettings) tagQuerySettings.hidden = kind === "summary";
-      document.querySelectorAll("[data-classification-help]").forEach((item) => {
+      document.querySelectorAll("[data-classification-only]").forEach((item) => {
         item.hidden = kind !== "classification";
+        item.querySelectorAll("input, textarea, select, button").forEach((control) => {
+          control.disabled = kind !== "classification";
+        });
       });
-      document.querySelectorAll("[data-regexp-tag-help]").forEach((item) => {
+      document.querySelectorAll("[data-regexp-only]").forEach((item) => {
         item.hidden = kind !== "regexp";
+        item.querySelectorAll("input, textarea, select, button").forEach((control) => {
+          control.disabled = kind !== "regexp";
+        });
       });
       document.querySelectorAll("[data-llm-query-setting]").forEach((item) => {
         const hidden = kind === "regexp";
@@ -1190,7 +1170,7 @@
           control.disabled = hidden;
         });
       });
-      document.querySelector("select[data-model-picker]")?.dispatchEvent(
+      document.querySelector("select[data-paper-processing]")?.dispatchEvent(
         new Event("change", { bubbles: true })
       );
     };

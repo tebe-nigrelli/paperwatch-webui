@@ -1133,7 +1133,7 @@ def test_manual_fetch_downloads_pdf_and_checks_blogs(
         assert db.get_paper(paper_id)["local_pdf_path"]
 
 def test_automatic_saved_queries_target_new_papers_and_blogs(
-    app_config, paper_record, analysis_result, monkeypatch
+    app_config, author_candidate, paper_record, analysis_result, monkeypatch
 ):
     class NoopOpenAlex:
         def close(self):
@@ -1169,6 +1169,20 @@ def test_automatic_saved_queries_target_new_papers_and_blogs(
     monkeypatch.setattr("paperwatch.query_jobs.run_query_for_model", run_model)
 
     with Database(app_config.paths.database) as db:
+        db.add_author(author_candidate)
+        blog_id = db.add_author_blog(author_candidate.openalex_id, "https://example.test/blog")
+        blog_entry_id = db.save_blog_entry(
+            blog_id=blog_id,
+            title="New blog entry",
+            content_sha256="new-blog-entry",
+            normalized_text="New blog evidence",
+            diff_text="",
+            change_kind="changed",
+            previous_entry_id=None,
+            entry_kind="rss",
+            external_id="new-blog-entry",
+            source_url="https://example.test/blog/new",
+        )
         paper_id, _ = db.upsert_paper(paper_record)
         db.create_saved_query(
             name="New papers",
@@ -1195,7 +1209,7 @@ def test_automatic_saved_queries_target_new_papers_and_blogs(
         stats = RunStats(
             run_id=db.start_run(),
             new_paper_ids=[paper_id, paper_id],
-            new_blog_entry_ids=[17, 17],
+            new_blog_entry_ids=[blog_entry_id, blog_entry_id],
         )
         app._run_automatic_queries(stats)
         runs = db.list_query_runs()
@@ -1206,7 +1220,7 @@ def test_automatic_saved_queries_target_new_papers_and_blogs(
         paper_selection = captured[0][1]
         blog_selection = captured[1][1]
         assert paper_selection["paper_ids"] == [paper_id]
-        assert blog_selection["blog_entry_ids"] == [17]
+        assert blog_selection["blog_entry_ids"] == [blog_entry_id]
         assert paper_selection["content_type"] == "papers"
         assert blog_selection["content_type"] == "blogs"
 
@@ -1214,7 +1228,7 @@ def test_automatic_saved_queries_target_new_papers_and_blogs(
             raise RuntimeError("query failed")
 
         monkeypatch.setattr("paperwatch.query_jobs.run_query_for_model", fail_model)
-        failed = RunStats(run_id=db.start_run(), new_blog_entry_ids=[17])
+        failed = RunStats(run_id=db.start_run(), new_blog_entry_ids=[blog_entry_id])
         app._run_automatic_queries(failed)
         assert failed.errors_count == 1
         assert db.get_run_errors(failed.run_id)[0]["stage"] == "automatic_blogs_query"

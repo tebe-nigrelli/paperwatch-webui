@@ -29,15 +29,16 @@ def _classifier(
     content_scope: str = "papers",
     paper_source_scope: str = "fulltext",
 ) -> dict[str, Any]:
+    allowed_values = tuple(values) if any(value.upper() == "STUB" for value in values) else (*values, "STUB")
     return {
         "name": name,
-        "prompt": f"{instruction}\n\nAllowed values: {', '.join(values)}.\n\n{CLASSIFIER_OUTPUT}",
+        "prompt": f"{instruction}\n\nAllowed values: {', '.join(allowed_values)}.\n\n{CLASSIFIER_OUTPUT}",
         "content_scope": content_scope,
         "paper_source_scope": paper_source_scope,
         "pdf_strategy": "chunked",
         "query_kind": "classification",
         "label_class": label_class,
-        "label_values": _labels(*values),
+        "label_values": _labels(*allowed_values),
     }
 
 
@@ -315,8 +316,7 @@ def add_default_queries(db: Any, model_profile: str = "") -> int:
         if definition["name"].casefold() in existing:
             continue
         values = dict(definition)
-        local_regexp = values.get("regexp_mode") == "print"
-        values["model_profiles"] = () if local_regexp or not model_profile else (model_profile,)
+        values["model_profiles"] = ()
         values["auto_run_papers"] = False
         values["auto_run_blogs"] = False
         db.create_saved_query(**values)

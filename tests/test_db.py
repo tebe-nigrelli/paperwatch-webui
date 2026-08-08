@@ -222,6 +222,61 @@ def test_version_zero_database_is_upgraded_without_data_loss(tmp_path):
         assert db._conn.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
 
 
+def test_v31_query_runs_migrate_before_content_indexes(tmp_path):
+    import sqlite3
+
+    path = tmp_path / "v31-query-runs.sqlite"
+    with Database(path):
+        pass
+
+    conn = sqlite3.connect(path)
+    conn.execute("PRAGMA foreign_keys = OFF")
+    conn.execute("DROP INDEX IF EXISTS idx_query_runs_paper")
+    conn.execute("DROP INDEX IF EXISTS idx_query_runs_blog")
+    conn.execute("DROP TABLE query_runs")
+    conn.executescript(
+        """
+        CREATE TABLE query_runs (
+            id INTEGER PRIMARY KEY,
+            batch_id TEXT NOT NULL,
+            query_id INTEGER NOT NULL REFERENCES saved_queries(id) ON DELETE CASCADE,
+            profile TEXT NOT NULL,
+            provider TEXT NOT NULL,
+            model TEXT NOT NULL,
+            status TEXT NOT NULL CHECK (status IN ('queued', 'running', 'success', 'failed')),
+            context_window_tokens INTEGER NOT NULL,
+            selection_json TEXT NOT NULL DEFAULT '{}',
+            matched_count INTEGER NOT NULL DEFAULT 0,
+            input_chars INTEGER NOT NULL DEFAULT 0,
+            output_json TEXT,
+            created_at TEXT NOT NULL,
+            started_at TEXT,
+            finished_at TEXT,
+            error_text TEXT,
+            UNIQUE (batch_id, profile)
+        );
+        CREATE INDEX idx_query_runs_query ON query_runs(query_id, id DESC);
+        CREATE INDEX idx_query_runs_batch ON query_runs(batch_id, id);
+        CREATE INDEX idx_query_runs_success ON query_runs(id) WHERE status='success';
+        """
+    )
+    conn.execute("PRAGMA user_version = 31")
+    conn.commit()
+    conn.close()
+
+    with Database(path) as db:
+        columns = {
+            row["name"] for row in db._conn.execute("PRAGMA table_info(query_runs)")
+        }
+        indexes = {
+            row["name"] for row in db._conn.execute("PRAGMA index_list(query_runs)")
+        }
+        assert {"paper_id", "blog_entry_id"}.issubset(columns)
+        assert "idx_query_runs_paper" in indexes
+        assert "idx_query_runs_blog" in indexes
+        assert db._conn.execute("PRAGMA user_version").fetchone()[0] == 32
+
+
 def test_analysis_fields_are_named_columns_and_round_trip(tmp_path, paper_record, analysis_result):
     import json
 
@@ -719,7 +774,7 @@ def test_saved_query_v25_migration_normalizes_legacy_values(tmp_path):
             )
         }
         invalid = rows[7]
-        assert invalid["model_profile"] == ""
+        assert "model_profile" not in invalid.keys()
         assert invalid["source_type"] == "papers"
         assert invalid["paper_source_scope"] == "auto"
         assert invalid["pdf_strategy"] == "chunked"
@@ -731,7 +786,7 @@ def test_saved_query_v25_migration_normalizes_legacy_values(tmp_path):
         assert invalid["created_at"] and invalid["updated_at"]
 
         profiles = rows[8]
-        assert profiles["model_profile"] == "second"
+        assert "model_profile" not in profiles.keys()
         assert profiles["source_type"] == "summaries"
         assert profiles["paper_source_scope"] == "fulltext"
         assert profiles["pdf_strategy"] == "direct"
@@ -1022,8 +1077,9 @@ def test_classification_value_validation_and_decoding_edges():
         Database._classification_values("regexp", "Class", [{"value": "One", "pattern": ""}])
     with pytest.raises(ValueError, match="Invalid classification regexp"):
         Database._classification_values("regexp", "Class", [{"value": "One", "pattern": "["}])
-    with pytest.raises(ValueError, match="tag class"):
-        Database._classification_values("regexp", "", [{"value": "One", "pattern": "one"}])
+    assert Database._classification_values(
+        "regexp", "", [{"value": "One", "pattern": "one"}]
+    ) == ("regexp", "", "[]")
     with pytest.raises(ValueError, match="at least two"):
         Database._classification_values("classification", "Class", [{"value": "One", "pattern": "one"}])
     kind, label_class, encoded = Database._classification_values(
@@ -1035,8 +1091,8 @@ def test_classification_value_validation_and_decoding_edges():
             {"value": "", "pattern": "ignored"},
         ],
     )
-    assert (kind, label_class) == ("regexp", "Topic Class")
-    assert Database._decoded_label_values(encoded) == [{"value": "One", "pattern": "one"}]
+    assert (kind, label_class) == ("regexp", "")
+    assert Database._decoded_label_values(encoded) == []
     assert Database._classification_values("summary", "ignored", [{"value": "x", "pattern": "x"}])[:2] == (
         "summary",
         "",

@@ -774,38 +774,53 @@ def _query_profile_names(value: Any) -> tuple[str, ...]:
     ))
 
 
+def _default_query_profiles(config: AppConfig) -> tuple[str, ...]:
+    if config.llm.provider == "none":
+        return ()
+    return (config.llm.profile,)
+
+
 def _configured_context_window(
     config: AppConfig,
     profile_names: Iterable[str],
     requested: int | None = None,
+    *,
+    chunked: bool = True,
 ) -> int:
     profiles = [
         profile
         for name in dict.fromkeys(str(value).strip() for value in profile_names)
         if name and (profile := config.llm_profile(name)) is not None
     ]
-    native = [
-        profile for profile in profiles if profile.provider in {"codex", "claude-code"}
-    ]
-    if native:
-        if len(profiles) != 1:
-            raise ValueError("Codex and Claude Code must run as the only selected model")
-        return native[0].context_window_tokens
-    if requested is not None:
+    if requested is not None and chunked:
         return requested
     if len(profiles) == 1:
         return profiles[0].context_window_tokens
     return config.llm.context_window_tokens
 
 
+def _paper_processing(source_scope: str, pdf_strategy: str) -> str:
+    if source_scope == "pdf":
+        return "pdf"
+    if pdf_strategy == "direct":
+        return "whole_text"
+    return "chunked"
+
+
+def _processing_values(value: str) -> tuple[str, str]:
+    if value == "pdf":
+        return "pdf", "auto"
+    if value == "whole_text":
+        return "fulltext", "direct"
+    if value == "chunked":
+        return "auto", "chunked"
+    raise ValueError("Paper processing must be chunked, whole_text, or pdf")
+
+
 def _query_view(row: Any, config: AppConfig) -> dict[str, Any]:
     query = _row_dict(row)
     available = {item.profile: item for item in config.available_llms}
-    selected = _query_profile_names(
-        query.get("model_profile") or query.get("model_profiles_json")
-    )[:1]
-    if not selected and available:
-        selected = (next(iter(available)),)
+    selected = _default_query_profiles(config)
     query["model_profiles"] = list(selected)
     query["selected_models"] = [
         {
@@ -817,6 +832,9 @@ def _query_view(row: Any, config: AppConfig) -> dict[str, Any]:
     ]
     query["paper_source_scope"] = str(query.get("paper_source_scope") or "auto")
     query["pdf_strategy"] = str(query.get("pdf_strategy") or "chunked")
+    query["paper_processing"] = _paper_processing(
+        query["paper_source_scope"], query["pdf_strategy"]
+    )
     query["regexp_pattern"] = str(query.get("regexp_pattern") or "")
     query["regexp_radius"] = int(query.get("regexp_radius") or 0)
     query["regexp_debug_text"] = str(query.get("regexp_debug_text") or "")
@@ -836,7 +854,9 @@ def _query_view(row: Any, config: AppConfig) -> dict[str, Any]:
         if isinstance(item, dict) and item.get("value") and item.get("pattern")
     ]
     query["label_values_text"] = "\n".join(
-        f"{item['value']} = {item['pattern']}" for item in query["label_values"]
+        f"{item['value']} = {item['pattern']}"
+        for item in query["label_values"]
+        if item["value"].upper() != "STUB"
     )
     query["label_debug_text"] = str(query.get("label_debug_text") or "")
     query["local_regexp"] = bool(
@@ -865,8 +885,6 @@ def _query_execution_form(
     *,
     existing_query: Any | None = None,
 ) -> dict[str, Any]:
-    available = {item.profile: item for item in config.available_llms}
-
     def saved_text(name: str) -> str:
         if name in form:
             return str(form.get(name, ""))
@@ -876,50 +894,51 @@ def _query_execution_form(
             return str(existing_query[name] or "")
         except (KeyError, TypeError, IndexError):
             return str(getattr(existing_query, name, "") or "")
-    profiles = tuple(dict.fromkeys(
-        str(value).strip() for value in form.getlist("model") if str(value).strip()
-    ))
-    unknown = [name for name in profiles if name not in available]
-    if unknown:
-        raise ValueError(f"Unknown configured model profile(s): {', '.join(unknown)}")
-    if len(profiles) > 1:
-        raise ValueError("A saved query can use only one model")
-    if available and not profiles:
-        profiles = (next(iter(available)),)
-    source_scope = str(form.get("paper_source_scope", "auto"))
-    pdf_strategy = str(form.get("pdf_strategy", "chunked"))
-    if source_scope in {"abstract", "pdf"}:
-        pdf_strategy = "auto"
-    regexp_radius = _int_or_none(form.get("regexp_radius"))
-    if regexp_radius is None:
-        regexp_radius = 0
+
+    processing = str(form.get("paper_processing", "")).strip()
+    if processing:
+        source_scope, pdf_strategy = _processing_values(processing)
+    else:
+        source_scope = str(form.get("paper_source_scope", "auto"))
+        pdf_strategy = str(form.get("pdf_strategy", "chunked"))
+        processing = _paper_processing(source_scope, pdf_strategy)
+        source_scope, pdf_strategy = _processing_values(processing)
+
     query_kind = str(form.get("query_kind", "summary"))
+    regexp_pattern = str(
+        form.get("regexp_tag_pattern", "") if query_kind == "regexp"
+        else form.get("regexp_pattern", "")
+    )
+    regexp_radius = _int_or_none(form.get("regexp_radius")) or 0
+    regexp_mode = str(form.get("regexp_mode", "query"))
     if query_kind == "regexp":
-        profiles = ()
-        regexp_pattern = ""
         regexp_radius = 0
         regexp_mode = "query"
-    else:
-        regexp_pattern = str(form.get("regexp_pattern", ""))
-        regexp_mode = str(form.get("regexp_mode", "query"))
-    if source_scope == "pdf":
-        profile = available.get(profiles[0]) if profiles else None
-        if profile is None or profile.provider != "codex":
-            raise ValueError("Whole-PDF upload requires a Codex model")
+        if not regexp_pattern.strip():
+            raise ValueError("Regexp taggers require a regexp")
+        source_scope, pdf_strategy = "auto", "chunked"
+    elif processing in {"pdf", "whole_text"}:
+        if config.llm.provider != "codex":
+            raise ValueError("PDF file and whole-text modes require the default Codex model")
+
     return {
-        "model_profiles": profiles,
+        "model_profiles": (),
         "paper_source_scope": source_scope,
         "pdf_strategy": pdf_strategy,
         "regexp_pattern": regexp_pattern,
         "regexp_radius": regexp_radius,
-        "regexp_debug_text": saved_text("regexp_debug_text"),
+        "regexp_debug_text": (
+            str(form.get("regexp_tag_debug_text", ""))
+            if query_kind == "regexp" and "regexp_tag_debug_text" in form
+            else saved_text("regexp_debug_text")
+        ),
         "regexp_mode": regexp_mode,
         "content_scope": str(form.get("content_scope", "both")),
         "query_kind": query_kind,
-        "label_class": str(form.get("label_class", "")),
+        "label_class": str(form.get("label_class", "")) if query_kind == "classification" else "",
         "label_values": (
             _classification_form_values(str(form.get("label_values", "")))
-            if query_kind in {"classification", "regexp"}
+            if query_kind == "classification"
             else []
         ),
         "label_debug_text": saved_text("label_debug_text"),
@@ -938,27 +957,25 @@ def _saved_query_run_options(
     *,
     content_type: str,
 ) -> tuple[dict[str, Any], tuple[str, ...], int, str, str]:
-    """Resolve a saved query's defaults unless this run explicitly overrides them."""
+    """Resolve the config default model plus any explicit run-time overrides."""
     query_view = _query_view(query, config)
     override_defaults = str(form.get("override_query_defaults", "")) in {
         "1", "true", "on"
     }
+    profiles: tuple[str, ...] = ()
+    requested_context = None
+    source_scope = str(query_view["paper_source_scope"])
+    pdf_strategy = str(query_view["pdf_strategy"])
     if override_defaults:
-        profiles = tuple(dict.fromkeys(
+        requested_profiles = tuple(dict.fromkeys(
             str(value).strip()
             for value in form.getlist("model")
             if str(value).strip()
         ))
+        profiles = requested_profiles
         requested_context = _int_or_none(form.get("context_window_tokens"))
-        source_scope = str(
-            form.get("source_scope", query_view["paper_source_scope"])
-        )
-        pdf_strategy = str(form.get("pdf_strategy", query_view["pdf_strategy"]))
-    else:
-        profiles = tuple(query_view["model_profiles"])
-        requested_context = None
-        source_scope = str(query_view["paper_source_scope"])
-        pdf_strategy = str(query_view["pdf_strategy"])
+        processing = str(form.get("paper_processing", query_view["paper_processing"]))
+        source_scope, pdf_strategy = _processing_values(processing)
 
     if content_type == "blogs":
         source_scope = "blog"
@@ -970,13 +987,18 @@ def _saved_query_run_options(
     if local_regexp:
         profiles = ()
     available_profiles = {item.profile for item in config.available_llms}
-    if not local_regexp and (
+    if not local_regexp and override_defaults and (
         not profiles or any(name not in available_profiles for name in profiles)
     ):
-        raise ValueError("Select a configured model.")
-    context = _configured_context_window(config, profiles, requested_context)
+        raise ValueError("Configure a default model in config.toml or select a run-time override.")
+    if not local_regexp and not override_defaults and config.llm.provider == "none":
+        raise ValueError("Configure a default LLM in config.toml.")
+    chunked = content_type == "blogs" or not (source_scope == "pdf" or pdf_strategy == "direct")
+    context_profiles = profiles or _default_query_profiles(config)
+    context = _configured_context_window(
+        config, context_profiles, requested_context, chunked=chunked
+    )
     return query_view, profiles, context, source_scope, pdf_strategy
-
 
 def _analysis_view(row: Any) -> dict[str, Any]:
     data = _row_dict(row)
@@ -1917,12 +1939,19 @@ def _query_output(row: Any) -> dict[str, Any]:
     content_type = str(data["selection"].get("content_type") or "papers")
     source_scope = str(
         data["selection"].get("source_scope")
-        or ("blog" if content_type == "blogs" else "abstract")
+        or ("blog" if content_type == "blogs" else "auto")
     )
-    pdf_strategy = str(data["selection"].get("pdf_strategy") or "auto")
-    selection_items.append(f"Source: {source_scope}")
-    if source_scope == "fulltext":
-        selection_items.append(f"PDF strategy: {pdf_strategy}")
+    pdf_strategy = str(data["selection"].get("pdf_strategy") or "chunked")
+    if content_type == "blogs":
+        selection_items.append("Processing: stored blog text")
+    else:
+        processing = _paper_processing(source_scope, pdf_strategy)
+        label = {
+            "chunked": "Chunk + merge",
+            "whole_text": "Whole text",
+            "pdf": "PDF file",
+        }[processing]
+        selection_items.append(f"Processing: {label}")
     data["selection_label"] = " · ".join(selection_items) or "All matching records"
     raw_tags = data["selection"].get("author_tags")
     author_tags = raw_tags if isinstance(raw_tags, list) else []
@@ -1999,6 +2028,43 @@ def _query_output_for_content(
             if item_type == expected_type and item_title == wanted_title:
                 matching_items.append(item)
 
+    # New query runs are persisted one record per row. If a provider omitted
+    # identity fields, the run row itself is authoritative and lets us repair
+    # the item instead of presenting a missing per-record result. Never relabel
+    # an item that explicitly points at a different record.
+    try:
+        row_content_id = int(row[id_key]) if row[id_key] is not None else None
+    except (KeyError, TypeError, ValueError, IndexError):
+        row_content_id = None
+    if not matching_items and row_content_id == wanted_id:
+        expected_type = "paper" if id_key == "paper_id" else "blog"
+        if items:
+            for item in items:
+                if not isinstance(item, dict):
+                    continue
+                try:
+                    explicit_item_id = (
+                        int(item.get(id_key)) if item.get(id_key) is not None else None
+                    )
+                except (TypeError, ValueError):
+                    explicit_item_id = None
+                if explicit_item_id is not None and explicit_item_id != wanted_id:
+                    continue
+                repaired = dict(item)
+                repaired[id_key] = wanted_id
+                repaired["content_type"] = expected_type
+                repaired["title"] = content_title or str(repaired.get("title") or "Query result")
+                matching_items.append(repaired)
+        if not items:
+            summary = str(output.get("summary") or "No output returned for this record.")
+            matching_items.append({
+                "paper_id": wanted_id if id_key == "paper_id" else None,
+                "blog_entry_id": wanted_id if id_key == "blog_entry_id" else None,
+                "content_type": expected_type,
+                "title": content_title or "Query result",
+                "output": summary,
+            })
+
     localized = dict(output)
     localized["items"] = matching_items
     try:
@@ -2009,7 +2075,6 @@ def _query_output_for_content(
         localized["summary"] = ""
     data["output"] = localized
     data["content_result_count"] = len(matching_items)
-    data["content_result_missing"] = not matching_items
     return data
 
 def _csv_response(records: Iterable[dict[str, Any]]) -> Response:
@@ -3401,7 +3466,12 @@ def create_app(
             return failure(str(exc))
         if batch_id is None:
             return failure("Another saved prompt is already running.", status_code=409)
-        runner = "local regexp" if query_view["local_regexp"] else f"{len(set(profiles))} model(s)"
+        effective_profiles = profiles or _default_query_profiles(config)
+        runner = (
+            "local regexp"
+            if query_view["local_regexp"]
+            else f"{len(set(effective_profiles))} model(s)"
+        )
         message = f"Started {query['name']} with {runner}."
         if async_request:
             return JSONResponse({"ok": True, "batch_id": batch_id, "message": message})
@@ -4365,7 +4435,12 @@ def create_app(
             return RedirectResponse(
                 _notice_url(f"/papers/{paper_id}", message, level="warning"), status_code=303
             )
-        runner = "local regexp" if query_view["local_regexp"] else f"{len(set(profiles))} model(s)"
+        effective_profiles = profiles or _default_query_profiles(config)
+        runner = (
+            "local regexp"
+            if query_view["local_regexp"]
+            else f"{len(set(effective_profiles))} model(s)"
+        )
         message = f"Started {query['name']} with {runner}."
         if async_request:
             return JSONResponse({"ok": True, "batch_id": batch_id, "message": message})
@@ -4647,20 +4722,38 @@ def create_app(
                             }
                         )
             run["selection_links"] = links
-            run["selection_source"] = str(
+            source_scope = str(
                 selection.get("source_scope")
-                or ("blog" if selection.get("content_type") == "blogs" else "abstract")
+                or ("blog" if selection.get("content_type") == "blogs" else "auto")
+            )
+            pdf_strategy = str(selection.get("pdf_strategy") or "chunked")
+            run["selection_processing"] = (
+                "stored blog text"
+                if selection.get("content_type") == "blogs"
+                else {
+                    "chunked": "Chunk + merge",
+                    "whole_text": "Whole text",
+                    "pdf": "PDF file",
+                }[_paper_processing(source_scope, pdf_strategy)]
             )
         return render(request, "query_run_detail.html", run=run)
 
     @app.get("/queries/new", response_class=HTMLResponse)
     def query_new_page(request: Request) -> HTMLResponse:
-        selected = [config.available_llms[0].profile] if config.available_llms else []
+        selected = list(_default_query_profiles(config))
+        selected_profiles = [
+            item for item in config.available_llms if item.profile in set(selected)
+        ]
         query = {
             "name": "",
             "prompt": "",
             "is_builtin": False,
             "model_profiles": selected,
+            "selected_models": [
+                {"profile": item.profile, "model": item.model, "provider": item.provider}
+                for item in selected_profiles
+            ],
+            "paper_processing": "chunked",
             "paper_source_scope": "auto",
             "pdf_strategy": "chunked",
             "regexp_pattern": "",
@@ -4833,16 +4926,17 @@ def create_app(
     async def run_query(request: Request, query_id: int) -> RedirectResponse:
         form = await request.form()
         profiles = tuple(str(value) for value in form.getlist("model"))
+        processing = str(form.get("paper_processing", "chunked"))
         try:
+            source_scope, pdf_strategy = _processing_values(processing)
             context = _configured_context_window(
-                config, profiles, _int_or_none(form.get("context_window_tokens"))
+                config, profiles, _int_or_none(form.get("context_window_tokens")),
+                chunked=processing == "chunked",
             )
         except ValueError as exc:
             return RedirectResponse(
                 _notice_url("/queries", str(exc), level="error"), status_code=303
             )
-        source_scope = str(form.get("source_scope", "abstract"))
-        pdf_strategy = str(form.get("pdf_strategy", "auto"))
         try:
             batch_id = collection_controller.start(
                 query_id,
@@ -4865,7 +4959,9 @@ def create_app(
                 status_code=303,
             )
         warning = str(collection_controller.snapshot().warning or "").strip()
-        message = f"Started query with {len(set(profiles))} model(s)."
+        message = (
+            f"Started query with {len(set(profiles or _default_query_profiles(config)))} model(s)."
+        )
         if warning:
             message = f"{message} {warning}"
         return RedirectResponse(
@@ -4964,31 +5060,40 @@ def create_app(
                 ):
                     blog_match_count = db.count_blog_entries(**blog_filter_args)
 
+        profiles: tuple[str, ...] = ()
+        source_scope = str(query["paper_source_scope"] or "auto")
+        pdf_strategy = str(query["pdf_strategy"] or "chunked")
+        requested_context = None
         if override_defaults:
-            profiles = tuple(
+            requested_profiles = tuple(
                 str(value) for value in form.getlist("model") if str(value).strip()
             )
-            source_scope = str(form.get("source_scope", "abstract"))
-            pdf_strategy = str(form.get("pdf_strategy", "auto"))
+            if requested_profiles:
+                profiles = requested_profiles
+            source_scope, pdf_strategy = _processing_values(
+                str(form.get("paper_processing", query["paper_processing"]))
+            )
             requested_context = _int_or_none(form.get("context_window_tokens"))
-        else:
-            profiles = tuple(query["model_profiles"])
-            source_scope = str(query["paper_source_scope"] or "auto")
-            pdf_strategy = str(query["pdf_strategy"] or "chunked")
-            requested_context = None
 
         local_regexp = bool(query["local_regexp"])
         if local_regexp:
             profiles = ()
         available_profiles = {item.profile for item in config.available_llms}
-        if not local_regexp and (
+        if not local_regexp and override_defaults and (
             not profiles or any(name not in available_profiles for name in profiles)
         ):
             return RedirectResponse(
                 _notice_url(return_to, "Select a configured model.", level="error"), status_code=303
             )
+        if not local_regexp and not override_defaults and config.llm.provider == "none":
+            return RedirectResponse(
+                _notice_url(return_to, "Configure a default LLM in config.toml.", level="error"), status_code=303
+            )
         try:
-            context = _configured_context_window(config, profiles, requested_context)
+            context = _configured_context_window(
+                config, profiles or _default_query_profiles(config), requested_context,
+                chunked=not (source_scope == "pdf" or pdf_strategy == "direct"),
+            )
         except ValueError as exc:
             return RedirectResponse(
                 _notice_url(return_to, str(exc), level="error"), status_code=303
@@ -5112,7 +5217,7 @@ def create_app(
         requested_profiles = tuple(
             str(value) for value in form.getlist("model") if str(value).strip()
         )
-        profiles = requested_profiles or tuple(query["model_profiles"])
+        profiles = requested_profiles or _default_query_profiles(config)
         if not profiles and not query["local_regexp"]:
             return RedirectResponse(
                 _notice_url(
@@ -5134,8 +5239,9 @@ def create_app(
                 profiles,
                 _configured_context_window(
                     config,
-                    profiles,
+                    profiles or _default_query_profiles(config),
                     _int_or_none(form.get("context_window_tokens")),
+                    chunked=not (source_scope == "pdf" or pdf_strategy == "direct"),
                 ),
                 selection=selection,
                 source_scope=source_scope,

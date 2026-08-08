@@ -1002,10 +1002,7 @@ def test_automatic_regexp_tagger_runs_without_llm(app_config, paper_record):
             auto_run_papers=True,
             query_kind="regexp",
             content_scope="papers",
-            label_class="Architecture",
-            label_values=[
-                {"value": "Compact", "pattern": r"(?i)compact\s+agent"},
-            ],
+            regexp_pattern=r"(?i)compact\s+agent",
             paper_source_scope="abstract",
         )
         app = PaperWatch(
@@ -1023,5 +1020,5 @@ def test_automatic_regexp_tagger_runs_without_llm(app_config, paper_record):
         assert run["status"] == "success"
         assert run["provider"] == "local"
         tags = db.classification_results_for_content("paper", paper_id)
-        assert tags[0]["tag_name"] == "Architecture: Compact"
+        assert tags[0]["tag_name"].casefold() == "automatic compact tag: compact agent"
         assert stats.errors_count == 0

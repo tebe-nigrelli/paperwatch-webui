@@ -2059,41 +2059,12 @@ class PaperWatch:
         finally:
             self._stop_blog_fetches(blog_executor)
 
-    @staticmethod
-    def _stored_query_profiles(query: Any) -> tuple[str, ...]:
-        try:
-            profile = str(query["model_profile"] or "").strip()
-        except (KeyError, IndexError):
-            profile = ""
-        if profile:
-            return (profile,)
-        try:
-            values = json.loads(str(query["model_profiles_json"] or "[]"))
-        except (KeyError, IndexError, TypeError, json.JSONDecodeError):
-            values = []
-        if not isinstance(values, list):
-            return ()
-        return tuple(dict.fromkeys(
-            str(value).strip() for value in values if str(value).strip()
-        ))[:1]
-
     def _run_automatic_queries(self, stats: RunStats) -> None:
-        from .query_jobs import (
-            _selected_papers,
-            collect_query_documents,
-            preprocess_regexp_documents,
-            regexp_result,
-            regexp_tag_result,
-            run_query_for_model,
-            run_query_for_native_pdfs,
-        )
+        from .query_jobs import run_query_batch
 
-        available = {item.profile: item for item in self.config.available_llms}
+        default_profile = self.config.llm if self.config.llm.provider != "none" else None
         jobs: list[tuple[str, list[int], str, Any, tuple[str, ...]]] = []
-        targets = (
-            ("papers", stats.new_paper_ids),
-            ("blogs", stats.new_blog_entry_ids),
-        )
+        targets = (("papers", stats.new_paper_ids), ("blogs", stats.new_blog_entry_ids))
         for content_type, raw_ids in targets:
             ids = list(dict.fromkeys(raw_ids))
             if not ids:
@@ -2105,271 +2076,108 @@ class PaperWatch:
                     str(query["regexp_mode"] or "query") == "print" and bool(regexp_pattern)
                 )
                 if local:
-                    jobs.append((content_type, ids, str(query["name"]), query, ("regexp",)))
-                    continue
-                selected = self._stored_query_profiles(query)
-                if not selected and available:
-                    selected = (next(iter(available)),)
-                valid = tuple(name for name in selected if name in available)
-                missing = [name for name in selected if name not in available]
-                if missing:
+                    profiles = ("regexp",)
+                elif default_profile is not None:
+                    profiles = (default_profile.profile,)
+                else:
                     self._record_error(
                         stats,
                         stage=f"automatic_{content_type}_query",
                         exc=RuntimeError(
-                            f"{query['name']}: configured model profile(s) are unavailable: "
-                            f"{', '.join(missing)}"
+                            f"{query['name']}: no default LLM is configured in config.toml"
                         ),
                     )
-                if valid:
-                    jobs.append((content_type, ids, str(query["name"]), query, valid))
-                elif not selected:
-                    self._record_error(
-                        stats,
-                        stage=f"automatic_{content_type}_query",
-                        exc=RuntimeError(f"{query['name']}: no configured model is available"),
-                    )
+                    continue
+                jobs.append((content_type, ids, str(query["name"]), query, profiles))
 
         if not jobs:
             return
         self._start_progress(
-            sum(len(profiles) for _, _, _, _, profiles in jobs),
+            sum(len(ids) * len(profiles) for _, ids, _, _, profiles in jobs),
             "Running automatic prompts",
         )
 
         for content_type, ids, query_name, query, profile_names in jobs:
             check_cancelled(self._cancel_event)
-            source_scope = (
-                "blog" if content_type == "blogs"
-                else str(query["paper_source_scope"] or "auto")
+            source_scope = "blog" if content_type == "blogs" else str(
+                query["paper_source_scope"] or "auto"
             )
-            pdf_strategy = (
-                "auto" if content_type == "blogs"
-                else str(query["pdf_strategy"] or "chunked")
+            pdf_strategy = "auto" if content_type == "blogs" else str(
+                query["pdf_strategy"] or "chunked"
             )
-            query_kind = str(query["query_kind"] or "summary")
-            regexp_pattern = str(query["regexp_pattern"] or "").strip()
-            regexp_radius = int(query["regexp_radius"] or 0)
-            regexp_mode = str(query["regexp_mode"] or "query")
-            local_regexp_tags = query_kind == "regexp"
-            local_print = regexp_mode == "print" and bool(regexp_pattern)
-            first_profile = next(
-                (available[name] for name in profile_names if name in available), None
-            )
-            context_window_tokens = (
-                first_profile.context_window_tokens
-                if first_profile is not None
-                else self.config.llm.context_window_tokens
-            )
+            if content_type == "papers" and (
+                source_scope == "pdf" or pdf_strategy == "direct"
+            ):
+                if default_profile is None or default_profile.provider != "codex":
+                    error = (
+                        "PDF file and whole-text modes require the default Codex model "
+                        "configured in config.toml"
+                    )
+                    self._record_error(
+                        stats,
+                        stage=f"automatic_{content_type}_query",
+                        exc=RuntimeError(f"{query_name}: {error}"),
+                    )
+                    for _ in ids:
+                        self._advance_progress(f"{query_name} skipped: {error}", stats)
+                    continue
+
             selection: dict[str, Any] = {
                 "content_type": content_type,
                 "source_scope": source_scope,
                 "pdf_strategy": pdf_strategy,
                 "labels": [f"New {content_type}: {len(ids)}"],
             }
-            selection[
-                "paper_ids" if content_type == "papers" else "blog_entry_ids"
-            ] = ids
+            selection["paper_ids" if content_type == "papers" else "blog_entry_ids"] = ids
             batch_id = f"auto-{stats.run_id}-{content_type}-{query['id']}"
+            context_window_tokens = (
+                default_profile.context_window_tokens
+                if default_profile is not None
+                else self.config.llm.context_window_tokens
+            )
             run_ids = self.db.create_query_runs(
                 batch_id=batch_id,
                 query_id=int(query["id"]),
                 profiles=[
                     ("regexp", "local", "regexp")
                     if name == "regexp"
-                    else (name, available[name].provider, available[name].model)
+                    else (name, default_profile.provider, default_profile.model)
                     for name in profile_names
                 ],
                 context_window_tokens=context_window_tokens,
                 selection=selection,
             )
-
-            if source_scope == "pdf":
-                valid_pdf_upload = (
-                    content_type == "papers"
-                    and not local_regexp_tags
-                    and not local_print
-                    and len(profile_names) == 1
-                    and profile_names[0] in available
-                    and available[profile_names[0]].provider == "codex"
+            try:
+                result = run_query_batch(
+                    self.config.config_path,
+                    batch_id,
+                    int(query["id"]),
+                    profile_names,
+                    context_window_tokens,
+                    progress=None,
+                    cancel_event=self._cancel_event,
                 )
-                if not valid_pdf_upload:
-                    error = "Whole-PDF upload requires exactly one Codex model"
-                    for run_id in run_ids:
-                        self.db.finish_query_run(
-                            run_id, matched_count=0, input_chars=0, error=error
-                        )
-                        self._advance_progress(f"{query_name} failed before model execution")
+                if result.get("cancelled"):
+                    raise JobCancelled("Cancelled by user")
+                failed = int(result.get("failed", 0))
+                if failed:
                     self._record_error(
                         stats,
                         stage=f"automatic_{content_type}_query",
-                        exc=RuntimeError(f"{query_name}: {error}"),
-                    )
-                    continue
-
-            native_papers: list[Any] = []
-            documents: list[dict[str, Any]] = []
-            regexp_matches = 0
-            try:
-                native_only = (
-                    content_type == "papers"
-                    and not regexp_pattern
-                    and (
-                        source_scope == "pdf"
-                        or all(
-                            name in available
-                            and available[name].provider == "claude-code"
-                            and source_scope == "fulltext"
-                            for name in profile_names
-                        )
-                    )
-                )
-                if native_only:
-                    native_papers = _selected_papers(self.db, selection)
-                else:
-                    documents = collect_query_documents(
-                        self.db,
-                        source_scope,
-                        selection=selection,
-                        config=self.config,
-                        pdf_client=self.pdf_client,
-                    )
-                if regexp_pattern:
-                    documents, regexp_matches = preprocess_regexp_documents(
-                        documents, regexp_pattern, regexp_radius
+                        exc=RuntimeError(f"{query_name}: {failed} per-content run(s) failed"),
                     )
             except JobCancelled:
-                for run_id in run_ids:
-                    self.db.finish_query_run(
-                        run_id, matched_count=0, input_chars=0, error="Cancelled by user"
-                    )
                 raise
             except Exception as exc:
-                for run_id in run_ids:
-                    self.db.finish_query_run(
-                        run_id, matched_count=0, input_chars=0, error=str(exc)
-                    )
-                    self._advance_progress(
-                        f"{query_name} failed before model execution", stats
-                    )
                 self._record_error(
                     stats,
                     stage=f"automatic_{content_type}_query",
                     exc=RuntimeError(f"{query_name}: {exc}"),
                 )
-                continue
-
-            matched_count = len(native_papers) if native_papers else len(documents)
-            for profile_name, run_id in zip(profile_names, run_ids, strict=True):
-                check_cancelled(self._cancel_event)
-                self.db.start_query_run(run_id)
-                llm: LLMClient | None = None
-                owns_llm = False
-                try:
-                    if local_regexp_tags:
-                        result = regexp_tag_result(
-                            documents,
-                            Database._decoded_label_values(query["label_values_json"]),
-                        )
-                        output = result.model_dump()
-                        input_chars = sum(
-                            len(str(item.get("content") or item.get("abstract") or item.get("fulltext") or ""))
-                            for item in documents
-                        )
-                    elif local_print:
-                        result = regexp_result(documents, regexp_pattern, regexp_matches)
-                        output = result.model_dump()
-                        input_chars = sum(
-                            len(str(item.get("content") or item.get("abstract") or item.get("fulltext") or ""))
-                            for item in documents
-                        )
-                    else:
-                        profile = available[profile_name]
-                        effective_context = profile.context_window_tokens
-                        if profile_name == self.config.llm.profile:
-                            llm = self.llm
-                        else:
-                            llm = create_llm(profile)
-                            owns_llm = True
-                        configure_job_runtime(llm, self._progress, self._cancel_event)
-                        configure_context_window(llm, effective_context)
-                        check_ready = getattr(llm, "check_ready", None)
-                        if check_ready is not None:
-                            check_ready()
-                        native_pdf = (
-                            content_type == "papers"
-                            and not regexp_pattern
-                            and (
-                                (profile.provider == "codex" and source_scope == "pdf")
-                                or (
-                                    profile.provider == "claude-code"
-                                    and source_scope == "fulltext"
-                                )
-                            )
-                        )
-                        if native_pdf:
-                            if not native_papers:
-                                native_papers = _selected_papers(self.db, selection)
-                                matched_count = len(native_papers)
-                            result, _usage, input_chars = run_query_for_native_pdfs(
-                                llm,
-                                user_prompt=str(query["prompt"]),
-                                papers=native_papers,
-                                db=self.db,
-                                config=self.config,
-                                context_window_tokens=effective_context,
-                                max_input_chars=profile.max_input_chars,
-                                progress=self._progress,
-                                cancel_event=self._cancel_event,
-                            )
-                        else:
-                            result, _usage, input_chars = run_query_for_model(
-                                llm,
-                                user_prompt=str(query["prompt"]),
-                                documents=documents,
-                                context_window_tokens=effective_context,
-                                max_input_chars=profile.max_input_chars,
-                                pdf_strategy=pdf_strategy,
-                                content_type=content_type,
-                                progress=self._progress,
-                                cancel_event=self._cancel_event,
-                            )
-                        output = result.model_dump()
-                    self.db.finish_query_run(
-                        run_id,
-                        matched_count=matched_count,
-                        input_chars=input_chars,
-                        output=output,
-                    )
-                    self.db.apply_query_classifications(
-                        int(query["id"]), run_id, output
-                    )
-                except JobCancelled:
-                    self.db.finish_query_run(
-                        run_id,
-                        matched_count=matched_count,
-                        input_chars=0,
-                        error="Cancelled by user",
-                    )
-                    raise
-                except Exception as exc:
-                    self.db.finish_query_run(
-                        run_id,
-                        matched_count=matched_count,
-                        input_chars=0,
-                        error=str(exc),
-                    )
-                    self._record_error(
-                        stats,
-                        stage=f"automatic_{content_type}_query",
-                        exc=RuntimeError(
-                            f"{query_name} with {profile_name}: {exc}"
-                        ),
-                    )
-                finally:
-                    if llm is not None and owns_llm:
-                        llm.close()
+            finally:
+                for index in range(len(run_ids)):
                     self._advance_progress(
-                        f"Ran {query_name} with {profile_name} on new {content_type}",
+                        f"Ran {query_name} on new {content_type} ({index + 1}/{len(run_ids)})",
                         stats,
                     )
+
