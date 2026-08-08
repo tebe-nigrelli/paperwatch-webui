@@ -254,7 +254,7 @@ def _chunk_narrative_limit(value: str) -> str:
 
 Narrative = Annotated[str, AfterValidator(_narrative_limit)]
 ChunkNarrative = Annotated[str, AfterValidator(_chunk_narrative_limit)]
-CollectionNarrative = Annotated[str, Field(max_length=100_000)]
+CollectionNarrative = str
 OneSentence = Annotated[Narrative, Field(max_length=500)]
 PaperKind = Literal[
     "mathematics",

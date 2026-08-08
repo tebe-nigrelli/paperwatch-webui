@@ -13,6 +13,7 @@ from paperwatch.llm import LLMError, StructuredJSONResponse
 from paperwatch.models import BatchQueryResult
 from paperwatch.query_jobs import (
     QueryController,
+    QuerySelectionWarning,
     _pack_documents,
     _selection_search_args,
     _split_oversized_document,
@@ -259,21 +260,30 @@ def test_saved_prompt_source_validation_checks_every_selected_paper(
                 source_scope="abstract",
                 pdf_strategy="chunked",
             )
-        with pytest.raises(ValueError, match="1 selected paper.*abstract.*PDF only paper"):
-            validate_query_sources(
-                db,
-                selection={"paper_ids": [abstract_id, pdf_id]},
-                source_scope="abstract",
-                pdf_strategy="auto",
-            )
-        with pytest.raises(ValueError, match="1 selected paper.*PDF.*Abstract only paper"):
-            validate_query_sources(
-                db,
-                selection={"paper_ids": [abstract_id, pdf_id]},
-                source_scope="fulltext",
-                pdf_strategy="auto",
-            )
-        with pytest.raises(ValueError, match="Stale local PDF paper"):
+        abstract_selection = {"paper_ids": [abstract_id, pdf_id]}
+        assert validate_query_sources(
+            db,
+            selection=abstract_selection,
+            source_scope="abstract",
+            pdf_strategy="auto",
+        ) == 1
+        assert abstract_selection["resolved_paper_ids"] == [abstract_id]
+        assert abstract_selection["excluded_paper_ids"] == [pdf_id]
+        assert "Skipped 1 incompatible paper" in abstract_selection["warnings"][0]
+        assert "PDF only paper" in abstract_selection["warnings"][0]
+
+        fulltext_selection = {"paper_ids": [abstract_id, pdf_id]}
+        assert validate_query_sources(
+            db,
+            selection=fulltext_selection,
+            source_scope="fulltext",
+            pdf_strategy="auto",
+        ) == 1
+        assert fulltext_selection["resolved_paper_ids"] == [pdf_id]
+        assert fulltext_selection["excluded_paper_ids"] == [abstract_id]
+        assert "Abstract only paper" in fulltext_selection["warnings"][0]
+
+        with pytest.raises(QuerySelectionWarning, match="Stale local PDF paper"):
             validate_query_sources(
                 db,
                 selection={"paper_ids": [stale_id]},
@@ -287,6 +297,51 @@ def test_saved_prompt_source_validation_checks_every_selected_paper(
                 source_scope="abstract",
                 pdf_strategy="auto",
             )
+
+
+def test_query_controller_skips_incompatible_papers_and_persists_warning(
+    config_path, paper_record
+):
+    config = load_config(config_path)
+    incompatible = replace(
+        paper_record,
+        openalex_id="W-INCOMPATIBLE",
+        doi="10.1000/incompatible",
+        arxiv_id=None,
+        title="No PDF paper",
+        pdf_url=None,
+    )
+    with Database(config.paths.database) as db:
+        compatible_id, _ = db.upsert_paper(paper_record)
+        incompatible_id, _ = db.upsert_paper(incompatible)
+        query_id = db.create_saved_query(name="Skip missing", prompt="Review")
+
+    release = threading.Event()
+
+    def runner(*_args):
+        release.wait(1)
+        return {"completed": 1, "failed": 0}
+
+    controller = QueryController(config_path, runner=runner)
+    batch_id = controller.start(
+        query_id,
+        ("default",),
+        2048,
+        selection={"paper_ids": [compatible_id, incompatible_id]},
+        source_scope="fulltext",
+    )
+    assert batch_id
+    snapshot = controller.snapshot()
+    assert "Skipped 1 incompatible paper" in snapshot.warning
+    assert "No PDF paper" in snapshot.warning
+    with Database(config.paths.database) as db:
+        run = db.query_runs_for_batch(batch_id)[0]
+        selection = __import__("json").loads(run["selection_json"])
+        assert selection["resolved_paper_ids"] == [compatible_id]
+        assert selection["excluded_paper_ids"] == [incompatible_id]
+        assert selection["warnings"]
+    release.set()
+    controller.wait()
 
 
 def test_collection_query_map_reduce_and_empty_result():
@@ -338,6 +393,42 @@ def test_collection_query_map_reduce_and_empty_result():
     )
     assert len(__import__("json").dumps(nested[0], ensure_ascii=False, separators=(",", ":"))) <= 800
     assert nested[0][0]["paper_id"] == 3
+
+
+def test_query_output_over_100k_is_split_without_truncation():
+    payload = "0123456789" * 25_001
+
+    class HugeOutputLLM(FakeQueryLLM):
+        def generate_json(self, prompt, *, schema, schema_name):
+            self.calls.append(prompt)
+            return StructuredJSONResponse(
+                data={
+                    "title": "Large result",
+                    "summary": "Complete result",
+                    "items": [
+                        {
+                            "paper_id": 1,
+                            "blog_entry_id": None,
+                            "content_type": "paper",
+                            "title": "Large paper",
+                            "output": payload,
+                        }
+                    ],
+                },
+                usage={},
+                raw={},
+            )
+
+    result, _usage, _chars = run_query_for_model(
+        HugeOutputLLM(),
+        user_prompt="Return the complete analysis",
+        documents=[{"paper_id": 1, "title": "Large paper", "abstract": "input"}],
+        context_window_tokens=4096,
+        max_input_chars=10000,
+    )
+    assert len(result.items) == 3
+    assert all(len(item.output) <= 100_000 for item in result.items)
+    assert "".join(item.output for item in result.items) == payload
 
 
 def test_native_pdf_query_single_multi_and_provider_validation(monkeypatch):
@@ -659,12 +750,12 @@ def test_query_controller_validation_busy_and_failure(config_path, paper_record)
         controller.start(query_id, ("default",), 1024, source_scope="summary")
     with pytest.raises(ValueError, match="auto, direct, or chunked"):
         controller.start(query_id, ("default",), 1024, pdf_strategy="invalid")
-    with pytest.raises(ValueError, match="Selected paper without a PDF"):
+    with pytest.raises(QuerySelectionWarning, match="Selected paper without a PDF"):
         controller.start(
             query_id,
             ("default",),
             1024,
-            selection={"paper_ids": [paper_id, abstract_only_id]},
+            selection={"paper_ids": [abstract_only_id]},
             source_scope="fulltext",
         )
     with Database(config.paths.database) as db:
@@ -678,7 +769,10 @@ def test_query_controller_validation_busy_and_failure(config_path, paper_record)
         stored = db.query_runs_for_batch(batch)[0]
         stored_selection = __import__("json").loads(stored["selection_json"])
         assert stored_selection == {
-            **selection, "source_scope": "abstract", "pdf_strategy": "auto"
+            **selection,
+            "source_scope": "abstract",
+            "pdf_strategy": "auto",
+            "resolved_paper_ids": [paper_id],
         }
     assert controller.start(query_id, ("default",), 1024) is None
     gate.set()
@@ -783,7 +877,10 @@ def test_pdf_query_strategies_and_oversized_document_splitting():
     compact_only = _split_oversized_document(
         {"paper_id": 2, "title": "No text", "items": [{"output": "y" * 5000}]}, 500
     )
-    assert len(compact_only) == 1
+    assert len(compact_only) > 1
+    assert all(fragment["paper_id"] == 2 for fragment in compact_only)
+    reconstructed = "".join(fragment["record_fragment_json"] for fragment in compact_only)
+    assert __import__("json").loads(reconstructed) == {"items": [{"output": "y" * 5000}]}
 
 
 def test_query_batch_uses_runtime_source_and_pdf_strategy(
@@ -1108,7 +1205,7 @@ def test_query_source_edge_cases_cover_blog_fallback_and_auto_missing(
                 "display_stubs": True,
             },
         )
-        assert [item["blog_entry_id"] for item in all_blog_docs] == [entry_id]
+        assert all_blog_docs == []
 
         paper_without_source = replace(
             paper_record,

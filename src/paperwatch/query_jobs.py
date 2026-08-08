@@ -3,7 +3,10 @@ from __future__ import annotations
 import inspect
 import json
 import bisect
+import os
 import re
+from concurrent.futures import ThreadPoolExecutor
+from itertools import islice
 
 import httpx
 import secrets
@@ -27,6 +30,10 @@ from .locking import analysis_lock
 from .models import BATCH_QUERY_JSON_SCHEMA, BatchQueryResult
 
 
+class QuerySelectionWarning(ValueError):
+    """A query could not start because every matching record was incompatible."""
+
+
 @dataclass(slots=True)
 class QueryBatchSnapshot:
     running: bool = False
@@ -42,6 +49,7 @@ class QueryBatchSnapshot:
     cancel_requested: bool = False
     stage: str = ""
     message: str = ""
+    warning: str = ""
     live_output: str = ""
     error: str | None = None
     progress_current: int = 0
@@ -87,26 +95,42 @@ def _blog_document(row: Any) -> dict[str, Any]:
     }
 
 
-def _regexp_excerpts(text: str, pattern: str, radius: int) -> tuple[str, int]:
-    expression = re.compile(pattern, re.MULTILINE)
-    matches = list(expression.finditer(text))[:500]
+def _regexp_excerpts_compiled(
+    text: str, expression: re.Pattern[str], radius: int
+) -> tuple[str, int]:
+    matches = list(islice(expression.finditer(text), 500))
     if not matches:
         return "", 0
-    words = list(re.finditer(r"\S+", text))
-    starts = [item.start() for item in words]
-    ends = [item.end() for item in words]
     ranges: list[tuple[int, int]] = []
-    for match in matches:
-        if not words:
-            ranges.append((match.start(), match.end()))
-            continue
-        first = bisect.bisect_right(ends, match.start())
-        last = max(first, bisect.bisect_left(starts, max(match.end(), match.start() + 1)))
-        left = max(0, first - radius)
-        right = min(len(words), max(first + 1, last) + radius)
-        start = words[left].start() if left < len(words) else match.start()
-        end = words[right - 1].end() if right else match.end()
-        ranges.append((start, end))
+    if radius == 0:
+        # Radius zero is the common filter/tag case. Avoid tokenizing the entire
+        # document; expand only the matched spans to their surrounding words.
+        for match in matches:
+            start = match.start()
+            end = match.end()
+            while start > 0 and not text[start - 1].isspace():
+                start -= 1
+            while end < len(text) and not text[end].isspace():
+                end += 1
+            ranges.append((start, end))
+    else:
+        words = list(re.finditer(r"\S+", text))
+        starts = [item.start() for item in words]
+        ends = [item.end() for item in words]
+        for match in matches:
+            if not words:
+                ranges.append((match.start(), match.end()))
+                continue
+            first = bisect.bisect_right(ends, match.start())
+            last = max(
+                first,
+                bisect.bisect_left(starts, max(match.end(), match.start() + 1)),
+            )
+            left = max(0, first - radius)
+            right = min(len(words), max(first + 1, last) + radius)
+            start = words[left].start() if left < len(words) else match.start()
+            end = words[right - 1].end() if right else match.end()
+            ranges.append((start, end))
     merged: list[tuple[int, int]] = []
     for start, end in ranges:
         if merged and start <= merged[-1][1] + 1:
@@ -117,32 +141,66 @@ def _regexp_excerpts(text: str, pattern: str, radius: int) -> tuple[str, int]:
     return "\n\n[…]\n\n".join(excerpts), len(matches)
 
 
+def _regexp_excerpts(text: str, pattern: str, radius: int) -> tuple[str, int]:
+    return _regexp_excerpts_compiled(text, re.compile(pattern, re.MULTILINE), radius)
+
+
+def _regexp_worker_count(count: int) -> int:
+    if count <= 1:
+        return 1
+    return min(count, 32, max(2, (os.cpu_count() or 1) * 2))
+
+
+def _regexp_document_match(
+    document: dict[str, Any], expression: re.Pattern[str], radius: int
+) -> tuple[dict[str, Any] | None, int]:
+    content_key = next(
+        (
+            key
+            for key in ("fulltext", "abstract", "content", "content_excerpt")
+            if isinstance(document.get(key), str)
+        ),
+        None,
+    )
+    if content_key is None:
+        return None, 0
+    excerpt, matches = _regexp_excerpts_compiled(
+        str(document[content_key]), expression, radius
+    )
+    if not matches:
+        return None, 0
+    item = dict(document)
+    item[content_key] = excerpt
+    item["regexp_match_count"] = matches
+    return item, matches
+
+
 def preprocess_regexp_documents(
     documents: list[dict[str, Any]], pattern: str, radius: int
 ) -> tuple[list[dict[str, Any]], int]:
     if not pattern:
         return documents, 0
-    prepared: list[dict[str, Any]] = []
-    total_matches = 0
-    for document in documents:
-        content_key = next(
-            (
-                key
-                for key in ("fulltext", "abstract", "content", "content_excerpt")
-                if isinstance(document.get(key), str)
-            ),
-            None,
-        )
-        if content_key is None:
-            continue
-        excerpt, matches = _regexp_excerpts(str(document[content_key]), pattern, radius)
-        if not matches:
-            continue
-        item = dict(document)
-        item[content_key] = excerpt
-        item["regexp_match_count"] = matches
-        prepared.append(item)
-        total_matches += matches
+    expression = re.compile(pattern, re.MULTILINE)
+    workers = _regexp_worker_count(len(documents))
+    if workers == 1:
+        matches_by_document = [
+            _regexp_document_match(document, expression, radius)
+            for document in documents
+        ]
+    else:
+        # Documents are independent; bounded threads avoid copying large full-text
+        # strings into subprocesses and preserve input ordering.
+        with ThreadPoolExecutor(
+            max_workers=workers, thread_name_prefix="paperwatch-regexp"
+        ) as pool:
+            matches_by_document = list(
+                pool.map(
+                    lambda document: _regexp_document_match(document, expression, radius),
+                    documents,
+                )
+            )
+    prepared = [item for item, _matches in matches_by_document if item is not None]
+    total_matches = sum(matches for _item, matches in matches_by_document)
     return prepared, total_matches
 
 
@@ -177,39 +235,58 @@ def regexp_result(
     )
 
 
+def _regexp_tag_document(
+    document: dict[str, Any], compiled: list[tuple[str, re.Pattern[str]]]
+) -> tuple[dict[str, Any] | None, str | None]:
+    content = next(
+        (
+            str(document[key])
+            for key in ("fulltext", "abstract", "content", "content_excerpt")
+            if document.get(key) not in (None, "")
+        ),
+        "",
+    )
+    for value, expression in compiled:
+        match = expression.search(content)
+        if match is None:
+            continue
+        return (
+            {
+                "paper_id": document.get("paper_id"),
+                "blog_entry_id": document.get("blog_entry_id"),
+                "content_type": document.get("content_type", "paper"),
+                "title": str(document.get("title") or "Untitled record"),
+                "output": match.group(0),
+            },
+            value,
+        )
+    return None, None
+
+
 def regexp_tag_result(
     documents: list[dict[str, Any]], values: list[dict[str, str]]
 ) -> BatchQueryResult:
-    items: list[dict[str, Any]] = []
-    counts: dict[str, int] = {}
     compiled = [
         (item["value"], re.compile(item["pattern"], re.MULTILINE))
         for item in values
     ]
-    for document in documents:
-        content = next(
-            (
-                str(document[key])
-                for key in ("fulltext", "abstract", "content", "content_excerpt")
-                if document.get(key) not in (None, "")
-            ),
-            "",
-        )
-        for value, expression in compiled:
-            match = expression.search(content)
-            if match is None:
-                continue
-            counts[value] = counts.get(value, 0) + 1
-            items.append(
-                {
-                    "paper_id": document.get("paper_id"),
-                    "blog_entry_id": document.get("blog_entry_id"),
-                    "content_type": document.get("content_type", "paper"),
-                    "title": str(document.get("title") or "Untitled record"),
-                    "output": match.group(0),
-                }
+    workers = _regexp_worker_count(len(documents))
+    if workers == 1:
+        matches = [_regexp_tag_document(document, compiled) for document in documents]
+    else:
+        with ThreadPoolExecutor(
+            max_workers=workers, thread_name_prefix="paperwatch-regexp"
+        ) as pool:
+            matches = list(
+                pool.map(
+                    lambda document: _regexp_tag_document(document, compiled), documents
+                )
             )
-            break
+    items = [item for item, _value in matches if item is not None]
+    counts: dict[str, int] = {}
+    for _item, value in matches:
+        if value is not None:
+            counts[value] = counts.get(value, 0) + 1
     summary = ", ".join(f"{value}: {count}" for value, count in counts.items())
     return BatchQueryResult.model_validate(
         {
@@ -261,17 +338,34 @@ def _selection_search_args(selection: dict[str, Any] | None) -> dict[str, Any]:
 
 
 def _selected_papers(db: Database, selection: dict[str, Any] | None) -> list[Any]:
+    selection = selection or {}
     selected_ids: list[int] = []
-    if selection and isinstance(selection.get("paper_ids"), list):
-        for value in selection["paper_ids"]:
+    raw_ids = (
+        selection.get("resolved_paper_ids")
+        if isinstance(selection.get("resolved_paper_ids"), list)
+        else selection.get("paper_ids")
+    )
+    if isinstance(raw_ids, list):
+        for value in raw_ids:
             try:
                 selected_ids.append(int(value))
             except (TypeError, ValueError):
                 continue
+    excluded: set[int] = set()
+    if isinstance(selection.get("excluded_paper_ids"), list):
+        for value in selection["excluded_paper_ids"]:
+            try:
+                excluded.add(int(value))
+            except (TypeError, ValueError):
+                continue
     if selected_ids:
-        return [row for paper_id in dict.fromkeys(selected_ids) if (row := db.get_paper(paper_id)) is not None]
+        return [
+            row
+            for paper_id in dict.fromkeys(selected_ids)
+            if paper_id not in excluded and (row := db.get_paper(paper_id)) is not None
+        ]
     papers, _ = db.search_papers(**_selection_search_args(selection), limit=None, offset=0)
-    return papers
+    return [row for row in papers if int(row["id"]) not in excluded]
 
 
 def _selection_stub_filter(selection: dict[str, Any] | None) -> bool | None:
@@ -293,14 +387,18 @@ def _selection_stub_filter(selection: dict[str, Any] | None) -> bool | None:
 
 def _selected_blog_entries(db: Database, selection: dict[str, Any] | None) -> list[Any]:
     selected_ids: list[int] = []
-    if selection and isinstance(selection.get("blog_entry_ids"), list):
-        for value in selection["blog_entry_ids"]:
+    raw_ids = (
+        selection.get("resolved_blog_entry_ids")
+        if selection and isinstance(selection.get("resolved_blog_entry_ids"), list)
+        else selection.get("blog_entry_ids") if selection else None
+    )
+    if isinstance(raw_ids, list):
+        for value in raw_ids:
             try:
                 selected_ids.append(int(value))
             except (TypeError, ValueError):
                 continue
-    if selected_ids:
-        return db.blog_entries_by_ids(selected_ids, query_view=True)
+        return db.blog_entries_by_ids(selected_ids, query_view=True) if selected_ids else []
     args = _selection_search_args(selection)
     return db.list_blog_entries(
         limit=None,
@@ -326,6 +424,35 @@ def _selected_blog_entries(db: Database, selection: dict[str, Any] | None) -> li
     )
 
 
+def _paper_source_compatible(row: Any, source_scope: str) -> bool:
+    abstract = bool(str(row["abstract"] or "").strip())
+    pdf_url = bool(str(row["pdf_url"] or "").strip())
+    local_value = str(row["local_pdf_path"] or "").strip()
+    local_pdf = Path(local_value).expanduser() if local_value else None
+    has_pdf = pdf_url or bool(local_pdf and local_pdf.is_file())
+    if source_scope == "abstract":
+        return abstract
+    if source_scope in {"fulltext", "pdf"}:
+        return has_pdf
+    return abstract or has_pdf
+
+
+def _append_selection_warning(selection: dict[str, Any], warning: str) -> None:
+    warnings = selection.get("warnings")
+    if not isinstance(warnings, list):
+        warnings = []
+    if warning not in warnings:
+        warnings.append(warning)
+    selection["warnings"] = warnings
+
+
+def _selection_warning_text(selection: dict[str, Any] | None) -> str:
+    warnings = (selection or {}).get("warnings")
+    if not isinstance(warnings, list):
+        return ""
+    return " ".join(str(item).strip() for item in warnings if str(item).strip())
+
+
 def validate_query_sources(
     db: Database,
     *,
@@ -333,89 +460,53 @@ def validate_query_sources(
     source_scope: str,
     pdf_strategy: str,
 ) -> int:
-    """Reject a saved-prompt run when any selected record lacks its source."""
-    content_type = str((selection or {}).get("content_type") or "papers")
+    """Resolve compatible records, skipping individual papers that lack the requested source."""
+    selection = selection if selection is not None else {}
+    content_type = str(selection.get("content_type") or "papers")
     if content_type == "blogs":
-        selected_ids = (
-            selection.get("blog_entry_ids")
-            if selection and isinstance(selection.get("blog_entry_ids"), list)
-            else None
-        )
-        count = (
-            db.count_blog_entries_by_ids(selected_ids)
-            if selected_ids is not None
-            else db.count_blog_entries(
-                query=str((selection or {}).get("query") or ""),
-                title_query=str((selection or {}).get("title_query") or ""),
-                tags=tuple((selection or {}).get("content_tags") or ()),
-                author_id=str((selection or {}).get("author_id") or ""),
-                author_ids=tuple((selection or {}).get("author_ids") or ()),
-                author_tags=tuple((selection or {}).get("author_tags") or ()),
-                date_from=str((selection or {}).get("date_from") or ""),
-                date_to=str((selection or {}).get("date_to") or ""),
-                starred=(selection or {}).get("starred")
-                if isinstance((selection or {}).get("starred"), bool)
-                else None,
-                read=(selection or {}).get("read")
-                if isinstance((selection or {}).get("read"), bool)
-                else None,
-                analyzed=(selection or {}).get("analyzed")
-                if isinstance((selection or {}).get("analyzed"), bool)
-                else None,
-                notes=(selection or {}).get("notes")
-                if isinstance((selection or {}).get("notes"), bool)
-                else None,
-                stub=_selection_stub_filter(selection),
-            )
-        )
-        if not count:
+        entries = _selected_blog_entries(db, selection)
+        if not entries:
             raise ValueError("No blog entries match the current selection")
         if source_scope != "blog":
             raise ValueError("Blog saved prompts use the stored blog entry text")
         if pdf_strategy != "auto":
             raise ValueError("PDF strategy does not apply to blog entries")
-        return count
+        selection["resolved_blog_entry_ids"] = [int(row["id"]) for row in entries]
+        return len(entries)
     if content_type != "papers":
         raise ValueError("Content type must be papers or blogs")
     papers = _selected_papers(db, selection)
     if not papers:
         raise ValueError("No papers match the current selection")
-    if source_scope == "auto":
-        missing = []
-        for row in papers:
-            local_value = str(row["local_pdf_path"] or "").strip()
-            local_pdf = Path(local_value).expanduser() if local_value else None
-            if not str(row["abstract"] or "").strip() and not str(row["pdf_url"] or "").strip() and not (
-                local_pdf and local_pdf.is_file()
-            ):
-                missing.append(row)
-        source_label = "an abstract or PDF"
-    elif source_scope == "abstract":
-        if pdf_strategy != "auto":
-            raise ValueError("PDF strategy only applies when the source is full paper text")
-        missing = [row for row in papers if not str(row["abstract"] or "").strip()]
-        source_label = "an abstract"
-    else:
-        if source_scope == "pdf" and pdf_strategy != "auto":
-            raise ValueError("PDF strategy does not apply when uploading the whole PDF")
-        missing = []
-        for row in papers:
-            pdf_url = str(row["pdf_url"] or "").strip()
-            local_value = str(row["local_pdf_path"] or "").strip()
-            local_pdf = Path(local_value).expanduser() if local_value else None
-            if not pdf_url and not (local_pdf and local_pdf.is_file()):
-                missing.append(row)
-        source_label = "a PDF"
+    if source_scope == "abstract" and pdf_strategy != "auto":
+        raise ValueError("PDF strategy only applies when the source is full paper text")
+    if source_scope == "pdf" and pdf_strategy != "auto":
+        raise ValueError("PDF strategy does not apply when uploading the whole PDF")
+
+    source_label = {
+        "auto": "an abstract or PDF",
+        "abstract": "an abstract",
+        "fulltext": "a PDF",
+        "pdf": "a PDF",
+    }.get(source_scope, "a compatible source")
+    compatible = [row for row in papers if _paper_source_compatible(row, source_scope)]
+    missing = [row for row in papers if not _paper_source_compatible(row, source_scope)]
     if missing:
         examples = ", ".join(str(row["title"]) for row in missing[:3])
         remainder = len(missing) - min(3, len(missing))
         suffix = f" and {remainder} more" if remainder else ""
         noun = "paper" if len(missing) == 1 else "papers"
-        raise ValueError(
-            f"Cannot run this saved prompt: {len(missing)} selected {noun} "
-            f"do not have {source_label}: {examples}{suffix}"
+        warning = (
+            f"Skipped {len(missing)} incompatible {noun} without {source_label}: "
+            f"{examples}{suffix}."
         )
-    return len(papers)
+        _append_selection_warning(selection, warning)
+        selection["excluded_paper_ids"] = [int(row["id"]) for row in missing]
+    selection["resolved_paper_ids"] = [int(row["id"]) for row in compatible]
+    if not compatible:
+        warning = _selection_warning_text(selection) or "No compatible papers remain."
+        raise QuerySelectionWarning(f"{warning} No compatible papers remain to run.")
+    return len(compatible)
 
 
 def collect_query_documents(
@@ -502,7 +593,7 @@ def _query_prompt(user_prompt: str, documents: list[dict[str, Any]], *, merge: b
 Return exactly one JSON object matching the supplied schema. {instruction}
 The top-level summary should synthesize the collection.
 The items list should contain concrete, useful outputs rather than restating titles.
-Keep each text field below 100,000 characters. Do not invent facts.
+Do not truncate requested output. Do not invent facts.
 
 USER PROMPT:
 {user_prompt}
@@ -512,6 +603,39 @@ RECORDS:
 """
 
 
+QUERY_OUTPUT_SEGMENT_CHARS = 100_000
+
+
+def _split_result_outputs(
+    result: BatchQueryResult, segment_chars: int = QUERY_OUTPUT_SEGMENT_CHARS
+) -> BatchQueryResult:
+    """Split oversized item outputs into adjacent records without losing text."""
+    if segment_chars < 1:
+        raise ValueError("segment_chars must be positive")
+    split_items = []
+    changed = False
+    for item in result.items:
+        output = item.output
+        if len(output) <= segment_chars:
+            split_items.append(item)
+            continue
+        changed = True
+        payload = item.model_dump()
+        for start in range(0, len(output), segment_chars):
+            part = dict(payload)
+            part["output"] = output[start:start + segment_chars]
+            split_items.append(type(item).model_validate(part))
+    if not changed:
+        return result
+    return BatchQueryResult(
+        title=result.title, summary=result.summary, items=split_items
+    )
+
+
+def _validated_query_result(data: Any) -> BatchQueryResult:
+    return _split_result_outputs(BatchQueryResult.model_validate(data))
+
+
 def _generate(llm: LLMClient, prompt: str) -> tuple[BatchQueryResult, dict[str, Any]]:
     response = llm.generate_json(
         prompt,
@@ -519,7 +643,7 @@ def _generate(llm: LLMClient, prompt: str) -> tuple[BatchQueryResult, dict[str, 
         schema_name="paper_collection_query",
     )
     try:
-        return BatchQueryResult.model_validate(response.data), response.usage
+        return _validated_query_result(response.data), response.usage
     except ValidationError as exc:
         raise LLMError(f"Invalid collection-query result: {exc}") from exc
 
@@ -578,14 +702,14 @@ def run_query_for_native_pdfs(
                 schema=BATCH_QUERY_JSON_SCHEMA,
                 schema_name="saved_query_result",
             )
-            partials.append(BatchQueryResult.model_validate(response.data).model_dump())
+            partials.append(_validated_query_result(response.data).model_dump())
             for key, value in response.usage.items():
                 if isinstance(value, (int, float)):
                     usage[key] = usage.get(key, 0) + value
                 elif key not in usage:
                     usage[key] = value
     if len(partials) == 1:
-        return BatchQueryResult.model_validate(partials[0]), usage, input_chars
+        return _validated_query_result(partials[0]), usage, input_chars
     merged, merge_usage, merge_chars = run_query_for_model(
         llm,
         user_prompt="Merge these per-paper saved-query results into one collection result.",
@@ -610,78 +734,112 @@ def _json_size(value: Any) -> int:
     return len(json.dumps(value, ensure_ascii=False, separators=(",", ":")))
 
 
-def _compact_document(document: dict[str, Any], budget: int) -> dict[str, Any]:
-    """Keep a query record useful while guaranteeing that it fits one group."""
-    if _json_size([document]) <= budget:
-        return document
+def _text_chunks_for_budget(
+    text: str,
+    *,
+    budget: int,
+    build: Callable[[str], dict[str, Any]],
+) -> list[str]:
+    """Return exact consecutive slices whose wrapped JSON fits the budget."""
+    if not text:
+        if _json_size([build("")]) > budget:
+            raise LLMError("Record metadata alone exceeds the selected context window")
+        return [""]
+    chunks: list[str] = []
+    offset = 0
+    while offset < len(text):
+        lo, hi = 1, len(text) - offset
+        best = 0
+        while lo <= hi:
+            mid = (lo + hi) // 2
+            if _json_size([build(text[offset:offset + mid])]) <= budget:
+                best = mid
+                lo = mid + 1
+            else:
+                hi = mid - 1
+        if best == 0:
+            raise LLMError("Record metadata alone exceeds the selected context window")
+        chunks.append(text[offset:offset + best])
+        offset += best
+    return chunks
 
-    compact = {
-        key: document[key]
-        for key in (
-            "paper_id",
-            "blog_entry_id",
-            "content_type",
-            "title",
-            "publication_date",
-            "source",
+
+def _split_batch_partial(document: dict[str, Any], budget: int) -> list[dict[str, Any]]:
+    """Losslessly split an intermediate BatchQueryResult-shaped document."""
+    title = str(document.get("title") or "Collection result")
+    fragments: list[dict[str, Any]] = []
+    summary = document.get("summary")
+    if isinstance(summary, str) and summary:
+        def summary_doc(chunk: str) -> dict[str, Any]:
+            return {"title": title, "summary": chunk, "items": []}
+
+        fragments.extend(
+            summary_doc(chunk)
+            for chunk in _text_chunks_for_budget(
+                summary, budget=budget, build=summary_doc
+            )
         )
-        if document.get(key) is not None
-    }
-    source = next(
-        (
-            document[key]
-            for key in ("fulltext", "abstract", "content", "summary", "output", "items")
-            if document.get(key) not in (None, "", [], {})
-        ),
-        document,
-    )
-    raw = source if isinstance(source, str) else json.dumps(source, ensure_ascii=False)
-    marker = "\n[record truncated for collection query]"
-    compact["content_excerpt"] = marker
-    available = max(0, budget - _json_size([compact]) - 8)
-    compact["content_excerpt"] = raw[:available] + (marker if len(raw) > available else "")
 
-    # JSON escaping can make the serialized excerpt larger than its character count.
-    while _json_size([compact]) > budget and compact["content_excerpt"]:
-        excess = _json_size([compact]) - budget
-        compact["content_excerpt"] = compact["content_excerpt"][: -max(1, excess)]
+    raw_items = document.get("items")
+    if isinstance(raw_items, list):
+        for raw_item in raw_items:
+            if not isinstance(raw_item, dict):
+                encoded = json.dumps(raw_item, ensure_ascii=False, separators=(",", ":"))
 
-    if _json_size([compact]) <= budget:
-        return compact
+                def raw_doc(chunk: str) -> dict[str, Any]:
+                    return {"title": title, "summary": "", "item_fragment_json": chunk}
 
-    # Pathological tiny budgets: retain identity before falling back to an empty record.
-    for key in (
-        "source",
-        "publication_date",
-        "title",
-        "paper_id",
-        "blog_entry_id",
-        "content_type",
-    ):
-        compact.pop(key, None)
-        if _json_size([compact]) <= budget:
-            return compact
-    return {} if _json_size([{}]) <= budget else document
+                fragments.extend(
+                    raw_doc(chunk)
+                    for chunk in _text_chunks_for_budget(
+                        encoded, budget=budget, build=raw_doc
+                    )
+                )
+                continue
+            wrapper = {"title": title, "summary": "", "items": [raw_item]}
+            if _json_size([wrapper]) <= budget:
+                fragments.append(wrapper)
+                continue
+            output = raw_item.get("output")
+            if isinstance(output, str):
+                shell = {key: value for key, value in raw_item.items() if key != "output"}
 
+                def item_doc(chunk: str) -> dict[str, Any]:
+                    return {
+                        "title": title,
+                        "summary": "",
+                        "items": [{**shell, "output": chunk}],
+                    }
 
-def _pack_documents(documents: list[dict[str, Any]], budget: int) -> list[list[dict[str, Any]]]:
-    groups: list[list[dict[str, Any]]] = []
-    current: list[dict[str, Any]] = []
-    for document in documents:
-        document = _compact_document(document, budget)
-        candidate = [*current, document]
-        if current and _json_size(candidate) > budget:
-            groups.append(current)
-            current = []
-        current.append(document)
-    if current:
-        groups.append(current)
-    return groups
+                fragments.extend(
+                    item_doc(chunk)
+                    for chunk in _text_chunks_for_budget(
+                        output, budget=budget, build=item_doc
+                    )
+                )
+                continue
+            encoded = json.dumps(raw_item, ensure_ascii=False, separators=(",", ":"))
+
+            def item_json_doc(chunk: str) -> dict[str, Any]:
+                return {"title": title, "summary": "", "item_fragment_json": chunk}
+
+            fragments.extend(
+                item_json_doc(chunk)
+                for chunk in _text_chunks_for_budget(
+                    encoded, budget=budget, build=item_json_doc
+                )
+            )
+    return fragments or [document]
 
 
 def _split_oversized_document(document: dict[str, Any], budget: int) -> list[dict[str, Any]]:
     if _json_size([document]) <= budget:
         return [document]
+    if isinstance(document.get("items"), list) and "summary" in document:
+        fragments = _split_batch_partial(document, budget)
+        if all(_json_size([fragment]) <= budget for fragment in fragments):
+            return fragments
+
     content_key = next(
         (
             key
@@ -690,22 +848,75 @@ def _split_oversized_document(document: dict[str, Any], budget: int) -> list[dic
         ),
         None,
     )
-    if content_key is None:
-        return [_compact_document(document, budget)]
-    content = str(document[content_key])
-    shell = {key: value for key, value in document.items() if key != content_key}
-    shell["chunk_index"] = 1
-    shell["chunk_count"] = 1
-    room = max(400, budget - _json_size([shell]) - 200)
-    chunks = [content[index:index + room] for index in range(0, len(content), room)] or [""]
-    result: list[dict[str, Any]] = []
-    for index, chunk in enumerate(chunks, 1):
-        item = dict(shell)
-        item["chunk_index"] = index
-        item["chunk_count"] = len(chunks)
-        item[content_key] = chunk
-        result.append(_compact_document(item, budget))
-    return result
+    if content_key is not None:
+        content = str(document[content_key])
+        shell = {key: value for key, value in document.items() if key != content_key}
+        # Reserve enough space for the final chunk counters before choosing slices.
+        # This keeps every source character and preserves the existing chunk metadata.
+        def sized_content_doc(chunk: str) -> dict[str, Any]:
+            return {
+                **shell,
+                "chunk_index": 999999,
+                "chunk_count": 999999,
+                content_key: chunk,
+            }
+
+        chunks = _text_chunks_for_budget(
+            content, budget=budget, build=sized_content_doc
+        )
+        count = len(chunks)
+        return [
+            {
+                **shell,
+                "chunk_index": index,
+                "chunk_count": count,
+                content_key: chunk,
+            }
+            for index, chunk in enumerate(chunks, 1)
+        ]
+
+    identity_keys = ("paper_id", "blog_entry_id", "content_type", "title")
+    identity = {key: document[key] for key in identity_keys if document.get(key) is not None}
+    payload = {key: value for key, value in document.items() if key not in identity}
+    encoded = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+
+    def fragment_doc(chunk: str) -> dict[str, Any]:
+        return {**identity, "record_fragment_json": chunk}
+
+    return [
+        fragment_doc(chunk)
+        for chunk in _text_chunks_for_budget(
+            encoded, budget=budget, build=fragment_doc
+        )
+    ]
+
+
+def _pack_documents(documents: list[dict[str, Any]], budget: int) -> list[list[dict[str, Any]]]:
+    groups: list[list[dict[str, Any]]] = []
+    current: list[dict[str, Any]] = []
+    for document in documents:
+        for fragment in _split_oversized_document(document, budget):
+            if _json_size([fragment]) > budget:
+                raise LLMError("A query fragment exceeds the selected context window")
+            candidate = [*current, fragment]
+            if current and _json_size(candidate) > budget:
+                groups.append(current)
+                current = []
+            current.append(fragment)
+    if current:
+        groups.append(current)
+    return groups
+
+
+def _combine_partials_losslessly(partials: list[dict[str, Any]]) -> BatchQueryResult:
+    """Fallback when another model merge cannot fit without dropping text."""
+    results = [_validated_query_result(partial) for partial in partials]
+    title = results[0].title if results else "Collection query result"
+    summary = "\n\n".join(result.summary for result in results if result.summary)
+    items = [item for result in results for item in result.items]
+    return _split_result_outputs(
+        BatchQueryResult(title=title, summary=summary, items=items)
+    )
 
 
 def run_query_for_model(
@@ -771,10 +982,15 @@ def run_query_for_model(
     for round_index in range(6):
         check_cancelled(cancel_event)
         if len(partials) == 1:
-            return BatchQueryResult.model_validate(partials[0]), usage, input_chars
+            return _validated_query_result(partials[0]), usage, input_chars
+        expanded_count = sum(
+            len(_split_oversized_document(partial, record_budget))
+            for partial in partials
+        )
         merge_groups = _pack_documents(partials, record_budget)
-        if len(merge_groups) >= len(partials):
-            raise LLMError("Collection output exceeds the selected context window")
+        if len(merge_groups) >= expanded_count:
+            # No context-safe merge can reduce these outputs. Preserve them all.
+            return _combine_partials_losslessly(partials), usage, input_chars
         next_partials: list[dict[str, Any]] = []
         for group_index, group in enumerate(merge_groups):
             check_cancelled(cancel_event)
@@ -789,7 +1005,7 @@ def run_query_for_model(
                 elif key not in usage:
                     usage[key] = value
         partials = next_partials
-    raise LLMError("Could not merge collection-query outputs")
+    return _combine_partials_losslessly(partials), usage, input_chars
 
 def run_query_batch(
     config_path: Path,
@@ -1119,6 +1335,7 @@ class QueryController:
                     source_scope=source_scope,
                     pdf_strategy=pdf_strategy,
                 )
+                warning = _selection_warning_text(selection)
                 db.create_query_runs(
                     batch_id=batch_id, query_id=query_id,
                     profiles=[
@@ -1131,7 +1348,7 @@ class QueryController:
                 )
             paper_id = None
             blog_entry_id = None
-            if selection and isinstance(selection.get("paper_ids"), list) and selection["paper_ids"]:
+            if isinstance(selection.get("paper_ids"), list) and selection["paper_ids"]:
                 try:
                     paper_id = int(selection["paper_ids"][0])
                 except (TypeError, ValueError):
@@ -1147,6 +1364,7 @@ class QueryController:
                 running=True, batch_id=batch_id, query_id=query_id, paper_id=paper_id,
                 blog_entry_id=blog_entry_id, content_type=content_type,
                 profiles=selected, stage="Queued", message="Preparing saved prompt",
+                warning=warning,
             )
             self._thread = threading.Thread(
                 target=self._work, args=(batch_id, query_id, selected, context_window_tokens),
@@ -1195,6 +1413,7 @@ class QueryController:
             available = {item.profile: item for item in config.available_llms}
             jobs: list[tuple[str, int, tuple[str, ...]]] = []
             active_types: list[str] = []
+            warnings: list[str] = []
             with Database(config.paths.database) as db:
                 query = db.get_saved_query(query_id)
                 if query is None:
@@ -1250,12 +1469,19 @@ class QueryController:
                             continue
                     selection["source_scope"] = target_source
                     selection["pdf_strategy"] = target_pdf_strategy
-                    validate_query_sources(
-                        db,
-                        selection=selection,
-                        source_scope=target_source,
-                        pdf_strategy=target_pdf_strategy,
-                    )
+                    try:
+                        validate_query_sources(
+                            db,
+                            selection=selection,
+                            source_scope=target_source,
+                            pdf_strategy=target_pdf_strategy,
+                        )
+                    except QuerySelectionWarning as exc:
+                        warnings.append(str(exc))
+                        continue
+                    warning = _selection_warning_text(selection)
+                    if warning:
+                        warnings.append(warning)
                     batch_id = secrets.token_hex(10)
                     db.create_query_runs(
                         batch_id=batch_id,
@@ -1272,6 +1498,8 @@ class QueryController:
                     jobs.append((batch_id, query_id, selected))
                     active_types.append(content_type)
             if not jobs:
+                if warnings:
+                    raise QuerySelectionWarning(" ".join(dict.fromkeys(warnings)))
                 raise ValueError("No records match the current search results")
 
             self._cancel_event = threading.Event()
@@ -1284,6 +1512,7 @@ class QueryController:
                 profiles=jobs[0][2],
                 stage="Queued",
                 message=f"Preparing saved prompt for {len(jobs)} result set(s)",
+                warning=" ".join(dict.fromkeys(warnings)),
                 progress_total=len(jobs),
             )
             self._thread = threading.Thread(
@@ -1334,6 +1563,7 @@ class QueryController:
                     source_scope="blog",
                     pdf_strategy="auto",
                 )
+                warning = _selection_warning_text(selection)
                 for query_id in ordered_ids:
                     query = db.get_saved_query(query_id)
                     if query is None:
@@ -1372,6 +1602,7 @@ class QueryController:
                 profiles=(profile,),
                 stage="Queued",
                 message=f"Preparing {len(jobs)} saved queries",
+                warning=warning,
                 progress_total=len(jobs),
             )
             self._thread = threading.Thread(

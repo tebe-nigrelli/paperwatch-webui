@@ -377,6 +377,7 @@ def test_static_assets_use_partial_updates_and_requested_layout():
     assert '.filter-word-button[data-filter-state="yes"]' in css
     assert ".selected-content-tools{display:grid;grid-template-columns:220px 220px auto" in css
     assert ".regexp-editor-grid" in css
+    assert ".object-list article>.markdown-block{display:block" in css
     assert ".query-run-status-column,.query-run-status-cell{width:18rem;max-width:18rem}" in css
     assert "table:not(.unified-content-table):not(.saved-query-table):not(.author-table):not(.author-blog-table):not(.query-runs-table){min-width:max-content}" in css
     assert ".table-wrap>.author-table{width:100%;min-width:900px;table-layout:fixed" in css

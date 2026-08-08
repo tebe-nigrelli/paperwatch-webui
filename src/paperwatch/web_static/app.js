@@ -1392,6 +1392,11 @@
     window.setTimeout(pollContentCompletion, 250);
   }
 
+  const queryRunDetail = document.querySelector("[data-query-run-detail]");
+  if (queryRunDetail && ["queued", "running"].includes(queryRunDetail.dataset.queryRunStatus || "")) {
+    window.setTimeout(() => window.location.reload(), 1500);
+  }
+
   const paperDetailRoot = document.querySelector(".paper-detail-root[data-paper-id]");
   if (paperDetailRoot && (initialRunningKinds.analysis || initialRunningKinds.query)) {
     const paperId = Number(paperDetailRoot.dataset.paperId || 0);

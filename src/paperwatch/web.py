@@ -20,7 +20,7 @@ from dataclasses import asdict, dataclass
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable, Iterable
-from urllib.parse import quote_plus, urlencode, urlparse
+from urllib.parse import parse_qsl, quote_plus, urlencode, urlparse
 
 import httpx
 from fastapi import FastAPI, HTTPException, Request
@@ -46,7 +46,7 @@ from .blogs import (
     validate_content_selector,
 )
 from .config import AppConfig, load_config
-from .db import Database
+from .db import DEFAULT_SUMMARY_QUERY_NAME, Database
 from .default_queries import add_default_queries
 from .job_runtime import ProgressCallback
 from .locking import AnalysisAlreadyInProgress, analysis_lock
@@ -68,7 +68,7 @@ from .pdfs import (
     safe_pdf_name,
     validate_pdf_file,
 )
-from .query_jobs import QueryController
+from .query_jobs import QueryController, QuerySelectionWarning
 from .sources.arxiv import ArxivClient, ArxivEntry
 from .sources.openalex import OpenAlexClient
 
@@ -1245,6 +1245,18 @@ def _notice_url(path: str, message: str, *, level: str = "success") -> str:
     return f"{path}{separator}{urlencode({'notice': message, 'level': level})}"
 
 
+def _clean_local_return_path(value: Any, fallback: str = "/") -> str:
+    parsed = urlparse(str(value or ""))
+    if not parsed.path.startswith("/") or parsed.path.startswith("//"):
+        return fallback
+    query = urlencode([
+        (key, item)
+        for key, item in parse_qsl(parsed.query, keep_blank_values=True)
+        if key not in {"notice", "level"}
+    ])
+    return f"{parsed.path}?{query}" if query else parsed.path
+
+
 def _author_client(config: AppConfig) -> OpenAlexClient:
     return OpenAlexClient(
         api_key=config.openalex.api_key,
@@ -2143,9 +2155,24 @@ def create_app(
 
             blog_views = [blog_view(row) for row in blog_rows]
             selected_blog_views = [blog_view(row) for row in selected_blog_rows]
+            summary_paper_runs = db.latest_query_runs_for_content(
+                DEFAULT_SUMMARY_QUERY_NAME,
+                "paper",
+                [int(item["id"]) for item in (*paper_views, *selected_paper_views)],
+            )
+            summary_blog_runs = db.latest_query_runs_for_content(
+                DEFAULT_SUMMARY_QUERY_NAME,
+                "blog",
+                [int(item["id"]) for item in (*blog_views, *selected_blog_views)],
+            )
 
         def prepare_record(item: dict[str, Any], content_type: str) -> dict[str, Any]:
             item["content_type"] = content_type
+            summary_run = (summary_paper_runs if content_type == "paper" else summary_blog_runs).get(
+                int(item["id"])
+            )
+            item["summary_query_run_id"] = int(summary_run["id"]) if summary_run is not None else None
+            item["summary_query_status"] = str(summary_run["status"]) if summary_run is not None else ""
             if content_type == "paper":
                 item["record_date"] = item.get("publication_date") or item.get("discovered_at") or ""
                 item["record_fetched"] = item.get("fetched_at") or item.get("discovered_at") or ""
@@ -4386,7 +4413,11 @@ def create_app(
             run = _query_output(row)
             selection = run.get("selection") if isinstance(run.get("selection"), dict) else {}
             links: list[dict[str, str]] = []
-            blog_ids = selection.get("blog_entry_ids")
+            blog_ids = (
+                selection.get("resolved_blog_entry_ids")
+                if isinstance(selection.get("resolved_blog_entry_ids"), list)
+                else selection.get("blog_entry_ids")
+            )
             if isinstance(blog_ids, list):
                 for entry in db.blog_entries_by_ids(blog_ids):
                     links.append(
@@ -4395,7 +4426,11 @@ def create_app(
                             "url": f"/blogs/{int(entry['id'])}",
                         }
                     )
-            paper_ids = selection.get("paper_ids")
+            paper_ids = (
+                selection.get("resolved_paper_ids")
+                if isinstance(selection.get("resolved_paper_ids"), list)
+                else selection.get("paper_ids")
+            )
             if isinstance(paper_ids, list):
                 for raw_id in paper_ids:
                     paper_id = _int_or_none(raw_id)
@@ -4612,6 +4647,10 @@ def create_app(
                 source_scope=source_scope,
                 pdf_strategy=pdf_strategy,
             )
+        except QuerySelectionWarning as exc:
+            return RedirectResponse(
+                _notice_url("/queries", str(exc), level="warning"), status_code=303
+            )
         except ValueError as exc:
             return RedirectResponse(
                 _notice_url("/queries", str(exc), level="error"), status_code=303
@@ -4621,18 +4660,23 @@ def create_app(
                 _notice_url("/queries", "Another collection query is already running.", level="warning"),
                 status_code=303,
             )
+        warning = str(collection_controller.snapshot().warning or "").strip()
+        message = f"Started query with {len(set(profiles))} model(s)."
+        if warning:
+            message = f"{message} {warning}"
         return RedirectResponse(
-            _notice_url("/queries", f"Started query with {len(set(profiles))} model(s)."),
+            _notice_url("/queries", message, level="warning" if warning else "success"),
             status_code=303,
         )
 
     @app.post("/queries/run-filtered")
     async def run_filtered_query(request: Request) -> RedirectResponse:
         form = await request.form()
+        return_to = _clean_local_return_path(form.get("return_to"), _request_return_path(request))
         query_id = _int_or_none(form.get("query_id"))
         if query_id is None:
             return RedirectResponse(
-                _notice_url("/", "Select a saved query.", level="error"), status_code=303
+                _notice_url(return_to, "Select a saved query.", level="error"), status_code=303
             )
         override_defaults = str(form.get("override_query_defaults", "")) in {
             "1", "true", "on"
@@ -4686,7 +4730,7 @@ def create_app(
             stored_query = db.get_saved_query(query_id)
             if stored_query is None:
                 return RedirectResponse(
-                    _notice_url("/", "Saved query not found.", level="error"), status_code=303
+                    _notice_url(return_to, "Saved query not found.", level="error"), status_code=303
                 )
             query = _query_view(stored_query, config)
             authors_for_labels = db.list_authors_with_tags(tracked_only=True)
@@ -4737,13 +4781,13 @@ def create_app(
             not profiles or any(name not in available_profiles for name in profiles)
         ):
             return RedirectResponse(
-                _notice_url("/", "Select a configured model.", level="error"), status_code=303
+                _notice_url(return_to, "Select a configured model.", level="error"), status_code=303
             )
         try:
             context = _configured_context_window(config, profiles, requested_context)
         except ValueError as exc:
             return RedirectResponse(
-                _notice_url("/", str(exc), level="error"), status_code=303
+                _notice_url(return_to, str(exc), level="error"), status_code=303
             )
 
         targets: list[tuple[str, dict[str, Any]]] = []
@@ -4782,7 +4826,7 @@ def create_app(
             unsupported_target = "selected content" if run_selected else "current search results"
             return RedirectResponse(
                 _notice_url(
-                    "/",
+                    return_to,
                     f"This saved query does not support the {unsupported_target}.",
                     level="error",
                 ),
@@ -4811,22 +4855,29 @@ def create_app(
                     source_scope=source_scope,
                     pdf_strategy=pdf_strategy,
                 )
+        except QuerySelectionWarning as exc:
+            return RedirectResponse(
+                _notice_url(return_to, str(exc), level="warning"), status_code=303
+            )
         except ValueError as exc:
-            return RedirectResponse(_notice_url("/", str(exc), level="error"), status_code=303)
+            return RedirectResponse(_notice_url(return_to, str(exc), level="error"), status_code=303)
         if batch_result is None:
             return RedirectResponse(
-                _notice_url("/", "Another collection query is already running.", level="warning"),
+                _notice_url(return_to, "Another collection query is already running.", level="warning"),
                 status_code=303,
             )
-        target = _notice_url(
-            f"/queries?focus={query_id}",
-            (
-                "Started saved query on selected content."
-                if run_selected
-                else "Started saved query on all matching search results."
-            ),
+        message = (
+            "Started saved query on selected content."
+            if run_selected
+            else "Started saved query on all matching search results."
         )
-        return RedirectResponse(f"{target}#query-{query_id}", status_code=303)
+        warning = str(collection_controller.snapshot().warning or "").strip()
+        if warning:
+            message = f"{message} {warning}"
+        return RedirectResponse(
+            _notice_url(return_to, message, level="warning" if warning else "success"),
+            status_code=303,
+        )
 
     @app.post("/queries/{query_id}/run-existing/{content_type}")
     async def run_query_on_existing(
@@ -4887,6 +4938,10 @@ def create_app(
                 pdf_strategy=pdf_strategy,
                 content_type=content_type,
             )
+        except QuerySelectionWarning as exc:
+            return RedirectResponse(
+                _notice_url("/queries", str(exc), level="warning"), status_code=303
+            )
         except ValueError as exc:
             return RedirectResponse(
                 _notice_url("/queries", str(exc), level="error"), status_code=303
@@ -4900,12 +4955,15 @@ def create_app(
                 ),
                 status_code=303,
             )
+        warning = str(collection_controller.snapshot().warning or "").strip()
+        message = (
+            f"Started {query['name']} on all existing {content_type} with "
+            f"{len(profiles)} saved model(s)."
+        )
+        if warning:
+            message = f"{message} {warning}"
         return RedirectResponse(
-            _notice_url(
-                "/queries",
-                f"Started {query['name']} on all existing {content_type} with "
-                f"{len(profiles)} saved model(s).",
-            ),
+            _notice_url("/queries", message, level="warning" if warning else "success"),
             status_code=303,
         )
 
@@ -4988,6 +5046,27 @@ def create_app(
                 f"{len(selected_ids)} selected blog "
                 f"entr{'y' if len(selected_ids) == 1 else 'ies'}.",
             ),
+            status_code=303,
+        )
+
+    @app.post("/queries/runs/{run_id}/cancel")
+    def cancel_query_run(run_id: int) -> RedirectResponse:
+        with Database(config.paths.database) as db:
+            row = db.get_query_run(run_id)
+        if row is None:
+            raise HTTPException(404, "Query output not found")
+        if str(row["status"]) not in {"queued", "running"}:
+            return RedirectResponse(
+                _notice_url("/queries", "That query is no longer running.", level="warning"),
+                status_code=303,
+            )
+        if not collection_controller.cancel():
+            return RedirectResponse(
+                _notice_url("/queries", "No saved prompt is currently running.", level="warning"),
+                status_code=303,
+            )
+        return RedirectResponse(
+            _notice_url("/queries", f"Stopping {row['query_name']}…", level="warning"),
             status_code=303,
         )
 

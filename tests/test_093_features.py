@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from dataclasses import asdict
 import json
+import threading
+import time
 
 import httpx
 from fastapi.testclient import TestClient
@@ -183,6 +185,32 @@ def test_regexp_preprocessing_radius_merging_and_local_query(
         assert run["provider"] == "local"
         assert run["model"] == "regexp"
         assert output["items"][0]["output"] == "beta TARGET gamma"
+
+
+def test_regexp_preprocessing_parallelizes_content_records(monkeypatch):
+    import paperwatch.query_jobs as query_jobs
+
+    original = query_jobs._regexp_document_match
+    thread_ids: set[int] = set()
+    lock = threading.Lock()
+
+    def observed(document, expression, radius):
+        with lock:
+            thread_ids.add(threading.get_ident())
+        time.sleep(0.005)
+        return original(document, expression, radius)
+
+    monkeypatch.setattr(query_jobs, "_regexp_document_match", observed)
+    documents = [
+        {"paper_id": index, "title": f"Paper {index}", "abstract": f"alpha target {index}"}
+        for index in range(24)
+    ]
+    processed, matches = query_jobs.preprocess_regexp_documents(
+        documents, r"target", 1
+    )
+    assert matches == len(documents)
+    assert [item["paper_id"] for item in processed] == list(range(24))
+    assert len(thread_ids) > 1
 
 
 def test_shared_tags_direct_blog_import_rendering_and_fetch_history(

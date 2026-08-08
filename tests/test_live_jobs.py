@@ -626,7 +626,7 @@ def test_controller_progress_caps_and_close_failures(config_path):
 def test_query_helpers_validation_compaction_and_merging(monkeypatch):
     from paperwatch.llm import StructuredJSONResponse
     from paperwatch.query_jobs import (
-        _compact_document, _generate, _pack_documents, run_query_for_model,
+        _generate, _pack_documents, _split_oversized_document, run_query_for_model,
     )
 
     class Invalid:
@@ -636,11 +636,12 @@ def test_query_helpers_validation_compaction_and_merging(monkeypatch):
     with pytest.raises(Exception, match="Invalid collection-query result"):
         _generate(Invalid(), "x")
 
-    large = {"paper_id": 1, "title": "T" * 500, "abstract": "A" * 5000}
-    assert _compact_document(large, 200) != large
-    assert _compact_document(large, 2) in ({}, large)
+    large = {"paper_id": 1, "title": "T" * 50, "abstract": "A" * 5000}
+    fragments = _split_oversized_document(large, 250)
+    assert len(fragments) > 1
+    assert "".join(fragment["abstract"] for fragment in fragments) == large["abstract"]
     groups = _pack_documents([large, large], 250)
-    assert sum(len(group) for group in groups) == 2
+    assert sum(len(group) for group in groups) >= len(fragments) * 2
 
     class MergeLLM:
         provider = "ollama"
@@ -689,11 +690,11 @@ def test_query_helpers_validation_compaction_and_merging(monkeypatch):
         "paperwatch.query_jobs._pack_documents",
         lambda documents, budget: [[item] for item in documents],
     )
-    with pytest.raises(Exception, match="exceeds the selected context"):
-        run_query_for_model(
-            MergeLLM(), user_prompt="x", documents=docs,
-            context_window_tokens=512, max_input_chars=2500,
-        )
+    unmerged, _usage, _chars = run_query_for_model(
+        MergeLLM(), user_prompt="x", documents=docs,
+        context_window_tokens=512, max_input_chars=2500,
+    )
+    assert unmerged.items
 
 
 def test_query_batch_failure_cancel_and_controller_validation(

@@ -2305,7 +2305,10 @@ class Database:
         return (
             "SELECT CAST(selected_entry.value AS INTEGER) "
             "FROM query_runs qr, "
-            "json_each(qr.selection_json, '$.blog_entry_ids') selected_entry "
+            "json_each(CASE "
+            "WHEN json_type(qr.selection_json, '$.resolved_blog_entry_ids')='array' "
+            "THEN json_extract(qr.selection_json, '$.resolved_blog_entry_ids') "
+            "ELSE json_extract(qr.selection_json, '$.blog_entry_ids') END) selected_entry "
             "WHERE qr.status='success' "
             "AND selected_entry.type IN ('integer', 'text') "
             "AND CAST(selected_entry.value AS INTEGER) > 0"
@@ -5395,6 +5398,55 @@ class Database:
             (run_id,),
         ).fetchone()
 
+    def latest_query_runs_for_content(
+        self,
+        query_name: str,
+        content_type: str,
+        record_ids: Iterable[int],
+        *,
+        statuses: tuple[str, ...] = ("queued", "running", "success"),
+    ) -> dict[int, sqlite3.Row]:
+        """Return the latest named query run touching each requested record."""
+        ids = tuple(dict.fromkeys(int(value) for value in record_ids if int(value) > 0))
+        if not ids or not statuses:
+            return {}
+        normalized = content_type.strip().lower()
+        if normalized in {"paper", "papers"}:
+            resolved_path = "$.resolved_paper_ids"
+            fallback_path = "$.paper_ids"
+        elif normalized in {"blog", "blogs", "blog_entry"}:
+            resolved_path = "$.resolved_blog_entry_ids"
+            fallback_path = "$.blog_entry_ids"
+        else:
+            raise ValueError("Content type must be paper or blog")
+        id_placeholders = ",".join("?" for _ in ids)
+        status_placeholders = ",".join("?" for _ in statuses)
+        rows = self._conn.execute(
+            f"""
+            SELECT qr.*, q.name AS query_name, CAST(selected.value AS INTEGER) AS matched_record_id
+            FROM query_runs qr
+            JOIN saved_queries q ON q.id=qr.query_id
+            JOIN json_each(
+                CASE
+                    WHEN json_type(qr.selection_json, ?)='array'
+                    THEN json_extract(qr.selection_json, ?)
+                    ELSE json_extract(qr.selection_json, ?)
+                END
+            ) selected
+            WHERE q.name=? COLLATE NOCASE
+              AND qr.status IN ({status_placeholders})
+              AND selected.type IN ('integer', 'text')
+              AND CAST(selected.value AS INTEGER) IN ({id_placeholders})
+            ORDER BY qr.id DESC
+            """,
+            (resolved_path, resolved_path, fallback_path, query_name, *statuses, *ids),
+        ).fetchall()
+        result: dict[int, sqlite3.Row] = {}
+        for row in rows:
+            record_id = int(row["matched_record_id"])
+            result.setdefault(record_id, row)
+        return result
+
     def query_runs_for_paper(
         self, paper_id: int, *, successful_only: bool = True, limit: int = 100
     ) -> list[sqlite3.Row]:
@@ -5408,7 +5460,11 @@ class Database:
                 selection = json.loads(row["selection_json"] or "{}")
             except (TypeError, json.JSONDecodeError):
                 continue
-            paper_ids = selection.get("paper_ids") if isinstance(selection, dict) else None
+            paper_ids = (
+                selection.get("resolved_paper_ids")
+                if isinstance(selection, dict) and isinstance(selection.get("resolved_paper_ids"), list)
+                else selection.get("paper_ids") if isinstance(selection, dict) else None
+            )
             if not isinstance(paper_ids, list):
                 continue
             try:
@@ -5433,7 +5489,11 @@ class Database:
                 selection = json.loads(row["selection_json"] or "{}")
             except (TypeError, json.JSONDecodeError):
                 continue
-            entry_ids = selection.get("blog_entry_ids") if isinstance(selection, dict) else None
+            entry_ids = (
+                selection.get("resolved_blog_entry_ids")
+                if isinstance(selection, dict) and isinstance(selection.get("resolved_blog_entry_ids"), list)
+                else selection.get("blog_entry_ids") if isinstance(selection, dict) else None
+            )
             if not isinstance(entry_ids, list):
                 continue
             try:

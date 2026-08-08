@@ -672,3 +672,10 @@ label.control-disabled{opacity:.68}
 .content-row:hover:not(.content-row-selected){filter:none;background:color-mix(in srgb,var(--accent-soft) 72%,var(--surface))!important}
 :root[data-theme="dark"] .content-row:hover:not(.content-row-selected){background:color-mix(in srgb,var(--accent-soft) 76%,var(--surface))!important}
 .content-row-selected:hover{filter:none;background:color-mix(in srgb,var(--warn-soft) 68%,var(--accent-soft) 32%)!important}
+
+.summary-processing-link{display:inline-flex;flex-direction:column;align-items:flex-start;gap:3px;text-decoration:none}.summary-processing-link small{color:var(--muted)}.query-run-stop-form{margin-top:7px}.query-run-warning{display:block;margin-top:7px;padding:6px 8px;border:1px solid var(--warn);border-radius:7px;background:var(--warn-soft);color:var(--ink);white-space:normal;overflow-wrap:anywhere}
+
+/* Keep rendered query/analysis Markdown vertical inside object-list cards. */
+.object-list article{min-width:0;overflow-wrap:anywhere}
+.object-list article>.markdown-block{display:block;min-width:0;max-width:100%;overflow-wrap:anywhere}
+.prompt-result h4{overflow-wrap:anywhere}

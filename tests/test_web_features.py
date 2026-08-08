@@ -307,6 +307,7 @@ def test_saved_query_create_edit_run_output_and_delete(
     assert 'content-results-runner-details" open' not in recent.text
     assert 'name="selection_mode"' in recent.text
     assert 'name="selection_mode" value="results" data-run-target-value' in recent.text
+    assert 'name="return_to" value="/"' in recent.text
     assert 'type="button" data-run-target-toggle' in recent.text
     assert 'data-selected-count="0"' in recent.text
     assert 'data-source-scope data-wrap-cycle' in recent.text
@@ -377,9 +378,8 @@ def test_saved_query_create_edit_run_output_and_delete(
         follow_redirects=False,
     )
     assert response.status_code == 303
-    assert response.headers["location"].startswith("/queries?focus=")
-    assert f"#query-{query_id}" in response.headers["location"]
-    assert "notice=Started+saved+query" in response.headers["location"]
+    assert response.headers["location"].startswith("/?notice=Started+saved+query")
+    assert "/queries?focus=" not in response.headers["location"]
     assert query.calls[0][:3] == (query_id, ("default",), 4096)
     selection = query.calls[0][3]
     assert "paper_ids" not in selection
@@ -590,3 +590,126 @@ def test_paper_author_picker_falls_back_to_first_paper_author(
     assert page.status_code == 200
     assert '<option value="0" selected' in page.text
     assert 'data-author-index="0" aria-pressed="true">Ada Lovelace</button>' in page.text
+
+
+def test_content_summary_change_tracks_summarize_run_and_links_status(
+    config_path, author_candidate, paper_record, analysis_result
+):
+    config, paper_id = seed(config_path, author_candidate, paper_record, analysis_result)
+    client = make_app(config_path)
+    with Database(config.paths.database) as db:
+        summary = next(row for row in db.list_saved_queries() if row["name"] == "Summarize")
+        run_id = db.create_query_runs(
+            batch_id="summary-live",
+            query_id=int(summary["id"]),
+            profiles=[("default", "ollama", "test-model")],
+            context_window_tokens=2048,
+            selection={
+                "resolved_paper_ids": [paper_id],
+                "source_scope": "abstract",
+                "pdf_strategy": "auto",
+            },
+        )[0]
+
+    page = client.get("/")
+    assert page.status_code == 200
+    assert "Processing…" in page.text
+    assert "Summarize" in page.text
+    assert f'href="/queries/runs/{run_id}"' in page.text
+
+    detail = client.get(f"/queries/runs/{run_id}")
+    assert 'data-query-run-status="queued"' in detail.text
+    assert f'action="/queries/runs/{run_id}/cancel"' in detail.text
+
+    with Database(config.paths.database) as db:
+        db.start_query_run(run_id)
+        db.finish_query_run(
+            run_id,
+            matched_count=1,
+            input_chars=10,
+            output={
+                "title": "Summary",
+                "summary": "Done",
+                "items": [
+                    {
+                        "paper_id": paper_id,
+                        "content_type": "paper",
+                        "title": paper_record.title,
+                        "output": "Done",
+                    }
+                ],
+            },
+        )
+    page = client.get("/")
+    assert "Processing…" not in page.text
+    assert "Summary available" in page.text
+    assert f'href="/queries/runs/{run_id}"' in page.text
+
+
+def test_filtered_query_stays_on_content_page_and_shows_skip_warning(
+    config_path, author_candidate, paper_record, analysis_result
+):
+    config, _ = seed(config_path, author_candidate, paper_record, analysis_result)
+    with Database(config.paths.database) as db:
+        query_id = db.create_saved_query(name="Filtered warning", prompt="Review")
+
+    class WarningQueryStub(QueryStub):
+        def start(self, *args, **kwargs):
+            result = super().start(*args, **kwargs)
+            self.state.warning = "Skipped 2 incompatible papers without an abstract or PDF."
+            return result
+
+    client = make_app(config_path, query=WarningQueryStub())
+    response = client.post(
+        "/queries/run-filtered",
+        data={
+            "query_id": str(query_id),
+            "return_to": "/?q=Minimal&content=papers",
+            "q": "Minimal",
+            "content": "papers",
+        },
+        follow_redirects=False,
+    )
+    assert response.status_code == 303
+    location = response.headers["location"]
+    assert location.startswith("/?q=Minimal&content=papers&notice=")
+    assert "level=warning" in location
+    assert "/queries" not in location
+    page = client.get(location)
+    assert 'class="notice notice-warning"' in page.text
+    assert "Skipped 2 incompatible papers" in page.text
+
+
+def test_recent_outputs_can_stop_running_query(
+    config_path, author_candidate, paper_record, analysis_result
+):
+    config, paper_id = seed(config_path, author_candidate, paper_record, analysis_result)
+
+    class CancellableQueryStub(QueryStub):
+        def __init__(self):
+            super().__init__()
+            self.cancelled = False
+
+        def cancel(self):
+            self.cancelled = True
+            return True
+
+    query = CancellableQueryStub()
+    client = make_app(config_path, query=query)
+    with Database(config.paths.database) as db:
+        query_id = db.create_saved_query(name="Stop me", prompt="Review")
+        run_id = db.create_query_runs(
+            batch_id="stop-me",
+            query_id=query_id,
+            profiles=[("default", "ollama", "test-model")],
+            context_window_tokens=2048,
+            selection={"resolved_paper_ids": [paper_id]},
+        )[0]
+        db.start_query_run(run_id)
+
+    page = client.get("/queries")
+    assert f'action="/queries/runs/{run_id}/cancel"' in page.text
+    response = client.post(f"/queries/runs/{run_id}/cancel", follow_redirects=False)
+    assert response.status_code == 303
+    assert query.cancelled is True
+    assert "Stopping+Stop+me" in response.headers["location"]
