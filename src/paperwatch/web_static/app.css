@@ -679,3 +679,7 @@ label.control-disabled{opacity:.68}
 .object-list article{min-width:0;overflow-wrap:anywhere}
 .object-list article>.markdown-block{display:block;min-width:0;max-width:100%;overflow-wrap:anywhere}
 .prompt-result h4{overflow-wrap:anywhere}
+
+/* Highlight exact source matches in local regexp result excerpts. */
+.regexp-result-text{min-width:0;max-width:100%;overflow-wrap:anywhere;white-space:normal}
+.regexp-match{background:var(--warn-soft);color:var(--ink);border-radius:3px;padding:0 .08em;box-decoration-break:clone;-webkit-box-decoration-break:clone}

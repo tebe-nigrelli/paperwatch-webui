@@ -713,3 +713,181 @@ def test_recent_outputs_can_stop_running_query(
     assert response.status_code == 303
     assert query.cancelled is True
     assert "Stopping+Stop+me" in response.headers["location"]
+
+
+def test_regexp_print_results_highlight_exact_matches(
+    config_path, author_candidate, paper_record, analysis_result
+):
+    config, paper_id = seed(config_path, author_candidate, paper_record, analysis_result)
+    client = make_app(config_path)
+    pattern = r"(?i)military|defen[cs]e"
+    with Database(config.paths.database) as db:
+        query_id = db.create_saved_query(
+            name="Defense refs",
+            prompt="Print regexp matches.",
+            regexp_pattern=pattern,
+            regexp_radius=2,
+            regexp_mode="print",
+        )
+        run_id = db.create_query_runs(
+            batch_id="regexp-highlight",
+            query_id=query_id,
+            profiles=[("regexp", "local", "regexp")],
+            context_window_tokens=2048,
+            selection={"resolved_paper_ids": [paper_id]},
+        )[0]
+        db.finish_query_run(
+            run_id,
+            matched_count=1,
+            input_chars=40,
+            output={
+                "title": f"Regexp matches: {pattern}",
+                "summary": "3 match(es) across 1 record(s).",
+                "items": [
+                    {
+                        "paper_id": paper_id,
+                        "content_type": "paper",
+                        "title": paper_record.title,
+                        "output": "Military research and defence work; <script> stays text.",
+                    }
+                ],
+            },
+        )
+
+    detail = client.get(f"/queries/runs/{run_id}")
+    assert detail.status_code == 200
+    assert '<mark class="regexp-match">Military</mark>' in detail.text
+    assert '<mark class="regexp-match">defence</mark>' in detail.text
+    assert "&lt;script&gt; stays text." in detail.text
+    assert "<script> stays text." not in detail.text
+
+
+def test_paper_saved_query_results_are_localized_to_current_record(
+    config_path, author_candidate, paper_record, analysis_result
+):
+    from dataclasses import replace
+
+    config, paper_id = seed(config_path, author_candidate, paper_record, analysis_result)
+    sibling_record = replace(
+        paper_record,
+        openalex_id="W-SIBLING-QUERY",
+        doi=None,
+        arxiv_id=None,
+        title="Sibling batch-query paper",
+        publication_url="https://example.test/sibling-query-paper",
+        pdf_url=None,
+    )
+    with Database(config.paths.database) as db:
+        sibling_id, _ = db.upsert_paper(sibling_record)
+        query_id = db.create_saved_query(name="Batch summary", prompt="Summarize")
+        run_id = db.create_query_runs(
+            batch_id="localized-paper-output",
+            query_id=query_id,
+            profiles=[("default", "ollama", "test-model")],
+            context_window_tokens=4096,
+            selection={"resolved_paper_ids": [paper_id, sibling_id]},
+        )[0]
+        db.finish_query_run(
+            run_id,
+            matched_count=2,
+            input_chars=100,
+            output={
+                "title": "Batch result",
+                "summary": "COLLECTION-WIDE SUMMARY MUST NOT APPEAR",
+                "items": [
+                    {
+                        "paper_id": paper_id,
+                        "blog_entry_id": None,
+                        "content_type": "paper",
+                        "title": paper_record.title,
+                        "output": "CURRENT PAPER RESULT ONLY",
+                    },
+                    {
+                        "paper_id": sibling_id,
+                        "blog_entry_id": None,
+                        "content_type": "paper",
+                        "title": sibling_record.title,
+                        "output": "SIBLING PAPER RESULT MUST NOT APPEAR",
+                    },
+                ],
+            },
+        )
+
+    client = make_app(config_path)
+    page = client.get(f"/papers/{paper_id}")
+    assert page.status_code == 200
+    assert "CURRENT PAPER RESULT ONLY" in page.text
+    assert "SIBLING PAPER RESULT MUST NOT APPEAR" not in page.text
+    assert "COLLECTION-WIDE SUMMARY MUST NOT APPEAR" not in page.text
+
+
+def test_blog_saved_query_results_are_localized_to_current_record(
+    config_path, author_candidate, paper_record, analysis_result
+):
+    config, _ = seed(config_path, author_candidate, paper_record, analysis_result)
+    with Database(config.paths.database) as db:
+        blog_id = db.add_author_blog(
+            author_candidate.openalex_id,
+            "https://example.test/localized-blog",
+            label="Localized blog",
+        )
+        current_id = db.save_blog_entry(
+            blog_id=blog_id,
+            title="Current blog entry",
+            content_sha256="current-blog-hash",
+            normalized_text="Current text",
+            diff_text="",
+            change_kind="baseline",
+            previous_entry_id=None,
+            source_url="https://example.test/localized-blog/current",
+        )
+        sibling_id = db.save_blog_entry(
+            blog_id=blog_id,
+            title="Sibling blog entry",
+            content_sha256="sibling-blog-hash",
+            normalized_text="Sibling text",
+            diff_text="",
+            change_kind="baseline",
+            previous_entry_id=None,
+            source_url="https://example.test/localized-blog/sibling",
+        )
+        query_id = db.create_saved_query(name="Batch blog summary", prompt="Summarize")
+        run_id = db.create_query_runs(
+            batch_id="localized-blog-output",
+            query_id=query_id,
+            profiles=[("default", "ollama", "test-model")],
+            context_window_tokens=4096,
+            selection={"resolved_blog_entry_ids": [current_id, sibling_id]},
+        )[0]
+        db.finish_query_run(
+            run_id,
+            matched_count=2,
+            input_chars=100,
+            output={
+                "title": "Batch blog result",
+                "summary": "BLOG COLLECTION SUMMARY MUST NOT APPEAR",
+                "items": [
+                    {
+                        "paper_id": None,
+                        "blog_entry_id": current_id,
+                        "content_type": "blog",
+                        "title": "Current blog entry",
+                        "output": "CURRENT BLOG RESULT ONLY",
+                    },
+                    {
+                        "paper_id": None,
+                        "blog_entry_id": sibling_id,
+                        "content_type": "blog",
+                        "title": "Sibling blog entry",
+                        "output": "SIBLING BLOG RESULT MUST NOT APPEAR",
+                    },
+                ],
+            },
+        )
+
+    client = make_app(config_path)
+    page = client.get(f"/blogs/{current_id}")
+    assert page.status_code == 200
+    assert "CURRENT BLOG RESULT ONLY" in page.text
+    assert "SIBLING BLOG RESULT MUST NOT APPEAR" not in page.text
+    assert "BLOG COLLECTION SUMMARY MUST NOT APPEAR" not in page.text

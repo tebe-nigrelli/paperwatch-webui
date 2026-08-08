@@ -1101,6 +1101,36 @@ def _inline_display_text(value: Any) -> str:
     return " ".join(text.split())
 
 
+def _render_regexp_excerpt(value: str, pattern: str) -> str:
+    """Render exact regexp excerpts with matched source text highlighted safely."""
+    text = str(value or "")
+    if not text:
+        return ""
+    try:
+        expression = re.compile(str(pattern or ""), re.MULTILINE)
+    except re.error:
+        expression = None
+    if expression is None or not pattern:
+        return html.escape(text).replace("\n", "<br>")
+
+    pieces: list[str] = []
+    cursor = 0
+    for match in expression.finditer(text):
+        # Zero-width expressions are useful for filtering but have no visible text
+        # to highlight. Leave them alone rather than emitting empty marks.
+        if match.start() == match.end():
+            continue
+        pieces.append(html.escape(text[cursor:match.start()]))
+        pieces.append(
+            '<mark class="regexp-match">'
+            + html.escape(match.group(0))
+            + "</mark>"
+        )
+        cursor = match.end()
+    pieces.append(html.escape(text[cursor:]))
+    return "".join(pieces).replace("\n", "<br>")
+
+
 def _render_stored_markdown(value: str) -> str:
     """Render stored summaries and extracted blog markdown without raw HTML.
 
@@ -1815,6 +1845,12 @@ def _selection_with_labels(
 def _query_output(row: Any) -> dict[str, Any]:
     data = _row_dict(row)
     data["output"] = _json_value(data.get("output_json"), None)
+    data["regexp_pattern"] = ""
+    if isinstance(data["output"], dict):
+        output_title = str(data["output"].get("title") or "")
+        prefix = "Regexp matches: "
+        if output_title.startswith(prefix):
+            data["regexp_pattern"] = output_title[len(prefix):]
     selection = _json_value(data.get("selection_json"), {})
     data["selection"] = selection if isinstance(selection, dict) else {}
     selection_items = []
@@ -1866,6 +1902,56 @@ def _query_output(row: Any) -> dict[str, Any]:
         data["selection_url"] = f"/?{selection_query}" if selection_query else "/"
     return data
 
+
+
+def _query_output_for_content(
+    row: Any, content_type: str, content_id: int
+) -> dict[str, Any] | None:
+    """Return one saved-query run localized to a single paper or blog entry.
+
+    Query runs can span many records, but detail pages must never render sibling
+    records from the same batch.  Keep every output segment belonging to this
+    record (large outputs may be split into multiple adjacent items) and suppress
+    the collection-wide summary for multi-record runs.
+    """
+    data = _query_output(row)
+    output = data.get("output")
+    if not isinstance(output, dict):
+        return data
+    items = output.get("items")
+    if not isinstance(items, list):
+        return data
+
+    normalized = content_type.strip().lower()
+    id_key = "paper_id" if normalized in {"paper", "papers"} else "blog_entry_id"
+    wanted_id = int(content_id)
+    matching_items: list[dict[str, Any]] = []
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        try:
+            item_id = int(item.get(id_key))
+        except (TypeError, ValueError):
+            continue
+        if item_id == wanted_id:
+            matching_items.append(item)
+
+    # A run may have selected this record but the model may have omitted an item.
+    # Do not show a batch result from unrelated records in that case.
+    if not matching_items:
+        return None
+
+    localized = dict(output)
+    localized["items"] = matching_items
+    try:
+        matched_count = int(data.get("matched_count") or 0)
+    except (TypeError, ValueError):
+        matched_count = 0
+    if matched_count > 1:
+        localized["summary"] = ""
+    data["output"] = localized
+    data["content_result_count"] = len(matching_items)
+    return data
 
 def _csv_response(records: Iterable[dict[str, Any]]) -> Response:
     stream = io.StringIO(newline="")
@@ -1973,6 +2059,7 @@ def create_app(
     )
     templates.env.filters["querystring"] = lambda items: urlencode(items)
     templates.env.filters["markdown"] = _render_stored_markdown
+    templates.env.filters["regexp_excerpt"] = _render_regexp_excerpt
     templates.env.filters["inline_text"] = _inline_display_text
 
     app = FastAPI(title="paperwatch", docs_url=None, redoc_url=None, openapi_url=None)
@@ -3090,7 +3177,9 @@ def create_app(
         with Database(config.paths.database) as db:
             entry = db.get_blog_entry(entry_id)
             prompt_runs = [
-                _query_output(row) for row in db.query_runs_for_blog_entry(entry_id)
+                localized
+                for row in db.query_runs_for_blog_entry(entry_id)
+                if (localized := _query_output_for_content(row, "blog", entry_id)) is not None
             ]
             entry_tags = db.blog_entry_tags(entry_id)
             content_tags = db.list_content_tags()
@@ -3962,7 +4051,9 @@ def create_app(
             ]
             analyses = [_analysis_view(row) for row in db.paper_analyses(paper_id)]
             prompt_runs = [
-                _query_output(row) for row in db.query_runs_for_paper(paper_id)
+                localized
+                for row in db.query_runs_for_paper(paper_id)
+                if (localized := _query_output_for_content(row, "paper", paper_id)) is not None
             ]
             paper_tags = db.paper_tags(paper_id)
             content_tags = db.list_content_tags()
