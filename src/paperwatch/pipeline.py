@@ -781,6 +781,10 @@ class PaperWatch:
                         entry_kind="rss",
                         external_id=item.external_id,
                     )
+                    if previous is None:
+                        previous = self.db.matching_blog_entry_by_title(
+                            blog_id, title=item.title, source_url=item.url
+                        )
                     # Import primary arXiv targets even when the RSS record is
                     # unchanged, and retain an explicit in-app paper relationship.
                     linked_paper_id = self._import_arxiv_feed_item(
@@ -791,12 +795,36 @@ class PaperWatch:
                     )
                     if item.url and linked_paper_id is not None:
                         paper_by_url[item.url] = linked_paper_id
+                    same_title = (
+                        previous is not None
+                        and normalize_title(str(previous["title"] or ""))
+                        == normalize_title(item.title)
+                    )
                     if previous is not None and previous["content_sha256"] == item_sha256:
                         if linked_paper_id is not None:
                             self.db.link_blog_entry_to_paper(int(previous["id"]), linked_paper_id)
-                        self.db.set_blog_entry_published_at(
-                            int(previous["id"]), item.published_at
-                        )
+                        if same_title and (
+                            str(previous["source_url"] or "") != str(item.url or "")
+                            or str(previous["external_id"] or "") != str(item.external_id or "")
+                        ):
+                            self.db.update_blog_entry_revision(
+                                int(previous["id"]),
+                                title=item.title,
+                                content_sha256=str(previous["content_sha256"]),
+                                normalized_text=str(previous["normalized_text"]),
+                                diff_text=str(previous["diff_text"] or ""),
+                                change_kind=str(previous["change_kind"]),
+                                entry_kind="rss",
+                                external_id=item.external_id,
+                                source_url=item.url,
+                                published_at=item.published_at,
+                                rendered_html=previous["rendered_html"],
+                                linked_paper_id=linked_paper_id,
+                            )
+                        else:
+                            self.db.set_blog_entry_published_at(
+                                int(previous["id"]), item.published_at
+                            )
                         continue
                     initial_item = previous is None and initial_sync
                     if previous is None:
@@ -810,26 +838,44 @@ class PaperWatch:
                             # is only appropriate for snapshots.
                             source_mode="feed",
                         )
-                    entry_id = self.db.save_blog_entry(
-                        blog_id=blog_id,
-                        title=item.title,
-                        content_sha256=item_sha256,
-                        normalized_text=item_text,
-                        diff_text=diff,
-                        change_kind=kind,
-                        previous_entry_id=(
-                            int(previous["id"]) if previous is not None else None
-                        ),
-                        entry_kind="rss",
-                        external_id=item.external_id,
-                        source_url=item.url,
-                        published_at=item.published_at,
-                        rendered_html=item_html,
-                        linked_paper_id=linked_paper_id,
-                    )
+                    if same_title:
+                        entry_id = int(previous["id"])
+                        self.db.update_blog_entry_revision(
+                            entry_id,
+                            title=item.title,
+                            content_sha256=item_sha256,
+                            normalized_text=item_text,
+                            diff_text=diff,
+                            change_kind=kind,
+                            entry_kind="rss",
+                            external_id=item.external_id,
+                            source_url=item.url,
+                            published_at=item.published_at,
+                            rendered_html=item_html,
+                            linked_paper_id=linked_paper_id,
+                        )
+                    else:
+                        entry_id = self.db.save_blog_entry(
+                            blog_id=blog_id,
+                            title=item.title,
+                            content_sha256=item_sha256,
+                            normalized_text=item_text,
+                            diff_text=diff,
+                            change_kind=kind,
+                            previous_entry_id=(
+                                int(previous["id"]) if previous is not None else None
+                            ),
+                            entry_kind="rss",
+                            external_id=item.external_id,
+                            source_url=item.url,
+                            published_at=item.published_at,
+                            rendered_html=item_html,
+                            linked_paper_id=linked_paper_id,
+                        )
                     if kind != "baseline" and not initial_item:
                         stats.blog_updates_found += 1
-                        stats.new_blog_entry_ids.append(entry_id)
+                        if entry_id not in stats.new_blog_entry_ids:
+                            stats.new_blog_entry_ids.append(entry_id)
                 feed_urls = {item.url for item in fetched.feed_items if item.url}
                 for article in fetched.article_items:
                     # A 304 feed response has no item payload, but known article pages
@@ -853,19 +899,44 @@ class PaperWatch:
                         continue
                     if linked_paper_id is not None:
                         self.db.link_blog_entry_to_paper(int(rss_entry["id"]), linked_paper_id)
+                    had_website_content = RSS_WEBSITE_MARKER in str(
+                        rss_entry["normalized_text"] or ""
+                    )
                     combined_text, combined_html, combined_sha256 = _rss_with_article(
                         str(rss_entry["normalized_text"] or ""),
                         str(rss_entry["rendered_html"] or "") or None,
                         article,
                     )
                     if str(rss_entry["content_sha256"]) != combined_sha256:
-                        self.db.update_blog_entry_content(
+                        article_kind, article_diff = blog_diff(
+                            str(rss_entry["normalized_text"] or ""),
+                            combined_text,
+                            source_mode="feed",
+                        )
+                        self.db.update_blog_entry_revision(
                             int(rss_entry["id"]),
+                            title=str(rss_entry["title"] or article.title),
                             content_sha256=combined_sha256,
                             normalized_text=combined_text,
-                            rendered_html=combined_html,
+                            diff_text=article_diff,
+                            change_kind=article_kind,
+                            entry_kind="rss",
+                            source_url=article.url,
                             published_at=article.published_at,
+                            rendered_html=combined_html,
+                            linked_paper_id=linked_paper_id,
                         )
+                        # A later webpage-body change is a real update even though
+                        # it is folded into the stable RSS entry instead of creating
+                        # a duplicate snapshot row.
+                        if (
+                            not fetched.feed_items
+                            and had_website_content
+                            and article_kind != "baseline"
+                        ):
+                            stats.blog_updates_found += 1
+                            if int(rss_entry["id"]) not in stats.new_blog_entry_ids:
+                                stats.new_blog_entry_ids.append(int(rss_entry["id"]))
                     else:
                         self.db.set_blog_entry_published_at(
                             int(rss_entry["id"]), article.published_at
@@ -884,6 +955,10 @@ class PaperWatch:
                         entry_kind="snapshot",
                         external_id=article.external_id,
                     )
+                    if previous_article is None:
+                        previous_article = self.db.matching_blog_entry_by_title(
+                            blog_id, title=article.title, source_url=article.url
+                        )
                     if (
                         previous_article is not None
                         and previous_article["content_sha256"] == article.sha256
@@ -893,6 +968,31 @@ class PaperWatch:
                         )
                         continue
                     first_page_fetch = previous_article is None
+                    same_title = (
+                        previous_article is not None
+                        and normalize_title(str(previous_article["title"] or ""))
+                        == normalize_title(article.title)
+                    )
+                    if (
+                        same_title
+                        and str(previous_article["entry_kind"] or "") == "rss"
+                    ):
+                        # RSS and its fetched webpage are one logical blog entry.
+                        # Enrich the stable RSS row rather than creating a duplicate
+                        # snapshot with the same title.
+                        combined_text, combined_html, combined_sha256 = _rss_with_article(
+                            str(previous_article["normalized_text"] or ""),
+                            str(previous_article["rendered_html"] or "") or None,
+                            article,
+                        )
+                        self.db.update_blog_entry_content(
+                            int(previous_article["id"]),
+                            content_sha256=combined_sha256,
+                            normalized_text=combined_text,
+                            rendered_html=combined_html,
+                            published_at=article.published_at,
+                        )
+                        continue
                     if previous_article is None:
                         article_kind, article_diff = "changed", ""
                     else:
@@ -901,30 +1001,47 @@ class PaperWatch:
                             article.text,
                             source_mode="article",
                         )
-                    article_entry_id = self.db.save_blog_entry(
-                        blog_id=blog_id,
-                        title=article.title,
-                        content_sha256=article.sha256,
-                        normalized_text=article.text,
-                        diff_text=article_diff,
-                        change_kind=article_kind,
-                        previous_entry_id=(
-                            int(previous_article["id"])
-                            if previous_article is not None
-                            else None
-                        ),
-                        entry_kind="snapshot",
-                        external_id=article.external_id,
-                        source_url=article.url,
-                        rendered_html=article.rendered_html,
-                        published_at=article.published_at,
-                    )
+                    if same_title:
+                        article_entry_id = int(previous_article["id"])
+                        self.db.update_blog_entry_revision(
+                            article_entry_id,
+                            title=article.title,
+                            content_sha256=article.sha256,
+                            normalized_text=article.text,
+                            diff_text=article_diff,
+                            change_kind=article_kind,
+                            entry_kind="snapshot",
+                            external_id=article.external_id,
+                            source_url=article.url,
+                            rendered_html=article.rendered_html,
+                            published_at=article.published_at,
+                        )
+                    else:
+                        article_entry_id = self.db.save_blog_entry(
+                            blog_id=blog_id,
+                            title=article.title,
+                            content_sha256=article.sha256,
+                            normalized_text=article.text,
+                            diff_text=article_diff,
+                            change_kind=article_kind,
+                            previous_entry_id=(
+                                int(previous_article["id"])
+                                if previous_article is not None
+                                else None
+                            ),
+                            entry_kind="snapshot",
+                            external_id=article.external_id,
+                            source_url=article.url,
+                            rendered_html=article.rendered_html,
+                            published_at=article.published_at,
+                        )
                     # The feed item itself is the new-content notification. The
                     # first HTML fetch is a usable website snapshot, not a
                     # second notification for the same post.
                     if article_kind != "baseline" and not first_page_fetch:
                         stats.blog_updates_found += 1
-                        stats.new_blog_entry_ids.append(article_entry_id)
+                        if article_entry_id not in stats.new_blog_entry_ids:
+                            stats.new_blog_entry_ids.append(article_entry_id)
 
                 self.db.mark_blog_checked(
                     blog_id,
@@ -996,6 +1113,10 @@ class PaperWatch:
                 )
                 if previous_discovery is not None:
                     continue
+                if self.db.matching_blog_entry_by_title(
+                    blog_id, title=article.title, source_url=article.url
+                ) is not None:
+                    continue
                 linked_paper_id = self._import_arxiv_feed_item(
                     stats,
                     article.url,
@@ -1038,26 +1159,49 @@ class PaperWatch:
                         entry_kind="rss",
                         source_url=article.url,
                     )
+                if previous_article is None:
+                    previous_article = self.db.matching_blog_entry_by_title(
+                        blog_id, title=article.title, source_url=article.url
+                    )
                 if previous_article is not None and linked_paper_id is not None:
                     self.db.link_blog_entry_to_paper(
                         int(previous_article["id"]), linked_paper_id
                     )
                 if previous_article is not None and previous_article["content_sha256"] == article.sha256:
-                    self.db.set_blog_entry_published_at(
-                        int(previous_article["id"]), article.published_at
+                    same_title_unchanged = (
+                        normalize_title(str(previous_article["title"] or ""))
+                        == normalize_title(article.title)
                     )
-                    continue
-                if reuse_source_entry and previous_article is not None:
-                    self.db.update_blog_entry_content(
-                        int(previous_article["id"]),
-                        content_sha256=article.sha256,
-                        normalized_text=article.text,
-                        rendered_html=article.rendered_html,
-                        published_at=article.published_at,
-                    )
+                    if same_title_unchanged and (
+                        str(previous_article["source_url"] or "") != article.url
+                        or str(previous_article["external_id"] or "") != str(article.external_id or "")
+                    ):
+                        self.db.update_blog_entry_revision(
+                            int(previous_article["id"]),
+                            title=article.title,
+                            content_sha256=article.sha256,
+                            normalized_text=str(previous_article["normalized_text"]),
+                            diff_text=str(previous_article["diff_text"] or ""),
+                            change_kind=str(previous_article["change_kind"]),
+                            entry_kind="rss",
+                            external_id=article.external_id,
+                            source_url=article.url,
+                            published_at=article.published_at,
+                            rendered_html=previous_article["rendered_html"],
+                            linked_paper_id=linked_paper_id,
+                        )
+                    else:
+                        self.db.set_blog_entry_published_at(
+                            int(previous_article["id"]), article.published_at
+                        )
                     continue
                 initial_article = previous_article is None and (
                     initial_article_sync or article.url in existing_article_urls
+                )
+                same_title = (
+                    previous_article is not None
+                    and normalize_title(str(previous_article["title"] or ""))
+                    == normalize_title(article.title)
                 )
                 if previous_article is None:
                     article_kind, article_diff = "changed", ""
@@ -1067,28 +1211,46 @@ class PaperWatch:
                         article.text,
                         source_mode="article",
                     )
-                article_entry_id = self.db.save_blog_entry(
-                    blog_id=blog_id,
-                    title=article.title,
-                    content_sha256=article.sha256,
-                    normalized_text=article.text,
-                    diff_text=article_diff,
-                    change_kind=article_kind,
-                    previous_entry_id=(
-                        int(previous_article["id"])
-                        if previous_article is not None
-                        else None
-                    ),
-                    entry_kind="rss",
-                    external_id=article.external_id,
-                    source_url=article.url,
-                    rendered_html=article.rendered_html,
-                    published_at=article.published_at,
-                    linked_paper_id=linked_paper_id,
-                )
+                if same_title:
+                    article_entry_id = int(previous_article["id"])
+                    self.db.update_blog_entry_revision(
+                        article_entry_id,
+                        title=article.title,
+                        content_sha256=article.sha256,
+                        normalized_text=article.text,
+                        diff_text=article_diff,
+                        change_kind=article_kind,
+                        entry_kind="rss",
+                        external_id=article.external_id,
+                        source_url=article.url,
+                        rendered_html=article.rendered_html,
+                        published_at=article.published_at,
+                        linked_paper_id=linked_paper_id,
+                    )
+                else:
+                    article_entry_id = self.db.save_blog_entry(
+                        blog_id=blog_id,
+                        title=article.title,
+                        content_sha256=article.sha256,
+                        normalized_text=article.text,
+                        diff_text=article_diff,
+                        change_kind=article_kind,
+                        previous_entry_id=(
+                            int(previous_article["id"])
+                            if previous_article is not None
+                            else None
+                        ),
+                        entry_kind="rss",
+                        external_id=article.external_id,
+                        source_url=article.url,
+                        rendered_html=article.rendered_html,
+                        published_at=article.published_at,
+                        linked_paper_id=linked_paper_id,
+                    )
                 if article_kind != "baseline" and not initial_article:
                     stats.blog_updates_found += 1
-                    stats.new_blog_entry_ids.append(article_entry_id)
+                    if article_entry_id not in stats.new_blog_entry_ids:
+                        stats.new_blog_entry_ids.append(article_entry_id)
 
             if fetched.source_mode in {"article_index", "publications"}:
                 self.db.suppress_blog_source_page_entries(blog_id)

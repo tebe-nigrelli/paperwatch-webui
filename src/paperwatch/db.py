@@ -18,10 +18,11 @@ from .models import (
     json_dumps,
     parse_openalex_topics,
     short_openalex_id,
+    normalize_title,
 )
 
 
-SCHEMA_VERSION = 30
+SCHEMA_VERSION = 31
 BLOG_SOURCE_MODES = {
     "auto",
     "feed",
@@ -58,6 +59,18 @@ def _diff_word_count(diff_text: str | None, prefix: str) -> int:
             continue
         count += len(re.findall(r"\S+", raw_line[1:]))
     return count
+
+
+def _title_key(value: str | None) -> str:
+    return normalize_title(str(value or ""))
+
+
+def _website_host_key(value: str | None) -> str:
+    try:
+        host = (urlsplit(str(value or "")).hostname or "").casefold().rstrip(".")
+    except ValueError:
+        return ""
+    return host[4:] if host.startswith("www.") else host
 
 
 def _blog_entry_word_count(
@@ -626,6 +639,18 @@ class Database:
             _url_search_key,
             deterministic=True,
         )
+        self._conn.create_function(
+            "paperwatch_title_key",
+            1,
+            _title_key,
+            deterministic=True,
+        )
+        self._conn.create_function(
+            "paperwatch_host_key",
+            1,
+            _website_host_key,
+            deterministic=True,
+        )
         self._conn.execute("PRAGMA foreign_keys = ON")
         self._conn.execute("PRAGMA journal_mode = WAL")
         self._conn.execute("PRAGMA busy_timeout = 10000")
@@ -663,6 +688,8 @@ class Database:
             self._migrate_feed_article_tracking()
         if version < 21:
             self._migrate_arxiv_blog_links()
+        if version < 31:
+            self._migrate_blog_title_duplicates_v31()
         self._ensure_run_blog_columns()
         if version < 6:
             self._backfill_paper_topics()
@@ -884,6 +911,78 @@ class Database:
               AND lower(COALESCE(be.source_url, '')) LIKE '%arxiv.org/%'
             """
         )
+
+    def _migrate_blog_title_duplicates_v31(self) -> None:
+        """Collapse historical same-title entries within one blog source.
+
+        The oldest row remains the stable content identity so notes, stars, read
+        state, selections, and saved-query history attached to it remain valid.
+        Its fetched content is refreshed from the newest duplicate; later rows
+        are retained as hidden baselines so foreign keys and old run payloads stay
+        valid.
+        """
+        groups = self._conn.execute(
+            """
+            SELECT blog_id, paperwatch_title_key(title) AS title_key
+            FROM blog_entries
+            WHERE change_kind != 'baseline'
+              AND paperwatch_title_key(title) != ''
+            GROUP BY blog_id, paperwatch_title_key(title)
+            HAVING count(*) > 1
+            """
+        ).fetchall()
+        for group in groups:
+            rows = self._conn.execute(
+                """
+                SELECT * FROM blog_entries
+                WHERE blog_id=? AND change_kind != 'baseline'
+                  AND paperwatch_title_key(title)=?
+                ORDER BY id ASC
+                """,
+                (int(group["blog_id"]), str(group["title_key"])),
+            ).fetchall()
+            if len(rows) < 2:
+                continue
+            canonical = rows[0]
+            latest = max(
+                rows,
+                key=lambda row: (
+                    str(row["published_at"] or row["fetched_at"] or ""),
+                    int(row["id"]),
+                ),
+            )
+            canonical_id = int(canonical["id"])
+            duplicate_ids = [int(row["id"]) for row in rows[1:]]
+            self._conn.execute(
+                """
+                UPDATE blog_entries
+                SET title=?, content_sha256=?, normalized_text=?, rendered_html=?,
+                    linked_paper_id=COALESCE(?, linked_paper_id), diff_text=?,
+                    change_kind=?, source_url=COALESCE(?, source_url),
+                    published_at=COALESCE(?, published_at), fetched_at=?
+                WHERE id=?
+                """,
+                (
+                    latest["title"], latest["content_sha256"],
+                    latest["normalized_text"], latest["rendered_html"],
+                    latest["linked_paper_id"], latest["diff_text"],
+                    latest["change_kind"], latest["source_url"],
+                    latest["published_at"], latest["fetched_at"], canonical_id,
+                ),
+            )
+            placeholders = ",".join("?" for _ in duplicate_ids)
+            self._conn.execute(
+                f"""
+                INSERT OR IGNORE INTO blog_entry_tag_links(blog_entry_id, tag_id)
+                SELECT ?, tag_id FROM blog_entry_tag_links
+                WHERE blog_entry_id IN ({placeholders})
+                """,
+                (canonical_id, *duplicate_ids),
+            )
+            self._conn.execute(
+                f"UPDATE blog_entries SET change_kind='baseline' WHERE id IN ({placeholders})",
+                duplicate_ids,
+            )
 
     def _ensure_author_tracking_column(self) -> None:
         columns = {
@@ -2088,6 +2187,105 @@ class Database:
             (blog_id, entry_kind, source_url),
         ).fetchone()
 
+    def matching_blog_entry_by_title(
+        self,
+        blog_id: int,
+        *,
+        title: str,
+        source_url: str | None = None,
+    ) -> sqlite3.Row | None:
+        """Find the stable entry for the same title, author, and website.
+
+        Different paths on the same host are intentionally treated as the same
+        website. A source linked to the same tracked author may therefore reuse
+        an entry from another blog row on that host.
+        """
+        title_key = _title_key(title)
+        if not title_key:
+            return None
+        blog_row = self._conn.execute(
+            "SELECT url FROM blogs WHERE id=?", (int(blog_id),)
+        ).fetchone()
+        if blog_row is None:
+            return None
+        target_host = _website_host_key(source_url) or _website_host_key(blog_row["url"])
+        rows = self._conn.execute(
+            """
+            SELECT be.*, b.url AS blog_url
+            FROM blog_entries be
+            JOIN blogs b ON b.id=be.blog_id
+            WHERE be.change_kind != 'baseline'
+              AND b.dead=0
+              AND paperwatch_title_key(be.title)=?
+              AND (
+                    be.blog_id=?
+                    OR EXISTS (
+                        SELECT 1
+                        FROM author_blogs current_ab
+                        JOIN author_blogs candidate_ab
+                          ON candidate_ab.author_id=current_ab.author_id
+                        WHERE current_ab.blog_id=?
+                          AND candidate_ab.blog_id=be.blog_id
+                    )
+              )
+            ORDER BY CASE WHEN be.blog_id=? THEN 0 ELSE 1 END, be.id ASC
+            """,
+            (title_key, int(blog_id), int(blog_id), int(blog_id)),
+        ).fetchall()
+        for row in rows:
+            candidate_host = _website_host_key(row["source_url"]) or _website_host_key(
+                row["blog_url"]
+            )
+            if target_host and candidate_host == target_host:
+                return row
+        return None
+
+    def update_blog_entry_revision(
+        self,
+        entry_id: int,
+        *,
+        title: str,
+        content_sha256: str,
+        normalized_text: str,
+        diff_text: str,
+        change_kind: str,
+        source_url: str | None = None,
+        external_id: str | None = None,
+        entry_kind: str | None = None,
+        published_at: str | None = None,
+        rendered_html: str | None = None,
+        linked_paper_id: int | None = None,
+    ) -> bool:
+        """Refresh a stable same-title entry without replacing user state."""
+        with self.transaction() as conn:
+            existing = conn.execute(
+                "SELECT entry_kind FROM blog_entries WHERE id=?", (int(entry_id),)
+            ).fetchone()
+            if existing is None:
+                return False
+            same_kind = not entry_kind or str(existing["entry_kind"]) == str(entry_kind)
+            cur = conn.execute(
+                """
+                UPDATE blog_entries
+                SET title=?, content_sha256=?, normalized_text=?, rendered_html=?,
+                    linked_paper_id=COALESCE(?, linked_paper_id), diff_text=?,
+                    change_kind=CASE
+                        WHEN ?='baseline' AND change_kind!='baseline' THEN change_kind
+                        ELSE ?
+                    END,
+                    external_id=CASE WHEN ? THEN COALESCE(?, external_id) ELSE external_id END,
+                    source_url=COALESCE(?, source_url),
+                    published_at=COALESCE(?, published_at), fetched_at=?
+                WHERE id=?
+                """,
+                (
+                    title, content_sha256, normalized_text, rendered_html,
+                    linked_paper_id, diff_text, change_kind, change_kind, int(same_kind),
+                    external_id, source_url, published_at, utcnow(), int(entry_id),
+                ),
+            )
+        return cur.rowcount > 0
+
     def update_blog_entry_content(
         self,
         entry_id: int,
@@ -2332,8 +2530,24 @@ class Database:
         analyzed: bool | None = None,
         show_stubs: bool = True,
         stub: bool | None = None,
+        dedupe_titles: bool = False,
     ) -> tuple[str, list[Any]]:
         where = ["be.change_kind != 'baseline'", "b.dead=0"]
+        if dedupe_titles:
+            where.append(
+                "be.id=(SELECT max(be_d.id) "
+                "FROM blog_entries be_d JOIN blogs b_d ON b_d.id=be_d.blog_id "
+                "WHERE be_d.change_kind != 'baseline' AND b_d.dead=0 "
+                "AND paperwatch_title_key(be_d.title)=paperwatch_title_key(be.title) "
+                "AND paperwatch_host_key(COALESCE(be_d.source_url, b_d.url))="
+                "paperwatch_host_key(COALESCE(be.source_url, b.url)) "
+                "AND (be_d.blog_id=be.blog_id OR EXISTS ("
+                "SELECT 1 FROM author_blogs dedupe_current "
+                "JOIN author_blogs dedupe_candidate "
+                "ON dedupe_candidate.author_id=dedupe_current.author_id "
+                "WHERE dedupe_current.blog_id=be.blog_id "
+                "AND dedupe_candidate.blog_id=be_d.blog_id)))"
+            )
         params: list[Any] = []
         stub_sql = _blog_stub_sql()
         if stub is not None:
@@ -2503,6 +2717,7 @@ class Database:
         ids_only: bool = False,
         table_view: bool = False,
         query_view: bool = False,
+        dedupe_titles: bool = False,
     ) -> list[sqlite3.Row]:
         where_sql, params = self._blog_entry_filter_sql(
             query=query,
@@ -2520,6 +2735,7 @@ class Database:
             analyzed=analyzed,
             show_stubs=show_stubs,
             stub=stub,
+            dedupe_titles=dedupe_titles,
         )
         has_summary_sql = (
             "1"

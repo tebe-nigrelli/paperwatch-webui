@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import io
+import hashlib
 import sqlite3
 from datetime import date
 from pathlib import Path
@@ -515,18 +516,18 @@ def test_rss_items_are_imported_without_triggering_initial_updates(app_config, a
         assert blog["feed_initialized"] == 1
         assert blog["last_fetch_method"] == "rss"
         initial_entries = db.list_blog_entries()
-        assert len(initial_entries) == 4
+        assert len(initial_entries) == 2
         assert {entry["title"] for entry in initial_entries} == {"First", "Second"}
-        assert {entry["entry_kind"] for entry in initial_entries} == {"rss", "snapshot"}
+        assert {entry["entry_kind"] for entry in initial_entries} == {"rss"}
         assert {entry["change_kind"] for entry in initial_entries} == {"changed"}
         assert any("website body" in entry["normalized_text"] for entry in initial_entries)
 
         second = app.run(today=date(2026, 7, 31))
         assert second.blog_updates_found == 1
         new_entries = db.list_blog_entries()
-        assert len(new_entries) == 6
+        assert len(new_entries) == 3
         third_entries = [entry for entry in new_entries if entry["title"] == "Third"]
-        assert {entry["entry_kind"] for entry in third_entries} == {"rss", "snapshot"}
+        assert {entry["entry_kind"] for entry in third_entries} == {"rss"}
         assert {entry["source_url"] for entry in third_entries} == {
             "https://example.com/three"
         }
@@ -733,3 +734,178 @@ def test_snapshot_and_meaningful_link_change_modes_cover_semantic_edges():
     assert not blogs._meaningful_link_change({}, {"new": frozenset({"b"})}, source_mode="auto", content_changed=False)
     assert blogs._meaningful_link_change(old, {"new": frozenset({"b", "c"})}, source_mode="auto", content_changed=False)
     assert not blogs._meaningful_link_change(None, {"x": frozenset({"a"})}, source_mode="auto", content_changed=True)
+
+
+def test_same_title_new_path_reuses_entry_and_preserves_user_history(
+    app_config, author_candidate
+):
+    old_text = "Title: Stable post\nURL: https://example.com/posts/old\nOld body"
+    new_text = "Title: Stable post\nURL: https://example.com/writing/new-path\nNew body"
+    with Database(app_config.paths.database) as db:
+        db.add_author(author_candidate)
+        blog_id = db.add_author_blog("A123", "https://example.com/blog")
+        entry_id = db.save_blog_entry(
+            blog_id=blog_id,
+            title="Stable post",
+            content_sha256=hashlib.sha256(old_text.encode()).hexdigest(),
+            normalized_text=old_text,
+            diff_text="",
+            change_kind="changed",
+            previous_entry_id=None,
+            entry_kind="rss",
+            external_id="old-guid",
+            source_url="https://example.com/posts/old",
+        )
+        db.set_object_notes("blog", entry_id, "Keep this note")
+        query_id = db.create_saved_query(name="Existing summary", prompt="Summarize")
+        run_id = db.create_query_runs(
+            batch_id="existing-summary",
+            query_id=query_id,
+            profiles=[("default", "none", "none")],
+            context_window_tokens=1000,
+            selection={"blog_entry_ids": [entry_id]},
+        )[0]
+        db.start_query_run(run_id)
+        db.finish_query_run(
+            run_id,
+            matched_count=1,
+            input_chars=len(old_text),
+            output={
+                "summary": "Old summary",
+                "items": [{
+                    "blog_entry_id": entry_id,
+                    "content_type": "blog",
+                    "title": "Stable post",
+                    "output": "Old summary",
+                }],
+            },
+        )
+
+        app = PaperWatch(
+            app_config, db=db, openalex=NoPapers(), arxiv=None, llm=NoLLM()
+        )
+        row = app._prepare_blog_fetch_rows(db.list_enabled_blogs())[0]
+        fetched = blogs.BlogFetch(
+            method="rss",
+            title="Feed",
+            status_code=200,
+            feed_items=(
+                blogs.FeedItem(
+                    external_id="new-guid",
+                    title="Stable post",
+                    url="https://example.com/writing/new-path",
+                    published_at="2026-08-08",
+                    text=new_text,
+                    sha256=hashlib.sha256(new_text.encode()).hexdigest(),
+                ),
+            ),
+            source_mode="feed",
+        )
+        from paperwatch.pipeline import RunStats
+        run_stats = RunStats(run_id=db.start_run())
+        app._apply_blog_fetch(run_stats, row, fetched, None)
+
+        entries = db.list_blog_entries()
+        assert len(entries) == 1
+        current = entries[0]
+        assert int(current["id"]) == entry_id
+        assert current["source_url"] == "https://example.com/writing/new-path"
+        assert current["external_id"] == "new-guid"
+        assert current["normalized_text"] == new_text
+        assert current["notes"] == "Keep this note"
+        assert db.query_runs_for_blog_entry(entry_id)[0]["id"] == run_id
+        assert run_stats.new_blog_entry_ids == [entry_id]
+        app.close()
+
+
+def test_same_title_requires_same_author_and_site(tmp_path, author_candidate):
+    other = AuthorCandidate(openalex_id="A456", name="Other Author")
+    with Database(tmp_path / "blog-title-identity.sqlite") as db:
+        db.add_author(author_candidate)
+        db.add_author(other)
+        first_blog = db.add_author_blog("A123", "https://example.com/blog")
+        second_blog = db.add_author_blog("A456", "https://example.com/other")
+        db.save_blog_entry(
+            blog_id=first_blog,
+            title="Shared title",
+            content_sha256="one",
+            normalized_text="one",
+            diff_text="",
+            change_kind="changed",
+            previous_entry_id=None,
+            source_url="https://example.com/old/path",
+        )
+        assert db.matching_blog_entry_by_title(
+            second_blog,
+            title="Shared title",
+            source_url="https://example.com/new/path",
+        ) is None
+        db.add_author_blog("A123", "https://example.com/other")
+        matched = db.matching_blog_entry_by_title(
+            second_blog,
+            title="Shared title",
+            source_url="https://example.com/new/path",
+        )
+        assert matched is not None and int(matched["blog_id"]) == first_blog
+        db.save_blog_entry(
+            blog_id=second_blog,
+            title="Shared title",
+            content_sha256="two",
+            normalized_text="two",
+            diff_text="",
+            change_kind="changed",
+            previous_entry_id=None,
+            source_url="https://example.com/new/path",
+        )
+        assert db.count_blog_entries(dedupe_titles=True) == 1
+
+
+def test_schema_31_migration_collapses_existing_same_title_rows(tmp_path, author_candidate):
+    path = tmp_path / "title-dedupe-migration.sqlite"
+    with Database(path) as db:
+        db.add_author(author_candidate)
+        blog_id = db.add_author_blog("A123", "https://example.com/blog")
+        old_id = db.save_blog_entry(
+            blog_id=blog_id,
+            title="Same title",
+            content_sha256="old",
+            normalized_text="Old content",
+            diff_text="",
+            change_kind="changed",
+            previous_entry_id=None,
+            entry_kind="rss",
+            external_id="old-guid",
+            source_url="https://example.com/old",
+            published_at="2026-01-01",
+        )
+        db.set_object_notes("blog", old_id, "Persistent note")
+        new_id = db.save_blog_entry(
+            blog_id=blog_id,
+            title="Same title",
+            content_sha256="new",
+            normalized_text="Newest content",
+            diff_text="+Newest content",
+            change_kind="changed",
+            previous_entry_id=old_id,
+            entry_kind="rss",
+            external_id="new-guid",
+            source_url="https://example.com/new-path",
+            published_at="2026-08-08",
+        )
+        db.add_blog_entry_tag(new_id, "migrated-tag")
+        db._conn.execute("PRAGMA user_version = 30")
+        db._conn.commit()
+
+    with Database(path) as db:
+        visible = db.list_blog_entries()
+        assert len(visible) == 1
+        assert int(visible[0]["id"]) == old_id
+        assert visible[0]["normalized_text"] == "Newest content"
+        assert visible[0]["source_url"] == "https://example.com/new-path"
+        assert visible[0]["notes"] == "Persistent note"
+        assert "migrated-tag" in {row["name"] for row in db.blog_entry_tags(old_id)}
+        hidden = db._conn.execute(
+            "SELECT change_kind FROM blog_entries WHERE id=?", (new_id,)
+        ).fetchone()
+        assert hidden["change_kind"] == "baseline"
+        assert db._conn.execute("PRAGMA user_version").fetchone()[0] == 31

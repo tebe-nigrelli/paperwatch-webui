@@ -308,3 +308,41 @@ def test_builtin_query_without_delete_aligns_edit_to_top(config_path):
     assert "saved-query-actions-no-delete" in page.text
     css = (Path(__file__).parents[1] / "src" / "paperwatch" / "web_static" / "app.css").read_text()
     assert ".saved-query-actions-no-delete{vertical-align:top}" in css
+
+
+def test_content_page_deduplicates_blog_rows_by_title(config_path, author_candidate):
+    client = web_client(config_path)
+    config = load_config(config_path)
+    with Database(config.paths.database) as db:
+        db.add_author(author_candidate)
+        blog_id = db.add_author_blog(
+            author_candidate.openalex_id, "https://example.test/dedupe-blog"
+        )
+        db.save_blog_entry(
+            blog_id=blog_id,
+            title="Duplicate title",
+            content_sha256="old",
+            normalized_text="Old version",
+            diff_text="",
+            change_kind="changed",
+            previous_entry_id=None,
+            source_url="https://example.test/dedupe-blog/old",
+        )
+        db.save_blog_entry(
+            blog_id=blog_id,
+            title="Duplicate title",
+            content_sha256="new",
+            normalized_text="New version",
+            diff_text="+New version",
+            change_kind="changed",
+            previous_entry_id=None,
+            source_url="https://example.test/dedupe-blog/new",
+        )
+        assert db.count_blog_entries(dedupe_titles=True) == 1
+        rows = db.list_blog_entries(dedupe_titles=True)
+        assert len(rows) == 1
+        assert rows[0]["source_url"].endswith("/new")
+
+    page = client.get("/?content=blogs&stub=any")
+    assert page.status_code == 200
+    assert page.text.count("Duplicate title") == 1

@@ -101,7 +101,7 @@ def test_schema_25_pdf_fingerprint_persists_modified_state(
     with Database(config.paths.database) as db:
         db.set_local_pdf(paper_id, str(pdf), expected)
         row = dict(db.get_paper(paper_id))
-        assert SCHEMA_VERSION == 30
+        assert SCHEMA_VERSION == 31
         assert "pdf_modified_on_disk" in row
         assert _paper_pdf_state(db, row)["pdf_modified"] is False
 

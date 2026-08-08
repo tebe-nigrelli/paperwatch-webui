@@ -842,7 +842,7 @@ def test_semantic_diff_link_context_and_docs_thresholds():
 
 def test_database_source_settings_known_articles_and_schema(app_config, author_candidate):
     with Database(app_config.paths.database) as db:
-        assert SCHEMA_VERSION == 30
+        assert SCHEMA_VERSION == 31
         db.add_author(author_candidate)
         blog_id = db.add_author_blog(
             "A123",
@@ -1235,7 +1235,7 @@ def test_schema_18_promotes_and_seeds_initial_feed_items(tmp_path, author_candid
         entries = db.list_blog_entries()
         assert len(entries) == 1
         assert entries[0]["change_kind"] == "changed"
-        assert db._conn.execute("PRAGMA user_version").fetchone()[0] == 30
+        assert db._conn.execute("PRAGMA user_version").fetchone()[0] == 31
         assert db.known_blog_article_urls(blog_id) == ("https://example.com/post",)
 
 
@@ -1327,8 +1327,9 @@ def test_rss_pipeline_stores_linked_page_and_tracks_later_page_change(
         app._apply_blog_fetch(first_stats, first_row, first, None)
         assert first_stats.blog_updates_found == 0
         entries = db.list_blog_entries()
-        assert {entry["entry_kind"] for entry in entries} == {"rss", "snapshot"}
-        assert any("Full website body" in entry["normalized_text"] for entry in entries)
+        assert len(entries) == 1
+        assert {entry["entry_kind"] for entry in entries} == {"rss"}
+        assert "Full website body" in entries[0]["normalized_text"]
 
         second_row = app._prepare_blog_fetch_rows(db.list_enabled_blogs())[0]
         changed_page = page_text.replace("Full website body", "Substantially changed website body")
@@ -1353,7 +1354,7 @@ def test_rss_pipeline_stores_linked_page_and_tracks_later_page_change(
         app._apply_blog_fetch(second_stats, second_row, second, None)
         assert second_stats.blog_updates_found == 1
         changed = db.blog_entries_by_ids(second_stats.new_blog_entry_ids)[0]
-        assert changed["entry_kind"] == "snapshot"
+        assert changed["entry_kind"] == "rss"
         assert changed["source_url"] == "https://example.com/posts/one"
         assert "Substantially changed" in changed["diff_text"]
         app.close()

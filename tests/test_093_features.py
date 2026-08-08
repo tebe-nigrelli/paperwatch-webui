@@ -302,7 +302,7 @@ def test_shared_tags_direct_blog_import_rendering_and_fetch_history(
     ).status_code == 303
     with Database(config.paths.database) as db:
         assert db.list_content_tags() == []
-        assert SCHEMA_VERSION == 30
+        assert SCHEMA_VERSION == 31
 
 
 def test_regexp_and_tag_validation_edges(config_path):
@@ -408,10 +408,11 @@ def test_direct_import_validation_duplicate_versions_and_tag_errors(
         "/blogs/import", data={**base, "content": "Changed body"}, follow_redirects=False
     )
     changed_id = int(changed.headers["location"].split("/blogs/")[1].split("?")[0])
-    assert changed_id != first_id
+    assert changed_id == first_id
     with Database(config.paths.database) as db:
         changed_row = db.get_blog_entry(changed_id)
-        assert changed_row["previous_entry_id"] == first_id
+        assert changed_row["previous_entry_id"] is None
+        assert "Changed body" in changed_row["normalized_text"]
         assert changed_row["diff_text"]
 
     blank_blog_tag = client.post(

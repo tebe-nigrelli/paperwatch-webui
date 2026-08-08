@@ -761,6 +761,16 @@ def test_regexp_print_results_highlight_exact_matches(
     assert "&lt;script&gt; stays text." in detail.text
     assert "<script> stays text." not in detail.text
 
+    content_detail = client.get(f"/papers/{paper_id}")
+    assert content_detail.status_code == 200
+    assert "Defense refs" in content_detail.text
+    assert "Regexp matches:" not in content_detail.text
+    assert pattern not in content_detail.text
+    assert "1 matched record" not in content_detail.text
+    assert f'href="/queries/{query_id}/edit"' in content_detail.text
+    assert "Edit query" in content_detail.text
+    assert '<mark class="regexp-match">Military</mark>' in content_detail.text
+
 
 def test_paper_saved_query_results_are_localized_to_current_record(
     config_path, author_candidate, paper_record, analysis_result
@@ -891,3 +901,191 @@ def test_blog_saved_query_results_are_localized_to_current_record(
     assert "CURRENT BLOG RESULT ONLY" in page.text
     assert "SIBLING BLOG RESULT MUST NOT APPEAR" not in page.text
     assert "BLOG COLLECTION SUMMARY MUST NOT APPEAR" not in page.text
+
+
+def test_paper_saved_query_results_fall_back_to_exact_title_when_model_omits_id(
+    config_path, author_candidate, paper_record, analysis_result
+):
+    from dataclasses import replace
+
+    config, paper_id = seed(config_path, author_candidate, paper_record, analysis_result)
+    sibling_record = replace(
+        paper_record,
+        openalex_id="W-SIBLING-TITLE-FALLBACK",
+        doi=None,
+        arxiv_id=None,
+        title="Sibling title fallback paper",
+        publication_url="https://example.test/sibling-title-fallback",
+        pdf_url=None,
+    )
+    with Database(config.paths.database) as db:
+        sibling_id, _ = db.upsert_paper(sibling_record)
+        query_id = db.create_saved_query(name="Title fallback summary", prompt="Summarize")
+        run_id = db.create_query_runs(
+            batch_id="title-fallback-paper-output",
+            query_id=query_id,
+            profiles=[("default", "ollama", "test-model")],
+            context_window_tokens=4096,
+            selection={"resolved_paper_ids": [paper_id, sibling_id]},
+        )[0]
+        db.finish_query_run(
+            run_id,
+            matched_count=2,
+            input_chars=100,
+            output={
+                "title": "Batch result",
+                "summary": "COLLECTION SUMMARY HIDDEN",
+                "items": [
+                    {
+                        "paper_id": None,
+                        "blog_entry_id": None,
+                        "content_type": "paper",
+                        "title": paper_record.title,
+                        "output": "RECOVERED BY EXACT TITLE",
+                    },
+                    {
+                        "paper_id": sibling_id,
+                        "blog_entry_id": None,
+                        "content_type": "paper",
+                        "title": sibling_record.title,
+                        "output": "SIBLING MUST STAY HIDDEN",
+                    },
+                ],
+            },
+        )
+
+    page = make_app(config_path).get(f"/papers/{paper_id}")
+    assert page.status_code == 200
+    assert "Query results" in page.text
+    assert "RECOVERED BY EXACT TITLE" in page.text
+    assert "SIBLING MUST STAY HIDDEN" not in page.text
+    assert "COLLECTION SUMMARY HIDDEN" not in page.text
+
+
+def test_paper_saved_query_run_remains_visible_when_model_omits_current_item(
+    config_path, author_candidate, paper_record, analysis_result
+):
+    from dataclasses import replace
+
+    config, paper_id = seed(config_path, author_candidate, paper_record, analysis_result)
+    sibling_record = replace(
+        paper_record,
+        openalex_id="W-SIBLING-MISSING-ITEM",
+        doi=None,
+        arxiv_id=None,
+        title="Sibling missing-item paper",
+        publication_url="https://example.test/sibling-missing-item",
+        pdf_url=None,
+    )
+    with Database(config.paths.database) as db:
+        sibling_id, _ = db.upsert_paper(sibling_record)
+        query_id = db.create_saved_query(name="Missing item summary", prompt="Summarize")
+        run_id = db.create_query_runs(
+            batch_id="missing-current-paper-output",
+            query_id=query_id,
+            profiles=[("default", "ollama", "test-model")],
+            context_window_tokens=4096,
+            selection={"resolved_paper_ids": [paper_id, sibling_id]},
+        )[0]
+        db.finish_query_run(
+            run_id,
+            matched_count=2,
+            input_chars=100,
+            output={
+                "title": "Batch result",
+                "summary": "COLLECTION SUMMARY HIDDEN",
+                "items": [
+                    {
+                        "paper_id": sibling_id,
+                        "blog_entry_id": None,
+                        "content_type": "paper",
+                        "title": sibling_record.title,
+                        "output": "SIBLING MUST STAY HIDDEN",
+                    }
+                ],
+            },
+        )
+
+    page = make_app(config_path).get(f"/papers/{paper_id}")
+    assert page.status_code == 200
+    assert "Missing item summary" in page.text
+    assert "did not return a per-record result for this paper" in page.text
+    assert "SIBLING MUST STAY HIDDEN" not in page.text
+    assert "COLLECTION SUMMARY HIDDEN" not in page.text
+
+
+def test_blog_saved_query_results_fall_back_to_exact_title_when_model_omits_id(
+    config_path, author_candidate, paper_record, analysis_result
+):
+    config, _ = seed(config_path, author_candidate, paper_record, analysis_result)
+    with Database(config.paths.database) as db:
+        blog_id = db.add_author_blog(
+            author_candidate.openalex_id,
+            "https://example.test/blog-title-fallback",
+            label="Blog title fallback",
+        )
+        current_id = db.save_blog_entry(
+            blog_id=blog_id,
+            title="Current title fallback blog",
+            content_sha256="current-title-fallback-blog",
+            normalized_text="Current text",
+            diff_text="",
+            change_kind="baseline",
+            previous_entry_id=None,
+            source_url="https://example.test/blog-title-fallback/current",
+        )
+        sibling_id = db.save_blog_entry(
+            blog_id=blog_id,
+            title="Sibling title fallback blog",
+            content_sha256="sibling-title-fallback-blog",
+            normalized_text="Sibling text",
+            diff_text="",
+            change_kind="baseline",
+            previous_entry_id=None,
+            source_url="https://example.test/blog-title-fallback/sibling",
+        )
+        query_id = db.create_saved_query(name="Blog title fallback", prompt="Summarize")
+        run_id = db.create_query_runs(
+            batch_id="title-fallback-blog-output",
+            query_id=query_id,
+            profiles=[("default", "ollama", "test-model")],
+            context_window_tokens=4096,
+            selection={"resolved_blog_entry_ids": [current_id, sibling_id]},
+        )[0]
+        db.finish_query_run(
+            run_id,
+            matched_count=2,
+            input_chars=100,
+            output={
+                "title": "Regexp matches: (?i)current",
+                "summary": "BLOG COLLECTION SUMMARY HIDDEN",
+                "items": [
+                    {
+                        "paper_id": None,
+                        "blog_entry_id": None,
+                        "content_type": "blog",
+                        "title": "Current title fallback blog",
+                        "output": "BLOG RESULT RECOVERED BY TITLE",
+                    },
+                    {
+                        "paper_id": None,
+                        "blog_entry_id": sibling_id,
+                        "content_type": "blog",
+                        "title": "Sibling title fallback blog",
+                        "output": "BLOG SIBLING MUST STAY HIDDEN",
+                    },
+                ],
+            },
+        )
+
+    page = make_app(config_path).get(f"/blogs/{current_id}")
+    assert page.status_code == 200
+    assert "Saved query results" in page.text
+    assert "BLOG RESULT RECOVERED BY TITLE" in page.text
+    assert "BLOG SIBLING MUST STAY HIDDEN" not in page.text
+    assert "BLOG COLLECTION SUMMARY HIDDEN" not in page.text
+    assert "Regexp matches:" not in page.text
+    assert "(?i)current" not in page.text
+    assert "2 matched records" not in page.text
+    assert f'href="/queries/{query_id}/edit"' in page.text
+    assert "Edit query" in page.text

@@ -475,7 +475,7 @@ def test_schema_25_migrates_saved_query_model_and_removes_context(tmp_path):
         assert "context_window_tokens" not in columns
         assert db.get_saved_query(query_id)["model_profile"] == "secondary"
         assert db.get_query_run(run_id)["context_window_tokens"] == 7777
-        assert db._conn.execute("PRAGMA user_version").fetchone()[0] == 30
+        assert db._conn.execute("PRAGMA user_version").fetchone()[0] == 31
         assert db._conn.execute("PRAGMA foreign_key_check").fetchall() == []
 
 def test_context_window_override_is_local_only(app_config):

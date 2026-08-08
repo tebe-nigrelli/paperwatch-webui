@@ -64,7 +64,34 @@
 
 {% if analyses %}<section class="panel"><div class="panel-heading"><div><h2>Paper summaries</h2><p>Compact prompt summaries with links to the complete structured output.</p></div><span>{{ analyses|length }}</span></div><div class="object-list">{% for analysis in analyses %}<article><div><strong>Prompt summary</strong><span class="badge">{{ analysis.scope }} · {{ analysis.model }}</span></div><div class="markdown-block">{{ analysis.result.one_sentence_summary|markdown|safe }}</div><small>{{ analysis.created_at }}</small><div class="button-group"><a class="button button-small" href="/analyses/{{ analysis.id }}">Open full analysis</a></div></article>{% endfor %}</div></section>{% endif %}
 
-{% if prompt_runs %}<section class="panel prompt-results"><div class="panel-heading"><div><h2>Query results</h2><p>Completed saved queries run on this paper.</p></div><span>{{ prompt_runs|length }}</span></div><div class="object-list">{% for run in prompt_runs %}<article><div><strong><a href="/queries#query-{{ run.query_id }}">{{ run.query_name }}</a></strong><span class="status status-{{ run.status }}">{{ run.status }}</span></div><small>{{ run.model }} · {{ run.created_at }} · {{ run.matched_count }} record{{ '' if run.matched_count == 1 else 's' }}</small>{% if run.output %}<h3>{{ run.output.title }}</h3>{% if run.output.summary %}<div class="markdown-block">{{ run.output.summary|markdown|safe }}</div>{% endif %}{% for item in run.output["items"] %}<section><strong>{{ item.title }}</strong>{% if run.regexp_pattern %}<div class="markdown-block regexp-result-text">{{ item.output|regexp_excerpt(run.regexp_pattern)|safe }}</div>{% else %}<div class="markdown-block">{{ item.output|markdown|safe }}</div>{% endif %}</section>{% endfor %}{% endif %}<div class="button-group"><a class="button button-small" href="/queries/runs/{{ run.id }}">Open full result</a></div></article>{% endfor %}</div></section>{% endif %}
+{% if prompt_runs %}
+<section class="panel prompt-results">
+  <div class="panel-heading"><div><h2>Query results</h2></div><span>{{ prompt_runs|length }}</span></div>
+  <div class="prompt-result-list">
+    {% for run in prompt_runs %}
+    <article class="prompt-result-card">
+      <header class="prompt-result-header">
+        <div class="prompt-result-heading">
+          <h3>{{ run.query_name }}</h3>
+          <div class="prompt-result-meta"><span class="badge">{{ run.model }}</span><time datetime="{{ run.created_at }}">{{ run.created_at }}</time><span class="status status-{{ run.status }}">{{ run.status }}</span></div>
+        </div>
+        <div class="button-group prompt-result-actions"><a class="button button-small" href="/queries/{{ run.query_id }}/edit">Edit query</a><a class="button button-small" href="/queries/runs/{{ run.id }}">Open full result</a></div>
+      </header>
+      {% if run.output %}
+        {% if run.output.title and not run.regexp_pattern %}<h4 class="prompt-result-output-title">{{ run.output.title }}</h4>{% endif %}
+        {% if run.output.summary %}<div class="markdown-block prompt-result-summary">{{ run.output.summary|markdown|safe }}</div>{% endif %}
+        {% if run.content_result_missing %}<p class="muted">This query completed, but it did not return a per-record result for this paper. Open the full result to inspect the batch output.</p>{% endif %}
+        {% if run.output["items"] %}
+        <section class="prompt-result-output">
+          {% for item in run.output["items"] %}<div class="prompt-result-part">{% if run.output["items"]|length > 1 %}<small>Part {{ loop.index }} of {{ loop.length }}</small>{% endif %}{% if run.regexp_pattern %}<div class="markdown-block regexp-result-text">{{ item.output|regexp_excerpt(run.regexp_pattern)|safe }}</div>{% else %}<div class="markdown-block">{{ item.output|markdown|safe }}</div>{% endif %}</div>{% endfor %}
+        </section>
+        {% endif %}
+      {% endif %}
+    </article>
+    {% endfor %}
+  </div>
+</section>
+{% endif %}
 </div>
 </div>
 {% endblock %}

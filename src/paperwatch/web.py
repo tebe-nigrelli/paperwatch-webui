@@ -1519,23 +1519,48 @@ def _save_discovered_blog_fetch(
         previous = db.latest_blog_entry(
             blog_id, entry_kind="rss", external_id=item.external_id
         )
+        if previous is None:
+            previous = db.matching_blog_entry_by_title(
+                blog_id, title=item.title, source_url=source
+            )
         if previous is not None and str(previous["content_sha256"]) == sha256:
             seen_urls.add(source)
             continue
-        db.save_blog_entry(
-            blog_id=blog_id,
-            title=item.title,
-            content_sha256=sha256,
-            normalized_text=text,
-            diff_text="",
-            change_kind="changed",
-            previous_entry_id=int(previous["id"]) if previous is not None else None,
-            entry_kind="rss",
-            external_id=item.external_id,
-            source_url=source,
-            published_at=published_at,
-            rendered_html=rendered_html,
+        same_title = (
+            previous is not None
+            and normalize_title(str(previous["title"] or ""))
+            == normalize_title(item.title)
         )
+        if same_title:
+            _kind, diff = blog_diff(str(previous["normalized_text"]), text, source_mode="feed")
+            db.update_blog_entry_revision(
+                int(previous["id"]),
+                title=item.title,
+                content_sha256=sha256,
+                normalized_text=text,
+                diff_text=diff,
+                change_kind="changed",
+                entry_kind="rss",
+                external_id=item.external_id,
+                source_url=source,
+                published_at=published_at,
+                rendered_html=rendered_html,
+            )
+        else:
+            db.save_blog_entry(
+                blog_id=blog_id,
+                title=item.title,
+                content_sha256=sha256,
+                normalized_text=text,
+                diff_text="",
+                change_kind="changed",
+                previous_entry_id=int(previous["id"]) if previous is not None else None,
+                entry_kind="rss",
+                external_id=item.external_id,
+                source_url=source,
+                published_at=published_at,
+                rendered_html=rendered_html,
+            )
         seen_urls.add(source)
         saved += 1
 
@@ -1545,22 +1570,47 @@ def _save_discovered_blog_fetch(
         previous = db.latest_blog_entry_for_source(
             blog_id, entry_kind="snapshot", source_url=item.url
         )
+        if previous is None:
+            previous = db.matching_blog_entry_by_title(
+                blog_id, title=item.title, source_url=item.url
+            )
         if previous is not None and str(previous["content_sha256"]) == item.sha256:
             continue
-        db.save_blog_entry(
-            blog_id=blog_id,
-            title=item.title,
-            content_sha256=item.sha256,
-            normalized_text=item.text,
-            diff_text="",
-            change_kind="changed",
-            previous_entry_id=int(previous["id"]) if previous is not None else None,
-            entry_kind="snapshot",
-            external_id=item.external_id,
-            source_url=item.url,
-            published_at=item.published_at,
-            rendered_html=item.rendered_html,
+        same_title = (
+            previous is not None
+            and normalize_title(str(previous["title"] or ""))
+            == normalize_title(item.title)
         )
+        if same_title:
+            _kind, diff = blog_diff(str(previous["normalized_text"]), item.text, source_mode="article")
+            db.update_blog_entry_revision(
+                int(previous["id"]),
+                title=item.title,
+                content_sha256=item.sha256,
+                normalized_text=item.text,
+                diff_text=diff,
+                change_kind="changed",
+                entry_kind="snapshot",
+                external_id=item.external_id,
+                source_url=item.url,
+                published_at=item.published_at,
+                rendered_html=item.rendered_html,
+            )
+        else:
+            db.save_blog_entry(
+                blog_id=blog_id,
+                title=item.title,
+                content_sha256=item.sha256,
+                normalized_text=item.text,
+                diff_text="",
+                change_kind="changed",
+                previous_entry_id=int(previous["id"]) if previous is not None else None,
+                entry_kind="snapshot",
+                external_id=item.external_id,
+                source_url=item.url,
+                published_at=item.published_at,
+                rendered_html=item.rendered_html,
+            )
         seen_urls.add(item.url)
         saved += 1
 
@@ -1575,6 +1625,10 @@ def _save_discovered_blog_fetch(
             blog_id, entry_kind="rss", external_id=external_id
         )
         if previous is not None:
+            continue
+        if db.matching_blog_entry_by_title(
+            blog_id, title=item.title, source_url=item.url
+        ) is not None:
             continue
         text = "\n".join(
             value
@@ -1905,12 +1959,12 @@ def _query_output(row: Any) -> dict[str, Any]:
 
 
 def _query_output_for_content(
-    row: Any, content_type: str, content_id: int
-) -> dict[str, Any] | None:
+    row: Any, content_type: str, content_id: int, content_title: str = ""
+) -> dict[str, Any]:
     """Return one saved-query run localized to a single paper or blog entry.
 
     Query runs can span many records, but detail pages must never render sibling
-    records from the same batch.  Keep every output segment belonging to this
+    records from the same batch. Keep every output segment belonging to this
     record (large outputs may be split into multiple adjacent items) and suppress
     the collection-wide summary for multi-record runs.
     """
@@ -1932,14 +1986,23 @@ def _query_output_for_content(
         try:
             item_id = int(item.get(id_key))
         except (TypeError, ValueError):
-            continue
+            item_id = None
         if item_id == wanted_id:
             matching_items.append(item)
 
-    # A run may have selected this record but the model may have omitted an item.
-    # Do not show a batch result from unrelated records in that case.
-    if not matching_items:
-        return None
+    # Some providers occasionally omit or corrupt the record ID while preserving
+    # its exact title. Recover only exact-title matches; never fall back to an
+    # arbitrary batch item, which would leak sibling results onto this page.
+    if not matching_items and content_title.strip():
+        wanted_title = " ".join(content_title.split()).casefold()
+        expected_type = "paper" if id_key == "paper_id" else "blog"
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            item_type = str(item.get("content_type") or expected_type).strip().lower()
+            item_title = " ".join(str(item.get("title") or "").split()).casefold()
+            if item_type == expected_type and item_title == wanted_title:
+                matching_items.append(item)
 
     localized = dict(output)
     localized["items"] = matching_items
@@ -1951,6 +2014,7 @@ def _query_output_for_content(
         localized["summary"] = ""
     data["output"] = localized
     data["content_result_count"] = len(matching_items)
+    data["content_result_missing"] = not matching_items
     return data
 
 def _csv_response(records: Iterable[dict[str, Any]]) -> Response:
@@ -2146,6 +2210,7 @@ def create_app(
             "notes": filters.notes,
             "analyzed": filters.analyzed,
             "stub": filters.stub,
+            "dedupe_titles": True,
         }
         blog_compatible_filters = not (
             filters.topic_id
@@ -2202,7 +2267,7 @@ def create_app(
                 table_view=True,
             )
             selected_blog_total = (
-                db.count_blog_entries(selected=True) if has_blog_entries else 0
+                db.count_blog_entries(selected=True, dedupe_titles=True) if has_blog_entries else 0
             )
             selected_blog_rows = (
                 db.list_blog_entries(
@@ -2210,6 +2275,7 @@ def create_app(
                     selected=True,
                     sort="discovered",
                     table_view=True,
+                    dedupe_titles=True,
                 )
                 if selected_blog_total
                 else []
@@ -3140,6 +3206,10 @@ def create_app(
                 previous = db.latest_blog_entry(
                     blog_id, entry_kind="snapshot", external_id=external_id
                 )
+                if previous is None:
+                    previous = db.matching_blog_entry_by_title(
+                        blog_id, title=title, source_url=entry_url
+                    )
                 if previous is not None and previous["content_sha256"] == digest:
                     entry_id = int(previous["id"])
                 else:
@@ -3147,19 +3217,39 @@ def create_app(
                         str(previous["normalized_text"]) if previous is not None else None,
                         normalized,
                     )
-                    entry_id = db.save_blog_entry(
-                        blog_id=blog_id,
-                        title=title,
-                        content_sha256=digest,
-                        normalized_text=normalized,
-                        diff_text=diff,
-                        change_kind="changed" if previous is None else kind,
-                        previous_entry_id=int(previous["id"]) if previous is not None else None,
-                        entry_kind="snapshot",
-                        external_id=external_id,
-                        source_url=entry_url,
-                        published_at=published_at or None,
+                    same_title = (
+                        previous is not None
+                        and normalize_title(str(previous["title"] or ""))
+                        == normalize_title(title)
                     )
+                    if same_title:
+                        entry_id = int(previous["id"])
+                        db.update_blog_entry_revision(
+                            entry_id,
+                            title=title,
+                            content_sha256=digest,
+                            normalized_text=normalized,
+                            diff_text=diff,
+                            change_kind=kind,
+                            entry_kind="snapshot",
+                            external_id=external_id,
+                            source_url=entry_url,
+                            published_at=published_at or None,
+                        )
+                    else:
+                        entry_id = db.save_blog_entry(
+                            blog_id=blog_id,
+                            title=title,
+                            content_sha256=digest,
+                            normalized_text=normalized,
+                            diff_text=diff,
+                            change_kind="changed" if previous is None else kind,
+                            previous_entry_id=int(previous["id"]) if previous is not None else None,
+                            entry_kind="snapshot",
+                            external_id=external_id,
+                            source_url=entry_url,
+                            published_at=published_at or None,
+                        )
                 for tag in _split_tags(str(form.get("tags", ""))):
                     db.add_blog_entry_tag(entry_id, tag)
                 if str(form.get("notes", "")).strip():
@@ -3177,9 +3267,10 @@ def create_app(
         with Database(config.paths.database) as db:
             entry = db.get_blog_entry(entry_id)
             prompt_runs = [
-                localized
+                _query_output_for_content(
+                    row, "blog", entry_id, str(entry["title"] or "") if entry else ""
+                )
                 for row in db.query_runs_for_blog_entry(entry_id)
-                if (localized := _query_output_for_content(row, "blog", entry_id)) is not None
             ]
             entry_tags = db.blog_entry_tags(entry_id)
             content_tags = db.list_content_tags()
@@ -4051,9 +4142,8 @@ def create_app(
             ]
             analyses = [_analysis_view(row) for row in db.paper_analyses(paper_id)]
             prompt_runs = [
-                localized
+                _query_output_for_content(row, "paper", paper_id, str(paper["title"] or ""))
                 for row in db.query_runs_for_paper(paper_id)
-                if (localized := _query_output_for_content(row, "paper", paper_id)) is not None
             ]
             paper_tags = db.paper_tags(paper_id)
             content_tags = db.list_content_tags()
