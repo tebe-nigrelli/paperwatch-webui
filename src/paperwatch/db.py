@@ -319,6 +319,7 @@ CREATE TABLE IF NOT EXISTS blog_entries (
     title TEXT NOT NULL,
     content_sha256 TEXT NOT NULL,
     normalized_text TEXT NOT NULL,
+    content_word_count INTEGER,
     rendered_html TEXT,
     linked_paper_id INTEGER REFERENCES papers(id) ON DELETE SET NULL,
     starred INTEGER NOT NULL DEFAULT 0,
@@ -835,6 +836,7 @@ class Database:
             "read_at": "TEXT",
             "selected": "INTEGER NOT NULL DEFAULT 0",
             "stub_state": "TEXT NOT NULL DEFAULT 'auto' CHECK (stub_state IN ('auto', 'stub', 'full'))",
+            "content_word_count": "INTEGER",
         }
         for name, definition in entry_definitions.items():
             if name not in entry_columns:
@@ -845,6 +847,28 @@ class Database:
             """
             CREATE INDEX IF NOT EXISTS idx_blog_entries_external
             ON blog_entries(blog_id, entry_kind, external_id, id DESC)
+            """
+        )
+        # The content-page title dedupe predicate is a correlated lookup.  Index
+        # the normalized expression or opening /content becomes quadratic as the
+        # blog archive grows.  Re-run CREATE IF NOT EXISTS at startup so an
+        # existing database also repairs a manually dropped index.
+        self._conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_blog_entries_title_key
+            ON blog_entries(paperwatch_title_key(title), id DESC)
+            WHERE change_kind != 'baseline'
+            """
+        )
+        # Cache display word counts once instead of rescanning large stored blog
+        # bodies for every content-page render.  Existing rows are backfilled once.
+        self._conn.execute(
+            """
+            UPDATE blog_entries
+            SET content_word_count=paperwatch_blog_word_count(
+                normalized_text, diff_text, previous_entry_id
+            )
+            WHERE content_word_count IS NULL
             """
         )
 
@@ -956,15 +980,17 @@ class Database:
             self._conn.execute(
                 """
                 UPDATE blog_entries
-                SET title=?, content_sha256=?, normalized_text=?, rendered_html=?,
-                    linked_paper_id=COALESCE(?, linked_paper_id), diff_text=?,
+                SET title=?, content_sha256=?, normalized_text=?,
+                    content_word_count=paperwatch_blog_word_count(?, ?, previous_entry_id),
+                    rendered_html=?, linked_paper_id=COALESCE(?, linked_paper_id), diff_text=?,
                     change_kind=?, source_url=COALESCE(?, source_url),
                     published_at=COALESCE(?, published_at), fetched_at=?
                 WHERE id=?
                 """,
                 (
                     latest["title"], latest["content_sha256"],
-                    latest["normalized_text"], latest["rendered_html"],
+                    latest["normalized_text"], latest["normalized_text"],
+                    latest["diff_text"], latest["rendered_html"],
                     latest["linked_paper_id"], latest["diff_text"],
                     latest["change_kind"], latest["source_url"],
                     latest["published_at"], latest["fetched_at"], canonical_id,
@@ -2267,8 +2293,11 @@ class Database:
             cur = conn.execute(
                 """
                 UPDATE blog_entries
-                SET title=?, content_sha256=?, normalized_text=?, rendered_html=?,
-                    linked_paper_id=COALESCE(?, linked_paper_id), diff_text=?,
+                SET title=?, content_sha256=?, normalized_text=?,
+                    content_word_count=paperwatch_blog_word_count(
+                        ?, ?, previous_entry_id
+                    ),
+                    rendered_html=?, linked_paper_id=COALESCE(?, linked_paper_id), diff_text=?,
                     change_kind=CASE
                         WHEN ?='baseline' AND change_kind!='baseline' THEN change_kind
                         ELSE ?
@@ -2279,8 +2308,8 @@ class Database:
                 WHERE id=?
                 """,
                 (
-                    title, content_sha256, normalized_text, rendered_html,
-                    linked_paper_id, diff_text, change_kind, change_kind, int(same_kind),
+                    title, content_sha256, normalized_text, normalized_text, diff_text,
+                    rendered_html, linked_paper_id, diff_text, change_kind, change_kind, int(same_kind),
                     external_id, source_url, published_at, utcnow(), int(entry_id),
                 ),
             )
@@ -2300,12 +2329,16 @@ class Database:
             cur = conn.execute(
                 """
                 UPDATE blog_entries
-                SET content_sha256=?, normalized_text=?, rendered_html=?,
-                    published_at=COALESCE(?, published_at)
+                SET content_sha256=?, normalized_text=?,
+                    content_word_count=paperwatch_blog_word_count(
+                        ?, diff_text, previous_entry_id
+                    ),
+                    rendered_html=?, published_at=COALESCE(?, published_at)
                 WHERE id=?
                 """,
                 (
                     content_sha256,
+                    normalized_text,
                     normalized_text,
                     rendered_html,
                     published_at,
@@ -2375,9 +2408,9 @@ class Database:
                 """
                 INSERT INTO blog_entries(
                     blog_id, previous_entry_id, title, content_sha256,
-                    normalized_text, rendered_html, linked_paper_id, diff_text,
+                    normalized_text, content_word_count, rendered_html, linked_paper_id, diff_text,
                     change_kind, entry_kind, external_id, source_url, published_at, fetched_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, paperwatch_blog_word_count(?, ?, ?), ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     blog_id,
@@ -2385,6 +2418,9 @@ class Database:
                     title,
                     content_sha256,
                     normalized_text,
+                    normalized_text,
+                    diff_text,
+                    previous_entry_id,
                     rendered_html,
                     linked_paper_id,
                     diff_text,
@@ -2782,8 +2818,11 @@ class Database:
                 be.stub_state, ({_blog_stub_sql()}) AS is_stub,
                 be.notes, be.change_kind, be.entry_kind, be.source_url,
                 be.published_at, be.fetched_at,
-                paperwatch_blog_word_count(
-                    be.normalized_text, be.diff_text, be.previous_entry_id
+                COALESCE(
+                    be.content_word_count,
+                    paperwatch_blog_word_count(
+                        be.normalized_text, be.diff_text, be.previous_entry_id
+                    )
                 ) AS content_extent,
                 b.url, COALESCE(b.title, be.title) AS blog_title,
                 (SELECT group_concat(name, ', ') FROM (
@@ -3856,6 +3895,21 @@ class Database:
             ).fetchall()
         )
 
+    def list_topic_filter_options(self) -> list[sqlite3.Row]:
+        """Return only fields used by Content filters, without per-topic counts."""
+        return list(
+            self._conn.execute(
+                """
+                SELECT t.openalex_id, t.display_name
+                FROM topics t
+                WHERE EXISTS (
+                    SELECT 1 FROM paper_topics pt WHERE pt.topic_id=t.openalex_id
+                )
+                ORDER BY t.display_name COLLATE NOCASE
+                """
+            ).fetchall()
+        )
+
     def list_topics(self) -> list[sqlite3.Row]:
         return list(
             self._conn.execute(
@@ -4265,6 +4319,14 @@ class Database:
             ).fetchall()
         )
 
+    def list_author_filter_options(self) -> list[sqlite3.Row]:
+        """Return tracked-author names/IDs used by the Content filter UI."""
+        return list(
+            self._conn.execute(
+                "SELECT openalex_id, name FROM authors WHERE tracked=1 ORDER BY name COLLATE NOCASE"
+            ).fetchall()
+        )
+
     def list_tags(self) -> list[sqlite3.Row]:
         return list(
             self._conn.execute(
@@ -4327,6 +4389,25 @@ class Database:
                 "DELETE FROM author_tags WHERE id NOT IN (SELECT tag_id FROM author_tag_links)"
             )
         return cur.rowcount > 0
+
+    def list_content_tag_filter_options(self) -> list[sqlite3.Row]:
+        """Return distinct tag names without expensive per-tag count subqueries."""
+        return list(
+            self._conn.execute(
+                """
+                WITH names(name) AS (
+                    SELECT name FROM content_tags
+                    UNION
+                    SELECT tag_name FROM query_classification_results
+                    UNION
+                    SELECT name FROM author_tags
+                )
+                SELECT NULL AS id, name FROM names
+                WHERE trim(COALESCE(name, '')) != ''
+                ORDER BY name COLLATE NOCASE
+                """
+            ).fetchall()
+        )
 
     def list_content_tags(self) -> list[sqlite3.Row]:
         return list(
@@ -5459,6 +5540,17 @@ class Database:
 
     def get_saved_query(self, query_id: int) -> sqlite3.Row | None:
         return self._conn.execute("SELECT * FROM saved_queries WHERE id=?", (query_id,)).fetchone()
+
+    def list_saved_query_options(self) -> list[sqlite3.Row]:
+        """Return query definitions for Content controls without run-history subqueries."""
+        return list(
+            self._conn.execute(
+                """
+                SELECT * FROM saved_queries
+                ORDER BY is_builtin DESC, updated_at DESC, id DESC
+                """
+            ).fetchall()
+        )
 
     def list_saved_queries(self) -> list[sqlite3.Row]:
         return list(

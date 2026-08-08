@@ -43,6 +43,7 @@ authors/
 *.sqlite
 *.sqlite3
 *.lock
+*.zip
 data/
 pdfs/
 exports/

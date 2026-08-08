@@ -84,7 +84,7 @@ def test_content_list_uses_lightweight_rows_and_bounded_selected_preview(
 
     response = web_client(config_path).get("/")
     assert response.status_code == 200
-    assert 'name="page_size" value="25"' in response.text
+    assert 'name="page_size" value="250"' in response.text
     assert "Showing the newest 25 selected records" in response.text
     assert response.text.count('class="content-row content-row-blog') == 25
 

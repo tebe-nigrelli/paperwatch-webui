@@ -15,6 +15,7 @@ import shutil
 import subprocess
 import sys
 import threading
+import time
 import uuid
 from dataclasses import asdict, dataclass
 from datetime import date, datetime, timedelta, timezone
@@ -82,7 +83,7 @@ PAPER_KINDS = (
 SCOPES = ("abstract", "fulltext")
 SORTS = ("newest", "oldest", "discovered", "title")
 PAGE_SIZES = (25, 100, 250, 500, 1000)
-DEFAULT_PAGE_SIZE = 25
+DEFAULT_PAGE_SIZE = 250
 SELECTED_CONTENT_PREVIEW_LIMIT = 25
 
 
@@ -1813,16 +1814,10 @@ def _paper_pdf_state(
 
 def _paper_table_view(db: Database, row: Any) -> dict[str, Any]:
     data = _paper_pdf_state(db, _paper_view(row), verify_hash=False)
+    # Content can render hundreds of rows.  Never parse PDF page trees here;
+    # page counts are persisted during download/upload and lazily refreshed on
+    # the individual paper detail page instead.
     page_count = data.get("pdf_page_count")
-    local_pdf = str(data.get("local_pdf_path") or "").strip()
-    if page_count is None and local_pdf and not data.get("pdf_missing_on_disk"):
-        try:
-            page_count = pdf_page_count(Path(local_pdf).expanduser())
-        except PDFError:
-            page_count = None
-        if page_count is not None:
-            db.set_paper_pdf_page_count(int(data["id"]), int(page_count))
-            data["pdf_page_count"] = int(page_count)
     data["content_extent"] = int(page_count) if page_count is not None else None
     tracked = _json_value(data.get("tracked_authors_json"), [])
     if not isinstance(tracked, list):
@@ -2135,6 +2130,23 @@ def create_app(
     app.state.blog_client_factory = blog_factory
     app.mount("/static", StaticFiles(directory=str(static_dir)), name="static")
 
+    content_options_cache: dict[str, tuple[float, list[dict[str, Any]]]] = {}
+    content_options_cache_lock = threading.Lock()
+    content_options_cache_ttl = 5.0
+
+    def cached_content_options(
+        key: str, loader: Callable[[], Iterable[Any]]
+    ) -> list[dict[str, Any]]:
+        now = time.monotonic()
+        with content_options_cache_lock:
+            cached = content_options_cache.get(key)
+            if cached is not None and now - cached[0] < content_options_cache_ttl:
+                return [dict(item) for item in cached[1]]
+        rows = [dict(item) for item in loader()]
+        with content_options_cache_lock:
+            content_options_cache[key] = (now, rows)
+        return [dict(item) for item in rows]
+
     def render(request: Request, template: str, **context: Any) -> HTMLResponse:
         base = {
             "request": request,
@@ -2281,11 +2293,22 @@ def create_app(
                 else []
             )
             selected_state = db.selected_content_state()
-            author_rows = db.list_authors_with_tags(tracked_only=True)
-            tag_rows = db.list_tags()
-            content_tag_rows = db.list_content_tags()
-            topic_rows = db.list_topics()
-            saved_queries = [_query_view(row, config) for row in db.list_saved_queries()]
+            author_rows = cached_content_options(
+                "authors", db.list_author_filter_options
+            )
+            # Kept for template/context compatibility; Content does not display
+            # author-tag counts, so avoid the counted tag query on every load.
+            tag_rows = []
+            content_tag_rows = cached_content_options(
+                "content-tags", db.list_content_tag_filter_options
+            )
+            topic_rows = cached_content_options(
+                "topics", db.list_topic_filter_options
+            )
+            saved_query_rows = cached_content_options(
+                "saved-queries", db.list_saved_query_options
+            )
+            saved_queries = [_query_view(row, config) for row in saved_query_rows]
 
             paper_views = [_paper_table_view(db, row) for row in paper_rows]
             selected_paper_views = [_paper_table_view(db, row) for row in selected_paper_rows]
