@@ -62,14 +62,13 @@ prompt_version = "v2"
 # analyze_pdfs = true
 # prompt_version = "v2"
 #
-# OpenAI Codex through the Responses API. This uses OPENAI_API_KEY; it does
-# not invoke the Codex CLI or read its ChatGPT sign-in credentials.
+# Codex CLI using the installed `codex` executable and its existing local login.
+# No OpenAI API key is required for provider = "codex".
 # [[llm_profiles]]
 # name = "codex-review"
 # provider = "codex"
 # model = "gpt-5.3-codex"
-# base_url = "https://api.openai.com/v1"
-# api_key = "" # Prefer OPENAI_API_KEY
+# command = "codex"
 # reasoning_effort = "high" # low | medium | high | xhigh
 # timeout_seconds = 600
 # max_input_chars = 1000000

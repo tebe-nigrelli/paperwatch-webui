@@ -22,6 +22,7 @@ from paperwatch.web import (
     _manual_paper_record,
     _manual_publication_date,
     _manual_source_url,
+    _inline_display_text,
     _parse_tristate,
     _run_pipeline,
     create_app,
@@ -370,6 +371,10 @@ def test_paper_pagination_redirect(config_path, seeded_web, paper_record):
     assert "Previous" in client.get("/papers?page=2&page_size=25").text
 
 
+def test_inline_display_text_removes_real_and_escaped_newlines():
+    assert _inline_display_text("First\\nSecond\nThird\r\nFourth") == "First Second Third Fourth"
+
+
 def test_paper_detail_and_exports(config_path, seeded_web):
     _, paper_id, second_id, analysis_id, _ = seeded_web
     client, _ = make_client(config_path)
@@ -381,7 +386,10 @@ def test_paper_detail_and_exports(config_path, seeded_web):
     assert "Raw JSON and usage" not in response.text
     assert "Recent tasks" in response.text
     assert f'href="/analyses/{analysis_id}"' in response.text
-    assert response.text.index("Source metadata") < response.text.index("Recent tasks")
+    assert "Source metadata" not in response.text
+    assert 'data-copy-source="paper-source-metadata-copy"' in response.text
+    assert 'id="paper-source-metadata-copy" hidden' in response.text
+    assert response.text.index("Paper actions") < response.text.index("Recent tasks")
     assert "Run saved prompt" not in response.text
     assert "Override Defaults" not in response.text
     assert 'data-query-defaults-form' not in response.text

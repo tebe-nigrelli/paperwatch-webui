@@ -219,7 +219,7 @@
 /* 0.9.6 unified content, query scope, pagination and data-management controls */
 .brand{display:flex;flex-direction:column;align-items:flex-start;gap:0;line-height:1.05}
 .brand small{font-size:.64rem;line-height:1.2;font-weight:750;letter-spacing:.04em;color:var(--muted)}
-.data-management-wide{grid-column:1/-1}.query-output-link-cell{width:9rem;white-space:nowrap}.pagination-jump{display:flex;align-items:center;gap:8px}.pagination-jump label{display:flex;flex-direction:row;align-items:center;gap:6px}.pagination-jump input{width:5.5rem}.query-scope-toggle{justify-content:flex-start;min-width:9rem}.markdown-block>*:last-child{margin-bottom:0}
+.data-management-wide{grid-column:1/-1}.table-wrap>.query-runs-table{width:100%;min-width:0;table-layout:fixed}.query-runs-table th:nth-child(1){width:18%}.query-runs-table th:nth-child(2){width:15%}.query-run-records-column,.query-run-records-cell{width:7rem;max-width:7rem;white-space:normal;overflow-wrap:anywhere}.query-runs-table th:nth-child(5){width:11rem}.query-output-link-cell,.query-runs-table th:nth-child(6){width:9rem;white-space:nowrap}.query-run-status-column,.query-run-status-cell{width:18rem;max-width:18rem}.query-run-status-cell{white-space:normal;overflow-wrap:anywhere}.query-run-status-cell .task-error{display:block;white-space:normal;overflow-wrap:anywhere}.pagination-jump{display:flex;align-items:center;gap:8px}.pagination-jump label{display:flex;flex-direction:row;align-items:center;gap:6px}.pagination-jump input{width:5.5rem}.query-scope-toggle{justify-content:flex-start;min-width:9rem}.markdown-block>*:last-child{margin-bottom:0}
 .compact-markdown p{margin:.35rem 0 0;color:var(--muted);font-size:.86rem}
 .delete-record-groups{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:16px;margin-top:14px}.delete-record-group{min-width:0}.delete-record-group h4{margin:0 0 8px;color:var(--muted);font-size:.78rem;letter-spacing:.06em;text-transform:uppercase}.delete-record-grid{display:grid;grid-template-columns:1fr;gap:8px}.delete-record-grid form{display:flex;margin:0}.delete-record-button{display:grid;grid-template-columns:auto minmax(0,1fr);align-items:center;gap:10px;width:100%;min-height:64px;text-align:left}.delete-record-button>span:first-child{font-size:1.25rem;line-height:1}.delete-record-button>span:last-child{display:grid;gap:2px}.delete-record-button small{font-weight:500;line-height:1.25;opacity:.82}.search-select-cycle .search-select-input{cursor:pointer;caret-color:transparent}
 @media(max-width:800px){.delete-record-groups,.delete-record-grid{grid-template-columns:1fr}}
@@ -348,7 +348,7 @@ body.dialog-open{overflow:hidden}.dialog-close-button{display:grid!important;pla
 
 /* 0.10.0 detail layouts, data workspace, and responsive regexp editors */
 .table-wrap{overflow-x:auto;max-width:none}
-table:not(.unified-content-table):not(.saved-query-table):not(.author-table):not(.author-blog-table){min-width:max-content}
+table:not(.unified-content-table):not(.saved-query-table):not(.author-table):not(.author-blog-table):not(.query-runs-table){min-width:max-content}
 .paper-reference-layout{grid-template-columns:minmax(0,.75fr) minmax(420px,1.25fr);gap:26px}
 .paper-reference-metadata{grid-column:auto;grid-template-columns:repeat(2,minmax(0,1fr))}
 .paper-link-groups{padding-left:26px}
@@ -659,3 +659,16 @@ label.control-disabled{opacity:.68}
 .blog-source-notes-row .row-notes-editor[open]{padding:10px 12px;border:1px solid var(--line);border-radius:7px;background:var(--surface-2)}
 .blog-source-notes-row textarea{width:100%;min-width:0;max-width:100%;min-height:110px}
 .blog-source-notes-row.object-row-mark>td{border-left:3px solid var(--warn)}
+
+.linked-source-source-heading{vertical-align:top}
+.linked-source-source-header{display:grid;gap:5px;min-width:0}
+.linked-source-tag-filter{display:flex;align-items:center;gap:5px;margin:0;min-width:0}
+.linked-source-tag-filter label{min-width:0;flex:1}
+.linked-source-tag-filter .search-select{width:100%}
+.linked-source-tag-filter .search-select-input{min-height:32px;height:32px;padding:5px 7px;font-size:.76rem}
+.linked-source-tag-clear{width:30px;min-width:30px;height:30px;padding:0;display:inline-grid;place-items:center}
+
+/* Live content-state polish. Hover is intentionally distinct from read/unread fills. */
+.content-row:hover:not(.content-row-selected){filter:none;background:color-mix(in srgb,var(--accent-soft) 72%,var(--surface))!important}
+:root[data-theme="dark"] .content-row:hover:not(.content-row-selected){background:color-mix(in srgb,var(--accent-soft) 76%,var(--surface))!important}
+.content-row-selected:hover{filter:none;background:color-mix(in srgb,var(--warn-soft) 68%,var(--accent-soft) 32%)!important}

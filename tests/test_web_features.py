@@ -134,6 +134,7 @@ def test_recent_feed_theme_and_direct_links(
     assert 'const wrapCycle = cycle && select.hasAttribute("data-wrap-cycle")' in js
     assert 'targetValue.value = targetValue.value === "selected" ? "results" : "selected"' in js
     assert 'control.setAttribute("aria-disabled", String(locked))' in js
+    assert 'select.hasAttribute("data-float-options-up")' in js
     assert 'select.matches("[data-model-picker]") && select.closest(".content-results-runner-row")' in js
     assert 'document.body.appendChild(list)' in js
     assert 'await refreshContentPage(window.location.href, false)' in js
@@ -300,6 +301,7 @@ def test_saved_query_create_edit_run_output_and_delete(
     assert "Saved query" in recent.text
     assert 'name="override_query_defaults"' in recent.text
     assert "data-query-defaults-form" in recent.text
+    assert 'data-query-defaults data-float-options-up' in recent.text
     assert 'class="collection-runner-row content-results-runner-row"' in recent.text
     assert 'class="advanced-filters collection-runner-details content-results-runner-details"' in recent.text
     assert 'content-results-runner-details" open' not in recent.text

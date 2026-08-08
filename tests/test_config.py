@@ -195,8 +195,8 @@ model = "gpt-test"
 
 
 
-def test_codex_profile_uses_responses_defaults_and_environment_key(config_path: Path, monkeypatch):
-    monkeypatch.setenv("OPENAI_API_KEY", "codex-secret")
+def test_codex_profile_uses_cli_defaults_without_api_key(config_path: Path, monkeypatch):
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
     config_path.write_text(
         config_path.read_text()
         + """
@@ -210,8 +210,9 @@ context_window_tokens = 400000
     )
     profile = load_config(config_path).llm_profile("codex-review")
     assert profile.provider == "codex"
-    assert profile.base_url == "https://api.openai.com/v1"
-    assert profile.api_key == "codex-secret"
+    assert profile.base_url == ""
+    assert profile.api_key == ""
+    assert profile.command == "codex"
     assert profile.reasoning_effort == "medium"
     assert profile.context_window_tokens == 400000
 
@@ -365,3 +366,27 @@ def test_new_pdf_retry_and_strategy_values_are_validated(config_path: Path):
     )
     with pytest.raises(ConfigError, match="pdf_analysis_strategy"):
         load_config(config_path)
+def test_codex_profile_without_model_does_not_inherit_other_provider_model(tmp_path):
+    path = tmp_path / "config.toml"
+    path.write_text(
+        """
+[paths]
+database = "paperwatch.db"
+pdf_dir = "pdfs"
+prompt = "prompts/analyze.txt"
+
+[llm]
+provider = "openai"
+model = "gpt-api-only"
+api_key = "test"
+
+[[llm_profiles]]
+name = "codex-review"
+provider = "codex"
+command = "codex"
+"""
+    )
+    config = load_config(path)
+    profile = config.llm_profile("codex-review")
+    assert profile is not None
+    assert profile.model == ""

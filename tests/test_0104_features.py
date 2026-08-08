@@ -173,6 +173,9 @@ def test_linked_sources_table_has_pause_resume_and_remove(
     assert 'class="author-blog-table linked-sources-table"' in page.text
     assert 'class="linked-sources-columns"' in page.text
     assert '<th class="linked-source-icon-heading">Open</th>' in page.text
+    assert 'class="linked-source-source-heading"' in page.text
+    assert 'class="linked-source-tag-filter"' in page.text
+    assert 'aria-label="Filter source tag"' in page.text
     assert '<th>Tags</th>' in page.text
     assert 'class="source-tag-cell"' in page.text
     assert 'class="blog-source-notes-row' in page.text
@@ -186,6 +189,7 @@ def test_linked_sources_table_has_pause_resume_and_remove(
     assert ".icon-button{display:inline-grid;place-items:center" in css
     assert ".linked-sources-table col.linked-source-col-tags{width:15%}" in css
     assert ".blog-source-notes-row .row-notes-editor{width:100%;min-width:0;max-width:none" in css
+    assert ".linked-source-tag-filter{display:flex;align-items:center" in css
 
     paused = client.post(
         f"/authors/{author_candidate.openalex_id}/blogs/{blog_id}/pause",

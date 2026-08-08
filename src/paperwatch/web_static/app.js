@@ -476,7 +476,8 @@
 
   const paperJobs = document.getElementById("paper-jobs");
   const discoverPaperImports = Array.from(document.querySelectorAll("form[data-discover-paper-import]"));
-  if (document.body.dataset.runRunning === "true" && !paperJobs && discoverPaperImports.length === 0) {
+  if (document.body.dataset.runRunning === "true" && !paperJobs && discoverPaperImports.length === 0
+      && !document.querySelector("#content-page-root") && !document.querySelector(".paper-detail-root")) {
     window.setTimeout(() => window.location.reload(), 5000);
   }
 
@@ -799,50 +800,51 @@
     }
   }
 
-  document.querySelectorAll("[data-copy-source]").forEach((button) => {
-    button.addEventListener("click", async () => {
-      const source = document.getElementById(button.dataset.copySource || "");
-      if (!source) return;
-      const text = "value" in source ? source.value : source.textContent || "";
-      const originalHtml = button.innerHTML;
-      const originalLabel = button.getAttribute("aria-label") || "Copy text";
-      const showState = (label, failed = false) => {
-        button.classList.toggle("copy-failed", failed);
-        if (button.hasAttribute("data-copy-icon")) {
-          button.setAttribute("aria-label", label);
-          button.title = label;
-          button.dataset.copyState = label;
-        } else {
-          button.textContent = label;
-        }
-      };
-      try {
-        if (navigator.clipboard && window.isSecureContext) {
-          await navigator.clipboard.writeText(text);
-        } else {
-          const temporary = document.createElement("textarea");
-          temporary.value = text;
-          temporary.setAttribute("readonly", "");
-          temporary.style.position = "fixed";
-          temporary.style.opacity = "0";
-          document.body.appendChild(temporary);
-          temporary.select();
-          document.execCommand("copy");
-          temporary.remove();
-        }
-        showState("Copied");
-      } catch (_) {
-        showState("Copy failed", true);
+  document.addEventListener("click", async (event) => {
+    const button = event.target.closest("[data-copy-source]");
+    if (!button) return;
+    const source = document.getElementById(button.dataset.copySource || "");
+    if (!source) return;
+    const text = "value" in source ? source.value : source.textContent || "";
+    const originalHtml = button.innerHTML;
+    const originalLabel = button.getAttribute("aria-label") || "Copy text";
+    const showState = (label, failed = false) => {
+      button.classList.toggle("copy-failed", failed);
+      if (button.hasAttribute("data-copy-icon")) {
+        button.setAttribute("aria-label", label);
+        button.title = label;
+        button.dataset.copyState = label;
+      } else {
+        button.textContent = label;
       }
-      window.setTimeout(() => {
-        button.innerHTML = originalHtml;
-        button.setAttribute("aria-label", originalLabel);
-        button.title = originalLabel;
-        delete button.dataset.copyState;
-        button.classList.remove("copy-failed");
-      }, 1600);
-    });
+    };
+    try {
+      if (navigator.clipboard && window.isSecureContext) {
+        await navigator.clipboard.writeText(text);
+      } else {
+        const temporary = document.createElement("textarea");
+        temporary.value = text;
+        temporary.setAttribute("readonly", "");
+        temporary.style.position = "fixed";
+        temporary.style.opacity = "0";
+        document.body.appendChild(temporary);
+        temporary.select();
+        document.execCommand("copy");
+        temporary.remove();
+      }
+      showState("Copied");
+    } catch (_) {
+      showState("Copy failed", true);
+    }
+    window.setTimeout(() => {
+      button.innerHTML = originalHtml;
+      button.setAttribute("aria-label", originalLabel);
+      button.title = originalLabel;
+      delete button.dataset.copyState;
+      button.classList.remove("copy-failed");
+    }, 1600);
   });
+
 
   const enhanceSelect = (select, index) => {
     if (select.dataset.searchSelectReady === "true") return;
@@ -859,7 +861,8 @@
     const wrapper = document.createElement("div");
     wrapper.className = `search-select${multiple ? " search-select-multiple" : ""}${cycle ? " search-select-cycle" : ""}${wrapCycle ? " search-select-wrap-cycle" : ""}`;
     const floatingOptions = Boolean(
-      select.matches("[data-model-picker]") && select.closest(".content-results-runner-row")
+      select.hasAttribute("data-float-options-up") ||
+      (select.matches("[data-model-picker]") && select.closest(".content-results-runner-row"))
     );
     const input = document.createElement(wrapCycle ? "button" : "input");
     if (wrapCycle) input.type = "button";
@@ -1357,6 +1360,78 @@
     rememberContentUrl(finalUrl);
     return true;
   };
+  const runningKindsFromBody = () => ({
+    fetch: document.body.dataset.runRunning === "true",
+    analysis: document.body.dataset.analysisRunning === "true",
+    query: document.body.dataset.queryRunning === "true",
+  });
+  const fetchRunningStatus = async () => {
+    const response = await fetch("/api/running-status", { cache: "no-store" });
+    if (!response.ok) throw new Error(`Request failed with HTTP ${response.status}`);
+    return response.json();
+  };
+  const initialRunningKinds = runningKindsFromBody();
+  if (document.querySelector("#content-page-root")
+      && Object.values(initialRunningKinds).some(Boolean)) {
+    const pollContentCompletion = async () => {
+      try {
+        const status = await fetchRunningStatus();
+        const stillRunning = Object.entries(initialRunningKinds).some(
+          ([kind, watched]) => watched && Boolean(status[kind]?.running)
+        );
+        if (stillRunning) {
+          await refreshContentPage(window.location.href, false);
+          window.setTimeout(pollContentCompletion, 1500);
+          return;
+        }
+        await refreshContentPage(window.location.href, false);
+      } catch (_) {
+        window.setTimeout(pollContentCompletion, 1500);
+      }
+    };
+    window.setTimeout(pollContentCompletion, 250);
+  }
+
+  const paperDetailRoot = document.querySelector(".paper-detail-root[data-paper-id]");
+  if (paperDetailRoot && (initialRunningKinds.analysis || initialRunningKinds.query)) {
+    const paperId = Number(paperDetailRoot.dataset.paperId || 0);
+    let sawRelevantJob = false;
+    const refreshPaperResults = async () => {
+      const response = await fetch(window.location.pathname, {
+        cache: "no-store",
+        headers: { "X-Paperwatch-Fragment": "1" },
+      });
+      if (!response.ok) return false;
+      const doc = parseHtml(await response.text());
+      const incoming = doc.querySelector("#paper-results");
+      const current = document.querySelector("#paper-results");
+      if (!incoming || !current) return false;
+      current.replaceWith(incoming);
+      return true;
+    };
+    const pollPaperCompletion = async () => {
+      try {
+        const status = await fetchRunningStatus();
+        const analysisRelevant = Boolean(status.analysis?.batch_id)
+          && Number(status.analysis?.paper_id || 0) === paperId;
+        const queryRelevant = Boolean(status.query?.batch_id)
+          && Number(status.query?.paper_id || 0) === paperId;
+        sawRelevantJob ||= analysisRelevant || queryRelevant;
+        const stillRunning = (analysisRelevant && Boolean(status.analysis?.running))
+          || (queryRelevant && Boolean(status.query?.running));
+        if (stillRunning) {
+          await refreshPaperResults();
+          window.setTimeout(pollPaperCompletion, 1500);
+          return;
+        }
+        if (sawRelevantJob) await refreshPaperResults();
+      } catch (_) {
+        window.setTimeout(pollPaperCompletion, 1500);
+      }
+    };
+    window.setTimeout(pollPaperCompletion, 250);
+  }
+
   const refreshSelector = async (selector) => {
     const response = await fetch(window.location.href, { headers: { "X-Paperwatch-Partial": "1" } });
     return replaceFromResponse(response, selector);

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import re
 import shutil
 import sys
 from dataclasses import dataclass
@@ -89,6 +90,15 @@ def _parser() -> argparse.ArgumentParser:
 
     init = sub.add_parser("init", help="Create a starter configuration")
     init.add_argument("path", nargs="?", default="config.toml")
+
+    config_cmd = sub.add_parser("config", help="Edit primary LLM configuration")
+    config_sub = config_cmd.add_subparsers(dest="config_command", required=True)
+    provider_cmd = config_sub.add_parser(
+        "provider", help="Set [llm].provider while preserving the rest of config.toml"
+    )
+    provider_cmd.add_argument(
+        "provider", choices=("ollama", "openai", "codex", "claude-code", "none")
+    )
 
     author = sub.add_parser("author", help="Manage tracked authors")
     author_sub = author.add_subparsers(dest="author_command", required=True)
@@ -180,6 +190,60 @@ def _init_config(path: str) -> int:
         with as_file(prompt_ref) as prompt_source:
             shutil.copyfile(prompt_source, prompt_destination)
     print(destination)
+    return 0
+
+
+def _config_command(args: argparse.Namespace) -> int:
+    if args.config_command != "provider":
+        return 2
+    path = Path(args.config).expanduser()
+    if not path.is_file():
+        print(f"Config file not found: {path}", file=sys.stderr)
+        return 2
+    try:
+        text = path.read_text(encoding="utf-8")
+    except OSError as exc:
+        print(str(exc), file=sys.stderr)
+        return 2
+    section_match = re.search(r"(?ms)^\[llm\][ \t]*\n(?P<body>.*?)(?=^\[|\Z)", text)
+    if section_match is None:
+        print("config.toml has no [llm] section", file=sys.stderr)
+        return 2
+    body = section_match.group("body")
+    provider_line = f'provider = "{args.provider}"'
+    if re.search(r"(?m)^[ \t]*provider[ \t]*=", body):
+        body = re.sub(
+            r'(?m)^[ \t]*provider[ \t]*=[ \t]*[^\n#]*(?P<comment>[ \t]*#.*)?$',
+            lambda match: provider_line + (match.group("comment") or ""),
+            body,
+            count=1,
+        )
+    else:
+        body = provider_line + "\n" + body
+    if args.provider in {"codex", "claude-code"}:
+        command_name = "codex" if args.provider == "codex" else "claude"
+        command_line = f'command = "{command_name}"'
+        if re.search(r"(?m)^[ \t]*command[ \t]*=", body):
+            body = re.sub(
+                r'(?m)^[ \t]*command[ \t]*=[ \t]*[^\n#]*(?P<comment>[ \t]*#.*)?$',
+                lambda match: command_line + (match.group("comment") or ""),
+                body,
+                count=1,
+            )
+        else:
+            provider_match = re.search(r"(?m)^provider[^\n]*\n", body)
+            offset = provider_match.end() if provider_match else 0
+            body = body[:offset] + command_line + "\n" + body[offset:]
+    updated = text[: section_match.start("body")] + body + text[section_match.end("body") :]
+    try:
+        path.write_text(updated, encoding="utf-8")
+    except OSError as exc:
+        print(str(exc), file=sys.stderr)
+        return 2
+    if args.provider == "codex":
+        print(f'{path}: [llm] provider = "codex"; using installed codex CLI and its existing login')
+    else:
+        print(f'{path}: [llm] provider = "{args.provider}"')
     return 0
 
 
@@ -344,6 +408,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = _parser().parse_args(argv)
     if args.command == "init":
         return _init_config(args.path)
+    if args.command == "config":
+        return _config_command(args)
     if args.command == "web":
         try:
             return _serve_web(args)

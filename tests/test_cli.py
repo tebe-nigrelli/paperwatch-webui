@@ -61,6 +61,22 @@ def test_init_creates_config_and_prompt(tmp_path, capsys):
     assert cli.main(["init", str(destination)]) == 2
 
 
+def test_config_provider_switches_primary_llm_to_codex_cli(config_path, capsys):
+    before = config_path.read_text()
+    assert 'base_url = "http://ollama.test"' in before
+    assert cli.main(["--config", str(config_path), "config", "provider", "codex"]) == 0
+    text = config_path.read_text()
+    llm_section = text.split("[llm]", 1)[1]
+    assert 'provider = "codex"' in llm_section
+    assert 'command = "codex"' in llm_section
+    assert 'base_url = "http://ollama.test"' in llm_section
+    assert "existing login" in capsys.readouterr().out
+    from paperwatch.config import load_config
+    config = load_config(config_path)
+    assert config.llm.provider == "codex"
+    assert config.llm.command == "codex"
+
+
 def test_author_search_add_list_disable_remove(config_path, monkeypatch, capsys):
     monkeypatch.setattr(cli, "build_services", service_factory)
 

@@ -377,9 +377,15 @@ def test_static_assets_use_partial_updates_and_requested_layout():
     assert '.filter-word-button[data-filter-state="yes"]' in css
     assert ".selected-content-tools{display:grid;grid-template-columns:220px 220px auto" in css
     assert ".regexp-editor-grid" in css
-    assert "table:not(.unified-content-table):not(.saved-query-table):not(.author-table):not(.author-blog-table){min-width:max-content}" in css
+    assert ".query-run-status-column,.query-run-status-cell{width:18rem;max-width:18rem}" in css
+    assert "table:not(.unified-content-table):not(.saved-query-table):not(.author-table):not(.author-blog-table):not(.query-runs-table){min-width:max-content}" in css
     assert ".table-wrap>.author-table{width:100%;min-width:900px;table-layout:fixed" in css
     assert ".author-table col.author-col-name{width:24%}" in css
     assert ".author-table col.author-col-openalex{width:12%}" in css
     assert ".author-table col.author-col-download{width:5%}" in css
+    assert 'fetch("/api/running-status", { cache: "no-store" })' in script
+    assert "pollContentCompletion" in script
+    assert "pollPaperCompletion" in script
+    assert '.content-row:hover:not(.content-row-selected)' in css
+    assert 'background:color-mix(in srgb,var(--accent-soft) 72%,var(--surface))!important' in css
     assert '<colgroup class="author-table-columns">' in authors_template

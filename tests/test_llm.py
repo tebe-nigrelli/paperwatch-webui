@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from pathlib import Path
 import subprocess
 
 import httpx
@@ -372,51 +373,54 @@ def test_openai_responses_structured_request_and_response(analysis_result):
 
 
 
-def test_codex_responses_structured_request_and_reasoning(analysis_result):
+def test_codex_cli_structured_request_and_reasoning(analysis_result, monkeypatch):
+    process = FakeClaudeProcess(analysis_result.model_dump_json())
     seen = {}
 
-    def handler(request: httpx.Request) -> httpx.Response:
-        seen["path"] = request.url.path
-        seen["headers"] = request.headers
-        seen["json"] = json.loads(request.content)
-        return httpx.Response(
-            200,
-            json={
-                "output_text": analysis_result.model_dump_json(),
-                "usage": {"input_tokens": 12, "output_tokens": 34},
-            },
-        )
+    def popen(args, **kwargs):
+        seen["args"] = args
+        seen["kwargs"] = kwargs
+        return process
 
+    monkeypatch.setattr("paperwatch.llm.shutil.which", lambda command: "/usr/bin/codex")
+    monkeypatch.setattr("paperwatch.llm.subprocess.Popen", popen)
+    output = []
     llm = CodexClient(
-        model="gpt-5.3-codex",
-        base_url="https://api.openai.test/v1",
-        api_key="secret",
-        timeout_seconds=1,
+        model="gpt-5.3-codex", command="codex", timeout_seconds=9,
         reasoning_effort="high",
-        client=httpx.Client(transport=httpx.MockTransport(handler)),
     )
+    llm.set_runtime(lambda kind, value: output.append((kind, value)), None)
     response = llm.analyze("analyze this")
     assert llm.provider == "codex"
     assert response.result.generated_by_model == "gpt-5.3-codex (version not exposed)"
-    assert response.usage["output_tokens"] == 34
-    assert seen["path"] == "/v1/responses"
-    assert seen["headers"]["authorization"] == "Bearer secret"
-    assert seen["json"]["reasoning"] == {"effort": "high"}
-    assert seen["json"]["text"]["format"]["strict"] is True
+    assert response.usage == {"provider": "codex", "transport": "cli"}
+    assert len(process.prompts) == 1
+    assert process.prompts[0][1] == 9
+    assert process.prompts[0][0].endswith("\n\nanalyze this")
+    assert "Do not inspect files" in process.prompts[0][0]
+    assert seen["args"][:2] == ["codex", "exec"]
+    assert "--ephemeral" in seen["args"]
+    assert seen["args"][seen["args"].index("--sandbox") + 1] == "read-only"
+    assert "--skip-git-repo-check" in seen["args"]
+    assert "--output-schema" in seen["args"]
+    assert "--output-last-message" in seen["args"]
+    assert seen["args"][seen["args"].index("--model") + 1] == "gpt-5.3-codex"
+    assert 'model_reasoning_effort="high"' in seen["args"]
+    assert seen["args"][-1] == "-"
+    assert seen["kwargs"]["stdin"] is subprocess.PIPE
+    assert Path(seen["kwargs"]["cwd"]).name.startswith("paperwatch-codex-")
+    assert output and output[0][0] == "output"
 
 
-def test_codex_missing_key_has_specific_error():
-    llm = CodexClient(
-        model="gpt-5.3-codex",
-        base_url="https://api.openai.test",
-        api_key="",
-        timeout_seconds=1,
-        client=httpx.Client(),
-    )
-    with pytest.raises(LLMError, match="OpenAI Codex API key is missing"):
-        llm.check_ready()
-    with pytest.raises(LLMError, match="OpenAI Codex API key is missing"):
-        llm.analyze("x")
+def test_codex_cli_readiness_uses_installed_executable(tmp_path, monkeypatch):
+    monkeypatch.setattr("paperwatch.llm.shutil.which", lambda command: None)
+    missing = CodexClient(model="gpt-5.3-codex", command="not-installed", timeout_seconds=1)
+    with pytest.raises(LLMError, match="Codex CLI executable .* was not found"):
+        missing.check_ready()
+    local_command = tmp_path / "codex-local"
+    local_command.write_text("stub")
+    CodexClient(model="gpt-5.3-codex", command=str(local_command), timeout_seconds=1).check_ready()
+
 
 def test_llm_rejects_invalid_model_json():
     client = httpx.Client(
@@ -458,14 +462,15 @@ def test_no_llm_and_provider_factory_branches(app_config):
             app_config.llm,
             provider="codex",
             model="gpt-5.3-codex",
-            api_key="key",
-            base_url="https://api.test/v1",
+            command="custom-codex",
+            api_key="",
             reasoning_effort="xhigh",
         ),
         client=httpx.Client(),
     )
     assert isinstance(codex, CodexClient)
     assert codex.provider == "codex"
+    assert codex.command == "custom-codex"
     assert codex.reasoning_effort == "xhigh"
     with pytest.raises(LLMError, match="Unsupported"):
         create_llm(replace(app_config.llm, provider="bad"))
@@ -778,7 +783,7 @@ def test_ollama_openai_compatible_error_shapes_and_openai_readiness(analysis_res
         missing.check_ready()
 
 
-def test_openai_and_codex_http_error_messages(analysis_result):
+def test_openai_http_error_messages():
     detail_cases = [
         (httpx.Response(400, json={"error": {"message": "model is unavailable"}}), "model .* unavailable"),
         (httpx.Response(401, json={"message": "bad key"}), "API key was rejected"),
@@ -787,8 +792,8 @@ def test_openai_and_codex_http_error_messages(analysis_result):
         (httpx.Response(502), "HTTP 502"),
     ]
     for response, message in detail_cases:
-        llm = CodexClient(
-            model="gpt-5.3-codex",
+        llm = OpenAIClient(
+            model="gpt-test",
             base_url="https://api.openai.test",
             api_key="key",
             timeout_seconds=1,
@@ -803,92 +808,138 @@ def test_openai_and_codex_http_error_messages(analysis_result):
     assert OpenAIClient._error_detail(httpx.Response(400, json={"detail": " detail "})) == "detail"
 
 
-def test_codex_rejects_invalid_structured_result():
-    llm = CodexClient(
-        model="gpt-5.3-codex",
-        base_url="https://api.openai.test",
-        api_key="key",
-        timeout_seconds=1,
-        client=httpx.Client(
-            transport=httpx.MockTransport(
-                lambda request: httpx.Response(200, json={"output_text": '{"summary":"x"}'})
-            )
-        ),
-    )
-    with pytest.raises(LLMError, match="OpenAI Codex analysis failed"):
-        llm.analyze("x")
+def test_codex_cli_rejects_invalid_structured_result(monkeypatch):
+    monkeypatch.setattr("paperwatch.llm.shutil.which", lambda command: "/usr/bin/codex")
+    process = FakeClaudeProcess('{"summary":"x"}')
+    monkeypatch.setattr("paperwatch.llm.subprocess.Popen", lambda *args, **kwargs: process)
+    with pytest.raises(LLMError, match="Codex CLI analysis failed"):
+        CodexClient(model="gpt-5.3-codex", timeout_seconds=1).analyze("x")
 
 
-def test_codex_pdf_upload_attaches_original_file_and_deletes_remote_copy(
-    analysis_result, tmp_path
-):
+def test_codex_cli_pdf_reads_local_original_in_read_only_mode(analysis_result, tmp_path, monkeypatch):
     pdf = tmp_path / "whole-paper.pdf"
     pdf.write_bytes(b"%PDF-1.7\noriginal-complete-pdf\n%%EOF")
-    requests: list[tuple[str, str, bytes]] = []
+    process = FakeClaudeProcess(analysis_result.model_dump_json())
+    seen = {}
 
-    def handler(request: httpx.Request) -> httpx.Response:
-        body = request.content
-        requests.append((request.method, request.url.path, body))
-        if request.method == "POST" and request.url.path == "/v1/files":
-            assert b'purpose' in body
-            assert b'user_data' in body
-            assert b'whole-paper.pdf' in body
-            assert b'original-complete-pdf' in body
-            return httpx.Response(200, json={"id": "file-paper-123"})
-        if request.method == "POST" and request.url.path == "/v1/responses":
-            payload = json.loads(body)
-            content = payload["input"][0]["content"]
-            assert content[0] == {"type": "input_file", "file_id": "file-paper-123"}
-            assert content[1]["type"] == "input_text"
-            assert "attached pdf" in content[1]["text"].lower().replace(" as a", "")
-            return httpx.Response(
-                200,
-                json={
-                    "output_text": analysis_result.model_dump_json(),
-                    "usage": {"input_tokens": 123, "output_tokens": 45},
-                },
-            )
-        if request.method == "DELETE" and request.url.path == "/v1/files/file-paper-123":
-            return httpx.Response(200, json={"id": "file-paper-123", "deleted": True})
-        return httpx.Response(404)
+    def popen(args, **kwargs):
+        seen["args"] = args
+        seen["kwargs"] = kwargs
+        return process
 
-    llm = CodexClient(
-        model="gpt-5.3-codex",
-        base_url="https://api.openai.test/v1",
-        api_key="secret",
-        timeout_seconds=1,
-        reasoning_effort="high",
-        client=httpx.Client(transport=httpx.MockTransport(handler)),
-    )
-    response = llm.analyze_pdf("Read the attached PDF in full", pdf)
+    monkeypatch.setattr("paperwatch.llm.shutil.which", lambda command: "/usr/bin/codex")
+    monkeypatch.setattr("paperwatch.llm.subprocess.Popen", popen)
+    response = CodexClient(
+        model="gpt-5.3-codex", command="codex", timeout_seconds=1, reasoning_effort="high"
+    ).analyze_pdf("Read the complete paper", pdf)
     assert response.result.name == analysis_result.name
     assert response.usage["input_file_bytes"] == pdf.stat().st_size
-    assert [(method, path) for method, path, _ in requests] == [
-        ("POST", "/v1/files"),
-        ("POST", "/v1/responses"),
-        ("DELETE", "/v1/files/file-paper-123"),
-    ]
+    assert seen["kwargs"]["cwd"] == str(tmp_path)
+    assert seen["args"][seen["args"].index("--sandbox") + 1] == "read-only"
+    assert str(pdf) in process.prompts[0][0]
+    assert "complete document" in process.prompts[0][0]
+
+    with pytest.raises(LLMError, match="PDF file does not exist"):
+        CodexClient(model="gpt-5.3-codex").analyze_pdf("x", tmp_path / "missing.pdf")
 
 
-def test_codex_pdf_upload_failure_is_actionable_and_does_not_call_responses(tmp_path):
-    pdf = tmp_path / "paper.pdf"
-    pdf.write_bytes(b"%PDF-1.4\n%%EOF")
-    paths = []
+def test_codex_cli_failure_is_actionable(monkeypatch):
+    monkeypatch.setattr("paperwatch.llm.shutil.which", lambda command: "/usr/bin/codex")
+    process = FakeClaudeProcess("", "not logged in; run codex login", 1)
+    monkeypatch.setattr("paperwatch.llm.subprocess.Popen", lambda *args, **kwargs: process)
+    with pytest.raises(LLMError, match="not logged in; run codex login"):
+        CodexClient(model="gpt-5.3-codex", timeout_seconds=1).analyze("x")
 
-    def handler(request: httpx.Request) -> httpx.Response:
-        paths.append(request.url.path)
-        return httpx.Response(400, json={"error": {"message": "invalid PDF"}})
 
-    llm = CodexClient(
-        model="gpt-5.3-codex",
-        base_url="https://api.openai.test/v1",
-        api_key="secret",
-        timeout_seconds=1,
-        client=httpx.Client(transport=httpx.MockTransport(handler)),
+def test_codex_cli_failure_reports_tail_not_banner(monkeypatch):
+    monkeypatch.setattr("paperwatch.llm.shutil.which", lambda command: "/usr/bin/codex")
+    stderr = "\n".join(
+        ["OpenAI Codex v0.147.0", "--------", "user", "very long prompt"]
+        + [f"prompt line {index}" for index in range(100)]
+        + ["ERROR: request failed: context length exceeded"]
     )
-    with pytest.raises(LLMError, match="invalid PDF"):
-        llm.analyze_pdf("x", pdf)
-    assert paths == ["/v1/files"]
+    process = FakeClaudeProcess("", stderr, 1)
+    monkeypatch.setattr("paperwatch.llm.subprocess.Popen", lambda *args, **kwargs: process)
+    with pytest.raises(LLMError) as excinfo:
+        CodexClient(model="gpt-5.3-codex", timeout_seconds=1).analyze("x")
+    message = str(excinfo.value)
+    assert "context length exceeded" in message
+    assert "OpenAI Codex v0.147.0" not in message
+
+
+def test_codex_cli_retries_chatgpt_unsupported_model_with_cli_default(
+    analysis_result, monkeypatch
+):
+    monkeypatch.setattr("paperwatch.llm.shutil.which", lambda command: "/usr/bin/codex")
+    processes = [
+        FakeClaudeProcess(
+            "",
+            "ERROR: {\"status\":400,\"error\":{\"message\":\"The 'gpt-5.3-codex' model is not supported when using Codex with a ChatGPT account.\"}}",
+            1,
+        ),
+        FakeClaudeProcess(
+            analysis_result.model_dump_json(),
+            "OpenAI Codex v0.147.0\nmodel: gpt-5.1-codex-max\nprovider: openai",
+        ),
+    ]
+    calls = []
+
+    def popen(args, **kwargs):
+        calls.append(args)
+        return processes.pop(0)
+
+    monkeypatch.setattr("paperwatch.llm.subprocess.Popen", popen)
+    response = CodexClient(model="gpt-5.3-codex", timeout_seconds=1).analyze("x")
+    assert len(calls) == 2
+    assert calls[0][calls[0].index("--model") + 1] == "gpt-5.3-codex"
+    assert "--model" not in calls[1]
+    assert response.result.generated_by_model == "gpt-5.1-codex-max (version not exposed)"
+    assert response.usage["model_fallback"] is True
+    assert response.usage["requested_model"] == "gpt-5.3-codex"
+    assert response.usage["effective_model"] == "gpt-5.1-codex-max"
+
+
+def test_codex_cli_empty_model_uses_cli_default(analysis_result, monkeypatch):
+    monkeypatch.setattr("paperwatch.llm.shutil.which", lambda command: "/usr/bin/codex")
+    process = FakeClaudeProcess(
+        analysis_result.model_dump_json(),
+        "OpenAI Codex v0.147.0\nmodel: account-default-codex\nprovider: openai",
+    )
+    calls = []
+    monkeypatch.setattr(
+        "paperwatch.llm.subprocess.Popen",
+        lambda args, **kwargs: calls.append(args) or process,
+    )
+    response = CodexClient(model="", timeout_seconds=1).analyze("x")
+    assert "--model" not in calls[0]
+    assert response.result.generated_by_model == "account-default-codex (version not exposed)"
+    assert response.usage["effective_model"] == "account-default-codex"
+
+
+def test_codex_cli_retries_schema_specific_failure_without_output_schema(
+    analysis_result, monkeypatch
+):
+    monkeypatch.setattr("paperwatch.llm.shutil.which", lambda command: "/usr/bin/codex")
+    processes = [
+        FakeClaudeProcess(
+            "",
+            "ERROR invalid_json_schema: Invalid schema for response_format codex_output_schema",
+            1,
+        ),
+        FakeClaudeProcess(analysis_result.model_dump_json()),
+    ]
+    calls = []
+
+    def popen(args, **kwargs):
+        calls.append(args)
+        return processes.pop(0)
+
+    monkeypatch.setattr("paperwatch.llm.subprocess.Popen", popen)
+    response = CodexClient(model="gpt-5.3-codex", timeout_seconds=1).analyze("x")
+    assert response.result.name == analysis_result.name
+    assert len(calls) == 2
+    assert "--output-schema" in calls[0]
+    assert "--output-schema" not in calls[1]
 
 
 def test_ollama_retries_empty_and_incomplete_structured_output(analysis_result):

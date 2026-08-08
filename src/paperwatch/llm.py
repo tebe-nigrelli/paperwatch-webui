@@ -4,8 +4,10 @@ import copy
 from dataclasses import dataclass
 import json
 from pathlib import Path
+import re
 import shutil
 import subprocess
+import tempfile
 from typing import Any, Protocol, TypeVar
 import threading
 
@@ -760,14 +762,311 @@ class OpenAIClient:
 
 
 
-class CodexClient(OpenAIClient):
-    """OpenAI Codex models through the Responses API."""
+class CodexClient:
+    """Codex CLI headless mode using the user's existing local authentication."""
 
     provider = "codex"
 
-    @property
-    def provider_name(self) -> str:
-        return "OpenAI Codex"
+    def __init__(
+        self,
+        *,
+        model: str,
+        command: str = "codex",
+        timeout_seconds: float = 600,
+        reasoning_effort: str | None = None,
+    ) -> None:
+        self.model = model
+        self.command = command
+        self.timeout_seconds = timeout_seconds
+        self.reasoning_effort = reasoning_effort
+        self._progress: ProgressCallback | None = None
+        self._cancel_event: threading.Event | None = None
+        self._process: subprocess.Popen[str] | None = None
+
+    def set_runtime(
+        self, progress: ProgressCallback | None, cancel_event: threading.Event | None
+    ) -> None:
+        self._progress = progress
+        self._cancel_event = cancel_event
+
+    def close(self) -> None:
+        process = self._process
+        if process is not None and process.poll() is None:
+            process.terminate()
+
+    def check_ready(self) -> None:
+        executable = shutil.which(self.command)
+        if executable is None and not Path(self.command).is_file():
+            raise LLMError(
+                f"Codex CLI executable {self.command!r} was not found; install Codex or set command"
+            )
+
+    @staticmethod
+    def _normalized_schema(schema: dict[str, Any]) -> dict[str, Any]:
+        strict_schema = copy.deepcopy(schema)
+
+        def normalize(value: Any) -> None:
+            if isinstance(value, dict):
+                value.pop("default", None)
+                properties = value.get("properties")
+                if isinstance(properties, dict):
+                    value["required"] = list(properties)
+                    value["additionalProperties"] = False
+                for child in value.values():
+                    normalize(child)
+            elif isinstance(value, list):
+                for child in value:
+                    normalize(child)
+
+        normalize(strict_schema)
+        return strict_schema
+
+    def _command(
+        self,
+        schema_path: Path | None,
+        output_path: Path,
+        *,
+        include_model: bool = True,
+    ) -> list[str]:
+        command = [
+            self.command,
+            "exec",
+            "--skip-git-repo-check",
+            "--ephemeral",
+            "--sandbox",
+            "read-only",
+            "--color",
+            "never",
+        ]
+        if schema_path is not None:
+            command.extend(("--output-schema", str(schema_path)))
+        command.extend(("--output-last-message", str(output_path)))
+        if include_model and self.model:
+            command.extend(("--model", self.model))
+        if self.reasoning_effort:
+            command.extend(
+                ("--config", f'model_reasoning_effort="{self.reasoning_effort}"')
+            )
+        command.append("-")
+        return command
+
+    @staticmethod
+    def _failure_detail(stdout: str, stderr: str) -> str:
+        ansi = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
+        text = ansi.sub("", stderr or "")
+        lines = [line.strip() for line in text.splitlines() if line.strip()]
+        markers = (
+            "error", "failed", "failure", "invalid", "unsupported", "denied",
+            "authentication", "not logged", "login", "rate limit", "too large",
+            "context length", "response_format", "output schema", "output-schema",
+            "text.format.schema", "timed out", "timeout",
+        )
+        useful = [line for line in lines if any(marker in line.lower() for marker in markers)]
+        if useful:
+            detail = "\n".join(useful[-12:])
+        elif lines:
+            # Codex prints its banner and prompt first; the useful failure is normally at the end.
+            detail = "\n".join(lines[-20:])
+        else:
+            out_lines = [line.strip() for line in (stdout or "").splitlines() if line.strip()]
+            detail = "\n".join(out_lines[-20:]) if out_lines else "Codex CLI exited unsuccessfully"
+        return detail[-4000:]
+
+    @staticmethod
+    def _schema_failure(detail: str) -> bool:
+        lowered = detail.lower()
+        return (
+            "invalid_json_schema" in lowered
+            or "response_format" in lowered
+            or "text.format.schema" in lowered
+            or "output schema" in lowered
+            or "output-schema" in lowered
+            or ("schema" in lowered and "invalid" in lowered)
+        )
+
+    @staticmethod
+    def _chatgpt_model_failure(detail: str) -> bool:
+        lowered = detail.lower()
+        return (
+            "model is not supported when using codex with a chatgpt account" in lowered
+            or (
+                "not supported" in lowered
+                and "codex" in lowered
+                and "chatgpt account" in lowered
+            )
+        )
+
+    @staticmethod
+    def _reported_model(stdout: str, stderr: str) -> str | None:
+        for text in (stderr, stdout):
+            match = re.search(r"(?mi)^model:\s*([^\r\n]+?)\s*$", text or "")
+            if match:
+                model = match.group(1).strip()
+                if model:
+                    return model
+        return None
+
+    @staticmethod
+    def _single_shot_prompt(prompt: str, *, allow_local_pdf: bool) -> str:
+        if allow_local_pdf:
+            prefix = (
+                "You are being used as a single-shot analysis backend. Inspect only the exact "
+                "local PDF named in this prompt when needed. Do not inspect the surrounding "
+                "repository or unrelated files, and do not modify anything. "
+            )
+        else:
+            prefix = (
+                "You are being used as a single-shot analysis backend. Use only the material "
+                "contained in this prompt. Do not inspect files, run shell commands, call tools "
+                "or MCP servers, or modify anything. "
+            )
+        return prefix + "Return only the requested JSON object, with no Markdown fences or prose.\n\n" + prompt
+
+    def _generate_json(
+        self,
+        prompt: str,
+        *,
+        schema: dict[str, Any],
+        pdf_path: Path | None = None,
+    ) -> StructuredJSONResponse:
+        self.check_ready()
+        check_cancelled(self._cancel_event)
+        process_prompt = prompt
+        cwd: str | None = None
+        path: Path | None = None
+        if pdf_path is not None:
+            path = Path(pdf_path).expanduser().resolve()
+            if not path.is_file():
+                raise LLMError(f"PDF file does not exist: {path}")
+            cwd = str(path.parent)
+            process_prompt = (
+                f"The complete research-paper PDF is the local file {json.dumps(str(path))}. "
+                "Use read-only local tools as needed to inspect that exact PDF and analyze the "
+                "complete document, including figures, tables, appendices, footnotes, and "
+                "bibliography. Do not substitute an extracted-text summary.\n\n"
+                f"{prompt}"
+            )
+        process_prompt = self._single_shot_prompt(
+            process_prompt, allow_local_pdf=path is not None
+        )
+
+        with tempfile.TemporaryDirectory(prefix="paperwatch-codex-") as temp_dir:
+            temp = Path(temp_dir)
+            if cwd is None:
+                # Do not inherit Paperwatch's repository as the Codex working directory. That
+                # can load project instructions, MCP servers, skills, and unrelated repo context.
+                cwd = str(temp)
+            schema_path = temp / "schema.json"
+            output_path = temp / "last-message.json"
+            schema_path.write_text(
+                json.dumps(self._normalized_schema(schema), ensure_ascii=False),
+                encoding="utf-8",
+            )
+            popen_kwargs: dict[str, Any] = {
+                "stdin": subprocess.PIPE,
+                "stdout": subprocess.PIPE,
+                "stderr": subprocess.PIPE,
+                "text": True,
+                "encoding": "utf-8",
+            }
+            if cwd is not None:
+                popen_kwargs["cwd"] = cwd
+            def run(
+                schema: Path | None, *, include_model: bool
+            ) -> tuple[subprocess.Popen[str], str, str]:
+                try:
+                    current = subprocess.Popen(
+                        self._command(schema, output_path, include_model=include_model),
+                        **popen_kwargs,
+                    )
+                    self._process = current
+                    run_stdout, run_stderr = current.communicate(
+                        process_prompt, timeout=self.timeout_seconds
+                    )
+                    return current, run_stdout, run_stderr
+                except subprocess.TimeoutExpired as exc:
+                    current.terminate()
+                    try:
+                        current.communicate(timeout=5)
+                    except subprocess.TimeoutExpired:
+                        current.kill()
+                        current.communicate()
+                    raise LLMError(
+                        f"Codex CLI analysis timed out after {self.timeout_seconds:g} seconds"
+                    ) from exc
+                except OSError as exc:
+                    raise LLMError(f"Codex CLI could not start: {exc}") from exc
+                finally:
+                    self._process = None
+
+            active_schema: Path | None = schema_path
+            include_model = bool(self.model)
+            model_fallback = False
+            while True:
+                process, stdout, stderr = run(active_schema, include_model=include_model)
+                check_cancelled(self._cancel_event)
+                if process.returncode == 0:
+                    break
+                detail = self._failure_detail(stdout, stderr)
+                retry = False
+                if include_model and self._chatgpt_model_failure(detail):
+                    # ChatGPT-authenticated Codex exposes a different model set from the API.
+                    # Let the installed CLI choose an account-compatible default rather than
+                    # hard-coding a model name whose availability can change over time.
+                    include_model = False
+                    model_fallback = True
+                    retry = True
+                elif active_schema is not None and self._schema_failure(detail):
+                    # Structured-output support has changed across CLI releases. Retry without
+                    # the CLI schema and validate the returned JSON locally.
+                    active_schema = None
+                    retry = True
+                if not retry:
+                    raise LLMError(f"Codex CLI analysis failed: {detail}")
+                try:
+                    output_path.unlink(missing_ok=True)
+                except OSError:
+                    pass
+            output_text = ""
+            try:
+                if output_path.is_file():
+                    output_text = output_path.read_text(encoding="utf-8").strip()
+            except OSError:
+                output_text = ""
+            if not output_text:
+                output_text = stdout.strip()
+            try:
+                data = json.loads(output_text)
+            except json.JSONDecodeError as exc:
+                raise LLMError("Codex CLI returned invalid structured JSON") from exc
+            if not isinstance(data, dict):
+                raise LLMError("Codex CLI structured output must be a JSON object")
+            usage: dict[str, Any] = {"provider": "codex", "transport": "cli"}
+            if model_fallback or not self.model:
+                effective_model = self._reported_model(stdout, stderr) or "Codex CLI default"
+                usage["effective_model"] = effective_model
+                if model_fallback:
+                    usage["requested_model"] = self.model
+                    usage["model_fallback"] = True
+            if path is not None:
+                usage["input_file_bytes"] = path.stat().st_size
+            if self._progress is not None:
+                self._progress("output", json.dumps(data, ensure_ascii=False))
+            return StructuredJSONResponse(
+                data=data,
+                usage=usage,
+                raw={"output": output_text},
+            )
+
+    def generate_json(
+        self,
+        prompt: str,
+        *,
+        schema: dict[str, Any],
+        schema_name: str,
+    ) -> StructuredJSONResponse:
+        del schema_name
+        return self._generate_json(prompt, schema=schema)
 
     def generate_json_with_pdf(
         self,
@@ -777,64 +1076,25 @@ class CodexClient(OpenAIClient):
         schema: dict[str, Any],
         schema_name: str,
     ) -> StructuredJSONResponse:
-        """Upload one PDF and request arbitrary schema-constrained JSON."""
-        if not self.api_key:
-            raise LLMError(f"{self.provider_name} API key is missing")
-        path = Path(pdf_path)
-        if not path.is_file():
-            raise LLMError(f"PDF file does not exist: {path}")
-        file_id: str | None = None
-        headers = {"Authorization": f"Bearer {self.api_key}"}
-        try:
-            with path.open("rb") as handle:
-                uploaded = self.client.post(
-                    f"{self.base_url}/files",
-                    headers=headers,
-                    data={"purpose": "user_data"},
-                    files={"file": (path.name, handle, "application/pdf")},
-                )
-            if uploaded.is_error:
-                raise self._http_error(uploaded)
-            upload_payload = uploaded.json()
-            if not isinstance(upload_payload, dict) or not isinstance(
-                upload_payload.get("id"), str
-            ):
-                raise LLMError("OpenAI Codex file upload returned no file ID")
-            file_id = upload_payload["id"]
+        del schema_name
+        return self._generate_json(prompt, schema=schema, pdf_path=Path(pdf_path))
 
-            request_payload = self._request_payload(prompt, schema=schema, schema_name=schema_name)
-            request_payload["input"] = [
-                {
-                    "role": "user",
-                    "content": [
-                        {"type": "input_file", "file_id": file_id},
-                        {"type": "input_text", "text": prompt},
-                    ],
-                }
-            ]
-            response = self.client.post(
-                f"{self.base_url}/responses",
-                headers=headers,
-                json=request_payload,
+    def analyze(self, prompt: str) -> LLMResponse:
+        try:
+            response = self.generate_json(
+                prompt, schema=ANALYSIS_JSON_SCHEMA, schema_name="paper_analysis"
             )
-            if response.is_error:
-                raise self._http_error(response)
-            structured = self._structured_response(response.json())
-            usage = dict(structured.usage)
-            usage["input_file_bytes"] = path.stat().st_size
-            return StructuredJSONResponse(
-                data=structured.data, usage=usage, raw=structured.raw
+            effective_model = str(
+                response.usage.get("effective_model") or self.model or "Codex CLI default"
             )
+            result = AnalysisResult.model_validate(response.data).model_copy(
+                update={"generated_by_model": model_attribution(effective_model)}
+            )
+            return LLMResponse(result=result, usage=response.usage, raw=response.raw)
         except LLMError:
             raise
-        except (OSError, httpx.HTTPError, ValueError, ValidationError) as exc:
-            raise LLMError(f"{self.provider_name} PDF request failed: {exc}") from exc
-        finally:
-            if file_id:
-                try:
-                    self.client.delete(f"{self.base_url}/files/{file_id}", headers=headers)
-                except httpx.HTTPError:
-                    pass
+        except ValidationError as exc:
+            raise LLMError(f"Codex CLI analysis failed: {exc}") from exc
 
     def analyze_pdf(self, prompt: str, pdf_path: Path) -> LLMResponse:
         try:
@@ -844,14 +1104,17 @@ class CodexClient(OpenAIClient):
                 schema=ANALYSIS_JSON_SCHEMA,
                 schema_name="paper_analysis",
             )
+            effective_model = str(
+                response.usage.get("effective_model") or self.model or "Codex CLI default"
+            )
             result = AnalysisResult.model_validate(response.data).model_copy(
-                update={"generated_by_model": model_attribution(self.model)}
+                update={"generated_by_model": model_attribution(effective_model)}
             )
             return LLMResponse(result=result, usage=response.usage, raw=response.raw)
         except LLMError:
             raise
         except ValidationError as exc:
-            raise LLMError(f"{self.provider_name} PDF analysis failed: {exc}") from exc
+            raise LLMError(f"Codex CLI PDF analysis failed: {exc}") from exc
 
 
 class ClaudeCodeClient:
@@ -1094,11 +1357,9 @@ def create_llm(config: LLMConfig, *, client: httpx.Client | None = None) -> LLMC
     if config.provider == "codex":
         return CodexClient(
             model=config.model,
-            base_url=config.base_url or "https://api.openai.com/v1",
-            api_key=config.api_key,
+            command=config.command or "codex",
             timeout_seconds=config.timeout_seconds,
             reasoning_effort=config.reasoning_effort or "medium",
-            client=client,
         )
     if config.provider == "claude-code":
         return ClaudeCodeClient(

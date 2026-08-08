@@ -18,7 +18,6 @@
 </section>
 <section class="panel">
   <div class="panel-heading"><div><h2>Linked sources</h2><p>Settings are shared when the same URL is linked to multiple authors. Pause stops checks without deleting history; remove only unlinks this author.</p></div><span>{{ blogs|length }}</span></div>
-  <form method="get" class="author-filter-form"><label><span>Filter source tag</span><select name="tag"><option value="">All tags</option>{% for tag in content_tags %}<option value="{{ tag.name }}" {% if active_tag == tag.name %}selected{% endif %}>{{ tag.name }}</option>{% endfor %}</select></label>{% if active_tag %}<a class="button button-small" href="/authors/{{ author.openalex_id }}/blogs">Clear</a>{% endif %}</form>
   <div class="table-wrap"><table class="author-blog-table linked-sources-table">
     <colgroup class="linked-sources-columns">
       <col class="linked-source-col-source">
@@ -32,7 +31,7 @@
       <col class="linked-source-col-state">
       <col class="linked-source-col-remove">
     </colgroup>
-    <thead><tr><th>Source</th><th class="linked-source-icon-heading">Open</th><th>Relationship</th><th class="linked-source-centered-heading">Method</th><th>Last checked</th><th class="linked-source-centered-heading">Updates</th><th class="linked-source-centered-heading">Status</th><th>Tags</th><th class="linked-source-icon-heading">Pause</th><th class="linked-source-icon-heading">Remove</th></tr></thead>
+    <thead><tr><th class="linked-source-source-heading"><div class="linked-source-source-header"><span>Source</span><form method="get" class="linked-source-tag-filter"><label><span class="visually-hidden">Filter source tag</span><select name="tag" aria-label="Filter source tag" data-search-placeholder="Filter source tag"><option value="">All tags</option>{% for tag in content_tags %}<option value="{{ tag.name }}" {% if active_tag == tag.name %}selected{% endif %}>{{ tag.name }}</option>{% endfor %}</select></label>{% if active_tag %}<a class="button button-small linked-source-tag-clear" href="/authors/{{ author.openalex_id }}/blogs" title="Clear source tag filter" aria-label="Clear source tag filter">×</a>{% endif %}</form></div></th><th class="linked-source-icon-heading">Open</th><th>Relationship</th><th class="linked-source-centered-heading">Method</th><th>Last checked</th><th class="linked-source-centered-heading">Updates</th><th class="linked-source-centered-heading">Status</th><th>Tags</th><th class="linked-source-icon-heading">Pause</th><th class="linked-source-icon-heading">Remove</th></tr></thead>
     <tbody>
   {% for blog in blogs %}
     <tr class="blog-source-main-row {% if blog.dead or not blog.enabled %}blog-source-broken {% endif %}{% if blog.notes %}object-row-mark{% endif %}">

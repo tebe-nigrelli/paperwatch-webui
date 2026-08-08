@@ -27,8 +27,8 @@
 
 <section class="panel">
   <div class="panel-heading"><h2>Recent outputs</h2><span>{{ runs|length }}</span></div>
-  <div class="table-wrap"><table><thead><tr><th>Query</th><th>Model</th><th>Status</th><th>Records</th><th>Created</th><th>Output</th></tr></thead><tbody>
-  {% for run in runs %}<tr><td><a href="#query-{{ run.query_id }}">{{ run.query_name }}</a></td><td>{{ run.model }}</td><td><span class="status status-{{ run.status }}">{{ run.status }}</span>{% if run.error_text %}<small class="task-error">{{ run.error_text }}</small>{% endif %}</td><td>{{ run.matched_count }}{% if run.selection_label %}<small>{{ run.selection_label }}</small>{% endif %}</td><td>{{ run.created_at }}</td><td class="query-output-link-cell"><a href="/queries/runs/{{ run.id }}">{% if run.output %}Open result{% elif run.status in ('queued', 'running') %}View status{% else %}View error{% endif %}</a></td></tr>{% else %}<tr><td colspan="6" class="empty">No query outputs.</td></tr>{% endfor %}
+  <div class="table-wrap"><table class="query-runs-table"><thead><tr><th>Query</th><th>Model</th><th class="query-run-status-column">Status</th><th class="query-run-records-column">Records</th><th>Created</th><th>Output</th></tr></thead><tbody>
+  {% for run in runs %}<tr><td><a href="#query-{{ run.query_id }}">{{ run.query_name }}</a></td><td>{{ run.model }}</td><td class="query-run-status-cell"><span class="status status-{{ run.status }}">{{ run.status }}</span>{% if run.error_text %}<small class="task-error">{{ run.error_text }}</small>{% endif %}</td><td class="query-run-records-cell">{{ run.matched_count }}{% if run.selection_label %}<small>{{ run.selection_label }}</small>{% endif %}</td><td>{{ run.created_at }}</td><td class="query-output-link-cell"><a href="/queries/runs/{{ run.id }}">{% if run.output %}Open result{% elif run.status in ('queued', 'running') %}View status{% else %}View error{% endif %}</a></td></tr>{% else %}<tr><td colspan="6" class="empty">No query outputs.</td></tr>{% endfor %}
   </tbody></table></div>
 </section>
 {% endblock %}

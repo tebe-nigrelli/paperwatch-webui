@@ -1094,6 +1094,13 @@ def _safe_markdown_url(value: str) -> str | None:
     return parsed.geturl()
 
 
+def _inline_display_text(value: Any) -> str:
+    """Collapse stored/escaped line breaks for one-line prose displays."""
+    text = "" if value is None else str(value)
+    text = text.replace("\\r\\n", " ").replace("\\n", " ").replace("\\r", " ")
+    return " ".join(text.split())
+
+
 def _render_stored_markdown(value: str) -> str:
     """Render stored summaries and extracted blog markdown without raw HTML.
 
@@ -1954,6 +1961,7 @@ def create_app(
     )
     templates.env.filters["querystring"] = lambda items: urlencode(items)
     templates.env.filters["markdown"] = _render_stored_markdown
+    templates.env.filters["inline_text"] = _inline_display_text
 
     app = FastAPI(title="paperwatch", docs_url=None, redoc_url=None, openapi_url=None)
     app.state.config = config

@@ -61,7 +61,7 @@ class LLMConfig:
     prompt_version: str
     reasoning_effort: str | None = None
     profile: str = "default"
-    command: str = "claude"
+    command: str = ""
 
 
 @dataclass(frozen=True)
@@ -131,17 +131,21 @@ def _llm_config(
         )
     default_url = (
         "https://api.openai.com/v1"
-        if provider in {"openai", "codex"}
-        else "http://localhost:11434"
+        if provider == "openai"
+        else ("http://localhost:11434" if provider == "ollama" else "")
     )
     same_provider = provider == str(inherited.get("provider", provider)).strip().lower()
     inherited_url = inherited.get("base_url") if same_provider else None
     api_key = str(section.get("api_key", inherited.get("api_key", "") if same_provider else "")).strip()
-    if provider in {"openai", "codex"} and not api_key:
+    if provider == "openai" and not api_key:
         api_key = os.getenv("OPENAI_API_KEY", "").strip()
+    command_default = "codex" if provider == "codex" else ("claude" if provider == "claude-code" else "")
+    inherited_command = inherited.get("command") if same_provider else None
+    inherited_model = inherited.get("model", "qwen3:8b") if same_provider else None
+    default_model = "" if provider == "codex" and inherited_model is None else (inherited_model or "qwen3:8b")
     return LLMConfig(
         provider=provider,
-        model=str(section.get("model", inherited.get("model", "qwen3:8b"))).strip(),
+        model=str(section.get("model", default_model)).strip(),
         base_url=str(section.get("base_url", inherited_url or default_url)).rstrip("/"),
         api_key=api_key,
         timeout_seconds=float(section.get("timeout_seconds", inherited.get("timeout_seconds", 180))),
@@ -170,7 +174,10 @@ def _llm_config(
             or ("medium" if provider == "codex" else None)
         ),
         profile=profile,
-        command=str(section.get("command", inherited.get("command", "claude"))).strip() or "claude",
+        command=(
+            str(section.get("command", inherited_command or command_default)).strip()
+            or command_default
+        ),
     )
 
 
@@ -193,7 +200,10 @@ def load_config(path: str | Path = "config.toml") -> AppConfig:
     llm = _section(data, "llm")
 
     primary_values = dict(llm)
-    if not str(primary_values.get("api_key", "")).strip():
+    if (
+        str(primary_values.get("provider", "ollama")).strip().lower() == "openai"
+        and not str(primary_values.get("api_key", "")).strip()
+    ):
         primary_values["api_key"] = os.getenv("OPENAI_API_KEY", "").strip()
     primary_llm = _llm_config(primary_values, profile="default")
 
@@ -210,7 +220,8 @@ def load_config(path: str | Path = "config.toml") -> AppConfig:
             raise ConfigError("Each [[llm_profiles]] entry requires a name")
         if name in profile_names:
             raise ConfigError(f"Duplicate LLM profile name: {name}")
-        if not str(raw.get("model", "")).strip():
+        raw_provider = str(raw.get("provider", primary_values.get("provider", "ollama"))).strip().lower()
+        if raw_provider != "codex" and not str(raw.get("model", "")).strip():
             raise ConfigError(f"LLM profile {name!r} requires a model")
         profile_names.add(name)
         profiles.append(_llm_config(raw, profile=name, defaults=primary_values))
@@ -272,7 +283,7 @@ def load_config(path: str | Path = "config.toml") -> AppConfig:
             raise ConfigError(
                 f"LLM profile {item.profile!r} pdf_analysis_strategy must be auto, direct, or chunked"
             )
-        if item.provider != "none" and not item.model:
+        if item.provider not in {"none", "codex"} and not item.model:
             raise ConfigError(f"LLM profile {item.profile!r} model cannot be empty")
         if item.provider not in {"openai", "codex", "claude-code"} and item.reasoning_effort is not None:
             raise ConfigError(
@@ -298,10 +309,9 @@ def load_config(path: str | Path = "config.toml") -> AppConfig:
             raise ConfigError(
                 f"Claude Code profile {item.profile!r} reasoning_effort must be low, medium, high, xhigh, or max"
             )
-        if item.provider in {"openai", "codex"} and not item.api_key:
-            provider_name = "OpenAI Codex" if item.provider == "codex" else "OpenAI"
+        if item.provider == "openai" and not item.api_key:
             raise ConfigError(
-                f"OPENAI_API_KEY or api_key is required for {provider_name} profile {item.profile!r}"
+                f"OPENAI_API_KEY or api_key is required for OpenAI profile {item.profile!r}"
             )
 
     cfg.paths.pdf_dir.mkdir(parents=True, exist_ok=True)

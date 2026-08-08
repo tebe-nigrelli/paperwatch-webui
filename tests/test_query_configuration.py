@@ -318,6 +318,9 @@ def test_default_query_installer_and_actions_column_deletion(config_path):
     assert css.status_code == 200
     assert "table:not(.unified-content-table):not(.saved-query-table)" in css.text
     assert ".table-wrap>.saved-query-table{width:100%;min-width:100%;max-width:100%" in css.text
+    assert 'class="query-runs-table"' in page.text
+    assert 'class="query-run-records-column"' in page.text
+    assert ".query-run-records-column,.query-run-records-cell{width:7rem;max-width:7rem" in css.text
 
     for row in optional:
         assert f'action="/queries/{int(row["id"])}/delete"' in page.text

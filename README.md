@@ -36,7 +36,7 @@ Failures are isolated per author, paper, PDF, model, or saved query. Cross-proce
 - Python 3.11+
 - An OpenAlex API key
 - Ollama, an OpenAI API key, or metadata-only mode
-- Optional OpenAI Codex API or locally authenticated Claude Code model access
+- Optional locally authenticated Codex CLI or Claude Code model access
 
 ## Install
 
@@ -76,16 +76,16 @@ ollama list
 
 Ollama is the local model runtime; `qwen3:8b`, `llama3.1:8b`, and similar names are models downloaded into it. The model named in `config.toml` must appear in `ollama list`.
 
-For OpenAI or OpenAI Codex API profiles:
+For OpenAI API profiles:
 
 ```bash
 export OPENAI_API_KEY='...'
 ```
 
-Paperwatch calls Codex models directly through the OpenAI Responses API. It does not
-shell out to the Codex coding-agent CLI and does not read Codex CLI ChatGPT-login
-credentials. This keeps paper analysis deterministic, schema-constrained, and free of
-filesystem or tool access.
+For Codex CLI profiles, install `codex` and sign in once with the account you want
+Paperwatch to reuse. `provider = "codex"` invokes `codex exec` in read-only mode and
+uses the CLI's existing authentication; Paperwatch does not require `OPENAI_API_KEY`
+for that provider.
 
 ## Start the Web UI
 
@@ -240,8 +240,7 @@ prompt_version = "v2"
 name = "codex-review"
 provider = "codex"
 model = "gpt-5.3-codex"
-base_url = "https://api.openai.com/v1"
-api_key = "" # Prefer OPENAI_API_KEY
+command = "codex"
 reasoning_effort = "high"
 timeout_seconds = 600
 max_input_chars = 1000000
@@ -383,19 +382,19 @@ curl http://localhost:11434/api/chat \
 
 Paperwatch performs one model-readiness check at the start of a daily run. If the model is unavailable, it still discovers papers and downloads PDFs, records one actionable error, and leaves the initial author cursor unchanged so the full one-year window can be analyzed after the model is installed. Native Ollama `/api/chat` is preferred; an OpenAI-compatible `/v1/chat/completions` endpoint is used as a fallback for compatible local servers such as llama.cpp.
 
-## OpenAI Codex
+## Codex CLI
 
-Codex support uses the OpenAI Responses API and strict JSON Schema output. Configure it
-as an additional model profile so the same paper can be summarized by Ollama and Codex
-side by side:
+Set `provider = "codex"` to run the installed Codex CLI in headless mode with its
+existing local authentication. Paperwatch invokes `codex exec`, supplies the requested
+JSON Schema through `--output-schema`, runs the agent in the read-only sandbox, and
+captures the final structured response. No OpenAI API key is read for this provider.
 
 ```toml
 [[llm_profiles]]
 name = "codex-review"
 provider = "codex"
 model = "gpt-5.3-codex"
-base_url = "https://api.openai.com/v1"
-api_key = ""
+command = "codex"
 reasoning_effort = "high"
 timeout_seconds = 600
 max_input_chars = 1000000
@@ -404,21 +403,19 @@ analyze_pdfs = true
 prompt_version = "v2"
 ```
 
-Then start Paperwatch with the API key available:
+Run `codex` once and complete its normal login before starting Paperwatch. To switch
+the primary `[llm]` section of an existing config without hand-editing TOML:
 
 ```bash
-export OPENAI_API_KEY='...'
-uv run paperwatch --config config.toml web
+paperwatch --config config.toml config provider codex
 ```
 
-On a paper page, select `codex-review` in **Summarize or rerun**. For a full-paper
-analysis, **Direct** and **Auto** upload the original PDF to OpenAI with file purpose
-`user_data`, attach the returned file ID to the Responses request, and delete the remote
-file after the response. The PDF is not replaced with locally extracted text in this
-path, so figures, page layout, tables, appendices, and bibliography remain available to
-the model. **Chunk + merge** remains an explicit alternative that extracts and processes
-text locally in bounded chunks. The reasoning effort and PDF content hash are part of
-the analysis cache identity.
+That command preserves the rest of `[llm]`, changes `provider` to `codex`, and sets
+`command = "codex"`. Existing `base_url` or `api_key` lines are left in place so they
+are available if you switch back to `openai`, but Codex CLI mode ignores them.
+
+For whole-PDF runs, Paperwatch gives the Codex CLI the local PDF path and keeps the
+agent read-only. Chunk + merge remains available as the extracted-text alternative.
 
 ## Claude Code CLI
 

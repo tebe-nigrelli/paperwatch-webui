@@ -17,7 +17,7 @@
     <div><dt>arXiv</dt><dd>{{ paper.arxiv_id or '—' }}</dd></div>
     <div><dt>Published</dt><dd>{{ paper.publication_date or '—' }}</dd></div>
   </dl>
-  <div class="prose"><h3>Abstract</h3>{% if paper.abstract %}<p>{{ paper.abstract }}</p>{% else %}<p class="muted">OpenAlex does not provide an abstract for this result.</p>{% endif %}</div>
+  <div class="prose"><h3>Abstract</h3>{% if paper.abstract %}<p>{{ paper.abstract|inline_text }}</p>{% else %}<p class="muted">OpenAlex does not provide an abstract for this result.</p>{% endif %}</div>
   {% if paper.topics %}<div><h3>Topics</h3><div class="tag-list">{% for topic in paper.topics %}<span class="tag">{{ topic.name }}</span>{% endfor %}</div></div>{% endif %}
 </section>
 {% endblock %}

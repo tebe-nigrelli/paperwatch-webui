@@ -2,7 +2,7 @@
 {% from "_author_panel.html" import author_panel %}
 {% block title %}{{ paper.title }} · paperwatch{% endblock %}
 {% block content %}
-<div class="paper-detail-root" data-pdf-drop-target>
+<div class="paper-detail-root" data-pdf-drop-target data-paper-id="{{ paper.id }}">
 <section class="page-heading paper-heading"{% if not paper.read_at %} data-auto-read data-content-type="paper" data-content-id="{{ paper.id }}"{% endif %}>
   <div class="paper-meta"><span>{{ paper.publication_date or 'Unknown date' }}</span><span>{{ paper.venue or 'Venue unavailable' }}</span></div>
   <h1{% if paper.notes or paper.pdf_modified %} class="object-name-noted"{% endif %}>{{ paper.title }}</h1>
@@ -41,6 +41,7 @@
           {% if paper.pdf_modified and paper.pdf_url %}<form method="post" action="/papers/{{ paper.id }}/pdf/restore" data-confirm="Replace the local PDF with a fresh download from the stored source?"><button class="button button-warning" type="submit">Restore PDF</button></form>{% endif %}
           <a class="button" href="/papers/{{ paper.id }}/export.json">Export JSON</a>
           <form method="post" action="/papers/{{ paper.id }}/delete" data-confirm="Mark this paper and all stored identifiers/source links as dead? It will not be fetched again."><button class="button button-danger" type="submit">Delete</button></form>
+          <button class="button icon-button" type="button" data-copy-source="paper-source-metadata-copy" data-copy-icon aria-label="Copy source metadata" title="Copy source metadata"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M8 7V5a2 2 0 0 1 2-2h8a2 2 0 0 1 2 2v10a2 2 0 0 1-2 2h-2M6 7h8a2 2 0 0 1 2 2v10a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V9a2 2 0 0 1 2-2Z" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg></button>
         </div>
         <form method="post" action="/papers/{{ paper.id }}/tags/add" class="inline-tag-form compact-action-form" data-async-action data-refresh-selector=".paper-reference-panel" data-enter-submit><label><span>Add tag</span><input name="tag" list="content-tag-options" maxlength="40" required placeholder="Type and press Enter"></label></form>
         <form method="post" action="/papers/{{ paper.id }}/pdf/upload" enctype="multipart/form-data" class="inline-upload-form compact-action-form" data-pdf-upload-form><label><span>{{ 'Replace local PDF' if paper.local_pdf_path else 'Import PDF' }}</span><input type="file" name="pdf" accept="application/pdf,.pdf" required data-auto-upload></label></form>
@@ -50,13 +51,12 @@
     </div>
   </div>
   <datalist id="content-tag-options">{% for tag in content_tags %}<option value="{{ tag.name }}">{% endfor %}</datalist>
+  <pre id="paper-source-metadata-copy" hidden>{{ metadata|prettyjson }}</pre>
 </section>
-{% if paper.abstract %}<section class="panel prose"><div class="panel-heading"><h2>Source abstract</h2></div><p>{{ paper.abstract }}</p></section>{% endif %}
+{% if paper.abstract %}<section class="panel prose"><div class="panel-heading"><h2>Source abstract</h2></div><p>{{ paper.abstract|inline_text }}</p></section>{% endif %}
 <section class="panel object-notes-panel inline-notes-panel" data-inline-notes><div class="panel-heading">{% if not paper.notes %}<div><h2>Notes</h2><p>Private Markdown notes for this paper.</p></div>{% else %}<span></span>{% endif %}<button class="button button-small" type="button" data-notes-edit>{{ 'Edit' if paper.notes else 'Add notes' }}</button></div><div data-notes-display>{% if paper.notes %}<article class="prose notes-rendered">{{ paper.notes|markdown|safe }}</article>{% else %}<p class="muted">No notes.</p>{% endif %}</div><form method="post" action="/notes/paper/{{ paper.id }}" data-async-action data-refresh-selector=".object-notes-panel" data-notes-form hidden><textarea name="notes" rows="8" maxlength="200000" placeholder="Markdown notes">{{ paper.notes or '' }}</textarea><div class="button-group"><button class="button button-primary" type="submit">Save notes</button><button class="button" type="button" data-notes-cancel>Cancel</button></div></form></section>
 
 <div id="paper-results">
-<details class="panel"><summary>Source metadata</summary><pre>{{ metadata|prettyjson }}</pre></details>
-
 <section class="panel model-task-history">
   <h3 class="subheading">Recent tasks</h3>
   {% if analysis_tasks %}<div class="table-wrap"><table><thead><tr><th>Model</th><th>Source</th><th>Strategy</th><th>Status</th><th>Result</th></tr></thead><tbody>{% for task in analysis_tasks %}<tr><td><strong>{{ task.profile }}</strong><small>{{ task.model }}</small></td><td>{{ task.scope }}</td><td>{{ task.analysis_strategy }}{% if task.context_window_tokens %}<small>{{ task.context_window_tokens }} tokens · {{ task.chunk_count }} chunks</small>{% endif %}</td><td><span class="status status-{{ task.status }}">{{ task.status }}</span>{% if task.error_text %}<small class="task-error">{{ task.error_text }}</small>{% endif %}</td><td>{% if task.analysis_id %}<a href="/analyses/{{ task.analysis_id }}">Open</a>{% else %}—{% endif %}</td></tr>{% endfor %}</tbody></table></div>{% else %}<p class="muted">No analysis tasks yet.</p>{% endif %}

@@ -388,6 +388,8 @@ def test_blog_saved_prompt_routes_and_collection_runner(config_path):
             "override_query_defaults": "1",
             "model": "default",
             "context_window_tokens": "2048",
+            "source_scope": "pdf",
+            "pdf_strategy": "direct",
         },
         headers={"x-paperwatch-async": "1"},
     )
@@ -397,7 +399,9 @@ def test_blog_saved_prompt_routes_and_collection_runner(config_path):
     assert args[:3] == (query_id, ("default",), 2048)
     assert kwargs["content_type"] == "blogs"
     assert kwargs["selection"]["blog_entry_ids"] == [entry_id]
+    # The PDF-oriented Codex choice means whole stored text for blogs.
     assert kwargs["source_scope"] == "blog"
+    assert kwargs["pdf_strategy"] == "auto"
 
     selected = client.post(
         "/queries/run-blogs",
