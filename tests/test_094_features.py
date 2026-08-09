@@ -268,6 +268,7 @@ def test_catalog_and_full_data_management_round_trip(
 
     delete_blogs = client.post("/data/delete/blogs", follow_redirects=False)
     assert delete_blogs.status_code == 303
+    assert delete_blogs.headers["location"].startswith("/data?")
     with Database(config.paths.database) as db:
         assert db.get_blog_entry(entry_id) is None
         assert any(int(row["id"]) == blog_id for row in db.list_enabled_blogs())
@@ -296,6 +297,7 @@ def test_catalog_and_full_data_management_round_trip(
         follow_redirects=False,
     )
     assert import_catalog.status_code == 303
+    assert import_catalog.headers["location"].startswith("/data?")
     with Database(config.paths.database) as db:
         authors = db.list_authors(tracked_only=True)
         assert len(authors) == 1
@@ -308,6 +310,7 @@ def test_catalog_and_full_data_management_round_trip(
         follow_redirects=False,
     )
     assert import_full.status_code == 303
+    assert import_full.headers["location"].startswith("/data?")
     assert "Imported+the+full+Paperwatch" in import_full.headers["location"]
     with Database(config.paths.database) as db:
         assert db.get_paper(paper_id) is not None
@@ -350,6 +353,7 @@ def test_data_management_rejects_missing_files_and_active_jobs(config_path):
     ):
         response = busy.post(endpoint, data={}, follow_redirects=False)
         assert response.status_code == 303
+        assert response.headers["location"].startswith("/data?")
         assert "Stop+active+jobs" in response.headers["location"]
 
 

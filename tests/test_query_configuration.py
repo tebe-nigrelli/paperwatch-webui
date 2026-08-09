@@ -278,7 +278,7 @@ def test_default_query_installer_and_actions_column_deletion(config_path):
 
     installed = client.post("/data/queries/defaults", follow_redirects=False)
     assert installed.status_code == 303
-    assert installed.headers["location"].startswith("/queries?")
+    assert installed.headers["location"].startswith("/data?")
     assert "All+default+queries+are+already+present" in installed.headers["location"]
 
     with Database(config.paths.database) as db:

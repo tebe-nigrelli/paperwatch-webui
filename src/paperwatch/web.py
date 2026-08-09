@@ -5462,20 +5462,20 @@ def create_app(
     def delete_all_authors() -> RedirectResponse:
         if not _data_actions_available():
             return RedirectResponse(
-                _notice_url("/runs", "Stop active jobs before deleting data.", level="warning"),
+                _notice_url("/data", "Stop active jobs before deleting data.", level="warning"),
                 status_code=303,
             )
         with Database(config.paths.database) as db:
             count = db.delete_all_authors()
         return RedirectResponse(
-            _notice_url("/runs", f"Deleted {count} author record(s)."), status_code=303
+            _notice_url("/data", f"Deleted {count} author record(s)."), status_code=303
         )
 
     @app.post("/data/delete/papers")
     def delete_all_papers() -> RedirectResponse:
         if not _data_actions_available():
             return RedirectResponse(
-                _notice_url("/runs", "Stop active jobs before deleting data.", level="warning"),
+                _notice_url("/data", "Stop active jobs before deleting data.", level="warning"),
                 status_code=303,
             )
         with Database(config.paths.database) as db:
@@ -5489,7 +5489,7 @@ def create_app(
                 removed += 1
         return RedirectResponse(
             _notice_url(
-                "/runs", f"Deleted {count} paper record(s) and {removed} stored PDF(s)."
+                "/data", f"Deleted {count} paper record(s) and {removed} stored PDF(s)."
             ),
             status_code=303,
         )
@@ -5498,14 +5498,14 @@ def create_app(
     def delete_all_downloaded_blogs() -> RedirectResponse:
         if not _data_actions_available():
             return RedirectResponse(
-                _notice_url("/runs", "Stop active jobs before deleting data.", level="warning"),
+                _notice_url("/data", "Stop active jobs before deleting data.", level="warning"),
                 status_code=303,
             )
         with Database(config.paths.database) as db:
             count = db.delete_all_blog_entries()
         return RedirectResponse(
             _notice_url(
-                "/runs",
+                "/data",
                 f"Deleted {count} downloaded blog entr{'y' if count == 1 else 'ies'}; source links were kept.",
             ),
             status_code=303,
@@ -5515,14 +5515,14 @@ def create_app(
     def delete_all_summaries() -> RedirectResponse:
         if not _data_actions_available():
             return RedirectResponse(
-                _notice_url("/runs", "Stop active jobs before deleting data.", level="warning"),
+                _notice_url("/data", "Stop active jobs before deleting data.", level="warning"),
                 status_code=303,
             )
         with Database(config.paths.database) as db:
             count = db.delete_all_summaries()
         return RedirectResponse(
             _notice_url(
-                "/runs",
+                "/data",
                 f"Deleted {count} generated summar{'y' if count == 1 else 'ies'} and their task history.",
             ),
             status_code=303,
@@ -5532,14 +5532,14 @@ def create_app(
     def delete_fetch_history() -> RedirectResponse:
         if not _data_actions_available():
             return RedirectResponse(
-                _notice_url("/runs", "Stop active jobs before deleting data.", level="warning"),
+                _notice_url("/data", "Stop active jobs before deleting data.", level="warning"),
                 status_code=303,
             )
         with Database(config.paths.database) as db:
             count = db.delete_fetch_history()
         return RedirectResponse(
             _notice_url(
-                "/runs",
+                "/data",
                 f"Deleted {count} fetch-history record{'s' if count != 1 else ''}.",
             ),
             status_code=303,
@@ -5555,20 +5555,20 @@ def create_app(
             if count
             else "All default queries are already present."
         )
-        return RedirectResponse(_notice_url("/queries", message), status_code=303)
+        return RedirectResponse(_notice_url("/data", message), status_code=303)
 
     @app.post("/data/delete/queries")
     def delete_all_queries() -> RedirectResponse:
         if not _data_actions_available():
             return RedirectResponse(
-                _notice_url("/runs", "Stop active jobs before deleting data.", level="warning"),
+                _notice_url("/data", "Stop active jobs before deleting data.", level="warning"),
                 status_code=303,
             )
         with Database(config.paths.database) as db:
             count = db.delete_all_queries()
         return RedirectResponse(
             _notice_url(
-                "/runs",
+                "/data",
                 f"Deleted {count} saved quer{'y' if count == 1 else 'ies'}; the built-in query was restored.",
             ),
             status_code=303,
@@ -5578,14 +5578,14 @@ def create_app(
     def delete_query_history() -> RedirectResponse:
         if not _data_actions_available():
             return RedirectResponse(
-                _notice_url("/runs", "Stop active jobs before deleting data.", level="warning"),
+                _notice_url("/data", "Stop active jobs before deleting data.", level="warning"),
                 status_code=303,
             )
         with Database(config.paths.database) as db:
             count = db.delete_query_history()
         return RedirectResponse(
             _notice_url(
-                "/runs",
+                "/data",
                 f"Deleted {count} saved-query output record{'s' if count != 1 else ''}.",
             ),
             status_code=303,
@@ -5606,14 +5606,14 @@ def create_app(
     async def import_authors_blogs(request: Request) -> RedirectResponse:
         if not _data_actions_available():
             return RedirectResponse(
-                _notice_url("/runs", "Stop active jobs before importing data.", level="warning"),
+                _notice_url("/data", "Stop active jobs before importing data.", level="warning"),
                 status_code=303,
             )
         form = await request.form()
         upload = form.get("file")
         if not isinstance(upload, UploadFile):
             return RedirectResponse(
-                _notice_url("/runs", "Choose an authors and blogs JSON file.", level="error"),
+                _notice_url("/data", "Choose an authors and blogs JSON file.", level="error"),
                 status_code=303,
             )
         try:
@@ -5627,13 +5627,13 @@ def create_app(
                 authors_count, links_count = db.import_author_blog_catalog(payload)
         except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
             return RedirectResponse(
-                _notice_url("/runs", str(exc), level="error"), status_code=303
+                _notice_url("/data", str(exc), level="error"), status_code=303
             )
         finally:
             await upload.close()
         return RedirectResponse(
             _notice_url(
-                "/runs",
+                "/data",
                 f"Imported {authors_count} author(s) and {links_count} author-blog link(s).",
             ),
             status_code=303,
@@ -5683,14 +5683,14 @@ def create_app(
     async def import_all_data(request: Request) -> RedirectResponse:
         if not _data_actions_available():
             return RedirectResponse(
-                _notice_url("/runs", "Stop active jobs before importing data.", level="warning"),
+                _notice_url("/data", "Stop active jobs before importing data.", level="warning"),
                 status_code=303,
             )
         form = await request.form()
         upload = form.get("file")
         if not isinstance(upload, UploadFile):
             return RedirectResponse(
-                _notice_url("/runs", "Choose a Paperwatch full-data ZIP file.", level="error"),
+                _notice_url("/data", "Choose a Paperwatch full-data ZIP file.", level="error"),
                 status_code=303,
             )
         staging_root = Path(tempfile.mkdtemp(prefix="paperwatch-import-"))
@@ -5775,13 +5775,13 @@ def create_app(
             os.replace(pdf_stage, pdf_target)
         except (OSError, sqlite3.Error, zipfile.BadZipFile, json.JSONDecodeError, ValueError) as exc:
             return RedirectResponse(
-                _notice_url("/runs", f"Import failed: {exc}", level="error"), status_code=303
+                _notice_url("/data", f"Import failed: {exc}", level="error"), status_code=303
             )
         finally:
             await upload.close()
             shutil.rmtree(staging_root, ignore_errors=True)
         return RedirectResponse(
-            _notice_url("/runs", "Imported the full Paperwatch database and PDF store."),
+            _notice_url("/data", "Imported the full Paperwatch database and PDF store."),
             status_code=303,
         )
 
