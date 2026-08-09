@@ -183,6 +183,34 @@ def test_transaction_rolls_back_and_newer_schema_is_rejected(tmp_path):
         Database(path)
 
 
+def test_reopening_unchanged_database_skips_schema_initialization(tmp_path, monkeypatch):
+    path = tmp_path / "db.sqlite"
+    with Database(path):
+        pass
+
+    def unexpected_schema_check(_self):
+        raise AssertionError("unchanged databases should reuse schema initialization")
+
+    monkeypatch.setattr(
+        Database, "_ensure_author_tracking_column", unexpected_schema_check
+    )
+    with Database(path) as db:
+        assert db._conn.execute("PRAGMA foreign_keys").fetchone()[0] == 1
+
+
+def test_schema_change_invalidates_cached_initialization(tmp_path):
+    path = tmp_path / "db.sqlite"
+    with Database(path) as db:
+        db._conn.execute("DROP INDEX idx_papers_doi")
+        db._conn.commit()
+
+    with Database(path) as db:
+        indexes = {
+            row["name"] for row in db._conn.execute("PRAGMA index_list(papers)")
+        }
+        assert "idx_papers_doi" in indexes
+
+
 def test_adding_author_relinks_existing_coauthorship(tmp_path, author_candidate, paper_record):
     with Database(tmp_path / "db.sqlite") as db:
         paper_id, _ = db.upsert_paper(paper_record)

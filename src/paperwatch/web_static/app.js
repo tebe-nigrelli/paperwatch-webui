@@ -1440,14 +1440,29 @@
   };
   if (document.querySelector("#content-page-root")) rememberContentUrl(window.location.href);
   let contentRefreshSequence = 0;
+  let contentRefreshController = null;
   const refreshContentPage = async (url = window.location.href, push = false) => {
     const refreshSequence = ++contentRefreshSequence;
-    const response = await fetch(url, {
-      cache: "no-store",
-      headers: { "X-Paperwatch-Partial": "1" },
-    });
-    if (!response.ok) throw new Error(`Request failed with HTTP ${response.status}`);
-    const doc = parseHtml(await response.text());
+    contentRefreshController?.abort();
+    const refreshController = new AbortController();
+    contentRefreshController = refreshController;
+    let response;
+    let responseText;
+    try {
+      response = await fetch(url, {
+        cache: "no-store",
+        headers: { "X-Paperwatch-Partial": "1" },
+        signal: refreshController.signal,
+      });
+      if (!response.ok) throw new Error(`Request failed with HTTP ${response.status}`);
+      responseText = await response.text();
+    } catch (error) {
+      if (error?.name === "AbortError") return false;
+      throw error;
+    } finally {
+      if (contentRefreshController === refreshController) contentRefreshController = null;
+    }
+    const doc = parseHtml(responseText);
     if (refreshSequence !== contentRefreshSequence) return false;
     syncContentResultsRunnerFromDocument(doc);
     const incomingResults = doc.querySelector("#content-results-root");

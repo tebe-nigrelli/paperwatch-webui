@@ -2581,6 +2581,10 @@ def create_app(
             "default-src 'self'; style-src 'self'; img-src 'self' data: https: http:; "
             "script-src 'self'; base-uri 'self'; form-action 'self'; frame-ancestors 'none'"
         )
+        if request.url.path.startswith("/static/"):
+            # Static asset URLs carry a content digest, so they can be reused
+            # without a validation request and automatically change on updates.
+            response.headers["Cache-Control"] = "public, max-age=31536000, immutable"
         return response
 
     def _render_content_page(

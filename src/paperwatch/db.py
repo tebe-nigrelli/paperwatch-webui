@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import hashlib
 import sqlite3
+import threading
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
@@ -23,6 +24,13 @@ from .models import (
 
 
 SCHEMA_VERSION = 32
+
+# Schema creation and migrations are process-level work, while normal database
+# access is connection-level work.  Keep the expensive initialization result
+# for each physical database file so short-lived web request connections do not
+# re-run every CREATE TABLE/INDEX and migration probe.
+_INITIALIZED_DATABASES: dict[Path, tuple[int, int, int]] = {}
+_DATABASE_INITIALIZATION_LOCK = threading.Lock()
 BLOG_SOURCE_MODES = {
     "auto",
     "feed",
@@ -681,56 +689,72 @@ class Database:
             deterministic=True,
         )
         self._conn.execute("PRAGMA foreign_keys = ON")
-        self._conn.execute("PRAGMA journal_mode = WAL")
         self._conn.execute("PRAGMA busy_timeout = 10000")
-        version = int(self._conn.execute("PRAGMA user_version").fetchone()[0])
-        if version > SCHEMA_VERSION:
-            self._conn.close()
-            raise DatabaseError(
-                f"Database schema version {version} is newer than supported version {SCHEMA_VERSION}"
-            )
+        database_key = self.path.resolve()
+        with _DATABASE_INITIALIZATION_LOCK:
+            version = int(self._conn.execute("PRAGMA user_version").fetchone()[0])
+            identity = self._database_identity()
+            if (
+                version == SCHEMA_VERSION
+                and _INITIALIZED_DATABASES.get(database_key) == identity
+            ):
+                return
+            if version > SCHEMA_VERSION:
+                self._conn.close()
+                raise DatabaseError(
+                    f"Database schema version {version} is newer than supported version {SCHEMA_VERSION}"
+                )
 
-        self._conn.executescript(COMMON_SCHEMA)
-        self._ensure_author_tracking_column()
-        self._ensure_paper_columns()
-        self._ensure_extended_metadata_columns()
-        if version == 1:
-            self._migrate_v1_analyses()
-        elif version == 0 and self._is_legacy_analyses_table():
-            self._migrate_v1_analyses()
-        else:
-            self._conn.executescript(ANALYSES_SCHEMA)
-        self._conn.executescript(ANALYSIS_TASKS_SCHEMA)
-        self._ensure_analysis_columns()
-        self._conn.executescript(EXTRA_SCHEMA)
-        self._migrate_saved_queries_v25()
-        self._migrate_saved_queries_v32()
-        self._ensure_query_columns()
-        self._migrate_query_runs_v32()
-        self._conn.executescript(QUERY_RUN_CONTENT_INDEXES)
-        self._ensure_default_saved_queries()
-        self._conn.executescript(TOPICS_SCHEMA)
-        self._conn.executescript(BLOGS_SCHEMA)
-        self._ensure_blog_columns()
-        self._ensure_extended_metadata_columns()
-        self._ensure_default_settings()
-        if version < 17:
-            self._promote_initial_blog_items()
-        if version < 18:
-            self._migrate_feed_article_tracking()
-        if version < 21:
-            self._migrate_arxiv_blog_links()
-        if version < 31:
-            self._migrate_blog_title_duplicates_v31()
-        self._ensure_run_blog_columns()
-        if version < 6:
-            self._backfill_paper_topics()
-        self._conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
-        self._conn.commit()
-        # Older local regexp/"print matches" runs stored their highlighted
-        # output but did not persist the match as a content tag.  Backfill
-        # those rows idempotently so upgrading fixes existing content too.
-        self._backfill_local_regexp_query_tags()
+            self._conn.execute("PRAGMA journal_mode = WAL")
+            self._conn.executescript(COMMON_SCHEMA)
+            self._ensure_author_tracking_column()
+            self._ensure_paper_columns()
+            self._ensure_extended_metadata_columns()
+            if version == 1:
+                self._migrate_v1_analyses()
+            elif version == 0 and self._is_legacy_analyses_table():
+                self._migrate_v1_analyses()
+            else:
+                self._conn.executescript(ANALYSES_SCHEMA)
+            self._conn.executescript(ANALYSIS_TASKS_SCHEMA)
+            self._ensure_analysis_columns()
+            self._conn.executescript(EXTRA_SCHEMA)
+            self._migrate_saved_queries_v25()
+            self._migrate_saved_queries_v32()
+            self._ensure_query_columns()
+            self._migrate_query_runs_v32()
+            self._conn.executescript(QUERY_RUN_CONTENT_INDEXES)
+            self._ensure_default_saved_queries()
+            self._conn.executescript(TOPICS_SCHEMA)
+            self._conn.executescript(BLOGS_SCHEMA)
+            self._ensure_blog_columns()
+            self._ensure_extended_metadata_columns()
+            self._ensure_default_settings()
+            if version < 17:
+                self._promote_initial_blog_items()
+            if version < 18:
+                self._migrate_feed_article_tracking()
+            if version < 21:
+                self._migrate_arxiv_blog_links()
+            if version < 31:
+                self._migrate_blog_title_duplicates_v31()
+            self._ensure_run_blog_columns()
+            if version < 6:
+                self._backfill_paper_topics()
+            self._conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
+            self._conn.commit()
+            # Older local regexp/"print matches" runs stored their highlighted
+            # output but did not persist the match as a content tag.  Backfill
+            # those rows idempotently so upgrading fixes existing content too.
+            self._backfill_local_regexp_query_tags()
+            _INITIALIZED_DATABASES[database_key] = self._database_identity()
+
+    def _database_identity(self) -> tuple[int, int, int]:
+        stat = self.path.stat()
+        schema_generation = int(
+            self._conn.execute("PRAGMA schema_version").fetchone()[0]
+        )
+        return stat.st_dev, stat.st_ino, schema_generation
 
     @staticmethod
     def _query_uses_freeform_regexp_tag(query: Any) -> bool:

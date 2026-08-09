@@ -241,8 +241,12 @@ def test_dashboard_assets_and_security_headers(config_path, seeded_web):
     ) in response.text
     assert response.headers["x-frame-options"] == "DENY"
     assert "default-src 'self'" in response.headers["content-security-policy"]
-    assert client.get("/static/app.css").status_code == 200
-    assert client.get("/static/app.js").status_code == 200
+    css = client.get("/static/app.css")
+    javascript = client.get("/static/app.js")
+    assert css.status_code == 200
+    assert javascript.status_code == 200
+    assert css.headers["cache-control"] == "public, max-age=31536000, immutable"
+    assert javascript.headers["cache-control"] == "public, max-age=31536000, immutable"
 
 
 def test_running_state_uses_header_control_without_feedback_banner(config_path, seeded_web):

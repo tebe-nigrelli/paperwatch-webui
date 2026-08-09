@@ -367,6 +367,8 @@ def test_static_assets_use_partial_updates_and_requested_layout():
     assert "paperwatch-content-url" in script
     assert "paperwatch-content-reload" in script
     assert 'cache: "no-store"' in script
+    assert "new AbortController()" in script
+    assert "contentRefreshController?.abort()" in script
     assert 'contentHome?.addEventListener("click"' in script
     assert 'refreshContentPage(contentHome.href, false)' in script
     assert 'storageGet(contentReloadKey) === "1"' in script
