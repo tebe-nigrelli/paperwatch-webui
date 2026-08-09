@@ -96,6 +96,13 @@ def test_large_search_selects_are_rendered_lazily():
     assert "list.replaceChildren(fragment)" in script
 
 
+def test_content_partial_refresh_ignores_stale_responses():
+    script = Path("src/paperwatch/web_static/app.js").read_text(encoding="utf-8")
+    assert "let contentRefreshSequence = 0" in script
+    assert "const refreshSequence = ++contentRefreshSequence" in script
+    assert "if (refreshSequence !== contentRefreshSequence) return false" in script
+
+
 def test_profile_controls_select_actual_controls_not_model_options():
     """Model option metadata must not be mistaken for the PDF strategy control.
 

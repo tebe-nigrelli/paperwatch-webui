@@ -1439,13 +1439,16 @@
     if (contentHome) contentHome.href = value;
   };
   if (document.querySelector("#content-page-root")) rememberContentUrl(window.location.href);
+  let contentRefreshSequence = 0;
   const refreshContentPage = async (url = window.location.href, push = false) => {
+    const refreshSequence = ++contentRefreshSequence;
     const response = await fetch(url, {
       cache: "no-store",
       headers: { "X-Paperwatch-Partial": "1" },
     });
     if (!response.ok) throw new Error(`Request failed with HTTP ${response.status}`);
     const doc = parseHtml(await response.text());
+    if (refreshSequence !== contentRefreshSequence) return false;
     syncContentResultsRunnerFromDocument(doc);
     const incomingResults = doc.querySelector("#content-results-root");
     const currentResults = document.querySelector("#content-results-root");
