@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import asyncio
+import threading
 from datetime import date
 from pathlib import Path
 
@@ -302,6 +304,10 @@ def test_fresh_web_database_installs_defaults_and_pdf_setting_persists(config_pa
     assert data.text.index("Delete stored records") < data.text.index("Defaults and fetching")
     assert "Download PDFs automatically" in data.text
     assert "Master enabled · click to disable" in data.text
+    assert 'class="delete-record-grid defaults-fetching-grid"' in data.text
+    assert data.text.index("Add default queries") < data.text.index("Shutdown app")
+    assert data.text.index("Shutdown app") < data.text.index("Download PDFs automatically")
+    assert data.text.index("Download PDFs automatically") < data.text.index("Restart app")
 
     disabled = client.post(
         "/data/settings/download-pdfs",
@@ -322,6 +328,37 @@ def test_fresh_web_database_installs_defaults_and_pdf_setting_persists(config_pa
     assert enabled.status_code == 303
     with Database(config.paths.database) as db:
         assert db.download_pdfs_enabled() is True
+
+
+def test_app_shutdown_and_restart_controls_signal_after_response(config_path):
+    signals = []
+    signal_received = threading.Event()
+
+    def stop_process():
+        signals.append("stop")
+        signal_received.set()
+
+    app = create_app(config_path, process_shutdown=stop_process)
+    endpoints = {
+        route.path: route.endpoint
+        for route in app.routes
+        if hasattr(route, "endpoint")
+    }
+
+    stopped = asyncio.run(endpoints["/data/app/shutdown"]())
+    assert stopped.status_code == 200
+    assert b"shutting down" in stopped.body
+    assert app.state.restart_requested is False
+    assert signal_received.wait(1)
+    assert signals == ["stop"]
+
+    signal_received.clear()
+    restarted = asyncio.run(endpoints["/data/app/restart"]())
+    assert restarted.status_code == 200
+    assert b"restarting" in restarted.body
+    assert app.state.restart_requested is True
+    assert signal_received.wait(1)
+    assert signals == ["stop", "stop"]
 
 
 def test_automatic_pipeline_obeys_persistent_pdf_download_setting(

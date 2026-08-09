@@ -401,9 +401,12 @@ def _serve_web(args: argparse.Namespace) -> int:
 
     from .web import create_app
 
-    app = create_app(args.config)
-    uvicorn.run(app, host=args.host, port=args.port, log_level=args.log_level)
-    return 0
+    while True:
+        app = create_app(args.config)
+        uvicorn.run(app, host=args.host, port=args.port, log_level=args.log_level)
+        state = getattr(app, "state", None)
+        if not bool(getattr(state, "restart_requested", False)):
+            return 0
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = _parser().parse_args(argv)

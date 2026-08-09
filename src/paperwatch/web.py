@@ -11,6 +11,7 @@ import tempfile
 import zipfile
 import json
 import re
+import signal
 import shutil
 import subprocess
 import sys
@@ -2162,6 +2163,7 @@ def create_app(
     author_client_factory: Callable[[AppConfig], Any] | None = None,
     arxiv_client_factory: Callable[[AppConfig], Any] | None = None,
     blog_client_factory: Callable[[AppConfig], Any] | None = None,
+    process_shutdown: Callable[[], None] | None = None,
 ) -> FastAPI:
     config = load_config(config_path)
     controller = run_controller or RunController(config.config_path)
@@ -2170,6 +2172,14 @@ def create_app(
     client_factory = author_client_factory or _author_client
     arxiv_factory = arxiv_client_factory or _arxiv_client
     blog_factory = blog_client_factory or _blog_client
+    shutdown_process = process_shutdown or (
+        lambda: os.kill(os.getpid(), signal.SIGTERM)
+    )
+
+    def schedule_process_shutdown() -> None:
+        timer = threading.Timer(0.25, shutdown_process)
+        timer.daemon = True
+        timer.start()
     try:
         with analysis_lock(config.paths.database):
             with Database(config.paths.database) as recovery_db:
@@ -2208,6 +2218,7 @@ def create_app(
     app.state.run_controller = controller
     app.state.analysis_controller = model_controller
     app.state.query_controller = collection_controller
+    app.state.restart_requested = False
     app.state.author_client_factory = client_factory
     app.state.blog_client_factory = blog_factory
     app.mount("/static", StaticFiles(directory=str(static_dir)), name="static")
@@ -2862,6 +2873,27 @@ def create_app(
         return RedirectResponse(
             _notice_url("/data", f"Automatic PDF downloads {state}."),
             status_code=303,
+        )
+
+    @app.post("/data/app/shutdown", response_class=HTMLResponse)
+    async def shutdown_app() -> HTMLResponse:
+        app.state.restart_requested = False
+        schedule_process_shutdown()
+        return HTMLResponse(
+            "<title>Paperwatch stopped</title>"
+            "<main><h1>Paperwatch is shutting down</h1>"
+            "<p>You can close this tab.</p></main>",
+        )
+
+    @app.post("/data/app/restart", response_class=HTMLResponse)
+    async def restart_app() -> HTMLResponse:
+        app.state.restart_requested = True
+        schedule_process_shutdown()
+        return HTMLResponse(
+            "<title>Restarting Paperwatch</title>"
+            '<meta http-equiv="refresh" content="4;url=/data">'
+            "<main><h1>Paperwatch is restarting</h1>"
+            "<p>This page will reconnect automatically.</p></main>",
         )
 
     @app.post("/authors/manual")

@@ -600,6 +600,8 @@ label.control-disabled{opacity:.68}
 .blog-diff-removed{color:var(--danger);background:color-mix(in srgb,var(--danger-soft) 45%,transparent)}
 .blog-diff-context{color:var(--code-ink)}
 .data-defaults-fetching-card .setting-enabled{border-color:var(--good);background:var(--good-soft);color:var(--good)}
+.data-defaults-fetching-card .defaults-fetching-grid{grid-template-columns:repeat(2,minmax(0,1fr))}
+@media(max-width:800px){.data-defaults-fetching-card .defaults-fetching-grid{grid-template-columns:1fr}}
 
 
 /* 0.10.4 source controls and per-author PDF preferences */

@@ -240,6 +240,32 @@ def test_web_command_runs_uvicorn(config_path, monkeypatch):
     assert calls == {"app": marker, "host": "127.0.0.2", "port": 9000, "log_level": "debug"}
 
 
+def test_web_command_recreates_app_when_restart_is_requested(config_path, monkeypatch):
+    class State:
+        restart_requested = False
+
+    class App:
+        def __init__(self):
+            self.state = State()
+
+    apps = [App(), App()]
+    created = []
+
+    def fake_create_app(path):
+        app = apps[len(created)]
+        created.append(app)
+        return app
+
+    def fake_run(app, **kwargs):
+        app.state.restart_requested = app is apps[0]
+
+    monkeypatch.setattr("paperwatch.web.create_app", fake_create_app)
+    monkeypatch.setattr("uvicorn.run", fake_run)
+
+    assert cli.main(["--config", str(config_path), "web"]) == 0
+    assert created == apps
+
+
 def test_web_command_reports_config_error(config_path, monkeypatch, capsys):
     monkeypatch.setattr("paperwatch.web.create_app", lambda path: (_ for _ in ()).throw(ValueError("bad web config")))
     assert cli.main(["--config", str(config_path), "web"]) == 2
