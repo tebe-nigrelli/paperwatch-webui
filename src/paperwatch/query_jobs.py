@@ -388,7 +388,16 @@ def _selected_blog_entries(db: Database, selection: dict[str, Any] | None) -> li
                 selected_ids.append(int(value))
             except (TypeError, ValueError):
                 continue
-        return db.blog_entries_by_ids(selected_ids, query_view=True) if selected_ids else []
+        # Explicit query selections include baseline rows. Freshly initialized
+        # blog sources deliberately enqueue those rows for automatic saved
+        # queries, even though ordinary blog listings hide baselines.
+        return (
+            db.blog_entries_by_ids(
+                selected_ids, query_view=True, include_baseline=True
+            )
+            if selected_ids
+            else []
+        )
     args = _selection_search_args(selection)
     return db.list_blog_entries(
         limit=None,

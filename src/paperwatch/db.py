@@ -3444,7 +3444,11 @@ class Database:
         )
 
     def blog_entries_by_ids(
-        self, entry_ids: Iterable[int], *, query_view: bool = False
+        self,
+        entry_ids: Iterable[int],
+        *,
+        query_view: bool = False,
+        include_baseline: bool = False,
     ) -> list[sqlite3.Row]:
         ids: list[int] = []
         for value in entry_ids:
@@ -3480,6 +3484,7 @@ class Database:
                     ORDER BY name COLLATE NOCASE
                 )), '') AS content_tags
             """
+        baseline_filter = "" if include_baseline else "AND be.change_kind != 'baseline'"
         rows = self._conn.execute(
             f"""
             SELECT {columns}
@@ -3490,7 +3495,7 @@ class Database:
                 )) AS author_names
                 {tags_column}
             FROM blog_entries be JOIN blogs b ON b.id=be.blog_id
-            WHERE be.id IN ({placeholders}) AND be.change_kind != 'baseline'
+            WHERE be.id IN ({placeholders}) {baseline_filter}
             """,
             ids,
         ).fetchall()

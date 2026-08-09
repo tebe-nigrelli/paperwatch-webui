@@ -974,6 +974,21 @@ def test_blog_query_documents_validation_batch_and_controller(
         assert documents[0]["diff"] == "-old\n+new"
         assert db.blog_entries_by_ids(["bad", entry_id, entry_id, -1])[0]["id"] == entry_id
 
+        baseline_documents = collect_query_documents(
+            db,
+            "blog",
+            selection={
+                "content_type": "blogs",
+                "blog_entry_ids": [baseline_id],
+            },
+        )
+        assert len(baseline_documents) == 1
+        assert baseline_documents[0]["blog_entry_id"] == baseline_id
+        assert baseline_documents[0]["content"] == "old text"
+        # Baselines remain hidden from ordinary explicit lookups unless the
+        # caller opts into the query-processing behavior.
+        assert db.blog_entries_by_ids([baseline_id]) == []
+
         selection = {"content_type": "blogs", "blog_entry_ids": [entry_id]}
         assert validate_query_sources(
             db, selection=selection, source_scope="blog", pdf_strategy="auto"
