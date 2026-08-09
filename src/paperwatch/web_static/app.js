@@ -1366,6 +1366,7 @@
     return true;
   };
   const contentUrlKey = "paperwatch-content-url";
+  const contentReloadKey = "paperwatch-content-reload";
   const contentHome = document.querySelector("[data-content-home-link]");
   const storedContentUrl = storageGet(contentUrlKey);
   if (contentHome && storedContentUrl) contentHome.href = storedContentUrl;
@@ -1377,7 +1378,10 @@
   };
   if (document.querySelector("#content-page-root")) rememberContentUrl(window.location.href);
   const refreshContentPage = async (url = window.location.href, push = false) => {
-    const response = await fetch(url, { headers: { "X-Paperwatch-Partial": "1" } });
+    const response = await fetch(url, {
+      cache: "no-store",
+      headers: { "X-Paperwatch-Partial": "1" },
+    });
     if (!response.ok) throw new Error(`Request failed with HTTP ${response.status}`);
     const doc = parseHtml(await response.text());
     syncContentResultsRunnerFromDocument(doc);
@@ -1401,6 +1405,24 @@
     rememberContentUrl(finalUrl);
     return true;
   };
+  contentHome?.addEventListener("click", (event) => {
+    if (event.button !== 0 || event.metaKey || event.ctrlKey || event.shiftKey || event.altKey) return;
+    if (document.querySelector("#content-page-root")) {
+      event.preventDefault();
+      refreshContentPage(contentHome.href, false).catch(console.error);
+      return;
+    }
+    storageSet(contentReloadKey, "1");
+  });
+  if (document.querySelector("#content-page-root") && storageGet(contentReloadKey) === "1") {
+    storageRemove(contentReloadKey);
+    window.setTimeout(() => refreshContentPage(window.location.href, false).catch(console.error), 0);
+  }
+  window.addEventListener("pageshow", (event) => {
+    if (event.persisted && document.querySelector("#content-page-root")) {
+      refreshContentPage(window.location.href, false).catch(console.error);
+    }
+  });
   const runningKindsFromBody = () => ({
     fetch: document.body.dataset.runRunning === "true",
     analysis: document.body.dataset.analysisRunning === "true",

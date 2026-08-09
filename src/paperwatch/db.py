@@ -739,6 +739,21 @@ class Database:
             and bool(str(query["regexp_pattern"] or "").strip())
         )
 
+    @staticmethod
+    def _regexp_tag_is_link(value: Any) -> bool:
+        text = str(value or "").strip()
+        if not text:
+            return False
+        if re.match(r"(?i)^https?://", text):
+            return True
+        return bool(
+            re.fullmatch(
+                r"(?i)(?:www\.)?(?:[a-z0-9](?:[a-z0-9-]{0,62}[a-z0-9])?\.)+"
+                r"[a-z]{2,63}(?::\d+)?(?:[/#?][^\s]*)?",
+                text,
+            )
+        )
+
     def _backfill_local_regexp_query_tags(self) -> None:
         rows = self._conn.execute(
             """
@@ -814,6 +829,27 @@ class Database:
                 """,
                 (utcnow(),),
             )
+            generated_link_rows = conn.execute(
+                """
+                SELECT qcr.id, qcr.value
+                FROM query_classification_results qcr
+                JOIN saved_queries q ON q.id=qcr.query_id
+                WHERE qcr.manually_modified=0
+                  AND trim(COALESCE(q.regexp_pattern, '')) != ''
+                  AND (q.query_kind='regexp' OR q.regexp_mode='print')
+                """
+            ).fetchall()
+            link_ids = [
+                int(row["id"])
+                for row in generated_link_rows
+                if self._regexp_tag_is_link(row["value"])
+            ]
+            if link_ids:
+                placeholders = ",".join("?" for _ in link_ids)
+                conn.execute(
+                    f"DELETE FROM query_classification_results WHERE id IN ({placeholders})",
+                    link_ids,
+                )
 
     def _ensure_default_settings(self) -> None:
         self._conn.execute(
@@ -5732,6 +5768,8 @@ class Database:
                 if freeform_regexp:
                     selected_value = " ".join(raw_output.split())
                     selected_value = re.sub(r"(?i)^https?://", "", selected_value)[:80] or None
+                    if selected_value is not None and self._regexp_tag_is_link(selected_value):
+                        continue
                 else:
                     selected_value = next(
                         (

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import re
+from pathlib import Path
 
 from paperwatch.config import load_config
 from paperwatch.default_queries import (
@@ -66,7 +67,7 @@ def test_regexp_defaults_include_specific_low_noise_terms():
         assert re.search(patterns[name], text, re.MULTILINE) is None, name
 
 
-def test_regexp_generated_url_tag_drops_scheme(config_path, paper_record):
+def test_regexp_generated_url_match_does_not_become_tag(config_path, paper_record):
     config = load_config(config_path)
     with Database(config.paths.database) as db:
         paper_id, _ = db.upsert_paper(paper_record)
@@ -98,10 +99,8 @@ def test_regexp_generated_url_tag_drops_scheme(config_path, paper_record):
                 ]
             },
         )
-        assert changed == 1
-        tag = db.classification_results_for_content("paper", paper_id)[0]
-        assert tag["value"] == "github.com/example/research-system"
-        assert tag["tag_name"] == "github.com/example/research-system"
+        assert changed == 0
+        assert db.classification_results_for_content("paper", paper_id) == []
 
     result = regexp_tag_result(
         [
@@ -120,6 +119,72 @@ def test_regexp_generated_url_tag_drops_scheme(config_path, paper_record):
     )
     assert "https://<mark" in rendered
     assert '<mark class="regexp-match">github.com/example/research-system</mark>' in rendered
+
+
+def test_existing_generated_regexp_link_tags_are_removed_but_manual_tags_survive(
+    config_path, paper_record
+):
+    config = load_config(config_path)
+    with Database(config.paths.database) as db:
+        paper_id, _ = db.upsert_paper(paper_record)
+        query_id = db.create_saved_query(
+            name="Repository link",
+            prompt="",
+            query_kind="regexp",
+            content_scope="papers",
+            regexp_pattern=r"github\.com/[^\s]+",
+            paper_source_scope="abstract",
+        )
+        run_id = db.create_query_runs(
+            batch_id="old-url-regexp-tag",
+            query_id=query_id,
+            profiles=[("default", "ollama", "test-model")],
+            context_window_tokens=2048,
+            selection={"content_type": "papers", "paper_ids": [paper_id]},
+        )[0]
+        now = "2026-08-09T00:00:00+00:00"
+        db._conn.execute(
+            """
+            INSERT INTO query_classification_results(
+                query_id, query_run_id, content_type, paper_id, blog_entry_id,
+                value, tag_name, raw_output, manually_modified, created_at, updated_at
+            ) VALUES (?, ?, 'paper', ?, NULL, ?, ?, ?, 0, ?, ?)
+            """,
+            (
+                query_id,
+                run_id,
+                paper_id,
+                "github.com/example/research-system",
+                "github.com/example/research-system",
+                "https://github.com/example/research-system",
+                now,
+                now,
+            ),
+        )
+        db._conn.commit()
+
+    with Database(config.paths.database) as db:
+        assert db.classification_results_for_content("paper", paper_id) == []
+        assert db.set_content_classification(
+            query_id, "paper", paper_id, "github.com/manual/keep"
+        )
+
+    with Database(config.paths.database) as db:
+        tags = db.classification_results_for_content("paper", paper_id)
+        assert len(tags) == 1
+        assert tags[0]["value"] == "github.com/manual/keep"
+        assert bool(tags[0]["manually_modified"]) is True
+
+
+def test_content_table_tag_chips_are_blocky_and_wrap():
+    css = Path("src/paperwatch/web_static/app.css").read_text(encoding="utf-8")
+    selector = ".unified-content-table td[data-content-tags] .tag"
+    assert selector in css
+    rule = css.split(selector, 1)[1].split("}", 1)[0]
+    assert "border-radius:5px" in rule
+    assert "width:100%" in rule
+    assert "white-space:normal" in rule
+    assert "overflow-wrap:anywhere" in rule
 
 
 def test_existing_untouched_regexp_defaults_are_refreshed_but_edits_are_preserved(config_path):

@@ -863,6 +863,12 @@ def _query_view(row: Any, config: AppConfig) -> dict[str, Any]:
         query["query_kind"] == "regexp"
         or (query["regexp_pattern"] and query["regexp_mode"] == "print")
     )
+    # Legacy/default regexp-only queries are stored as summary + print so they
+    # can preserve excerpt-style output.  They still require no model and must
+    # be presented/filterable as Regexp queries rather than Summary queries.
+    query["display_query_kind"] = (
+        "regexp" if query["local_regexp"] else query["query_kind"]
+    )
     return query
 
 

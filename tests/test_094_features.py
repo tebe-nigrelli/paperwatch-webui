@@ -213,8 +213,9 @@ def test_unified_download_page_blog_tags_detail_toolbar_and_remote_image_csp(
     back = detail.text.index("Back to updates")
     original = detail.text.index("Open original")
     copy = detail.text.index('aria-label="Copy text"')
-    assert back < original < copy
-    assert 'class="button-group blog-detail-actions"' in detail.text
+    assert original < back < copy
+    assert 'class="panel paper-reference-panel blog-reference-panel"' in detail.text
+    assert 'class="paper-link-group paper-link-group-actions"' in detail.text
     assert '<svg viewBox="0 0 24 24"' in detail.text
     assert 'src="https://cdn.example.test/diagram.gif"' in detail.text
     assert 'referrerpolicy="no-referrer"' in detail.text

@@ -312,6 +312,13 @@ def test_default_query_installer_and_actions_column_deletion(config_path):
     assert 'href="/?query_id=' not in page.text
     assert 'href="/blogs?query_id=' not in page.text
     assert "Regexp filter" not in page.text
+    assert page.text.count('data-filter-type="regexp"') == 10
+    funding_at = page.text.index("Funding and grants")
+    funding_row = page.text[page.text.rfind("<tr", 0, funding_at):page.text.index("</tr>", funding_at)]
+    assert 'data-filter-type="regexp"' in funding_row
+    assert ">Regexp</span>" in funding_row
+    assert "Local regexp" in funding_row and "No model call" in funding_row
+    assert "Clear tags" in funding_row
 
     css = client.get("/static/app.css")
     assert css.status_code == 200

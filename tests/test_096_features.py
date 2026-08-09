@@ -241,13 +241,14 @@ def test_content_author_links_page_jump_query_result_and_controls(
 
     blog_page = web.get(f"/blogs/{entry_id}")
     assert "Jump to summary" in blog_page.text
-    assert '<details class="panel blog-content-panel" open>' in blog_page.text
+    assert '<section class="panel blog-content-panel">' in blog_page.text
+    assert "Source content" in blog_page.text
     assert 'id="summary"' in blog_page.text
     assert "<h2>Summary</h2>" in blog_page.text
     assert "<strong>Strong</strong>" in blog_page.text
     assert "<ul><li>First</li><li>Second</li></ul>" in blog_page.text
 
-    queries = web.get("/queries")
+    queries = web.get("/queries?mode=history")
     assert f'/queries/runs/{run_id}' in queries.text
     assert "Open result" in queries.text
     assert "Strong result" not in queries.text

@@ -869,6 +869,7 @@ def test_private_filter_and_regexp_helpers_cover_edge_inputs(config_path):
         config,
     )
     assert query["local_regexp"] is True and query["label_values"] == []
+    assert query["display_query_kind"] == "regexp"
     assert _classification_form_values("# comment\nHigh = high\n\nLow = low") == [
         {"value": "High", "pattern": "high"},
         {"value": "Low", "pattern": "low"},

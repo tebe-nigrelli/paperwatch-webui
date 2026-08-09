@@ -1652,13 +1652,29 @@ def _follow_feed_articles(
     known_urls = tuple(
         str(value) for value in (_row_value(row, "_known_article_urls", ()) or ())
     )
+    configured_limit = int(
+        _row_value(row, "_article_fetch_limit", MAX_ARTICLE_FETCHES)
+        or MAX_ARTICLE_FETCHES
+    )
+    # RSS items are already bounded, explicit content records.  Their primary
+    # URL is part of the item itself, not a speculative child link discovered
+    # while crawling an index page, so fetch every advertised item page and let
+    # the pipeline append the webpage body to the feed text.  Keep the normal
+    # rotating cap for 304 responses, where there is no current item payload.
+    if items:
+        current_urls = {item.url for item in discovered}
+        known_for_fetch = tuple(url for url in known_urls if url in current_urls)
+        fetch_limit = max(configured_limit, len(discovered))
+    else:
+        known_for_fetch = known_urls
+        fetch_limit = configured_limit
     article_items, cursor_next, diagnostics = _fetch_article_pages(
         client,
         candidates=discovered,
-        known_urls=known_urls,
+        known_urls=known_for_fetch,
         cursor=int(_row_value(row, "article_cursor", 0) or 0),
         selector=None,
-        limit=int(_row_value(row, "_article_fetch_limit", MAX_ARTICLE_FETCHES) or MAX_ARTICLE_FETCHES),
+        limit=fetch_limit,
     )
     return discovered, article_items, cursor_next, diagnostics
 

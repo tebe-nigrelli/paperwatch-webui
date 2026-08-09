@@ -159,7 +159,11 @@ def test_content_detail_data_and_query_layouts(
     blog = web.get(f"/blogs/{entry_id}")
     assert "content-tags-panel" not in blog.text
     assert "inline-notes-panel" in blog.text
-    assert "blog-heading-actions" in blog.text
+    assert "blog-reference-panel" in blog.text
+    assert "paper-reference-layout" in blog.text
+    assert blog.text.index("author-picker-panel") < blog.text.index("blog-reference-panel")
+    assert blog.text.index("blog-reference-panel") < blog.text.index("blog-content-panel")
+    assert blog.text.index("blog-content-panel") < blog.text.index("inline-notes-panel")
 
     query = web.get("/queries/new")
     assert "regexp-editor-grid" in query.text
@@ -361,6 +365,12 @@ def test_static_assets_use_partial_updates_and_requested_layout():
     css = (root / "web_static" / "app.css").read_text()
     authors_template = (root / "web_templates" / "authors.html").read_text()
     assert "paperwatch-content-url" in script
+    assert "paperwatch-content-reload" in script
+    assert 'cache: "no-store"' in script
+    assert 'contentHome?.addEventListener("click"' in script
+    assert 'refreshContentPage(contentHome.href, false)' in script
+    assert 'storageGet(contentReloadKey) === "1"' in script
+    assert 'event.persisted && document.querySelector("#content-page-root")' in script
     assert "#content-results-root" in script
     assert "syncSelectionRow" in script
     assert 'form.setAttribute("action", `/content/selected/${starred ? "unstar" : "star"}`)' in script

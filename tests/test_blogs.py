@@ -499,7 +499,11 @@ def test_rss_items_are_imported_without_triggering_initial_updates(app_config, a
     client = httpx.Client(transport=httpx.MockTransport(handler))
     with Database(app_config.paths.database) as db:
         db.add_author(author_candidate)
-        db.add_author_blog("A123", "https://example.com/blog")
+        blog_id = db.add_author_blog("A123", "https://example.com/blog")
+        db.sync_known_blog_articles(
+            blog_id,
+            ((f"https://example.com/old-{index}", f"Old {index}") for index in range(20)),
+        )
         app = PaperWatch(
             app_config,
             db=db,
@@ -539,6 +543,67 @@ def test_rss_items_are_imported_without_triggering_initial_updates(app_config, a
         assert changed["entry_kind"] == "rss"
         assert changed["previous_entry_id"] is not None
         assert "Updated body" in changed["diff_text"]
+    client.close()
+
+
+def test_every_rss_item_fetches_primary_url_and_appends_webpage(
+    app_config, author_candidate, monkeypatch
+):
+    monkeypatch.setattr(blogs, "MAX_ARTICLE_FETCHES", 2)
+    page = (
+        '<html><head><link rel="alternate" type="application/rss+xml" '
+        'href="/feed.xml"></head><body><main>Page</main></body></html>'
+    )
+    items = "".join(
+        f"<item><guid>post-{index}</guid><title>Post {index}</title>"
+        f"<link>https://example.com/post-{index}</link>"
+        f"<description>Feed teaser {index}</description></item>"
+        for index in range(12)
+    )
+    feed = f"<rss><channel><title>Author feed</title>{items}</channel></rss>"
+    article_requests: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/blog":
+            return httpx.Response(200, headers={"content-type": "text/html"}, text=page)
+        if request.url.path == "/feed.xml":
+            return httpx.Response(
+                200,
+                headers={"content-type": "application/rss+xml"},
+                text=feed,
+            )
+        if request.url.path.startswith("/post-"):
+            article_requests.append(request.url.path)
+            return httpx.Response(
+                200,
+                headers={"content-type": "text/html"},
+                text=(
+                    f"<title>{request.url.path}</title><main>"
+                    f"Full website body for {request.url.path}</main>"
+                ),
+            )
+        raise AssertionError(request.url)
+
+    client = httpx.Client(transport=httpx.MockTransport(handler))
+    with Database(app_config.paths.database) as db:
+        db.add_author(author_candidate)
+        db.add_author_blog("A123", "https://example.com/blog")
+        app = PaperWatch(
+            app_config,
+            db=db,
+            openalex=NoPapers(),
+            arxiv=None,
+            llm=NoLLM(),
+            pdf_client=client,
+        )
+        stats = app.run(today=date(2026, 8, 9))
+        assert stats.status == "success"
+        entries = [row for row in db.list_blog_entries() if row["entry_kind"] == "rss"]
+        assert len(entries) == 12
+        assert len(article_requests) == 12
+        assert all("Feed teaser" in row["normalized_text"] for row in entries)
+        assert all("Website content:" in row["normalized_text"] for row in entries)
+        assert all("Full website body" in row["normalized_text"] for row in entries)
     client.close()
 
 

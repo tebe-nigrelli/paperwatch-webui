@@ -702,3 +702,59 @@ label.control-disabled{opacity:.68}
 .prompt-result-part+.prompt-result-part{border-top:1px solid var(--line);margin-top:10px;padding-top:10px}
 .prompt-result-part>.markdown-block{display:block;min-width:0;max-width:100%;overflow-wrap:anywhere}
 @media(max-width:700px){.prompt-result-header{flex-direction:column}.prompt-result-actions{width:100%}}
+
+/* Keep content-table tags contained in their narrow column. */
+.unified-content-table td[data-content-tags] .content-tag-row{align-items:stretch;gap:4px;margin-top:0;min-width:0}
+.unified-content-table td[data-content-tags] .tag{display:block;width:100%;max-width:100%;min-width:0;border-radius:5px;padding:5px 7px;line-height:1.25;white-space:normal;overflow-wrap:anywhere;word-break:break-word}
+
+/* Compact, aligned per-content query tag editors. */
+.classification-panel{padding:14px 16px}
+.classification-panel .panel-heading{align-items:center;margin-bottom:9px}
+.classification-panel .panel-heading h2{margin:0;font-size:1.05rem}
+.classification-panel .panel-heading p{margin-top:2px;font-size:.78rem;line-height:1.35}
+.classification-panel .classification-grid{display:flex;align-items:center;align-content:flex-start;flex-wrap:wrap;gap:6px}
+.classification-panel .classification-row{display:flex;align-items:center;gap:5px;min-width:0;max-width:100%;padding:5px 6px;border-radius:7px}
+.classification-panel .classification-row label{display:flex;flex-direction:row;align-items:center;gap:5px;min-width:0;font-size:.72rem;line-height:1}
+.classification-panel .classification-row label>span{flex:0 0 auto;max-width:150px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--muted);font-size:.69rem}
+.classification-panel .classification-row input,
+.classification-panel .classification-row select{width:auto;min-width:88px;max-width:180px;height:27px;padding:2px 6px;border-radius:5px;font-size:.74rem;line-height:1.1}
+.classification-panel .classification-row input{max-width:210px}
+.classification-panel .classification-row .button-small{min-height:27px;padding:2px 7px;border-radius:5px;font-size:.72rem;line-height:1}
+.classification-panel .classification-row>a{display:block;max-width:145px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;align-self:center;font-size:.7rem;line-height:1.1}
+@media(max-width:650px){.classification-panel .classification-grid{align-items:stretch}.classification-panel .classification-row{width:100%;flex-wrap:wrap}.classification-panel .classification-row label{flex:1 1 180px}.classification-panel .classification-row input,.classification-panel .classification-row select{flex:1 1 auto;max-width:none}}
+
+/* Keep compact query-tag editors readable: use normal text size and wrap labels. */
+.classification-panel .panel-heading p{font-size:inherit;line-height:1.45}
+.classification-panel .classification-row{align-items:flex-start}
+.classification-panel .classification-row label{align-items:flex-start;font-size:inherit;line-height:1.35}
+.classification-panel .classification-row label>span{
+  flex:0 1 150px;
+  max-width:150px;
+  overflow:visible;
+  text-overflow:clip;
+  white-space:normal;
+  overflow-wrap:anywhere;
+  font-size:inherit;
+  line-height:1.35;
+}
+.classification-panel .classification-row input,
+.classification-panel .classification-row select{
+  height:auto;
+  min-height:31px;
+  font-size:inherit;
+  line-height:1.25;
+}
+.classification-panel .classification-row .button-small{
+  min-height:31px;
+  font-size:inherit;
+  line-height:1.2;
+}
+.classification-panel .classification-row>a{
+  max-width:145px;
+  overflow:visible;
+  text-overflow:clip;
+  white-space:normal;
+  overflow-wrap:anywhere;
+  font-size:inherit;
+  line-height:1.35;
+}

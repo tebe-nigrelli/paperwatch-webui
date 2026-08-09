@@ -1136,7 +1136,7 @@ def test_blog_saved_query_results_fall_back_to_exact_title_when_model_omits_id(
 
     page = make_app(config_path).get(f"/blogs/{current_id}")
     assert page.status_code == 200
-    assert "Saved query results" in page.text
+    assert "Query results" in page.text
     assert "BLOG RESULT RECOVERED BY TITLE" in page.text
     assert "BLOG SIBLING MUST STAY HIDDEN" not in page.text
     assert "BLOG COLLECTION SUMMARY HIDDEN" not in page.text
