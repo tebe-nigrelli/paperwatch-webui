@@ -155,6 +155,42 @@ def test_classifier_query_assigns_shared_tags_and_allows_controlled_edits(
         assert db.classification_results_for_content("paper", paper_id) == []
 
 
+def test_content_table_colors_tags_by_provenance(
+    config_path, author_candidate, paper_record
+):
+    paper_id, _entry_id = seed(config_path, author_candidate, paper_record)
+    config = load_config(config_path)
+    with Database(config.paths.database) as db:
+        assert db.add_paper_tag(paper_id, "Written")
+        assert db.add_paper_tag(paper_id, "Imported", source="import")
+        query_id = db.create_saved_query(
+            name="Topic classifier",
+            prompt="Choose a topic.",
+            query_kind="classification",
+            label_class="Topic",
+            label_values=[
+                {"value": "AI", "pattern": "ai"},
+                {"value": "Other", "pattern": "other"},
+            ],
+        )
+        run_id = db.create_query_runs(
+            batch_id="tag-provenance",
+            query_id=query_id,
+            profiles=[("default", "ollama", "model")],
+            context_window_tokens=2048,
+            selection={"paper_ids": [paper_id]},
+        )[0]
+        db.apply_query_classifications(
+            query_id, run_id, {"items": [{"paper_id": paper_id, "output": "ai"}]}
+        )
+
+    home = client(config_path).get("/")
+    assert home.status_code == 200
+    assert 'class="tag content-tag-source-user" data-tag-source="user" title="User tag"' in home.text
+    assert 'class="tag content-tag-source-import" data-tag-source="import" title="Imported tag"' in home.text
+    assert 'class="tag content-tag-source-automated" data-tag-source="automated" title="Automated classification tag"' in home.text
+
+
 def test_web_star_selection_reading_classifier_and_author_csv_ui(
     config_path, author_candidate, paper_record
 ):

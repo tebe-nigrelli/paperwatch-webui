@@ -2738,6 +2738,18 @@ def create_app(
 
             blog_views = [blog_view(row) for row in blog_rows]
             selected_blog_views = [blog_view(row) for row in selected_blog_rows]
+            paper_tag_items = db.content_tag_items(
+                "paper",
+                [int(item["id"]) for item in (*paper_views, *selected_paper_views)],
+            )
+            blog_tag_items = db.content_tag_items(
+                "blog",
+                [int(item["id"]) for item in (*blog_views, *selected_blog_views)],
+            )
+            for item in (*paper_views, *selected_paper_views):
+                item["content_tag_items"] = paper_tag_items.get(int(item["id"]), [])
+            for item in (*blog_views, *selected_blog_views):
+                item["content_tag_items"] = blog_tag_items.get(int(item["id"]), [])
             summary_paper_runs = db.latest_query_runs_for_content(
                 DEFAULT_SUMMARY_QUERY_NAME,
                 "paper",
@@ -3846,7 +3858,7 @@ def create_app(
                             published_at=published_at or None,
                         )
                 for tag in _split_tags(str(form.get("tags", ""))):
-                    db.add_blog_entry_tag(entry_id, tag)
+                    db.add_blog_entry_tag(entry_id, tag, source="import")
                 if str(form.get("notes", "")).strip():
                     db.set_object_notes("blog", entry_id, str(form.get("notes", "")))
         except ValueError as exc:
@@ -4311,7 +4323,7 @@ def create_app(
             with Database(config.paths.database) as db:
                 db.set_local_pdf(paper_id, str(destination), pdf_sha256(destination))
                 for tag in _split_tags(values.get("tags", "")):
-                    db.add_paper_tag(paper_id, tag)
+                    db.add_paper_tag(paper_id, tag, source="import")
                 if values.get("notes", "").strip():
                     db.set_object_notes("paper", paper_id, values["notes"])
             if backup is not None:

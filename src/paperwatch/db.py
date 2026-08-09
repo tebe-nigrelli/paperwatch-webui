@@ -380,6 +380,7 @@ CREATE TABLE IF NOT EXISTS content_tags (
 CREATE TABLE IF NOT EXISTS paper_tag_links (
     paper_id INTEGER NOT NULL REFERENCES papers(id) ON DELETE CASCADE,
     tag_id INTEGER NOT NULL REFERENCES content_tags(id) ON DELETE CASCADE,
+    source TEXT NOT NULL DEFAULT 'user' CHECK (source IN ('user', 'import')),
     PRIMARY KEY (paper_id, tag_id)
 );
 CREATE INDEX IF NOT EXISTS idx_paper_tag_links_tag
@@ -387,6 +388,7 @@ ON paper_tag_links(tag_id, paper_id);
 CREATE TABLE IF NOT EXISTS blog_entry_tag_links (
     blog_entry_id INTEGER NOT NULL REFERENCES blog_entries(id) ON DELETE CASCADE,
     tag_id INTEGER NOT NULL REFERENCES content_tags(id) ON DELETE CASCADE,
+    source TEXT NOT NULL DEFAULT 'user' CHECK (source IN ('user', 'import')),
     PRIMARY KEY (blog_entry_id, tag_id)
 );
 CREATE INDEX IF NOT EXISTS idx_blog_entry_tag_links_tag
@@ -394,6 +396,7 @@ ON blog_entry_tag_links(tag_id, blog_entry_id);
 CREATE TABLE IF NOT EXISTS blog_source_tag_links (
     blog_id INTEGER NOT NULL REFERENCES blogs(id) ON DELETE CASCADE,
     tag_id INTEGER NOT NULL REFERENCES content_tags(id) ON DELETE CASCADE,
+    source TEXT NOT NULL DEFAULT 'user' CHECK (source IN ('user', 'import')),
     PRIMARY KEY (blog_id, tag_id)
 );
 CREATE INDEX IF NOT EXISTS idx_blog_source_tag_links_tag
@@ -898,6 +901,15 @@ class Database:
                 "notes": "TEXT NOT NULL DEFAULT ''",
             },
             "blog_entries": {"notes": "TEXT NOT NULL DEFAULT ''"},
+            "paper_tag_links": {
+                "source": "TEXT NOT NULL DEFAULT 'user' CHECK (source IN ('user', 'import'))"
+            },
+            "blog_entry_tag_links": {
+                "source": "TEXT NOT NULL DEFAULT 'user' CHECK (source IN ('user', 'import'))"
+            },
+            "blog_source_tag_links": {
+                "source": "TEXT NOT NULL DEFAULT 'user' CHECK (source IN ('user', 'import'))"
+            },
         }
         for table, definitions in additions.items():
             exists = self._conn.execute(
@@ -919,6 +931,7 @@ class Database:
             CREATE TABLE IF NOT EXISTS blog_source_tag_links (
                 blog_id INTEGER NOT NULL REFERENCES blogs(id) ON DELETE CASCADE,
                 tag_id INTEGER NOT NULL REFERENCES content_tags(id) ON DELETE CASCADE,
+                source TEXT NOT NULL DEFAULT 'user' CHECK (source IN ('user', 'import')),
                 PRIMARY KEY (blog_id, tag_id)
             );
             CREATE INDEX IF NOT EXISTS idx_blog_source_tag_links_tag
@@ -5015,6 +5028,51 @@ class Database:
             ).fetchall()
         )
 
+    def content_tag_items(
+        self, content_type: str, record_ids: Iterable[int]
+    ) -> dict[int, list[dict[str, Any]]]:
+        _table, normalized = self._content_table(content_type)
+        ids = tuple(dict.fromkeys(int(record_id) for record_id in record_ids))
+        if not ids:
+            return {}
+        if normalized == "paper":
+            link_table = "paper_tag_links"
+            link_column = "paper_id"
+            classification_column = "paper_id"
+        else:
+            link_table = "blog_entry_tag_links"
+            link_column = "blog_entry_id"
+            classification_column = "blog_entry_id"
+        placeholders = ",".join("?" for _ in ids)
+        rows = self._conn.execute(
+            f"""
+            SELECT record_id, name, source FROM (
+                SELECT links.{link_column} AS record_id, ct.name AS name,
+                       links.source AS source
+                FROM {link_table} links
+                JOIN content_tags ct ON ct.id=links.tag_id
+                WHERE links.{link_column} IN ({placeholders})
+                UNION ALL
+                SELECT qcr.{classification_column} AS record_id, qcr.tag_name AS name,
+                       'automated' AS source
+                FROM query_classification_results qcr
+                WHERE qcr.{classification_column} IN ({placeholders})
+            )
+            ORDER BY record_id, name COLLATE NOCASE, source
+            """,
+            (*ids, *ids),
+        ).fetchall()
+        result: dict[int, list[dict[str, Any]]] = {record_id: [] for record_id in ids}
+        seen: dict[int, set[tuple[str, str]]] = {record_id: set() for record_id in ids}
+        for row in rows:
+            record_id = int(row["record_id"])
+            item = {"name": str(row["name"]), "source": str(row["source"])}
+            key = (item["name"].casefold(), item["source"])
+            if key not in seen[record_id]:
+                result[record_id].append(item)
+                seen[record_id].add(key)
+        return result
+
     def blog_source_tags(self, blog_id: int) -> list[sqlite3.Row]:
         return list(
             self._conn.execute(
@@ -5029,8 +5087,17 @@ class Database:
             ).fetchall()
         )
 
-    def _add_content_tag(self, table: str, column: str, record_id: int, tag: str) -> bool:
+    def _add_content_tag(
+        self,
+        table: str,
+        column: str,
+        record_id: int,
+        tag: str,
+        *,
+        source: str = "user",
+    ) -> bool:
         cleaned = self._clean_tag(tag)
+        tag_source = "import" if source == "import" else "user"
         parent_table = {
             "paper_tag_links": "papers",
             "blog_entry_tag_links": "blog_entries",
@@ -5052,9 +5119,14 @@ class Database:
             ).fetchone()
             assert tag_row is not None
             conn.execute(
-                f"INSERT OR IGNORE INTO {table}({column}, tag_id) VALUES (?, ?)",
-                (record_id, int(tag_row["id"])),
+                f"INSERT OR IGNORE INTO {table}({column}, tag_id, source) VALUES (?, ?, ?)",
+                (record_id, int(tag_row["id"]), tag_source),
             )
+            if tag_source == "user":
+                conn.execute(
+                    f"UPDATE {table} SET source='user' WHERE {column}=? AND tag_id=?",
+                    (record_id, int(tag_row["id"])),
+                )
         return True
 
     def _remove_content_tag(self, table: str, column: str, record_id: int, tag: str) -> bool:
@@ -5075,15 +5147,23 @@ class Database:
             )
         return cur.rowcount > 0
 
-    def add_paper_tag(self, paper_id: int, tag: str) -> bool:
-        return self._add_content_tag("paper_tag_links", "paper_id", paper_id, tag)
+    def add_paper_tag(self, paper_id: int, tag: str, *, source: str = "user") -> bool:
+        return self._add_content_tag(
+            "paper_tag_links", "paper_id", paper_id, tag, source=source
+        )
 
     def remove_paper_tag(self, paper_id: int, tag: str) -> bool:
         return self._remove_content_tag("paper_tag_links", "paper_id", paper_id, tag)
 
-    def add_blog_entry_tag(self, entry_id: int, tag: str) -> bool:
+    def add_blog_entry_tag(
+        self, entry_id: int, tag: str, *, source: str = "user"
+    ) -> bool:
         return self._add_content_tag(
-            "blog_entry_tag_links", "blog_entry_id", entry_id, tag
+            "blog_entry_tag_links",
+            "blog_entry_id",
+            entry_id,
+            tag,
+            source=source,
         )
 
     def remove_blog_entry_tag(self, entry_id: int, tag: str) -> bool:

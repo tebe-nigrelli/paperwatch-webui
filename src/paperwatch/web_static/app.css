@@ -781,3 +781,8 @@ label.control-disabled{opacity:.68}
 @media(max-width:1050px){.selected-content-header{grid-template-columns:1fr}.selected-content-tools{justify-content:start}}
 @media(max-width:720px){.selected-content-tools{grid-template-columns:minmax(150px,1fr) minmax(150px,1fr) auto 34px;width:100%}}
 @media(max-width:560px){.selected-content-tools{grid-template-columns:1fr auto}.selected-content-tools>form:nth-child(1),.selected-content-tools>form:nth-child(2){grid-column:1/-1}.selected-content-tools>form:nth-child(3){grid-column:1}.selected-export-button{grid-column:2}.selected-content-tools .button{width:100%}}
+
+/* Distinguish content-tag provenance in the unified content table. */
+.unified-content-table td[data-content-tags] .content-tag-source-user{background:var(--accent-soft);border-color:var(--accent);color:var(--accent)}
+.unified-content-table td[data-content-tags] .content-tag-source-import{background:var(--warn-soft);border-color:var(--warn);color:var(--warn)}
+.unified-content-table td[data-content-tags] .content-tag-source-automated{background:var(--good-soft);border-color:var(--good);color:var(--good)}
