@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import re
 import shutil
 import sys
@@ -311,12 +312,40 @@ def _run(args: argparse.Namespace, services: Services) -> int:
 def _backfill(args: argparse.Namespace, services: Services) -> int:
     current_day = args.today or datetime.now(timezone.utc).date()
     since = current_day - timedelta(days=args.days)
+    last_counts: tuple[int, int, int, int] | None = None
+
+    def progress(kind: str, value: str) -> None:
+        nonlocal last_counts
+        if kind == "stage":
+            print(value, flush=True)
+            return
+        if kind == "message":
+            print(value, flush=True)
+            return
+        if kind != "run_stats":
+            return
+        values = json.loads(value)
+        counts = (
+            int(values.get("authors_checked", 0)),
+            int(values.get("papers_found", 0)),
+            int(values.get("pdfs_downloaded", 0)),
+            int(values.get("errors_count", 0)),
+        )
+        if counts == last_counts:
+            return
+        last_counts = counts
+        print(
+            f"authors={counts[0]} papers={counts[1]} pdfs={counts[2]} errors={counts[3]}",
+            flush=True,
+        )
+
     app = PaperWatch(
         services.config,
         db=services.db,
         openalex=services.openalex,
         arxiv=services.arxiv,
         llm=services.llm,
+        progress=progress,
     )
     try:
         stats = app.run(

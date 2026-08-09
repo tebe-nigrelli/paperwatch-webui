@@ -285,9 +285,16 @@ def test_backfill_command_uses_explicit_window_and_download_only(
     class FakePaperWatch:
         def __init__(self, *args, **kwargs):
             self.pdf_client = FakePdfClient()
+            self.progress = kwargs["progress"]
 
         def run(self, **kwargs):
             calls.append(kwargs)
+            self.progress("stage", "Backfilling papers and PDFs")
+            self.progress(
+                "run_stats",
+                '{"authors_checked":1,"papers_found":4,"pdfs_downloaded":3,"errors_count":0}',
+            )
+            self.progress("message", "Checked author Ada Lovelace")
             return SimpleNamespace(
                 run_id=11,
                 status="success",
@@ -328,6 +335,9 @@ def test_backfill_command_uses_explicit_window_and_download_only(
         }
     ]
     output = capsys.readouterr().out
+    assert "Backfilling papers and PDFs" in output
+    assert "authors=1 papers=4 pdfs=3 errors=0" in output
+    assert "Checked author Ada Lovelace" in output
     assert "since=2025-07-30" in output
     assert "analyses=0" in output
 
