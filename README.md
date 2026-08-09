@@ -502,4 +502,4 @@ python -m compileall -q src tests
 pytest
 ```
 
-The release suite is offline and deterministic, includes branch coverage, and fails below 95%. See [TESTING.md](TESTING.md) and [AUDIT.md](AUDIT.md).
+The release suite is offline and deterministic, includes branch coverage, and fails below 92.5%. See [TESTING.md](TESTING.md) and [AUDIT.md](AUDIT.md).

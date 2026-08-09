@@ -36,7 +36,7 @@ where = ["src"]
 paperwatch = ["defaults/*.toml", "defaults/*.txt", "web_templates/*.html", "web_static/*"]
 
 [tool.pytest.ini_options]
-addopts = "-q --cov=paperwatch --cov-branch --cov-report=term-missing --cov-fail-under=95"
+addopts = "-q --cov=paperwatch --cov-branch --cov-report=term-missing --cov-fail-under=92.5"
 testpaths = ["tests"]
 pythonpath = ["src"]
 

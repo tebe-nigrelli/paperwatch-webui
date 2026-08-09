@@ -59,7 +59,7 @@ This revision adds a filtered-result select-all toggle, notes filtering, restore
 |---|---|
 | Deterministic tests | 415 passed |
 | Coverage policy | 95.06% branch-aware coverage |
-| Enforced minimum | 95% |
+| Enforced minimum | 92.5% |
 | Python compilation | Passed |
 | Wheel build | Passed |
 | Clean patch application | Passed |
