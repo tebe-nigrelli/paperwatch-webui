@@ -308,6 +308,7 @@ def test_fresh_web_database_installs_defaults_and_pdf_setting_persists(config_pa
     assert data.text.index("Add default queries") < data.text.index("Shutdown app")
     assert data.text.index("Shutdown app") < data.text.index("Download PDFs automatically")
     assert data.text.index("Download PDFs automatically") < data.text.index("Restart app")
+    assert 'data-app-uptime data-uptime-seconds="' in data.text
 
     disabled = client.post(
         "/data/settings/download-pdfs",
@@ -331,14 +332,22 @@ def test_fresh_web_database_installs_defaults_and_pdf_setting_persists(config_pa
 
 
 def test_app_shutdown_and_restart_controls_signal_after_response(config_path):
-    signals = []
+    actions = []
     signal_received = threading.Event()
 
     def stop_process():
-        signals.append("stop")
+        actions.append("stop")
         signal_received.set()
 
-    app = create_app(config_path, process_shutdown=stop_process)
+    def restart_process():
+        actions.append("restart")
+        signal_received.set()
+
+    app = create_app(
+        config_path,
+        process_shutdown=stop_process,
+        process_restart=restart_process,
+    )
     endpoints = {
         route.path: route.endpoint
         for route in app.routes
@@ -350,7 +359,7 @@ def test_app_shutdown_and_restart_controls_signal_after_response(config_path):
     assert b"shutting down" in stopped.body
     assert app.state.restart_requested is False
     assert signal_received.wait(1)
-    assert signals == ["stop"]
+    assert actions == ["stop"]
 
     signal_received.clear()
     restarted = asyncio.run(endpoints["/data/app/restart"]())
@@ -358,7 +367,7 @@ def test_app_shutdown_and_restart_controls_signal_after_response(config_path):
     assert b"restarting" in restarted.body
     assert app.state.restart_requested is True
     assert signal_received.wait(1)
-    assert signals == ["stop", "stop"]
+    assert actions == ["stop", "restart"]
 
 
 def test_automatic_pipeline_obeys_persistent_pdf_download_setting(

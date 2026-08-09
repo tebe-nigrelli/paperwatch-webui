@@ -56,6 +56,22 @@
     details.addEventListener("toggle", () => storageSet(key, String(details.open)));
   });
 
+  document.querySelectorAll("[data-app-uptime]").forEach((display) => {
+    const initialSeconds = Number.parseInt(display.dataset.uptimeSeconds || "0", 10);
+    const startedAt = Date.now() - Math.max(0, initialSeconds) * 1000;
+    const renderUptime = () => {
+      const totalMinutes = Math.floor((Date.now() - startedAt) / 60000);
+      const days = Math.floor(totalMinutes / 1440);
+      const hours = Math.floor((totalMinutes % 1440) / 60);
+      const minutes = totalMinutes % 60;
+      display.textContent = [days, hours, minutes]
+        .map((value) => String(value).padStart(2, "0"))
+        .join(":");
+    };
+    renderUptime();
+    window.setInterval(renderUptime, 1000);
+  });
+
   document.querySelectorAll("[data-author-tag-combobox]").forEach((fieldset) => {
     const input = fieldset.querySelector("[data-author-tag-input]");
     const selection = fieldset.querySelector("[data-author-tag-selection]");

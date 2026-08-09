@@ -2164,7 +2164,9 @@ def create_app(
     arxiv_client_factory: Callable[[AppConfig], Any] | None = None,
     blog_client_factory: Callable[[AppConfig], Any] | None = None,
     process_shutdown: Callable[[], None] | None = None,
+    process_restart: Callable[[], None] | None = None,
 ) -> FastAPI:
+    app_started_at = time.monotonic()
     config = load_config(config_path)
     controller = run_controller or RunController(config.config_path)
     model_controller = analysis_controller or AnalysisController(config.config_path)
@@ -2175,9 +2177,12 @@ def create_app(
     shutdown_process = process_shutdown or (
         lambda: os.kill(os.getpid(), signal.SIGTERM)
     )
+    restart_process = process_restart or (
+        lambda: os.execv(sys.orig_argv[0], sys.orig_argv)
+    )
 
-    def schedule_process_shutdown() -> None:
-        timer = threading.Timer(0.25, shutdown_process)
+    def schedule_process_action(action: Callable[[], None]) -> None:
+        timer = threading.Timer(0.25, action)
         timer.daemon = True
         timer.start()
     try:
@@ -2867,6 +2872,7 @@ def create_app(
             "data_management.html",
             authors=authors,
             download_pdfs=download_pdfs,
+            app_uptime_seconds=int(time.monotonic() - app_started_at),
         )
 
     @app.post("/data/settings/download-pdfs")
@@ -2889,7 +2895,7 @@ def create_app(
     @app.post("/data/app/shutdown", response_class=HTMLResponse)
     async def shutdown_app() -> HTMLResponse:
         app.state.restart_requested = False
-        schedule_process_shutdown()
+        schedule_process_action(shutdown_process)
         return HTMLResponse(
             "<title>Paperwatch stopped</title>"
             "<main><h1>Paperwatch is shutting down</h1>"
@@ -2899,7 +2905,7 @@ def create_app(
     @app.post("/data/app/restart", response_class=HTMLResponse)
     async def restart_app() -> HTMLResponse:
         app.state.restart_requested = True
-        schedule_process_shutdown()
+        schedule_process_action(restart_process)
         return HTMLResponse(
             "<title>Restarting Paperwatch</title>"
             '<meta http-equiv="refresh" content="4;url=/data">'
