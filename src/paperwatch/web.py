@@ -2752,8 +2752,9 @@ def create_app(
     def export_authors_csv() -> Response:
         output = io.StringIO(newline="")
         fields = [
-            "Author Name", "Institution", "OpenAlex ID", "Starred", "Enabled",
-            "Download Papers", "Tags", "Notes",
+            "Author Name", "Institution", "OpenAlex ID", "Paperwatch ID", "ORCID",
+            "Works Count", "Cited By Count", "Starred", "Enabled", "Download Papers",
+            "Tags", "Notes", "Added At", "Last Checked At", "Metadata JSON",
         ]
         writer = csv.DictWriter(output, fieldnames=fields)
         writer.writeheader()
@@ -2763,11 +2764,18 @@ def create_app(
                     "Author Name": row["name"],
                     "Institution": row["institution"] or "",
                     "OpenAlex ID": "" if str(row["openalex_id"]).startswith("LOCAL-") else row["openalex_id"],
+                    "Paperwatch ID": row["openalex_id"],
+                    "ORCID": row["orcid"] or "",
+                    "Works Count": row["works_count"],
+                    "Cited By Count": row["cited_by_count"],
                     "Starred": "yes" if row["starred"] else "no",
                     "Enabled": "yes" if row["enabled"] else "no",
                     "Download Papers": "yes" if row["download_papers"] else "no",
                     "Tags": row["tags"] or "",
                     "Notes": row["notes"] or "",
+                    "Added At": row["added_at"] or "",
+                    "Last Checked At": row["last_checked_at"] or "",
+                    "Metadata JSON": row["metadata_json"] or "{}",
                 })
         return Response(output.getvalue(), media_type="text/csv; charset=utf-8", headers={"Content-Disposition": 'attachment; filename="paperwatch-authors.csv"'})
 
@@ -2775,10 +2783,11 @@ def create_app(
     def export_blogs_csv() -> Response:
         output = io.StringIO(newline="")
         fields = [
-            "Researcher / author", "Current lab / organization",
-            "Primary applied-ML source", "Primary source URL", "Relationship to author",
-            "Primary source type", "Primary source mode", "Primary content selector",
-            "Primary article URL pattern", "Primary tags", "Notes", "Enabled", "Dead",
+            "Researcher / author", "Author ID", "Current lab / organization",
+            "Primary applied-ML source", "Primary source title", "Primary source URL",
+            "Relationship to author", "Primary source type", "Primary source mode",
+            "Primary content selector", "Primary article URL pattern", "Primary tags",
+            "Notes", "Enabled", "Dead",
         ]
         writer = csv.DictWriter(output, fieldnames=fields)
         writer.writeheader()
@@ -2787,8 +2796,10 @@ def create_app(
                 for blog in db.author_blogs(str(author["openalex_id"])):
                     writer.writerow({
                         "Researcher / author": author["name"],
+                        "Author ID": author["openalex_id"],
                         "Current lab / organization": author["institution"] or "",
-                        "Primary applied-ML source": blog["label"] or blog["title"] or "",
+                        "Primary applied-ML source": blog["label"] or "",
+                        "Primary source title": blog["title"] or "",
                         "Primary source URL": blog["url"],
                         "Relationship to author": blog["relationship"] or "",
                         "Primary source type": blog["item_stream_mode"] or "",
@@ -3026,6 +3037,13 @@ def create_app(
                 (fields[key] for key in ("openalex id", "openalex author id") if key in fields),
                 None,
             )
+            paperwatch_id_column = next(
+                (fields[key] for key in ("paperwatch id", "paperwatch author id") if key in fields),
+                None,
+            )
+            orcid_column = fields.get("orcid")
+            works_count_column = fields.get("works count")
+            cited_by_count_column = fields.get("cited by count")
             starred_column = fields.get("starred")
             enabled_column = fields.get("enabled")
             download_papers_column = next(
@@ -3034,6 +3052,25 @@ def create_app(
             )
             tags_column = fields.get("tags")
             notes_column = next((fields[key] for key in ("notes", "comments") if key in fields), None)
+            added_at_column = fields.get("added at")
+            last_checked_at_column = fields.get("last checked at")
+            metadata_column = fields.get("metadata json")
+
+            def csv_bool(value: str, default: bool) -> bool:
+                cleaned = str(value or "").strip().casefold()
+                if not cleaned:
+                    return default
+                return cleaned not in {"0", "false", "no", "off", "disabled"}
+
+            def csv_count(value: str) -> int:
+                cleaned = str(value or "").strip()
+                if not cleaned:
+                    return 0
+                try:
+                    return max(0, int(cleaned))
+                except ValueError as exc:
+                    raise ValueError(f"Invalid integer value: {cleaned}") from exc
+
             with Database(config.paths.database) as db:
                 for raw_row in reader:
                     row = {str(key).strip(): str(value or "").strip() for key, value in raw_row.items()}
@@ -3041,48 +3078,108 @@ def create_app(
                     if not name:
                         continue
                     institution = clean_text(row.get(institution_column)) if institution_column else None
-                    openalex_id = _manual_openalex_author_id(
+                    external_id = _manual_openalex_author_id(
                         row.get(openalex_column, "") if openalex_column else ""
                     )
-                    if openalex_id:
-                        db.add_author(
-                            AuthorCandidate(
-                                openalex_id=openalex_id,
-                                name=name,
-                                institution=institution,
-                                metadata={"csv_import": True},
-                            )
-                        )
-                        identifier = openalex_id
+                    portable_id = (
+                        short_openalex_id(row.get(paperwatch_id_column, ""))
+                        if paperwatch_id_column
+                        else None
+                    )
+                    if portable_id and not (portable_id.startswith("LOCAL-") or re.fullmatch(r"A\d+", portable_id)):
+                        raise ValueError("Paperwatch ID must be a LOCAL- identifier or OpenAlex author ID")
+                    identifier = portable_id or external_id
+                    if not identifier:
+                        digest = hashlib.sha256(name.casefold().encode("utf-8")).hexdigest()[:16]
+                        identifier = f"LOCAL-{digest}".upper()
+                    is_local = identifier.startswith("LOCAL-")
+                    existing = db.get_author(identifier)
+                    existing_metadata: dict[str, Any] = {}
+                    if existing is not None:
+                        try:
+                            parsed_existing = json.loads(existing["metadata_json"] or "{}")
+                            if isinstance(parsed_existing, dict):
+                                existing_metadata = parsed_existing
+                        except (TypeError, json.JSONDecodeError):
+                            pass
+                    metadata: dict[str, Any]
+                    if metadata_column and row.get(metadata_column, ""):
+                        try:
+                            parsed_metadata = json.loads(row[metadata_column])
+                        except json.JSONDecodeError as exc:
+                            raise ValueError("Metadata JSON must contain valid JSON") from exc
+                        if not isinstance(parsed_metadata, dict):
+                            raise ValueError("Metadata JSON must contain a JSON object")
+                        metadata = parsed_metadata
+                    elif existing is not None:
+                        metadata = existing_metadata
                     else:
-                        db.add_manual_author(name, institution)
-                        matches = db.find_authors_by_name(name)
-                        identifier = str(matches[0]["openalex_id"]) if matches else ""
-                    if identifier and starred_column:
-                        db.set_author_starred(
-                            identifier,
-                            row.get(starred_column, "").casefold() in {"1", "true", "yes", "on", "starred"},
+                        metadata = (
+                            {"manual": True, "papers_enabled": False}
+                            if is_local
+                            else {"csv_import": True}
                         )
-                    if identifier and enabled_column:
-                        db.set_author_enabled(
-                            identifier,
-                            row.get(enabled_column, "yes").casefold() not in {"0", "false", "no", "off", "disabled"},
-                        )
-                    if identifier and download_papers_column:
-                        db.set_author_download_papers(
-                            identifier,
-                            row.get(download_papers_column, "yes").casefold()
-                            not in {"0", "false", "no", "off", "disabled"},
-                        )
-                    if identifier:
-                        for tag in (*import_tags, *_split_tags(row.get(tags_column, "") if tags_column else "")):
-                            db.add_author_tag(identifier, tag)
-                    if identifier and notes_column:
-                        stored_author = db.get_author(identifier)
-                        if stored_author is not None:
-                            db.set_object_notes(
-                                "author", int(stored_author["id"]), row.get(notes_column, "")
+                    db.import_author_record(
+                        openalex_id=identifier,
+                        name=name,
+                        orcid=(
+                            row.get(orcid_column, "")
+                            if orcid_column
+                            else (existing["orcid"] if existing is not None else None)
+                        ),
+                        institution=(
+                            institution
+                            if institution_column
+                            else (existing["institution"] if existing is not None else None)
+                        ),
+                        works_count=(
+                            csv_count(row.get(works_count_column, ""))
+                            if works_count_column
+                            else int(existing["works_count"] if existing is not None else 0)
+                        ),
+                        cited_by_count=(
+                            csv_count(row.get(cited_by_count_column, ""))
+                            if cited_by_count_column
+                            else int(existing["cited_by_count"] if existing is not None else 0)
+                        ),
+                        enabled=(
+                            csv_bool(row.get(enabled_column, ""), not is_local)
+                            if enabled_column
+                            else bool(existing["enabled"] if existing is not None else not is_local)
+                        ),
+                        starred=(
+                            csv_bool(row.get(starred_column, ""), False)
+                            if starred_column
+                            else bool(existing["starred"] if existing is not None else False)
+                        ),
+                        download_papers=(
+                            csv_bool(row.get(download_papers_column, ""), not is_local)
+                            if download_papers_column
+                            else bool(
+                                existing["download_papers"]
+                                if existing is not None
+                                else not is_local
                             )
+                        ),
+                        notes=(
+                            row.get(notes_column, "")
+                            if notes_column
+                            else str(existing["notes"] if existing is not None else "")
+                        ),
+                        added_at=(
+                            row.get(added_at_column, "")
+                            if added_at_column
+                            else str(existing["added_at"] if existing is not None else "") or None
+                        ),
+                        last_checked_at=(
+                            row.get(last_checked_at_column, "")
+                            if last_checked_at_column
+                            else (existing["last_checked_at"] if existing is not None else None)
+                        ),
+                        metadata=metadata,
+                    )
+                    for tag in (*import_tags, *_split_tags(row.get(tags_column, "") if tags_column else "")):
+                        db.add_author_tag(identifier, tag)
                     imported += 1
         except (UnicodeDecodeError, ValueError) as exc:
             return RedirectResponse(

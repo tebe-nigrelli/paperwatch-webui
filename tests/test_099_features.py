@@ -3,6 +3,9 @@ from __future__ import annotations
 import csv
 import hashlib
 import io
+import json
+import sqlite3
+import zipfile
 from pathlib import Path
 
 from fastapi.testclient import TestClient
@@ -1114,3 +1117,303 @@ def test_099_pdf_import_metadata_replacement_and_rollback(
         files={"pdf": ("replacement.pdf", pdf_bytes(180), "application/pdf")},
         follow_redirects=False,
     ).status_code == 404
+
+
+def _roundtrip_config(config_path: Path, target_root: Path, name: str) -> Path:
+    config = load_config(config_path)
+    target = target_root / f"{name}.toml"
+    text = config_path.read_text()
+    text = text.replace(str(config.paths.database), str(target_root / f"{name}.db"))
+    text = text.replace(str(config.paths.pdf_dir), str(target_root / f"{name}-pdfs"))
+    target.write_text(text)
+    return target
+
+
+def _csv_rows(text: str, *keys: str) -> list[dict[str, str]]:
+    rows = list(csv.DictReader(io.StringIO(text)))
+    return sorted(rows, key=lambda row: tuple(row.get(key, "") for key in keys))
+
+
+def _portable_catalog(payload: dict) -> dict:
+    copied = json.loads(json.dumps(payload))
+    for author in copied.get("authors", []):
+        for blog in author.get("blogs", []):
+            blog.pop("id", None)
+    return copied
+
+
+def _sqlite_snapshot(path: Path) -> dict[str, list[tuple]]:
+    conn = sqlite3.connect(str(path))
+    try:
+        tables = [
+            str(row[0])
+            for row in conn.execute(
+                "SELECT name FROM sqlite_master "
+                "WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name"
+            ).fetchall()
+        ]
+        snapshot: dict[str, list[tuple]] = {}
+        for table in tables:
+            quoted = '"' + table.replace('"', '""') + '"'
+            rows = [tuple(row) for row in conn.execute(f"SELECT * FROM {quoted}").fetchall()]
+            snapshot[table] = sorted(rows, key=repr)
+        return snapshot
+    finally:
+        conn.close()
+
+
+def test_data_author_csv_roundtrip_is_lossless(tmp_path, config_path, author_candidate):
+    config = load_config(config_path)
+    with Database(config.paths.database) as db:
+        db.import_author_record(
+            openalex_id=author_candidate.openalex_id,
+            name=author_candidate.name,
+            orcid=author_candidate.orcid,
+            institution=author_candidate.institution,
+            works_count=author_candidate.works_count,
+            cited_by_count=author_candidate.cited_by_count,
+            enabled=False,
+            starred=True,
+            download_papers=False,
+            notes="OpenAlex note, with commas\nand a second line",
+            added_at="2025-01-02T03:04:05+00:00",
+            last_checked_at="2026-08-08T09:10:11+00:00",
+            metadata={"source": "roundtrip", "nested": {"ok": True}},
+        )
+        db.add_author_tag(author_candidate.openalex_id, "Alpha")
+        db.add_author_tag(author_candidate.openalex_id, "Beta")
+        local_id = "LOCAL-ROUNDTRIP-ABC123"
+        db.import_author_record(
+            openalex_id=local_id,
+            name="Same Name Local",
+            institution="Independent Lab",
+            enabled=True,
+            starred=True,
+            download_papers=True,
+            notes="Local note",
+            added_at="2024-02-03T04:05:06+00:00",
+            last_checked_at="2026-07-01T00:00:00+00:00",
+            metadata={"manual": True, "papers_enabled": True, "custom": "kept"},
+        )
+        db.add_author_tag(local_id, "Local")
+
+    source_web = web_client(config_path)
+    exported = source_web.get("/exports/authors.csv")
+    assert exported.status_code == 200
+    source_rows = _csv_rows(exported.text, "Paperwatch ID")
+    assert {row["Paperwatch ID"] for row in source_rows} == {
+        author_candidate.openalex_id,
+        local_id,
+    }
+    assert next(row for row in source_rows if row["Paperwatch ID"] == local_id)["OpenAlex ID"] == ""
+
+    target_config = _roundtrip_config(config_path, tmp_path, "authors-lossless")
+    target_web = web_client(target_config)
+    imported = target_web.post(
+        "/authors/import",
+        files={"csv_file": ("authors.csv", exported.content, "text/csv")},
+        follow_redirects=False,
+    )
+    assert imported.status_code == 303
+    reexported = target_web.get("/exports/authors.csv")
+    assert _csv_rows(reexported.text, "Paperwatch ID") == source_rows
+
+
+def test_data_blog_csv_roundtrip_is_lossless_and_uses_author_id(
+    tmp_path, config_path, author_candidate
+):
+    config = load_config(config_path)
+    with Database(config.paths.database) as db:
+        first_id = author_candidate.openalex_id
+        second_id = "A124"
+        db.import_author_record(openalex_id=first_id, name="Duplicate Name")
+        db.import_author_record(openalex_id=second_id, name="Duplicate Name")
+        first_blog = db.import_author_blog_record(
+            first_id,
+            "https://example.test/first/",
+            title="Fetched first title",
+            label="",
+            relationship="Author",
+            source_mode="article_index",
+            content_selector="main article",
+            article_url_pattern=r"/posts/\\d+",
+            enabled=False,
+            dead=False,
+            notes="First source note",
+            item_stream_mode="article_index",
+        )
+        db.add_blog_source_tag(first_blog, "Official")
+        second_blog = db.import_author_blog_record(
+            second_id,
+            "https://example.test/second/",
+            title="Fetched second title",
+            label="Second label",
+            relationship="Lab",
+            source_mode="feed",
+            enabled=False,
+            dead=True,
+            notes="Second source note",
+            item_stream_mode="feed",
+        )
+        db.add_blog_source_tag(second_blog, "Dead source")
+
+    source_web = web_client(config_path)
+    exported = source_web.get("/exports/blogs.csv")
+    assert exported.status_code == 200
+    source_rows = _csv_rows(exported.text, "Author ID", "Primary source URL")
+    assert {row["Author ID"] for row in source_rows} == {first_id, second_id}
+    first = next(row for row in source_rows if row["Author ID"] == first_id)
+    assert first["Primary applied-ML source"] == ""
+    assert first["Primary source title"] == "Fetched first title"
+    assert first["Primary source type"] == "article_index"
+    assert first["Enabled"] == "no"
+
+    target_config = _roundtrip_config(config_path, tmp_path, "blogs-lossless")
+    target = load_config(target_config)
+    with Database(target.paths.database) as db:
+        # Duplicate names deliberately make name-only matching ambiguous.
+        db.import_author_record(openalex_id=first_id, name="Duplicate Name")
+        db.import_author_record(openalex_id=second_id, name="Duplicate Name")
+    target_web = web_client(target_config)
+    imported = target_web.post(
+        "/authors/blogs/import",
+        files={"csv_file": ("blogs.csv", exported.content, "text/csv")},
+        follow_redirects=False,
+    )
+    assert imported.status_code == 303
+    reexported = target_web.get("/exports/blogs.csv")
+    assert _csv_rows(reexported.text, "Author ID", "Primary source URL") == source_rows
+
+
+def test_data_author_blog_json_roundtrip_is_lossless(tmp_path, config_path):
+    config = load_config(config_path)
+    with Database(config.paths.database) as db:
+        local_id = "LOCAL-JSON-ROUNDTRIP"
+        db.import_author_record(
+            openalex_id=local_id,
+            name="Portable Local",
+            institution="Portable Lab",
+            works_count=7,
+            cited_by_count=11,
+            enabled=True,
+            starred=True,
+            download_papers=True,
+            notes="Portable author note",
+            added_at="2023-04-05T06:07:08+00:00",
+            metadata={"manual": True, "custom": [1, 2, 3]},
+        )
+        db.add_author_tag(local_id, "Portable")
+        blog_id = db.import_author_blog_record(
+            local_id,
+            "https://portable.example/blog/",
+            title="Fetched title must remain a title",
+            label="",
+            relationship="Direct",
+            source_mode="article_index",
+            content_selector="article.post",
+            article_url_pattern=r"/entry/",
+            enabled=False,
+            dead=False,
+            notes="Portable source note",
+            item_stream_mode="article_index",
+        )
+        db.add_blog_source_tag(blog_id, "First party")
+
+    source_web = web_client(config_path)
+    exported = source_web.get("/data/export/authors-blogs")
+    assert exported.status_code == 200
+    source = exported.json()
+    target_config = _roundtrip_config(config_path, tmp_path, "catalog-lossless")
+    target_web = web_client(target_config)
+    imported = target_web.post(
+        "/data/import/authors-blogs",
+        files={"file": ("authors-blogs.json", exported.content, "application/json")},
+        follow_redirects=False,
+    )
+    assert imported.status_code == 303
+    restored = target_web.get("/data/export/authors-blogs").json()
+    assert _portable_catalog(restored) == _portable_catalog(source)
+
+
+def test_data_full_zip_roundtrip_preserves_database_and_pdf_store(
+    tmp_path, config_path, author_candidate, paper_record
+):
+    paper_id, blog_id, entry_id = seed(config_path, author_candidate, paper_record)
+    config = load_config(config_path)
+    config.paths.pdf_dir.mkdir(parents=True, exist_ok=True)
+    stored_pdf = config.paths.pdf_dir / "nested" / "stored.pdf"
+    stored_pdf.parent.mkdir(parents=True, exist_ok=True)
+    stored_pdf.write_bytes(b"%PDF-1.4\nlossless-pdf-bytes\n%%EOF")
+    orphan = config.paths.pdf_dir / "orphan.bin"
+    orphan.write_bytes(b"orphan bytes are part of the store")
+    with Database(config.paths.database) as db:
+        db._conn.execute(
+            "UPDATE papers SET local_pdf_path=?, pdf_sha256=?, pdf_size=? WHERE id=?",
+            (
+                str(stored_pdf.resolve()),
+                hashlib.sha256(stored_pdf.read_bytes()).hexdigest(),
+                stored_pdf.stat().st_size,
+                paper_id,
+            ),
+        )
+        db._conn.commit()
+        db.add_author_tag(author_candidate.openalex_id, "Whole backup")
+        db.add_blog_source_tag(blog_id, "Whole backup")
+        db.add_blog_entry_tag(entry_id, "Whole backup")
+        db.set_download_pdfs_enabled(False)
+        query_id = db.create_saved_query(name="Backup query", prompt="Keep me")
+        run_id = db.create_query_runs(
+            batch_id="backup-batch",
+            query_id=query_id,
+            profiles=[("default", "ollama", "test-model")],
+            context_window_tokens=2048,
+            selection={"paper_ids": [paper_id]},
+        )[0]
+        db.finish_query_run(
+            run_id,
+            matched_count=1,
+            input_chars=12,
+            output={"title": "Backup result", "summary": "Kept", "items": []},
+        )
+
+    web = web_client(config_path)
+    exported = web.get("/data/export/all")
+    assert exported.status_code == 200
+    archive_bytes = exported.content
+    archive_db = tmp_path / "archive.sqlite3"
+    with zipfile.ZipFile(io.BytesIO(archive_bytes)) as archive:
+        archive_db.write_bytes(archive.read("database.sqlite3"))
+        archived_files = {
+            name.removeprefix("pdfs/"): archive.read(name)
+            for name in archive.namelist()
+            if name.startswith("pdfs/") and not name.endswith("/")
+        }
+    expected_db = _sqlite_snapshot(archive_db)
+    assert archived_files == {
+        "nested/stored.pdf": stored_pdf.read_bytes(),
+        "orphan.bin": orphan.read_bytes(),
+    }
+
+    with Database(config.paths.database) as db:
+        db.delete_all_blog_entries()
+        db.delete_all_summaries()
+        db._conn.execute("DELETE FROM saved_queries WHERE id=?", (query_id,))
+        db._conn.execute("UPDATE authors SET notes='mutated after export'")
+        db._conn.commit()
+    stored_pdf.write_bytes(b"mutated")
+    orphan.unlink()
+    (config.paths.pdf_dir / "extra.bin").write_bytes(b"extra")
+
+    imported = web.post(
+        "/data/import/all",
+        files={"file": ("paperwatch-full-data.zip", archive_bytes, "application/zip")},
+        follow_redirects=False,
+    )
+    assert imported.status_code == 303
+    assert _sqlite_snapshot(config.paths.database) == expected_db
+    restored_files = {
+        file.relative_to(config.paths.pdf_dir).as_posix(): file.read_bytes()
+        for file in config.paths.pdf_dir.rglob("*")
+        if file.is_file()
+    }
+    assert restored_files == archived_files

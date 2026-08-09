@@ -1852,6 +1852,88 @@ class Database:
         assert row is not None
         return int(row["id"])
 
+    def import_author_record(
+        self,
+        *,
+        openalex_id: str,
+        name: str,
+        orcid: str | None = None,
+        institution: str | None = None,
+        works_count: int = 0,
+        cited_by_count: int = 0,
+        enabled: bool = True,
+        starred: bool = False,
+        download_papers: bool = True,
+        notes: str = "",
+        added_at: str | None = None,
+        last_checked_at: str | None = None,
+        metadata: dict[str, Any] | None = None,
+    ) -> int:
+        """Import one portable author record without discarding exported fields."""
+        identifier = self._author_id(openalex_id)
+        cleaned_name = " ".join(str(name).strip().split())
+        if not cleaned_name:
+            raise ValueError("Author name is required")
+        if len(cleaned_name) > 300:
+            raise ValueError("Author name is too long")
+        cleaned_institution = " ".join(str(institution or "").strip().split()) or None
+        cleaned_orcid = str(orcid or "").strip() or None
+        imported_at = str(added_at or "").strip() or utcnow()
+        checked_at = str(last_checked_at or "").strip() or None
+        metadata_value = metadata if isinstance(metadata, dict) else {}
+        with self.transaction() as conn:
+            conn.execute(
+                """
+                INSERT INTO authors (
+                    openalex_id, name, orcid, institution, works_count, cited_by_count,
+                    enabled, tracked, starred, download_papers, notes, added_at,
+                    last_checked_at, metadata_json
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(openalex_id) DO UPDATE SET
+                    name=excluded.name,
+                    orcid=excluded.orcid,
+                    institution=excluded.institution,
+                    works_count=excluded.works_count,
+                    cited_by_count=excluded.cited_by_count,
+                    enabled=excluded.enabled,
+                    tracked=1,
+                    starred=excluded.starred,
+                    download_papers=excluded.download_papers,
+                    notes=excluded.notes,
+                    added_at=excluded.added_at,
+                    last_checked_at=excluded.last_checked_at,
+                    metadata_json=excluded.metadata_json
+                """,
+                (
+                    identifier,
+                    cleaned_name,
+                    cleaned_orcid,
+                    cleaned_institution,
+                    max(0, int(works_count)),
+                    max(0, int(cited_by_count)),
+                    1 if enabled else 0,
+                    1 if starred else 0,
+                    1 if download_papers else 0,
+                    str(notes or ""),
+                    imported_at,
+                    checked_at,
+                    json_dumps(metadata_value),
+                ),
+            )
+            row = conn.execute(
+                "SELECT id FROM authors WHERE openalex_id=?", (identifier,)
+            ).fetchone()
+            assert row is not None
+            conn.execute(
+                """
+                UPDATE paper_authors
+                SET tracked_author_id=?
+                WHERE openalex_author_id=?
+                """,
+                (int(row["id"]), identifier),
+            )
+        return int(row["id"])
+
     def find_authors_by_name(self, name: str) -> list[sqlite3.Row]:
         cleaned = " ".join(name.strip().split())
         if not cleaned:
@@ -2128,6 +2210,88 @@ class Database:
                 ),
             )
             blog = conn.execute("SELECT id FROM blogs WHERE url=?", (cleaned_url,)).fetchone()
+            assert blog is not None
+            conn.execute(
+                """
+                INSERT INTO author_blogs(author_id, blog_id, label, relationship)
+                VALUES (?, ?, ?, ?)
+                ON CONFLICT(author_id, blog_id) DO UPDATE SET
+                    label=excluded.label,
+                    relationship=excluded.relationship
+                """,
+                (int(author["id"]), int(blog["id"]), cleaned_label, cleaned_relationship),
+            )
+        return int(blog["id"])
+
+    def import_author_blog_record(
+        self,
+        openalex_id: str,
+        url: str,
+        *,
+        title: str | None = None,
+        label: str = "",
+        relationship: str = "",
+        source_mode: str = "auto",
+        content_selector: str | None = None,
+        article_url_pattern: str | None = None,
+        enabled: bool = True,
+        dead: bool = False,
+        notes: str = "",
+        item_stream_mode: str | None = None,
+    ) -> int:
+        """Import a portable blog-source record with its exported state intact."""
+        identifier = self._author_id(openalex_id)
+        cleaned_url = str(url).strip()
+        if not cleaned_url:
+            raise ValueError("Blog URL is required")
+        cleaned_title = " ".join(str(title or "").strip().split())[:500] or None
+        cleaned_label = " ".join(str(label or "").strip().split())[:300] or None
+        cleaned_relationship = " ".join(str(relationship or "").strip().split())[:300] or None
+        cleaned_mode = str(source_mode or "auto").strip().lower().replace("-", "_") or "auto"
+        if cleaned_mode not in BLOG_SOURCE_MODES:
+            raise ValueError(f"Unknown blog source mode: {cleaned_mode}")
+        cleaned_selector = str(content_selector or "").strip()[:500] or None
+        cleaned_pattern = str(article_url_pattern or "").strip()[:500] or None
+        cleaned_stream = str(item_stream_mode or "").strip() or None
+        with self.transaction() as conn:
+            author = conn.execute(
+                "SELECT id FROM authors WHERE openalex_id=? AND tracked=1",
+                (identifier,),
+            ).fetchone()
+            if author is None:
+                raise ValueError("Author not found")
+            conn.execute(
+                """
+                INSERT INTO blogs(
+                    url, title, notes, enabled, dead, source_mode, content_selector,
+                    article_url_pattern, item_stream_mode, added_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(url) DO UPDATE SET
+                    title=COALESCE(excluded.title, blogs.title),
+                    notes=excluded.notes,
+                    enabled=excluded.enabled,
+                    dead=excluded.dead,
+                    source_mode=excluded.source_mode,
+                    content_selector=excluded.content_selector,
+                    article_url_pattern=excluded.article_url_pattern,
+                    item_stream_mode=COALESCE(excluded.item_stream_mode, blogs.item_stream_mode)
+                """,
+                (
+                    cleaned_url,
+                    cleaned_title,
+                    str(notes or ""),
+                    1 if enabled else 0,
+                    1 if dead else 0,
+                    cleaned_mode,
+                    cleaned_selector,
+                    cleaned_pattern,
+                    cleaned_stream,
+                    utcnow(),
+                ),
+            )
+            blog = conn.execute(
+                "SELECT id FROM blogs WHERE url=?", (cleaned_url,)
+            ).fetchone()
             assert blog is not None
             conn.execute(
                 """
@@ -5193,13 +5357,17 @@ class Database:
                 dict(item)
                 for item in self._conn.execute(
                     """
-                    SELECT b.id, b.url, COALESCE(ab.label, b.title, '') AS label,
+                    SELECT b.id, b.url, b.title, COALESCE(ab.label, '') AS label,
                            COALESCE(ab.relationship, '') AS relationship,
                            b.source_mode, b.content_selector, b.article_url_pattern,
-                           b.enabled, b.dead, b.notes,
-                           COALESCE((SELECT group_concat(ct.name, ', ') FROM blog_source_tag_links bstl
+                           b.enabled, b.dead, b.notes, b.item_stream_mode,
+                           COALESCE((SELECT group_concat(name, ', ') FROM (
+                               SELECT ct.name AS name
+                               FROM blog_source_tag_links bstl
                                JOIN content_tags ct ON ct.id=bstl.tag_id
-                               WHERE bstl.blog_id=b.id), '') AS tags
+                               WHERE bstl.blog_id=b.id
+                               ORDER BY ct.name COLLATE NOCASE
+                           )), '') AS tags
                     FROM author_blogs ab JOIN blogs b ON b.id=ab.blog_id
                     WHERE ab.author_id=? ORDER BY b.url
                     """,
@@ -5230,36 +5398,24 @@ class Database:
             identifier = str(raw.get("openalex_id") or "").strip()
             if not name or not identifier:
                 raise ValueError("Every author requires a name and identifier")
-            if identifier.startswith("LOCAL-"):
-                self.add_manual_author(name, str(raw.get("institution") or "") or None)
-                matches = self.find_authors_by_name(name)
-                if not matches:
-                    raise ValueError(f"Could not import author {name}")
-                identifier = str(matches[0]["openalex_id"])
-            else:
-                metadata = raw.get("metadata") if isinstance(raw.get("metadata"), dict) else {}
-                self.add_author(
-                    AuthorCandidate(
-                        openalex_id=identifier,
-                        name=name,
-                        orcid=str(raw.get("orcid") or "") or None,
-                        institution=str(raw.get("institution") or "") or None,
-                        works_count=int(raw.get("works_count") or 0),
-                        cited_by_count=int(raw.get("cited_by_count") or 0),
-                        metadata=metadata,
-                    )
-                )
-            if not bool(raw.get("enabled", 1)):
-                self.set_author_enabled(identifier, False)
-            self.set_author_starred(identifier, bool(raw.get("starred", 0)))
-            self.set_author_download_papers(
-                identifier, bool(raw.get("download_papers", 1))
+            metadata = raw.get("metadata") if isinstance(raw.get("metadata"), dict) else {}
+            self.import_author_record(
+                openalex_id=identifier,
+                name=name,
+                orcid=str(raw.get("orcid") or "") or None,
+                institution=str(raw.get("institution") or "") or None,
+                works_count=int(raw.get("works_count") or 0),
+                cited_by_count=int(raw.get("cited_by_count") or 0),
+                enabled=bool(raw.get("enabled", 1)),
+                starred=bool(raw.get("starred", 0)),
+                download_papers=bool(raw.get("download_papers", 1)),
+                notes=str(raw.get("notes") or ""),
+                added_at=str(raw.get("added_at") or "") or None,
+                metadata=metadata,
             )
+            identifier = self._author_id(identifier)
             for tag in raw.get("tags", ()) if isinstance(raw.get("tags"), list) else ():
                 self.add_author_tag(identifier, str(tag))
-            author_row = self.get_author(identifier)
-            if author_row is not None:
-                self.set_object_notes("author", int(author_row["id"]), str(raw.get("notes") or ""))
             imported_authors += 1
             blogs = raw.get("blogs")
             if not isinstance(blogs, list):
@@ -5267,24 +5423,25 @@ class Database:
             for blog in blogs:
                 if not isinstance(blog, dict):
                     continue
-                blog_id = self.add_author_blog(
+                blog_id = self.import_author_blog_record(
                     identifier,
                     str(blog.get("url") or ""),
+                    title=str(blog.get("title") or "") or None,
                     label=str(blog.get("label") or ""),
                     relationship=str(blog.get("relationship") or ""),
                     source_mode=str(blog.get("source_mode") or "auto"),
                     content_selector=str(blog.get("content_selector") or "") or None,
                     article_url_pattern=str(blog.get("article_url_pattern") or "") or None,
+                    enabled=bool(blog.get("enabled", 1)),
                     dead=bool(blog.get("dead", 0)),
+                    notes=str(blog.get("notes") or ""),
+                    item_stream_mode=str(blog.get("item_stream_mode") or "") or None,
                 )
-                self.set_object_notes("blog_source", blog_id, str(blog.get("notes") or ""))
                 raw_tags = blog.get("tags")
                 tags = raw_tags if isinstance(raw_tags, list) else str(raw_tags or "").split(",")
                 for tag in tags:
                     if str(tag).strip():
                         self.add_blog_source_tag(blog_id, str(tag))
-                if not bool(blog.get("enabled", 1)):
-                    self.set_author_blog_broken(identifier, blog_id, True)
                 imported_links += 1
         return imported_authors, imported_links
 

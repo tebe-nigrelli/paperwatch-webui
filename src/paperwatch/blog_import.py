@@ -42,11 +42,40 @@ def import_blog_links(
         if not name:
             stats.authors_missing += 1
             continue
-        matches = db.find_authors_by_name(name)
-        if not matches and create_missing:
-            db.add_manual_author(name, row.get("Current lab / organization"))
+        exported_author_id = str(
+            row.get("Author ID")
+            or row.get("Paperwatch ID")
+            or row.get("OpenAlex ID")
+            or ""
+        ).strip()
+        matches = []
+        if exported_author_id:
+            exact = db.get_author(exported_author_id)
+            if exact is not None and exact["tracked"]:
+                matches = [exact]
+            elif create_missing:
+                is_local = exported_author_id.upper().startswith("LOCAL-")
+                db.import_author_record(
+                    openalex_id=exported_author_id,
+                    name=name,
+                    institution=row.get("Current lab / organization"),
+                    enabled=not is_local,
+                    download_papers=not is_local,
+                    metadata=(
+                        {"manual": True, "papers_enabled": False}
+                        if is_local
+                        else {"csv_import": True}
+                    ),
+                )
+                exact = db.get_author(exported_author_id)
+                matches = [exact] if exact is not None else []
+                stats.authors_created += 1
+        else:
             matches = db.find_authors_by_name(name)
-            stats.authors_created += 1
+            if not matches and create_missing:
+                db.add_manual_author(name, row.get("Current lab / organization"))
+                matches = db.find_authors_by_name(name)
+                stats.authors_created += 1
         if not matches:
             stats.authors_missing += 1
             continue
@@ -66,6 +95,7 @@ def import_blog_links(
             (
                 row.get("Primary source URL") or "",
                 row.get("Primary applied-ML source") or "",
+                row.get("Primary source title") or "",
                 row.get("Relationship to author") or "",
                 row.get("Primary source type") or "",
                 row.get("Primary source mode") or "",
@@ -75,6 +105,7 @@ def import_blog_links(
             (
                 row.get("Secondary source URL") or "",
                 row.get("Secondary nearby source") or "",
+                row.get("Secondary source title") or "",
                 row.get("Secondary relationship") or "",
                 row.get("Secondary source type") or row.get("Secondary focus") or "",
                 row.get("Secondary source mode") or "",
@@ -85,6 +116,7 @@ def import_blog_links(
         for source_index, (
             raw_url,
             label,
+            source_title,
             relationship,
             source_type,
             explicit_mode,
@@ -101,9 +133,16 @@ def import_blog_links(
             dead = str(row.get("Dead") or "").strip().casefold() in {
                 "1", "true", "yes", "on", "dead"
             }
-            blog_id = db.add_author_blog(
+            enabled = str(row.get("Enabled") or "yes").strip().casefold() not in {
+                "0", "false", "no", "off", "disabled"
+            }
+            notes = (
+                row.get("Primary notes") if source_index == 0 else row.get("Secondary notes")
+            ) or row.get("Notes") or ""
+            blog_id = db.import_author_blog_record(
                 author_id,
                 url,
+                title=source_title or None,
                 label=label,
                 relationship=relationship,
                 source_mode=(
@@ -112,7 +151,10 @@ def import_blog_links(
                 ),
                 content_selector=content_selector,
                 article_url_pattern=article_url_pattern,
+                enabled=enabled,
                 dead=dead,
+                notes=str(notes),
+                item_stream_mode=source_type.strip() or None,
             )
             tag_value = (
                 row.get("Primary tags") if source_index == 0
@@ -121,12 +163,6 @@ def import_blog_links(
             for raw_tag in (*import_tags, *str(tag_value).replace(";", ",").split(",")):
                 if str(raw_tag).strip():
                     db.add_blog_source_tag(blog_id, str(raw_tag))
-            notes = row.get("Primary notes") or row.get("Notes") or ""
-            if str(notes).strip():
-                db.set_object_notes("blog_source", blog_id, str(notes))
-            enabled = str(row.get("Enabled") or "yes").strip().casefold()
-            if not dead and enabled in {"0", "false", "no", "off", "disabled"}:
-                db.set_author_blog_broken(author_id, blog_id, True)
             stats.links += 1
     return stats
 
