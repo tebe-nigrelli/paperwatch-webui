@@ -19,7 +19,7 @@ from .blogs import (
     validate_content_selector,
 )
 from .db import Database
-from .default_queries import add_default_queries
+from .default_queries import add_default_queries, refresh_default_regexp_patterns
 from .llm import LLMClient, create_llm
 from .pipeline import PaperWatch
 from .sources.arxiv import ArxivClient
@@ -47,6 +47,7 @@ def build_services(config: AppConfig) -> Services:
     if db.was_created:
         model_profile = config.available_llms[0].profile if config.available_llms else ""
         add_default_queries(db, model_profile)
+    refresh_default_regexp_patterns(db)
     return Services(
         config=config,
         db=db,

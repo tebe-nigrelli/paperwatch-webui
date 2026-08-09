@@ -197,8 +197,26 @@ def test_regexp_query_uses_match_output_as_editable_query_tag(config_path, paper
         assert tags[0]["freeform"] is True
         assert tags[0]["label_class"] == "Compact match"
         assert tags[0]["value"].casefold() == "compact agent"
-        assert tags[0]["tag_name"].casefold() == "compact match: compact agent"
+        assert tags[0]["tag_name"].casefold() == "compact agent"
 
+        filter_tags = [row["name"] for row in db.list_content_tag_filter_options()]
+        assert "compact agent" in filter_tags
+
+    client = TestClient(
+        create_app(
+            config_path,
+            run_controller=_NoopRun(),
+            analysis_controller=_NoopAnalysis(),
+            query_controller=_NoopQuery(),
+            author_client_factory=lambda config: _AuthorClient(),
+        )
+    )
+    page = client.get("/", params={"tag": "compact agent"})
+    assert page.status_code == 200
+    assert paper_record.title in page.text
+    assert 'value="compact agent" selected' in page.text
+
+    with Database(config.paths.database) as db:
         assert db.set_content_classification(query_id, "paper", paper_id, "Manual value")
         assert db.classification_results_for_content("paper", paper_id)[0]["value"] == "Manual value"
         assert db.clear_query_classifications(query_id) == 1
@@ -325,7 +343,7 @@ def test_new_paper_fetch_runs_automatic_regexp_query(
         assert runs[0]["paper_id"] == paper_id
         tags = db.classification_results_for_content("paper", paper_id)
         assert [tag["tag_name"].casefold() for tag in tags] == [
-            "auto compact: compact agent"
+            "compact agent"
         ]
 
         second = app.run(today=date(2026, 8, 8))
@@ -415,21 +433,25 @@ def test_new_blog_feed_item_runs_automatic_regexp_query(
         )
 
         first = app.run(today=date(2026, 8, 8))
-        assert first.new_blog_entry_ids == []
-        assert [
+        assert len(first.new_blog_entry_ids) == 1
+        baseline_id = first.new_blog_entry_ids[0]
+        first_runs = [
             row for row in db.list_query_runs() if int(row["query_id"]) == query_id
-        ] == []
+        ]
+        assert len(first_runs) == 1
+        assert int(first_runs[0]["blog_entry_id"]) == baseline_id
+        assert db.classification_results_for_content("blog", baseline_id) == []
 
         second = app.run(today=date(2026, 8, 8))
         assert len(second.new_blog_entry_ids) == 1
         entry_id = second.new_blog_entry_ids[0]
         runs = [row for row in db.list_query_runs() if int(row["query_id"]) == query_id]
-        assert len(runs) == 1
-        assert runs[0]["status"] == "success"
-        assert runs[0]["blog_entry_id"] == entry_id
+        assert len(runs) == 2
+        assert {row["status"] for row in runs} == {"success"}
+        assert any(int(row["blog_entry_id"]) == entry_id for row in runs)
         tags = db.classification_results_for_content("blog", entry_id)
         assert [tag["tag_name"].casefold() for tag in tags] == [
-            "auto launch: launch marker"
+            "launch marker"
         ]
         app.close()
 

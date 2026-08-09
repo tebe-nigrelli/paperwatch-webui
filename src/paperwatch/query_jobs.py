@@ -249,12 +249,15 @@ def _regexp_tag_document(
     match = expression.search(content)
     if match is None:
         return None
+    matched_text = re.sub(r"(?i)^https?://", "", match.group(0))
+    if not matched_text:
+        return None
     return {
         "paper_id": document.get("paper_id"),
         "blog_entry_id": document.get("blog_entry_id"),
         "content_type": document.get("content_type", "paper"),
         "title": str(document.get("title") or "Untitled record"),
-        "output": match.group(0),
+        "output": matched_text,
     }
 
 
@@ -1192,8 +1195,17 @@ def run_query_batch(
                             run_id, matched_count=1, input_chars=input_chars,
                             output=saved_result.model_dump(),
                         )
+                        # "Print regexp matches" is also a model-free regexp
+                        # query.  Persist the exact first match as this query's
+                        # per-content tag, while keeping the larger excerpt as
+                        # the human-readable run output.
+                        db.apply_query_classifications(
+                            query_id,
+                            run_id,
+                            regexp_tag_result(documents, regexp_pattern).model_dump(),
+                        )
                         completed += 1
-                        publish(progress, "message", "Printed regexp matches")
+                        publish(progress, "message", "Printed regexp matches and applied tag")
                         publish(progress, "progress", f"{progress_index}/{len(runs)}")
                         continue
 
@@ -1654,6 +1666,177 @@ class QueryController:
                 target=self._work_many,
                 args=(tuple(jobs), context_window_tokens),
                 name="paperwatch-query-sequence",
+                daemon=True,
+            )
+            self._thread.start()
+            return tuple(job[0] for job in jobs)
+
+    def start_many_on_results(
+        self,
+        query_ids: tuple[int, ...],
+        profiles: tuple[str, ...],
+        context_window_tokens: int,
+        *,
+        targets: tuple[tuple[str, dict[str, Any]], ...],
+        source_scope: str = "auto",
+        pdf_strategy: str = "chunked",
+        override_defaults: bool = False,
+    ) -> tuple[str, ...] | None:
+        """Queue multiple saved queries over the same result sets.
+
+        Saved query processing settings remain per-query unless the caller
+        explicitly enables the shared run-time override controls.
+        """
+        with self._lock:
+            if self._snapshot.running:
+                return None
+            if not 512 <= context_window_tokens <= 1_000_000:
+                raise ValueError("Context window must be between 512 and 1000000 tokens")
+            ordered_ids = tuple(dict.fromkeys(int(value) for value in query_ids if int(value) > 0))
+            if not ordered_ids:
+                raise ValueError("Select at least one saved query")
+
+            ordered_targets: list[tuple[str, dict[str, Any]]] = []
+            seen_targets: set[str] = set()
+            for content_type, raw_selection in targets:
+                content_type = str(content_type)
+                if content_type not in {"papers", "blogs"}:
+                    raise ValueError("Content type must be papers or blogs")
+                if content_type not in seen_targets:
+                    ordered_targets.append((content_type, dict(raw_selection)))
+                    seen_targets.add(content_type)
+            if not ordered_targets:
+                raise ValueError("No search results were selected")
+            if override_defaults and "papers" in seen_targets and source_scope not in {
+                "abstract", "fulltext", "auto", "pdf"
+            }:
+                raise ValueError(
+                    "Query source must be abstract or fulltext, or whole-PDF upload; automatic runs may use auto"
+                )
+            if override_defaults and pdf_strategy not in {"auto", "direct", "chunked"}:
+                raise ValueError("PDF strategy must be auto, direct, or chunked")
+
+            config = load_config(self.config_path)
+            available = {item.profile: item for item in config.available_llms}
+            jobs: list[tuple[str, int, tuple[str, ...]]] = []
+            active_types: list[str] = []
+            warnings: list[str] = []
+            with Database(config.paths.database) as db:
+                for query_id in ordered_ids:
+                    query = db.get_saved_query(query_id)
+                    if query is None:
+                        raise ValueError(f"Saved query {query_id} was not found")
+                    supported = str(query["content_scope"] or "both")
+                    local_print = (
+                        str(query["regexp_mode"] or "query") == "print"
+                        and bool(str(query["regexp_pattern"] or "").strip())
+                    )
+                    local_regexp_tags = str(query["query_kind"] or "summary") == "regexp"
+                    local_query = local_print or local_regexp_tags
+                    selected = (
+                        ("regexp",)
+                        if local_query
+                        else tuple(dict.fromkeys(profiles))
+                    )
+                    if not selected and config.llm.provider != "none":
+                        selected = (config.llm.profile,)
+                    if not selected:
+                        raise ValueError("Configure a default LLM in config.toml or select a model")
+                    unknown = [name for name in selected if name not in available and name != "regexp"]
+                    if unknown:
+                        raise ValueError(
+                            f"Unknown configured model profile(s): {', '.join(unknown)}"
+                        )
+                    configured_profiles = [available[name] for name in selected if name in available]
+
+                    if override_defaults:
+                        query_source = source_scope
+                        query_pdf_strategy = pdf_strategy
+                    else:
+                        query_source = str(query["paper_source_scope"] or "auto")
+                        query_pdf_strategy = str(query["pdf_strategy"] or "chunked")
+
+                    # Local regexp queries always operate on extracted text.
+                    if local_query:
+                        query_source, query_pdf_strategy = "auto", "chunked"
+                    # Codex-only processing settings from an older saved query
+                    # must not make a non-Codex default unusable: non-Codex
+                    # models always use the normal chunk + merge path.
+                    if not local_query and (
+                        query_source == "pdf" or query_pdf_strategy == "direct"
+                    ):
+                        if len(configured_profiles) != 1 or configured_profiles[0].provider != "codex":
+                            query_source, query_pdf_strategy = "auto", "chunked"
+
+                    for content_type, raw_selection in ordered_targets:
+                        if supported not in {"both", content_type}:
+                            continue
+                        selection = dict(raw_selection)
+                        if content_type == "blogs":
+                            selection["content_type"] = "blogs"
+                            target_source = "blog"
+                            target_pdf_strategy = "auto"
+                            if not _selected_blog_entries(db, selection):
+                                continue
+                        else:
+                            selection.pop("content_type", None)
+                            target_source = query_source
+                            target_pdf_strategy = query_pdf_strategy
+                            if not _selected_papers(db, selection):
+                                continue
+                        selection["source_scope"] = target_source
+                        selection["pdf_strategy"] = target_pdf_strategy
+                        try:
+                            validate_query_sources(
+                                db,
+                                selection=selection,
+                                source_scope=target_source,
+                                pdf_strategy=target_pdf_strategy,
+                            )
+                        except QuerySelectionWarning as exc:
+                            warnings.append(f"{query['name']}: {exc}")
+                            continue
+                        warning = _selection_warning_text(selection)
+                        if warning:
+                            warnings.append(warning)
+                        batch_id = secrets.token_hex(10)
+                        db.create_query_runs(
+                            batch_id=batch_id,
+                            query_id=query_id,
+                            profiles=[
+                                (name, "local", "regexp")
+                                if name == "regexp"
+                                else (name, available[name].provider, available[name].model)
+                                for name in selected
+                            ],
+                            context_window_tokens=context_window_tokens,
+                            selection=selection,
+                        )
+                        jobs.append((batch_id, query_id, selected))
+                        active_types.append(content_type)
+
+            if not jobs:
+                if warnings:
+                    raise QuerySelectionWarning(" ".join(dict.fromkeys(warnings)))
+                raise ValueError("No selected queries support the current search results")
+
+            self._cancel_event = threading.Event()
+            self._active_llm = None
+            self._snapshot = QueryBatchSnapshot(
+                running=True,
+                batch_id=jobs[0][0],
+                query_id=jobs[0][1],
+                content_type="results" if len(set(active_types)) > 1 else active_types[0],
+                profiles=jobs[0][2],
+                stage="Queued",
+                message=f"Preparing {len(ordered_ids)} saved queries",
+                warning=" ".join(dict.fromkeys(warnings)),
+                progress_total=len(jobs),
+            )
+            self._thread = threading.Thread(
+                target=self._work_many,
+                args=(tuple(jobs), context_window_tokens),
+                name="paperwatch-query-results-sequence",
                 daemon=True,
             )
             self._thread.start()

@@ -104,11 +104,11 @@ def test_profile_controls_select_actual_controls_not_model_options():
     profile synchronization until the browser tab is CPU-bound.
     """
     script = Path("src/paperwatch/web_static/app.js").read_text(encoding="utf-8")
-    assert 'form.querySelector("select[data-source-scope]")' in script
-    assert 'form.querySelector("select[data-pdf-strategy]")' in script
-    assert 'form.querySelector("input[data-context-window]")' in script
-    assert 'form.querySelector("select[data-model-picker]")' in script
-    assert 'form.querySelector("[data-pdf-strategy]")' not in script
+    assert 'data-paper-processing' in script
+    assert 'data-context-window' in script
+    assert 'data-model-picker' in script
+    assert 'select[data-source-scope]' not in script
+    assert 'select[data-pdf-strategy]' not in script
 
 
 def test_filtered_select_all_is_set_based(

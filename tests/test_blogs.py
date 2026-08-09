@@ -908,4 +908,4 @@ def test_schema_31_migration_collapses_existing_same_title_rows(tmp_path, author
             "SELECT change_kind FROM blog_entries WHERE id=?", (new_id,)
         ).fetchone()
         assert hidden["change_kind"] == "baseline"
-        assert db._conn.execute("PRAGMA user_version").fetchone()[0] == 31
+        assert db._conn.execute("PRAGMA user_version").fetchone()[0] == 32

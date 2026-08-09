@@ -724,6 +724,96 @@ class Database:
             self._backfill_paper_topics()
         self._conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
         self._conn.commit()
+        # Older local regexp/"print matches" runs stored their highlighted
+        # output but did not persist the match as a content tag.  Backfill
+        # those rows idempotently so upgrading fixes existing content too.
+        self._backfill_local_regexp_query_tags()
+
+    @staticmethod
+    def _query_uses_freeform_regexp_tag(query: Any) -> bool:
+        query_kind = str(query["query_kind"] or "summary")
+        if query_kind == "regexp":
+            return True
+        return (
+            str(query["regexp_mode"] or "query") == "print"
+            and bool(str(query["regexp_pattern"] or "").strip())
+        )
+
+    def _backfill_local_regexp_query_tags(self) -> None:
+        rows = self._conn.execute(
+            """
+            SELECT qr.id AS run_id, qr.query_id, qr.paper_id, qr.blog_entry_id,
+                   qr.output_json, q.regexp_pattern, q.query_kind, q.regexp_mode
+            FROM query_runs qr
+            JOIN saved_queries q ON q.id=qr.query_id
+            WHERE qr.status='success'
+              AND qr.output_json IS NOT NULL
+              AND trim(COALESCE(q.regexp_pattern, '')) != ''
+              AND (q.query_kind='regexp' OR q.regexp_mode='print')
+              AND NOT EXISTS (
+                  SELECT 1 FROM query_classification_results qcr
+                  WHERE qcr.query_id=qr.query_id
+                    AND (
+                        (qr.paper_id IS NOT NULL AND qcr.paper_id=qr.paper_id)
+                        OR
+                        (qr.blog_entry_id IS NOT NULL AND qcr.blog_entry_id=qr.blog_entry_id)
+                    )
+              )
+            ORDER BY qr.id
+            """
+        ).fetchall()
+        for row in rows:
+            try:
+                expression = re.compile(str(row["regexp_pattern"]), re.MULTILINE)
+                payload = json.loads(str(row["output_json"] or "{}"))
+            except (re.error, TypeError, ValueError, json.JSONDecodeError):
+                continue
+            items = payload.get("items") if isinstance(payload, dict) else None
+            if not isinstance(items, list):
+                continue
+            exact_match: str | None = None
+            for item in items:
+                if not isinstance(item, dict):
+                    continue
+                output = str(item.get("output") or "")
+                if str(row["query_kind"] or "summary") == "regexp":
+                    exact_match = output.strip() or None
+                else:
+                    match = expression.search(output)
+                    exact_match = match.group(0) if match is not None else None
+                if exact_match:
+                    break
+            if not exact_match:
+                continue
+            item: dict[str, Any] = {"output": exact_match}
+            if row["paper_id"] is not None:
+                item["paper_id"] = int(row["paper_id"])
+                item["content_type"] = "paper"
+            elif row["blog_entry_id"] is not None:
+                item["blog_entry_id"] = int(row["blog_entry_id"])
+                item["content_type"] = "blog"
+            else:
+                # Pre-v32 aggregate runs have no authoritative per-content id;
+                # do not guess which item belongs to which content record.
+                continue
+            self.apply_query_classifications(
+                int(row["query_id"]), int(row["run_id"]), {"items": [item]}
+            )
+        with self.transaction() as conn:
+            conn.execute(
+                """
+                UPDATE query_classification_results
+                SET tag_name=value, updated_at=?
+                WHERE tag_name<>value
+                  AND EXISTS (
+                      SELECT 1 FROM saved_queries q
+                      WHERE q.id=query_classification_results.query_id
+                        AND trim(COALESCE(q.regexp_pattern, '')) != ''
+                        AND (q.query_kind='regexp' OR q.regexp_mode='print')
+                  )
+                """,
+                (utcnow(),),
+            )
 
     def _ensure_default_settings(self) -> None:
         self._conn.execute(
@@ -5615,14 +5705,15 @@ class Database:
         output: dict[str, Any],
     ) -> int:
         query = self.get_saved_query(query_id)
-        if query is None or str(query["query_kind"] or "summary") not in {
-            "classification", "regexp"
-        }:
+        if query is None:
             return 0
         query_kind = str(query["query_kind"] or "summary")
+        freeform_regexp = self._query_uses_freeform_regexp_tag(query)
+        if query_kind != "classification" and not freeform_regexp:
+            return 0
         label_class = (
             " ".join(str(query["name"] or "").split())
-            if query_kind == "regexp"
+            if freeform_regexp
             else " ".join(str(query["label_class"] or "").split())
         )
         values = self._decoded_label_values(query["label_values_json"])
@@ -5638,8 +5729,9 @@ class Database:
                 if not isinstance(item, dict):
                     continue
                 raw_output = str(item.get("output") or "")
-                if query_kind == "regexp":
-                    selected_value = " ".join(raw_output.split())[:80] or None
+                if freeform_regexp:
+                    selected_value = " ".join(raw_output.split())
+                    selected_value = re.sub(r"(?i)^https?://", "", selected_value)[:80] or None
                 else:
                     selected_value = next(
                         (
@@ -5675,7 +5767,7 @@ class Database:
                     continue
                 if existing is not None and bool(existing["manually_modified"]):
                     continue
-                tag_name = f"{label_class}: {selected_value}"[:80]
+                tag_name = selected_value if freeform_regexp else f"{label_class}: {selected_value}"[:80]
                 if existing is None:
                     conn.execute(
                         """
@@ -5725,8 +5817,8 @@ class Database:
         column = "paper_id" if normalized == "paper" else "blog_entry_id"
         rows = self._conn.execute(
             f"""
-            SELECT qcr.*, q.name AS query_name, q.label_class, q.label_values_json
-                 , q.query_kind
+            SELECT qcr.*, q.name AS query_name, q.label_class, q.label_values_json,
+                   q.query_kind, q.regexp_mode, q.regexp_pattern
             FROM query_classification_results qcr
             JOIN saved_queries q ON q.id=qcr.query_id
             WHERE qcr.{column}=?
@@ -5741,7 +5833,7 @@ class Database:
                 value["value"]
                 for value in self._decoded_label_values(row["label_values_json"])
             ]
-            item["freeform"] = str(row["query_kind"] or "summary") == "regexp"
+            item["freeform"] = self._query_uses_freeform_regexp_tag(row)
             if item["freeform"]:
                 item["label_class"] = str(row["query_name"] or "Regexp")
             result.append(item)
@@ -5755,12 +5847,13 @@ class Database:
         value: str,
     ) -> bool:
         query = self.get_saved_query(query_id)
-        if query is None or str(query["query_kind"] or "summary") not in {
-            "classification", "regexp"
-        }:
+        if query is None or (
+            str(query["query_kind"] or "summary") != "classification"
+            and not self._query_uses_freeform_regexp_tag(query)
+        ):
             return False
         query_kind = str(query["query_kind"] or "summary")
-        if query_kind == "regexp":
+        if self._query_uses_freeform_regexp_tag(query):
             selected = " ".join(value.strip().split())[:80]
             if not selected:
                 raise ValueError("Regexp tag value cannot be empty")
@@ -5780,7 +5873,7 @@ class Database:
         column = "paper_id" if normalized == "paper" else "blog_entry_id"
         other_column = "blog_entry_id" if normalized == "paper" else "paper_id"
         now = utcnow()
-        tag_name = f"{label_class}: {selected}"[:80]
+        tag_name = selected if self._query_uses_freeform_regexp_tag(query) else f"{label_class}: {selected}"[:80]
         with self.transaction() as conn:
             existing = conn.execute(
                 f"SELECT id FROM query_classification_results WHERE query_id=? AND {column}=?",
@@ -5920,7 +6013,18 @@ class Database:
                 if value > 0 and value not in ids:
                     ids.append(value)
             if not ids:
-                return [(base_selection, None, None)]
+                return []
+            table = "blog_entries" if is_blog else "papers"
+            placeholders = ",".join("?" for _ in ids)
+            existing_ids = {
+                int(row["id"])
+                for row in self._conn.execute(
+                    f"SELECT id FROM {table} WHERE id IN ({placeholders})", ids
+                ).fetchall()
+            }
+            ids = [value for value in ids if value in existing_ids]
+            if not ids:
+                return []
             result: list[tuple[dict[str, Any], int | None, int | None]] = []
             for record_id in ids:
                 item = dict(base_selection)
@@ -6028,26 +6132,31 @@ class Database:
             ).fetchall()
         )
 
-    def list_query_runs(self, query_id: int | None = None, limit: int = 100) -> list[sqlite3.Row]:
+    def list_query_runs(
+        self, query_id: int | None = None, limit: int | None = 100
+    ) -> list[sqlite3.Row]:
+        limit_sql = "" if limit is None else " LIMIT ?"
+        params: tuple[Any, ...] = () if limit is None else (limit,)
         if query_id is None:
             return list(
                 self._conn.execute(
-                    """
+                    f"""
                     SELECT qr.*, q.name AS query_name
                     FROM query_runs qr JOIN saved_queries q ON q.id=qr.query_id
-                    ORDER BY qr.id DESC LIMIT ?
+                    ORDER BY qr.id DESC{limit_sql}
                     """,
-                    (limit,),
+                    params,
                 ).fetchall()
             )
+        params = (query_id,) if limit is None else (query_id, limit)
         return list(
             self._conn.execute(
-                """
+                f"""
                 SELECT qr.*, q.name AS query_name
                 FROM query_runs qr JOIN saved_queries q ON q.id=qr.query_id
-                WHERE qr.query_id=? ORDER BY qr.id DESC LIMIT ?
+                WHERE qr.query_id=? ORDER BY qr.id DESC{limit_sql}
                 """,
-                (query_id, limit),
+                params,
             ).fetchall()
         )
 

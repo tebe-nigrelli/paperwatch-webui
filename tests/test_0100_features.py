@@ -101,7 +101,7 @@ def test_schema_25_pdf_fingerprint_persists_modified_state(
     with Database(config.paths.database) as db:
         db.set_local_pdf(paper_id, str(pdf), expected)
         row = dict(db.get_paper(paper_id))
-        assert SCHEMA_VERSION == 31
+        assert SCHEMA_VERSION == 32
         assert "pdf_modified_on_disk" in row
         assert _paper_pdf_state(db, row)["pdf_modified"] is False
 
@@ -236,7 +236,7 @@ def test_blog_results_runner_accepts_multiple_queries_and_one_model(
     assert kind == "many"
     assert args[:3] == (
         (first, second),
-        "default",
+        "",
         config.llm.context_window_tokens,
     )
     assert kwargs["content_type"] == "blogs"

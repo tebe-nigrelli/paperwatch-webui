@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from typing import Any
 
+from .db import utcnow
+
 
 CLASSIFIER_OUTPUT = (
     "For each record, select exactly one allowed value. First line: "
@@ -9,6 +11,20 @@ CLASSIFIER_OUTPUT = (
     "Use Unknown or Unclear when the source does not contain enough evidence. "
     "Do not infer from reputation or author identity alone."
 )
+
+
+LEGACY_REGEXP_PATTERNS: dict[str, str] = {
+    "Funding and grants": r"(?i)\b(?:funded\s+by|financial\s+support\s+(?:from|by)|sponsored\s+by|grant\s+(?:no\.?|number)|contract\s+(?:no\.?|number)|award\s+(?:no\.?|number))\b",
+    "Defense and military references": r"(?i)\b(?:military|defen[cs]e|warfighting|battlefield|weapon(?:s|ry)?|dual[- ]use|DARPA|IARPA|AFOSR|ONR|Army Research (?:Office|Laboratory)|Naval Research Laboratory|Department of Defense|Ministry of Defen[cs]e)\b",
+    "Source code and repositories": r"(?i)\b(?:source\s+code|code\s+(?:is|will be)\s+(?:available|released)|implementation\s+(?:is|will be)\s+(?:available|released))\b|https?://(?:www\.)?(?:github\.com|gitlab\.com|bitbucket\.org)/\S+",
+    "Data, weights, and research artifacts": r"(?i)\b(?:dataset|data|model weights?|checkpoints?)\s+(?:is|are|will be)\s+(?:publicly\s+)?(?:available|released)\b|https?://(?:huggingface\.co|zenodo\.org|figshare\.com|osf\.io)/\S+",
+    "Compute and hardware requirements": r"(?i)\b(?:GPU[- ]?hours?|TPU[- ]?hours?|FLOPs?|petaflop|exaflop|A100|H100|H200|B100|B200|TPU\s*v\d|(?:billion|million)\s+parameters?|parameter\s+count|training\s+compute)\b",
+    "Limitations and impact sections": r"(?im)^\s*(?:\d+(?:\.\d+)*[\s.: -]*)?(?:limitations?|threats?\s+to\s+validity|failure\s+modes?|open\s+questions?|broader\s+impacts?)\s*$",
+    "Real-world deployment evidence": r"(?i)\b(?:deployed\s+in|production\s+(?:system|environment|traffic)|field\s+(?:trial|study|test)|real[- ]world\s+(?:deployment|evaluation)|prospective\s+(?:study|trial)|in[- ]the[- ]wild)\b",
+    "Statistical uncertainty and rigor": r"(?i)\b(?:confidence\s+interval|credible\s+interval|standard\s+error|statistically\s+significant|p[- ]?value|effect\s+size|multiple\s+comparisons?|power\s+analysis)\b",
+    "Strong novelty and performance claims": r"(?i)\b(?:state[- ]of[- ]the[- ]art|SOTA|outperform(?:s|ed|ing)?|surpass(?:es|ed|ing)?|first\s+to|for\s+the\s+first\s+time|significant(?:ly)?\s+improv(?:e|es|ed|ement))\b",
+    "Failures, negative results, and impossibility": r"(?i)\b(?:negative\s+result|failed\s+to|fails\s+to|does\s+not\s+outperform|no\s+significant\s+(?:difference|improvement)|performance\s+degradation|counterexample|impossibility\s+result|lower\s+bound)\b",
+}
 
 
 def _labels(*values: str) -> tuple[dict[str, str], ...]:
@@ -255,54 +271,54 @@ DEFAULT_SAVED_QUERIES: tuple[dict[str, Any], ...] = (
     ),
     _regexp(
         "Funding and grants",
-        r"(?i)\b(?:funded\s+by|financial\s+support\s+(?:from|by)|sponsored\s+by|grant\s+(?:no\.?|number)|contract\s+(?:no\.?|number)|award\s+(?:no\.?|number))\b",
+        r"(?i)\b(?:funded\s+by|funding\s+(?:from|provided\s+by)|financial\s+support\s+(?:from|by)|supported\s+by\s+(?:the\s+)?(?:NSF|NIH|ERC|UKRI|DOE|DARPA|IARPA)|sponsored\s+by|under\s+(?:grant|contract)|grant\s+(?:agreement|no\.?|number)|contract\s+(?:no\.?|number)|award\s+(?:no\.?|number)|NSF\s+grant|NIH\s+grant|ERC\s+grant)\b",
         100,
     ),
     _regexp(
         "Defense and military references",
-        r"(?i)\b(?:military|defen[cs]e|warfighting|battlefield|weapon(?:s|ry)?|dual[- ]use|DARPA|IARPA|AFOSR|ONR|Army Research (?:Office|Laboratory)|Naval Research Laboratory|Department of Defense|Ministry of Defen[cs]e)\b",
+        r"(?i)\b(?:military|defen[cs]e|warfighting|battlefield|weapon(?:s|ry)?|dual[- ]use|DARPA|IARPA|AFOSR|ONR|DoD|Department of Defense|Ministry of Defen[cs]e|Army Research (?:Office|Laboratory)|Naval Research Laboratory|Air Force Research Laboratory|USAF|U\.S\.\s+Army|U\.S\.\s+Navy|NATO)\b",
         150,
     ),
     _regexp(
         "Source code and repositories",
-        r"(?i)\b(?:source\s+code|code\s+(?:is|will be)\s+(?:available|released)|implementation\s+(?:is|will be)\s+(?:available|released))\b|https?://(?:www\.)?(?:github\.com|gitlab\.com|bitbucket\.org)/\S+",
+        r"(?i)\b(?:source\s+code|open[- ]source(?:d)?|code\s+(?:is|will be|has been)\s+(?:publicly\s+)?(?:available|released)|implementation\s+(?:is|will be|has been)\s+(?:publicly\s+)?(?:available|released)|code\s+available\s+at)\b|\b(?:www\.)?(?:github\.com|gitlab\.com|bitbucket\.org)/[^\s<>\"')\]]+",
         50,
     ),
     _regexp(
         "Data, weights, and research artifacts",
-        r"(?i)\b(?:dataset|data|model weights?|checkpoints?)\s+(?:is|are|will be)\s+(?:publicly\s+)?(?:available|released)\b|https?://(?:huggingface\.co|zenodo\.org|figshare\.com|osf\.io)/\S+",
+        r"(?i)\b(?:(?:dataset|data|model weights?|pretrained weights?|checkpoints?|research artifacts?)\s+(?:is|are|will be|have been)\s+(?:publicly\s+)?(?:available|released)|release(?:d|s|ing)?\s+(?:the\s+)?(?:dataset|model weights?|checkpoints?)|artifact\s+(?:repository|release))\b|\b(?:www\.)?(?:huggingface\.co|zenodo\.org|figshare\.com|osf\.io)/[^\s<>\"')\]]+",
         60,
     ),
     _regexp(
         "Compute and hardware requirements",
-        r"(?i)\b(?:GPU[- ]?hours?|TPU[- ]?hours?|FLOPs?|petaflop|exaflop|A100|H100|H200|B100|B200|TPU\s*v\d|(?:billion|million)\s+parameters?|parameter\s+count|training\s+compute)\b",
+        r"(?i)\b(?:GPU[- ]?(?:hours?|days?)|TPU[- ]?(?:hours?|days?)|core[- ]hours?|node[- ]hours?|FLOPs?|TFLOPs?|PFLOPs?|petaflop|exaflop|A100|H100|H200|B100|B200|V100|L40S|MI250|MI300X|RTX\s*(?:3090|4090|5090)|DGX(?:\s+\w+)?|TPU\s*v\d(?:e|p)?|GPU\s+memory|VRAM|(?:billion|million)\s+parameters?|parameter\s+count|training\s+compute|training\s+time|inference\s+latency|tokens?\s*/\s*s(?:ec(?:ond)?)?)\b",
         100,
     ),
     _regexp(
         "Limitations and impact sections",
-        r"(?im)^\s*(?:\d+(?:\.\d+)*[\s.: -]*)?(?:limitations?|threats?\s+to\s+validity|failure\s+modes?|open\s+questions?|broader\s+impacts?)\s*$",
+        r"(?im)^\s*(?:\d+(?:\.\d+)*[\s.: -]*)?(?:limitations?(?:\s+and\s+future\s+work)?|threats?\s+to\s+validity|failure\s+modes?|open\s+questions?|broader\s+impacts?|societal\s+impacts?|ethical\s+considerations|risks?\s+and\s+limitations?)\s*$",
         350,
         content_scope="papers",
     ),
     _regexp(
         "Real-world deployment evidence",
-        r"(?i)\b(?:deployed\s+in|production\s+(?:system|environment|traffic)|field\s+(?:trial|study|test)|real[- ]world\s+(?:deployment|evaluation)|prospective\s+(?:study|trial)|in[- ]the[- ]wild)\b",
+        r"(?i)\b(?:deployed\s+(?:in|at|to)|production\s+(?:system|environment|traffic|deployment)|in\s+production|live\s+traffic|operational\s+deployment|pilot\s+deployment|field\s+(?:trial|study|test|deployment)|real[- ]world\s+(?:deployment|evaluation|trial)|prospective\s+(?:study|trial)|clinical\s+trial|in[- ]the[- ]wild)\b",
         150,
     ),
     _regexp(
         "Statistical uncertainty and rigor",
-        r"(?i)\b(?:confidence\s+interval|credible\s+interval|standard\s+error|statistically\s+significant|p[- ]?value|effect\s+size|multiple\s+comparisons?|power\s+analysis)\b",
+        r"(?i)\b(?:confidence\s+interval|credible\s+interval|95%\s+CI|standard\s+error|statistically\s+significant|statistical\s+significance|p[- ]?value|effect\s+size|Cohen'?s\s+d|multiple\s+comparisons?|power\s+analysis|Bonferroni|Benjamini[- ]Hochberg|bootstrap(?:ped)?\s+confidence)\b",
         80,
         content_scope="papers",
     ),
     _regexp(
         "Strong novelty and performance claims",
-        r"(?i)\b(?:state[- ]of[- ]the[- ]art|SOTA|outperform(?:s|ed|ing)?|surpass(?:es|ed|ing)?|first\s+to|for\s+the\s+first\s+time|significant(?:ly)?\s+improv(?:e|es|ed|ement))\b",
+        r"(?i)\b(?:state[- ]of[- ]the[- ]art|SOTA|new\s+state[- ]of[- ]the[- ]art|outperform(?:s|ed|ing)?|surpass(?:es|ed|ing)?|improves?\s+over\s+(?:the\s+)?(?:baseline|prior\s+work)|beats?\s+(?:the\s+)?baseline|record\s+performance|first\s+to|first\s+demonstration|for\s+the\s+first\s+time|significant(?:ly)?\s+improv(?:e|es|ed|ement))\b",
         120,
     ),
     _regexp(
         "Failures, negative results, and impossibility",
-        r"(?i)\b(?:negative\s+result|failed\s+to|fails\s+to|does\s+not\s+outperform|no\s+significant\s+(?:difference|improvement)|performance\s+degradation|counterexample|impossibility\s+result|lower\s+bound)\b",
+        r"(?i)\b(?:negative\s+result|failed\s+to|fails\s+to|failure\s+case|does\s+not\s+outperform|underperform(?:s|ed|ing)?|no\s+improvement|no\s+significant\s+(?:difference|improvement)|performance\s+degradation|degrades?\s+performance|counterexample|impossibility\s+result|provably\s+impossible|lower\s+bound)\b",
         150,
     ),
 )
@@ -323,3 +339,28 @@ def add_default_queries(db: Any, model_profile: str = "") -> int:
         existing.add(definition["name"].casefold())
         added += 1
     return added
+
+
+def refresh_default_regexp_patterns(db: Any) -> int:
+    """Upgrade untouched bundled regexp defaults without overwriting user edits."""
+    current = {
+        str(item["name"]): str(item["regexp_pattern"])
+        for item in DEFAULT_SAVED_QUERIES
+        if item.get("regexp_mode") == "print"
+    }
+    updated = 0
+    with db.transaction() as conn:
+        for name, old_pattern in LEGACY_REGEXP_PATTERNS.items():
+            new_pattern = current.get(name)
+            if not new_pattern or new_pattern == old_pattern:
+                continue
+            cur = conn.execute(
+                """
+                UPDATE saved_queries
+                SET regexp_pattern=?, updated_at=?
+                WHERE name=? AND regexp_mode='print' AND regexp_pattern=?
+                """,
+                (new_pattern, utcnow(), name, old_pattern),
+            )
+            updated += cur.rowcount
+    return updated

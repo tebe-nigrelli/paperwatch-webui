@@ -82,7 +82,7 @@ def test_schema_content_state_author_star_and_bulk_selection(
     paper_id, entry_id = seed(config_path, author_candidate, paper_record)
     config = load_config(config_path)
     with Database(config.paths.database) as db:
-        assert SCHEMA_VERSION == 31
+        assert SCHEMA_VERSION == 32
         assert db.get_paper(paper_id)["read_at"] is None
         assert db.get_blog_entry(entry_id)["read_at"] is None
         assert db.set_author_starred(author_candidate.openalex_id, True)
@@ -118,27 +118,35 @@ def test_classifier_query_assigns_shared_tags_and_allows_controlled_edits(
                 {"value": "Low", "pattern": "(?i)low"},
             ],
         )
-        run_id = db.create_query_runs(
-            batch_id="classification",
+        paper_run = db.create_query_runs(
+            batch_id="classification-paper",
             query_id=query_id,
             profiles=[("default", "ollama", "model")],
             context_window_tokens=2048,
+            selection={"paper_ids": [paper_id]},
+        )[0]
+        blog_run = db.create_query_runs(
+            batch_id="classification-blog",
+            query_id=query_id,
+            profiles=[("default", "ollama", "model")],
+            context_window_tokens=2048,
+            selection={"content_type": "blogs", "blog_entry_ids": [entry_id]},
         )[0]
         changed = db.apply_query_classifications(
             query_id,
-            run_id,
-            {
-                "items": [
-                    {"paper_id": paper_id, "output": "Priority: high"},
-                    {"blog_entry_id": entry_id, "output": "This is low priority"},
-                ]
-            },
+            paper_run,
+            {"items": [{"paper_id": paper_id, "output": "Priority: high"}]},
+        )
+        changed += db.apply_query_classifications(
+            query_id,
+            blog_run,
+            {"items": [{"blog_entry_id": entry_id, "output": "This is low priority"}]},
         )
         assert changed == 2
         assert db.search_papers(content_tags=["Priority: High"])[1] == 1
         assert len(db.list_blog_entries(tags=["Priority: Low"])) == 1
         paper_label = db.classification_results_for_content("paper", paper_id)[0]
-        assert paper_label["choices"] == ["High", "Low"]
+        assert paper_label["choices"] == ["High", "Low", "STUB"]
         assert db.set_content_classification(query_id, "paper", paper_id, "Low")
         assert db.classification_results_for_content("paper", paper_id)[0]["value"] == "Low"
         with pytest.raises(ValueError, match="not allowed"):
@@ -169,6 +177,7 @@ def test_web_star_selection_reading_classifier_and_author_csv_ui(
             query_id=query_id,
             profiles=[("default", "ollama", "model")],
             context_window_tokens=2048,
+            selection={"paper_ids": [paper_id]},
         )[0]
         db.apply_query_classifications(
             query_id,
@@ -186,7 +195,7 @@ def test_web_star_selection_reading_classifier_and_author_csv_ui(
 
     paper = web.get(f"/papers/{paper_id}")
     assert 'data-auto-read data-content-type="paper"' in paper.text
-    assert "Classifier labels" in paper.text
+    assert "Query tags" in paper.text
     blog = web.get(f"/blogs/{entry_id}")
     assert 'data-auto-read data-content-type="blog"' in blog.text
     assert "Local papers" in blog.text
@@ -225,5 +234,6 @@ def test_new_javascript_behaviour(config_path):
     script = client(config_path).get("/static/app.js").text
     assert "data-auto-read" in script
     assert "5000" in script
-    assert "data-classification-settings" in script
+    assert "data-classification-only" in script
+    assert "data-regexp-only" in script
     assert "data-dialog-open" in script

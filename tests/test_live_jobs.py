@@ -421,14 +421,13 @@ def test_paper_async_jobs_saved_prompt_and_no_reload_ui(
         data={
             "query_id": query_id,
             "model": "missing",
-            "source_scope": "abstract",
-            "pdf_strategy": "auto",
+            "paper_processing": "chunked",
             "context_window_tokens": 4096,
         },
         headers={"X-Paperwatch-Async": "1"},
     )
     assert response.status_code == 200 and response.json()["batch_id"] == "query-web"
-    assert query.calls[-1][:3] == (query_id, ("default",), config.llm.context_window_tokens)
+    assert query.calls[-1][:3] == (query_id, (), config.llm.context_window_tokens)
     assert query.calls[-1][3]["paper_ids"] == [paper_id]
     assert query.calls[-1][4:] == ("fulltext", "direct")
 
@@ -438,15 +437,14 @@ def test_paper_async_jobs_saved_prompt_and_no_reload_ui(
             "query_id": query_id,
             "override_query_defaults": "1",
             "model": "default",
-            "source_scope": "abstract",
-            "pdf_strategy": "auto",
+            "paper_processing": "chunked",
             "context_window_tokens": 4096,
         },
         headers={"X-Paperwatch-Async": "1"},
     )
     assert response.status_code == 200 and response.json()["batch_id"] == "query-web"
     assert query.calls[-1][:3] == (query_id, ("default",), 4096)
-    assert query.calls[-1][4:] == ("abstract", "auto")
+    assert query.calls[-1][4:] == ("auto", "chunked")
     assert client.post("/api/analysis-cancel").json()["ok"] is True
     assert client.post("/api/query-cancel").json()["ok"] is True
 
@@ -682,9 +680,9 @@ def test_query_helpers_validation_compaction_and_merging(monkeypatch):
         context_window_tokens=512, max_input_chars=2500,
         progress=lambda kind, value: events.append((kind, value)),
     )
-    assert result.summary == "Merged result"
+    assert result.summary.split("\n\n") == ["Merged result"] * 4
     assert usage["tokens"] >= 2 and usage["provider"] == "ollama"
-    assert chars > 0 and any("Merging" in value for _, value in events)
+    assert chars > 0 and any("Processing record" in value for _, value in events)
 
     monkeypatch.setattr(
         "paperwatch.query_jobs._pack_documents",
@@ -731,8 +729,10 @@ def test_query_batch_failure_cancel_and_controller_validation(
     controller = QueryController(config_path, runner=lambda *args: {"completed": 0, "failed": 0})
     with pytest.raises(ValueError, match="Context window"):
         controller.start(query_id, ("default",), 10)
-    with pytest.raises(ValueError, match="at least one"):
-        controller.start(query_id, (), 2048)
+    # An empty profile selection means "use the current [llm] default".
+    batch_id = controller.start(query_id, (), 2048, selection={"paper_ids": [paper_id]})
+    assert batch_id
+    controller.wait()
     with pytest.raises(ValueError, match="Unknown"):
         controller.start(query_id, ("missing",), 2048)
     with pytest.raises(ValueError, match="not found"):

@@ -396,7 +396,9 @@ def test_paper_detail_and_exports(config_path, seeded_web):
     results_page = client.get("/")
     assert "Run saved prompt" in results_page.text
     assert "Override Defaults" in results_page.text
-    assert "Upload whole PDF (Codex)" in results_page.text
+    assert 'name="paper_processing"' in results_page.text
+    assert 'value="whole_text"' in results_page.text
+    assert 'value="pdf"' in results_page.text
     assert "Run additional models" not in response.text
     assert "Google Scholar" in response.text
     assert "OpenAlex" in response.text
@@ -2106,10 +2108,15 @@ def test_web_helper_edge_cases_for_arxiv_preview_query_and_progress(config_path,
     assert empty_preview[0]["title"] == "Snapshot"
 
     config = load_config(config_path)
-    with pytest.raises(ValueError, match="only one model"):
-        _query_execution_form(FormData([("model", "default"), ("model", "second")]), replace(config, llm_profiles=(replace(config.llm, profile="second"),)))
-    with pytest.raises(ValueError, match="Whole-PDF upload requires a Codex model"):
-        _query_execution_form(FormData([("paper_source_scope", "pdf"), ("model", "default")]), config)
+    # Saved queries no longer persist a model. Legacy duplicate model fields are
+    # ignored and execution resolves the current config default at run time.
+    form = _query_execution_form(
+        FormData([("model", "default"), ("model", "second")]),
+        replace(config, llm_profiles=(replace(config.llm, profile="second"),)),
+    )
+    assert form["model_profiles"] == ()
+    with pytest.raises(ValueError, match="Codex"):
+        _query_execution_form(FormData([("paper_processing", "pdf")]), config)
 
 
 def test_author_csv_import_exercises_optional_identity_state_tags_and_notes(

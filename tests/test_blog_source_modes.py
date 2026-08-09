@@ -842,7 +842,7 @@ def test_semantic_diff_link_context_and_docs_thresholds():
 
 def test_database_source_settings_known_articles_and_schema(app_config, author_candidate):
     with Database(app_config.paths.database) as db:
-        assert SCHEMA_VERSION == 31
+        assert SCHEMA_VERSION == 32
         db.add_author(author_candidate)
         blog_id = db.add_author_blog(
             "A123",
@@ -1089,7 +1089,7 @@ def test_initial_publications_are_visible_without_being_reported_as_updates(
         stats = RunStats(run_id=db.start_run())
         app._apply_blog_fetch(stats, row, fetched, None)
         assert stats.blog_updates_found == 0
-        assert stats.new_blog_entry_ids == []
+        assert len(stats.new_blog_entry_ids) == 2
         assert {entry["title"] for entry in db.list_blog_entries()} == {
             "Paper one",
             "Paper two",
@@ -1235,7 +1235,7 @@ def test_schema_18_promotes_and_seeds_initial_feed_items(tmp_path, author_candid
         entries = db.list_blog_entries()
         assert len(entries) == 1
         assert entries[0]["change_kind"] == "changed"
-        assert db._conn.execute("PRAGMA user_version").fetchone()[0] == 31
+        assert db._conn.execute("PRAGMA user_version").fetchone()[0] == 32
         assert db.known_blog_article_urls(blog_id) == ("https://example.com/post",)
 
 

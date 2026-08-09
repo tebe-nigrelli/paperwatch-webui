@@ -1,18 +1,42 @@
 {% extends "base.html" %}
-{% block title %}Saved queries · paperwatch{% endblock %}
+{% block title %}Queries · paperwatch{% endblock %}
 {% block content %}
 <section class="page-heading split">
-  <div><h1>Saved queries</h1><p>Queries store their prompt and paper-processing mode. The default LLM is read from <code>config.toml</code> when the query runs. Select papers and run manually, or check New papers or New blog entries to run it after a fetch.</p></div>
+  <div><h1>Queries</h1><p>Saved query definitions and their execution history. The default LLM is read from <code>config.toml</code> when a query runs. Select papers and run manually, or enable automatic runs for new content.</p></div>
   <a class="button button-primary" href="/queries/new">New query</a>
 </section>
 
+<nav class="discover-mode-switch query-mode-switch" aria-label="Query view">
+  <a class="discover-mode-option{% if query_mode == 'saved' %} active{% endif %}" href="/queries?mode=saved" aria-current="{{ 'page' if query_mode == 'saved' else 'false' }}">
+    <strong>Saved queries</strong><span>Definitions and automatic runs</span>
+  </a>
+  <a class="discover-mode-option{% if query_mode == 'history' %} active{% endif %}" href="/queries?mode=history" aria-current="{{ 'page' if query_mode == 'history' else 'false' }}">
+    <strong>Query history</strong><span>Latest 100 per-content runs</span>
+  </a>
+</nav>
+
+{% if query_mode == 'saved' %}
 <form id="automatic-query-form" method="post" action="/queries/automatic" data-auto-save="query-selections"></form>
-<section class="panel">
-  <div class="panel-heading"><div><h2>Queries</h2><p>These two columns are the only fetch-time model triggers.</p></div><div class="query-selection-meta"><span>{{ queries|length }}</span><small id="automatic-query-status" class="muted" aria-live="polite">Changes save automatically</small></div></div>
-  <div class="table-wrap"><table class="saved-query-table"><thead><tr><th>Name</th><th>Type</th><th>Supports</th><th>Model</th><th>Paper processing</th><th>New papers</th><th>New blog entries</th><th>Runs</th><th>Latest</th><th>Actions</th></tr></thead><tbody>
-  {% for query in queries %}<tr id="query-{{ query.id }}">
+<section class="panel query-table-panel">
+  <div class="panel-heading"><div><h2>Saved queries</h2><p>Showing up to 100 queries. Filter any query property below. New-paper and new-blog selections save automatically.</p></div><div class="query-selection-meta"><span data-table-filter-count>{{ queries|length }}</span><small id="automatic-query-status" class="muted" aria-live="polite">Changes save automatically</small></div></div>
+  <div class="table-wrap"><table class="saved-query-table" data-query-filter-table><thead>
+    <tr><th>Name</th><th>Type</th><th>Supports</th><th>Model</th><th>Paper processing</th><th>New papers</th><th>New blog entries</th><th>Runs</th><th>Latest</th><th>Actions</th></tr>
+    <tr class="column-filter-row">
+      <th><input type="search" placeholder="Search name" aria-label="Filter queries by name" data-table-filter="name"></th>
+      <th><select aria-label="Filter queries by type" data-table-filter="type"><option value="">Any</option><option value="summary">Summary</option><option value="classification">Classifier</option><option value="regexp">Regexp</option></select></th>
+      <th><select aria-label="Filter queries by supported content" data-table-filter="supports"><option value="">Any</option><option value="both">Both</option><option value="papers">Paper</option><option value="blogs">Blog</option></select></th>
+      <th><input type="search" placeholder="Search model" aria-label="Filter queries by model" data-table-filter="model"></th>
+      <th><select aria-label="Filter queries by paper processing" data-table-filter="processing"><option value="">Any</option><option value="chunked">Chunk + merge</option><option value="whole_text">Whole text</option><option value="pdf">PDF file</option></select></th>
+      <th><select aria-label="Filter new-paper automatic queries" data-table-filter="new-papers"><option value="">Any</option><option value="yes">Enabled</option><option value="no">Disabled</option></select></th>
+      <th><select aria-label="Filter new-blog automatic queries" data-table-filter="new-blogs"><option value="">Any</option><option value="yes">Enabled</option><option value="no">Disabled</option></select></th>
+      <th><input type="search" inputmode="numeric" placeholder="Runs" aria-label="Filter queries by run count" data-table-filter="runs"></th>
+      <th><select aria-label="Filter queries by latest status" data-table-filter="latest"><option value="">Any</option><option value="not run">Not run</option><option value="queued">Queued</option><option value="running">Running</option><option value="success">Success</option><option value="failed">Failed</option></select></th>
+      <th></th>
+    </tr>
+  </thead><tbody>
+  {% for query in queries %}{% set model_filter = 'Local regexp' if query.local_regexp else (query.selected_models|map(attribute='model')|join(' ')) %}<tr id="query-{{ query.id }}" data-query-filter-row data-filter-name="{{ query.name }} {{ query.updated_at }}" data-filter-type="{{ query.query_kind }}" data-filter-supports="{{ query.content_scope }}" data-filter-model="{{ model_filter }}" data-filter-processing="{{ query.paper_processing }}" data-filter-new-papers="{{ 'yes' if query.auto_run_papers else 'no' }}" data-filter-new-blogs="{{ 'yes' if query.auto_run_blogs else 'no' }}" data-filter-runs="{{ query.run_count }}" data-filter-latest="{{ query.latest_status or 'not run' }}">
     <td><input type="hidden" name="query_id" value="{{ query.id }}" form="automatic-query-form"><strong>{{ query.name }}</strong>{% if query.is_builtin %}<small><span class="badge">Built in</span></small>{% endif %}<small>Updated {{ query.updated_at }}</small></td>
-    <td>{% if query.query_kind == 'classification' %}<span class="status status-warning">Classifier</span><small>{{ query.label_class }}</small>{% elif query.query_kind == 'regexp' %}<span class="status status-success">Regexp tagger</span><small>{{ query.name }}</small>{% else %}<span class="status status-disabled">Summary</span>{% endif %}</td>
+    <td>{% if query.query_kind == 'classification' %}<span class="status status-warning">Classifier</span><small>{{ query.label_class }}</small>{% elif query.query_kind == 'regexp' %}<span class="status status-success">Regexp tagger</span>{% else %}<span class="status status-disabled">Summary</span>{% endif %}</td>
     <td><span class="status status-{{ 'paper' if query.content_scope == 'papers' else 'blog' if query.content_scope == 'blogs' else 'success' }}">{{ {'both':'Both', 'papers':'Paper', 'blogs':'Blog'}.get(query.content_scope, 'Both') }}</span></td>
     <td>{% if query.local_regexp %}<span class="badge">Local regexp</span><small>No model call</small>{% else %}{% for model in query.selected_models %}<span class="badge">{{ model.profile }}</span><small>{{ model.model }}</small>{% else %}<span class="muted">No model</span>{% endfor %}{% endif %}</td>
     <td>{{ {'chunked':'Chunk + merge', 'whole_text':'Whole text', 'pdf':'PDF file'}.get(query.paper_processing, 'Chunk + merge') }}</td>
@@ -22,13 +46,27 @@
     <td><span class="status status-{{ query.latest_status or 'disabled' }}">{{ query.latest_status or 'not run' }}</span></td>
     <td class="saved-query-actions{% if query.is_builtin %} saved-query-actions-no-delete{% endif %}"><div class="saved-query-action-grid"><a class="button button-small button-primary saved-query-action-edit" href="/queries/{{ query.id }}/edit">Edit</a>{% if query.query_kind in ('classification', 'regexp') %}<form class="saved-query-action-clear" method="post" action="/queries/{{ query.id }}/classifications/delete" data-confirm="Remove every tag produced by this query?"><button class="button button-small button-danger" type="submit">Clear tags</button></form>{% endif %}{% if not query.is_builtin %}<form class="saved-query-action-delete" method="post" action="/queries/{{ query.id }}/delete" data-confirm="Delete this saved query and its run outputs?"><button class="button button-small button-danger" type="submit">Delete</button></form>{% endif %}</div></td>
   </tr>{% else %}<tr><td colspan="10" class="empty">No saved queries.</td></tr>{% endfor %}
+  <tr class="query-filter-empty" data-table-filter-empty hidden><td colspan="10" class="empty">No saved queries match these filters.</td></tr>
   </tbody></table></div>
 </section>
 
-<section class="panel">
-  <div class="panel-heading"><h2>Recent outputs</h2><span>{{ runs|length }}</span></div>
-  <div class="table-wrap"><table class="query-runs-table"><thead><tr><th>Query</th><th>Model</th><th class="query-run-status-column">Status</th><th class="query-run-records-column">Records</th><th>Created</th><th>Output</th></tr></thead><tbody>
-  {% for run in runs %}<tr><td><a href="#query-{{ run.query_id }}">{{ run.query_name }}</a></td><td>{{ run.model }}</td><td class="query-run-status-cell"><span class="status status-{{ run.status }}">{{ run.status }}</span>{% if run.error_text %}<small class="task-error">{{ run.error_text }}</small>{% endif %}{% if run.status in ('queued', 'running') %}<form method="post" action="/queries/runs/{{ run.id }}/cancel" class="query-run-stop-form"><button class="button button-small button-danger" type="submit">Stop</button></form>{% endif %}</td><td class="query-run-records-cell">{{ run.matched_count }}{% if run.selection_label %}<small>{{ run.selection_label }}</small>{% endif %}{% if run.selection.warnings %}{% for warning in run.selection.warnings %}<small class="query-run-warning">{{ warning }}</small>{% endfor %}{% endif %}</td><td>{{ run.created_at }}</td><td class="query-output-link-cell"><a href="/queries/runs/{{ run.id }}">{% if run.output %}Open result{% elif run.status in ('queued', 'running') %}View status{% else %}View error{% endif %}</a></td></tr>{% else %}<tr><td colspan="6" class="empty">No query outputs.</td></tr>{% endfor %}
+{% else %}
+<section class="panel query-table-panel">
+  <div class="panel-heading"><div><h2>Query history</h2><p>Showing the latest 100 per-content query runs and their outputs.</p></div><span data-table-filter-count>{{ runs|length }}</span></div>
+  <div class="table-wrap"><table class="query-runs-table" data-query-filter-table><thead>
+    <tr><th>Query</th><th>Model</th><th class="query-run-status-column">Status</th><th class="query-run-records-column">Records</th><th>Created</th><th>Output</th></tr>
+    <tr class="column-filter-row">
+      <th><input type="search" placeholder="Search query" aria-label="Filter history by query" data-table-filter="query"></th>
+      <th><input type="search" placeholder="Search model" aria-label="Filter history by model" data-table-filter="model"></th>
+      <th><select aria-label="Filter history by status" data-table-filter="status"><option value="">Any</option><option value="queued">Queued</option><option value="running">Running</option><option value="success">Success</option><option value="failed">Failed</option></select></th>
+      <th><input type="search" inputmode="numeric" placeholder="Records" aria-label="Filter history by record count" data-table-filter="records"></th>
+      <th><input type="search" placeholder="Date / time" aria-label="Filter history by creation date" data-table-filter="created"></th>
+      <th><select aria-label="Filter history by output state" data-table-filter="output"><option value="">Any</option><option value="result">Result</option><option value="pending">Pending</option><option value="error">Error</option></select></th>
+    </tr>
+  </thead><tbody>
+  {% for run in runs %}{% set output_state = 'result' if run.output else ('pending' if run.status in ('queued', 'running') else 'error') %}<tr data-query-filter-row data-filter-query="{{ run.query_name }}" data-filter-model="{{ run.model }}" data-filter-status="{{ run.status }}" data-filter-records="{{ run.matched_count }} {{ run.selection_label or '' }}" data-filter-created="{{ run.created_at }}" data-filter-output="{{ output_state }}"><td><a href="/queries?mode=saved#query-{{ run.query_id }}">{{ run.query_name }}</a></td><td>{{ run.model }}</td><td class="query-run-status-cell"><span class="status status-{{ run.status }}">{{ run.status }}</span>{% if run.error_text %}<small class="task-error">{{ run.error_text }}</small>{% endif %}{% if run.status in ('queued', 'running') %}<form method="post" action="/queries/runs/{{ run.id }}/cancel" class="query-run-stop-form"><button class="button button-small button-danger" type="submit">Stop</button></form>{% endif %}</td><td class="query-run-records-cell">{{ run.matched_count }}{% if run.selection_label %}<small>{{ run.selection_label }}</small>{% endif %}{% if run.selection.warnings %}{% for warning in run.selection.warnings %}<small class="query-run-warning">{{ warning }}</small>{% endfor %}{% endif %}</td><td>{{ run.created_at }}</td><td class="query-output-link-cell"><a href="/queries/runs/{{ run.id }}">{% if run.output %}Open result{% elif run.status in ('queued', 'running') %}View status{% else %}View error{% endif %}</a></td></tr>{% else %}<tr><td colspan="6" class="empty">No query outputs.</td></tr>{% endfor %}
+  <tr class="query-filter-empty" data-table-filter-empty hidden><td colspan="6" class="empty">No query history matches these filters.</td></tr>
   </tbody></table></div>
 </section>
+{% endif %}
 {% endblock %}

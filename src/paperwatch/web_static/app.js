@@ -227,10 +227,12 @@
 
     let syncingProfileOptions = false;
     const selectedModels = () => models ? Array.from(models.selectedOptions) : [];
+    const selectedQueries = () => defaults ? Array.from(defaults.selectedOptions) : [];
     const defaultsLocked = () => Boolean(defaultsToggle && !defaultsToggle.checked);
     const localQuery = () => {
       if (queryKind?.value === "regexp") return true;
-      return defaults?.selectedOptions[0]?.dataset.local === "true";
+      const selected = selectedQueries();
+      return selected.length > 0 && selected.every((option) => option.dataset.local === "true");
     };
 
     const syncProfileOptions = () => {
@@ -259,7 +261,15 @@
     };
 
     const applyQueryDefaults = () => {
-      const option = defaults?.selectedOptions[0];
+      const selectedQueriesNow = selectedQueries();
+      // A multi-query run may contain queries with different saved defaults.
+      // Keep those settings per query on the server; only mirror defaults into
+      // the override controls when exactly one query is selected.
+      if (defaults?.multiple && selectedQueriesNow.length !== 1) {
+        syncProfileOptions();
+        return;
+      }
+      const option = selectedQueriesNow[0];
       if (!option) {
         syncProfileOptions();
         return;
@@ -336,11 +346,48 @@
     Array.from(automaticQueryForm.elements)
       .filter((element) => element.type === "checkbox")
       .forEach((checkbox) => checkbox.addEventListener("change", () => {
+        const row = checkbox.closest("[data-query-filter-row]");
+        if (row) {
+          const key = checkbox.name === "auto_run_papers" ? "filterNewPapers" : "filterNewBlogs";
+          row.dataset[key] = checkbox.checked ? "yes" : "no";
+          row.closest("[data-query-filter-table]")?.dispatchEvent(new Event("query-filter-refresh"));
+        }
         setStatus("Unsaved changes");
         if (saveTimer) window.clearTimeout(saveTimer);
         saveTimer = window.setTimeout(saveSelections, 180);
       }));
   }
+
+  document.querySelectorAll("[data-query-filter-table]").forEach((table) => {
+    const rows = Array.from(table.querySelectorAll("tbody [data-query-filter-row]"));
+    const filters = Array.from(table.querySelectorAll("[data-table-filter]"));
+    const empty = table.querySelector("[data-table-filter-empty]");
+    const panel = table.closest(".query-table-panel");
+    const count = panel?.querySelector("[data-table-filter-count]");
+    const normalize = (value) => String(value || "").trim().toLocaleLowerCase();
+    const datasetKey = (name) => `filter${name.split("-").map((part) => part.charAt(0).toUpperCase() + part.slice(1)).join("")}`;
+    const applyFilters = () => {
+      let visible = 0;
+      rows.forEach((row) => {
+        const matches = filters.every((filter) => {
+          const needle = normalize(filter.value);
+          if (!needle) return true;
+          const key = datasetKey(filter.dataset.tableFilter || "");
+          return normalize(row.dataset[key]).includes(needle);
+        });
+        row.hidden = !matches;
+        if (matches) visible += 1;
+      });
+      if (empty) empty.hidden = visible !== 0 || rows.length === 0;
+      if (count) count.textContent = String(visible);
+    };
+    filters.forEach((filter) => {
+      filter.addEventListener("input", applyFilters);
+      filter.addEventListener("change", applyFilters);
+    });
+    table.addEventListener("query-filter-refresh", applyFilters);
+    applyFilters();
+  });
 
   const contentResultsRunnerForm = document.querySelector("form.content-results-runner-form");
   const syncContentRunTarget = () => {
@@ -837,6 +884,11 @@
     const wrapper = document.createElement("div");
     wrapper.className = `search-select${multiple ? " search-select-multiple" : ""}${cycle ? " search-select-cycle" : ""}${wrapCycle ? " search-select-wrap-cycle" : ""}`;
     const floatingOptions = Boolean(
+      select.hasAttribute("data-float-options") ||
+      select.hasAttribute("data-float-options-up") ||
+      (select.matches("[data-model-picker]") && select.closest(".content-results-runner-row"))
+    );
+    const floatOptionsUp = Boolean(
       select.hasAttribute("data-float-options-up") ||
       (select.matches("[data-model-picker]") && select.closest(".content-results-runner-row"))
     );
@@ -893,9 +945,18 @@
       list.style.left = `${left}px`;
       list.style.right = "auto";
       list.style.width = `${width}px`;
-      list.style.top = "auto";
-      list.style.bottom = `${window.innerHeight - rect.top + gap}px`;
-      list.style.maxHeight = `${Math.max(80, Math.min(280, rect.top - gap - viewportPadding))}px`;
+      const spaceAbove = Math.max(0, rect.top - gap - viewportPadding);
+      const spaceBelow = Math.max(0, window.innerHeight - rect.bottom - gap - viewportPadding);
+      const openUp = floatOptionsUp || (spaceBelow < 180 && spaceAbove > spaceBelow);
+      if (openUp) {
+        list.style.top = "auto";
+        list.style.bottom = `${window.innerHeight - rect.top + gap}px`;
+        list.style.maxHeight = `${Math.max(80, Math.min(280, spaceAbove))}px`;
+      } else {
+        list.style.top = `${rect.bottom + gap}px`;
+        list.style.bottom = "auto";
+        list.style.maxHeight = `${Math.max(80, Math.min(280, spaceBelow))}px`;
+      }
     };
     const visibleRows = () => optionRows;
     const setActive = (rowIndex) => {

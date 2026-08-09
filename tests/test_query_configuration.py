@@ -166,10 +166,12 @@ def test_query_page_stores_one_model_and_uses_config_context(config_path):
     assert page.status_code == 200
     assert "Context tokens" not in page.text
     assert 'name="context_window_tokens"' not in page.text
-    model_field = page.text.split('name="model"', 1)[1].split("</select>", 1)[0]
-    assert " multiple" not in model_field
-    assert "Full paper PDF" in page.text
-    assert 'value="default"' in page.text
+    assert 'name="model"' not in page.text
+    assert 'name="paper_processing"' in page.text
+    assert "Chunk + merge (default)" in page.text
+    assert "Whole text (Codex only)" in page.text
+    assert "PDF file (Codex only)" in page.text
+    assert "Current default model:" in page.text
 
     created = client.post(
         "/queries",
@@ -189,10 +191,10 @@ def test_query_page_stores_one_model_and_uses_config_context(config_path):
     with Database(config.paths.database) as db:
         row = next(item for item in db.list_saved_queries() if item["name"] == "Deep review")
         query_id = int(row["id"])
-        assert row["model_profile"] == "default"
+        assert "model_profile" not in row.keys()
         assert "model_profiles_json" not in row.keys()
         assert "context_window_tokens" not in row.keys()
-        assert row["paper_source_scope"] == "fulltext"
+        assert row["paper_source_scope"] == "auto"
         assert row["pdf_strategy"] == "chunked"
 
 
@@ -246,8 +248,7 @@ def test_query_page_stores_one_model_and_uses_config_context(config_path):
     with Database(config.paths.database) as db:
         row = db.get_saved_query(query_id)
         assert "context_window_tokens" not in row.keys()
-        assert row["model_profile"] == "default"
-        assert row["pdf_strategy"] == "auto"
+        assert "model_profile" not in row.keys()
         assert row["auto_run_papers"] == 0
         assert row["auto_run_blogs"] == 1
 
@@ -288,10 +289,8 @@ def test_default_query_installer_and_actions_column_deletion(config_path):
         assert sum(row["regexp_mode"] == "print" for row in optional) == 10
         assert all(row["auto_run_papers"] == 0 for row in optional)
         assert all(row["auto_run_blogs"] == 0 for row in optional)
-        assert all(
-            row["model_profile"] == ("" if row["regexp_mode"] == "print" else "default")
-            for row in optional
-        )
+        assert all("model_profile" not in row.keys() for row in optional)
+        assert all("model_profiles_json" not in row.keys() for row in optional)
         default_id = int(
             next(row for row in optional if row["name"] == "Evidence strength")["id"]
         )
@@ -318,8 +317,9 @@ def test_default_query_installer_and_actions_column_deletion(config_path):
     assert css.status_code == 200
     assert "table:not(.unified-content-table):not(.saved-query-table)" in css.text
     assert ".table-wrap>.saved-query-table{width:100%;min-width:100%;max-width:100%" in css.text
-    assert 'class="query-runs-table"' in page.text
-    assert 'class="query-run-records-column"' in page.text
+    history = client.get("/queries?mode=history")
+    assert 'class="query-runs-table"' in history.text
+    assert 'class="query-run-records-column"' in history.text
     assert ".query-run-records-column,.query-run-records-cell{width:7rem;max-width:7rem" in css.text
 
     for row in optional:
@@ -354,8 +354,7 @@ def test_collection_runner_places_override_and_options_after_query(
         runner.index('name="query_id"'),
         runner.index("collection-defaults-toggle"),
         runner.index('name="model"'),
-        runner.index('name="source_scope"'),
-        runner.index('name="pdf_strategy"'),
+        runner.index('name="paper_processing"'),
         runner.index('name="context_window_tokens"'),
         runner.index("collection-run-button"),
     ]
@@ -365,10 +364,10 @@ def test_collection_runner_places_override_and_options_after_query(
 def test_query_execution_validation_and_bulk_targets(config_path):
     config = load_config(config_path)
     with Database(config.paths.database) as db:
-        with pytest.raises(ValueError, match="only one model"):
-            db.create_saved_query(
-                name="Bad", prompt="P", model_profiles=("default", "secondary")
-            )
+        query_from_legacy_models = db.create_saved_query(
+            name="Legacy models ignored", prompt="P", model_profiles=("default", "secondary")
+        )
+        assert "model_profile" not in db.get_saved_query(query_from_legacy_models).keys()
         with pytest.raises(ValueError, match="Paper source"):
             db.create_saved_query(name="Bad", prompt="P", paper_source_scope="html")
         with pytest.raises(ValueError, match="PDF strategy"):
@@ -378,7 +377,7 @@ def test_query_execution_validation_and_bulk_targets(config_path):
             prompt="P",
             model_profiles=("default", "default", ""),
         )
-        assert db.get_saved_query(query_id)["model_profile"] == "default"
+        assert "model_profile" not in db.get_saved_query(query_id).keys()
         db.update_automatic_queries(
             [query_id], paper_query_ids=[query_id], blog_query_ids=[]
         )
@@ -470,12 +469,11 @@ def test_schema_25_migrates_saved_query_model_and_removes_context(tmp_path):
 
     with Database(path) as db:
         columns = [row["name"] for row in db._conn.execute("PRAGMA table_info(saved_queries)")]
-        assert "model_profile" in columns
+        assert "model_profile" not in columns
         assert "model_profiles_json" not in columns
         assert "context_window_tokens" not in columns
-        assert db.get_saved_query(query_id)["model_profile"] == "secondary"
         assert db.get_query_run(run_id)["context_window_tokens"] == 7777
-        assert db._conn.execute("PRAGMA user_version").fetchone()[0] == 31
+        assert db._conn.execute("PRAGMA user_version").fetchone()[0] == 32
         assert db._conn.execute("PRAGMA foreign_key_check").fetchall() == []
 
 def test_context_window_override_is_local_only(app_config):
@@ -489,13 +487,8 @@ def test_context_window_override_is_local_only(app_config):
     config = replace(app_config, llm_profiles=(codex,))
 
     assert _configured_context_window(config, ("default",), 2048) == 2048
-    assert _configured_context_window(config, ("codex-review",), 2048) == 400000
-    with pytest.raises(ValueError, match="only selected model"):
-        _configured_context_window(
-            config,
-            ("default", "codex-review"),
-            2048,
-        )
+    assert _configured_context_window(config, ("codex-review",), 2048) == 2048
+    assert _configured_context_window(config, ("default", "codex-review"), 2048) == 2048
 
 
 def test_backward_run_uses_saved_model_and_config_context(config_path, paper_record):
@@ -524,37 +517,21 @@ def test_backward_run_uses_saved_model_and_config_context(config_path, paper_rec
         ("default",),
         config.llm.context_window_tokens,
     )
-    assert kwargs["source_scope"] == "abstract"
-    assert kwargs["pdf_strategy"] == "auto"
+    assert kwargs["source_scope"] == "fulltext"
+    assert kwargs["pdf_strategy"] == "direct"
 
 
-def test_automatic_queries_use_saved_model_config_context(
-    app_config, paper_record, analysis_result, monkeypatch
+def test_automatic_queries_use_current_config_default_model(
+    app_config, paper_record, monkeypatch
 ):
-    secondary = replace(
-        app_config.llm,
-        profile="secondary",
-        model="second-model",
-        context_window_tokens=24000,
-    )
-    config = replace(app_config, llm_profiles=(secondary,))
     calls = []
 
-    class SecondaryLLM:
-        provider = "fake"
-        model = "second-model"
-        closed = False
+    class DefaultLLM:
+        provider = app_config.llm.provider
+        model = app_config.llm.model
 
         def check_ready(self):
             calls.append(("ready", self.model))
-
-        def close(self):
-            self.closed = True
-            calls.append(("closed", self.model))
-
-    class DefaultLLM:
-        provider = "fake"
-        model = "fake-model"
 
         def close(self):
             pass
@@ -565,78 +542,40 @@ def test_automatic_queries_use_saved_model_config_context(
 
     def collect(db, source_scope, **kwargs):
         calls.append(("collect", source_scope, kwargs["selection"]["pdf_strategy"]))
-        return [{"paper_id": 1, "title": "Paper", "content": "text"}]
+        return [{"paper_id": kwargs["selection"]["paper_ids"][0], "title": "Paper", "content": "text"}]
 
     def run_model(llm, **kwargs):
-        calls.append(
-            (
-                "run",
-                llm.model,
-                kwargs["context_window_tokens"],
-                kwargs["pdf_strategy"],
-            )
-        )
+        calls.append(("run", llm.model, kwargs["context_window_tokens"], kwargs["pdf_strategy"]))
         return BatchQueryResult(title="Done", summary="Done", items=[]), {}, 4
 
-    monkeypatch.setattr("paperwatch.pipeline.create_llm", lambda profile: SecondaryLLM())
     monkeypatch.setattr("paperwatch.query_jobs.collect_query_documents", collect)
     monkeypatch.setattr("paperwatch.query_jobs.run_query_for_model", run_model)
 
-    with Database(config.paths.database) as db:
+    with Database(app_config.paths.database) as db:
         paper_id, _ = db.upsert_paper(paper_record)
-        db.create_saved_query(
+        query_id = db.create_saved_query(
             name="Configured model",
             prompt="Review",
             auto_run_papers=True,
+            # Legacy saved model fields are deliberately ignored.
             model_profiles=("secondary",),
-            context_window_tokens=6000,
             paper_source_scope="fulltext",
             pdf_strategy="direct",
         )
-        db.create_saved_query(
-            name="Missing model",
-            prompt="Review",
-            auto_run_blogs=True,
-            model_profiles=("gone",),
-        )
         app = PaperWatch(
-            config,
-            db=db,
-            openalex=OpenAlex(),
-            arxiv=None,
-            llm=DefaultLLM(),
-            pdf_client=httpx.Client(),
+            app_config, db=db, openalex=OpenAlex(), arxiv=None,
+            llm=DefaultLLM(), pdf_client=httpx.Client(),
         )
-        stats = RunStats(
-            run_id=db.start_run(), new_paper_ids=[paper_id], new_blog_entry_ids=[9]
-        )
+        stats = RunStats(run_id=db.start_run(), new_paper_ids=[paper_id])
         app._run_automatic_queries(stats)
-        rows = [row for row in db.list_query_runs() if row["query_id"] != 1]
-        assert {row["model"] for row in rows} == {"second-model"}
-        assert {row["context_window_tokens"] for row in rows} == {
-            secondary.context_window_tokens
-        }
-        assert all(row["status"] == "success" for row in rows)
-        assert stats.errors_count == 1
+        run = next(row for row in db.list_query_runs() if int(row["query_id"]) == query_id)
+        assert run["status"] == "success"
+        assert run["profile"] == app_config.llm.profile
+        assert run["model"] == app_config.llm.model
+        assert stats.errors_count == 0
 
-        monkeypatch.setattr(
-            "paperwatch.query_jobs.run_query_for_model",
-            lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("model failed")),
-        )
-        failed = RunStats(run_id=db.start_run(), new_paper_ids=[paper_id])
-        app._run_automatic_queries(failed)
-        assert failed.errors_count >= 1
-        assert db.list_query_runs()[0]["status"] == "failed"
-    assert ("collect", "fulltext", "direct") in calls
-    assert (
-        "run",
-        "second-model",
-        secondary.context_window_tokens,
-        "direct",
-    ) in calls
-    assert ("ready", "second-model") in calls
-    assert ("closed", "second-model") in calls
-
+    assert any(call[0] == "collect" for call in calls)
+    assert any(call[:2] == ("run", app_config.llm.model) for call in calls)
 
 def test_download_only_historical_run_skips_blogs(app_config, author_candidate, monkeypatch):
     config = replace(app_config, llm=replace(app_config.llm, provider="none"))
@@ -680,14 +619,14 @@ def test_query_form_validation_and_missing_routes(config_path):
     unknown = client.post(
         "/queries",
         data={
-            "name": "Bad model",
+            "name": "Legacy model ignored",
             "prompt": "P",
             "model": "missing",
             "context_window_tokens": "2048",
         },
         follow_redirects=False,
     )
-    assert unknown.status_code == 303 and "level=error" in unknown.headers["location"]
+    assert unknown.status_code == 303 and "level=success" in unknown.headers["location"]
     legacy_context = client.post(
         "/queries",
         data={
@@ -720,12 +659,9 @@ def test_query_form_validation_and_missing_routes(config_path):
     assert cleared.status_code == 303
 
 
-def test_automatic_query_profile_and_collection_error_paths(
+def test_automatic_query_default_model_and_collection_error_paths(
     app_config, paper_record, monkeypatch
 ):
-    assert PaperWatch._stored_query_profiles({"model_profiles_json": "{"}) == ()
-    assert PaperWatch._stored_query_profiles({"model_profiles_json": "{}"}) == ()
-
     class OpenAlex:
         def close(self):
             pass
@@ -739,42 +675,27 @@ def test_automatic_query_profile_and_collection_error_paths(
 
     no_llm_config = replace(app_config, llm=replace(app_config.llm, provider="none"))
     with Database(no_llm_config.paths.database) as db:
-        app = PaperWatch(
-            no_llm_config,
-            db=db,
-            openalex=OpenAlex(),
-            arxiv=None,
-            llm=NoLLM(),
-            pdf_client=httpx.Client(),
-        )
-        app._run_automatic_queries(RunStats(run_id=db.start_run(), new_paper_ids=[1]))
-
-    # Re-open with an available model and exercise the no-valid-model and source failure paths.
-    with Database(app_config.paths.database) as db:
         paper_id, _ = db.upsert_paper(paper_record)
-        db.create_saved_query(
-            name="Unavailable only",
-            prompt="P",
-            auto_run_blogs=True,
-            model_profiles=("gone",),
-        )
+        db.create_saved_query(name="Needs model", prompt="P", auto_run_papers=True)
         app = PaperWatch(
-            app_config,
-            db=db,
-            openalex=OpenAlex(),
-            arxiv=None,
-            llm=NoLLM(),
-            pdf_client=httpx.Client(),
+            no_llm_config, db=db, openalex=OpenAlex(), arxiv=None,
+            llm=NoLLM(), pdf_client=httpx.Client(),
         )
-        missing = RunStats(run_id=db.start_run(), new_blog_entry_ids=[1])
+        missing = RunStats(run_id=db.start_run(), new_paper_ids=[paper_id])
         app._run_automatic_queries(missing)
         assert missing.errors_count == 1
 
-        db.create_saved_query(
-            name="Collection fails",
-            prompt="P",
-            auto_run_papers=True,
-            model_profiles=("default",),
+    # With a configured default, failures come from content/model execution, not
+    # a stale model name stored on the query.
+    with Database(app_config.paths.database) as db:
+        paper_id, _ = db.upsert_paper(paper_record)
+        query_id = db.create_saved_query(
+            name="Collection fails", prompt="P", auto_run_papers=True,
+            model_profiles=("gone",),  # legacy value is ignored
+        )
+        app = PaperWatch(
+            app_config, db=db, openalex=OpenAlex(), arxiv=None,
+            llm=NoLLM(), pdf_client=httpx.Client(),
         )
         monkeypatch.setattr(
             "paperwatch.query_jobs.collect_query_documents",
@@ -783,8 +704,9 @@ def test_automatic_query_profile_and_collection_error_paths(
         failed = RunStats(run_id=db.start_run(), new_paper_ids=[paper_id])
         app._run_automatic_queries(failed)
         assert failed.errors_count >= 1
-        assert any(row["status"] == "failed" for row in db.list_query_runs())
-
+        run = next(row for row in db.list_query_runs() if int(row["query_id"]) == query_id)
+        assert run["status"] == "failed"
+        assert run["model"] == app_config.llm.model
 
 def test_automatic_query_cancellation_marks_run(
     app_config, paper_record, monkeypatch
@@ -836,7 +758,8 @@ def test_regexp_tagger_can_be_created_from_query_form(config_path):
     client = _client(config_path)
     page = client.get("/queries/new")
     assert "Regexp tagger" in page.text
-    assert "Upload whole PDF (Codex)" in page.text
+    assert "PDF file (Codex only)" in page.text
+    assert "Whole text (Codex only)" in page.text
     assert "data-codex-only" in page.text
 
     response = client.post(
@@ -845,11 +768,9 @@ def test_regexp_tagger_can_be_created_from_query_form(config_path):
             "name": "Compact architecture",
             "query_kind": "regexp",
             "content_scope": "papers",
-            "label_class": "Architecture",
-            "label_values": r"Compact = (?i)compact\s+agent",
-            "label_debug_text": "A compact agent architecture.",
-            "paper_source_scope": "abstract",
-            "pdf_strategy": "auto",
+            "regexp_pattern": r"(?i)compact\s+agent",
+            "regexp_debug_text": "A compact agent architecture.",
+            "paper_processing": "chunked",
         },
         follow_redirects=False,
     )
@@ -864,17 +785,15 @@ def test_regexp_tagger_can_be_created_from_query_form(config_path):
             if item["name"] == "Compact architecture"
         )
         assert row["query_kind"] == "regexp"
-        assert row["model_profile"] == ""
+        assert "model_profile" not in row.keys()
         assert row["prompt"] == "Apply regexp tags locally."
-        values = Database._decoded_label_values(row["label_values_json"])
-        assert values == [
-            {"value": "Compact", "pattern": r"(?i)compact\s+agent"}
-        ]
-        assert row["label_debug_text"] == "A compact agent architecture."
+        assert row["regexp_pattern"] == r"(?i)compact\s+agent"
+        assert Database._decoded_label_values(row["label_values_json"]) == []
+        assert row["regexp_debug_text"] == "A compact agent architecture."
 
     edit_page = client.get(f"/queries/{int(row['id'])}/edit")
     assert edit_page.status_code == 200
-    assert 'name="label_debug_text"' in edit_page.text
+    assert 'name="regexp_debug_text"' in edit_page.text
     assert "A compact agent architecture." in edit_page.text
 
     updated = client.post(
@@ -883,17 +802,15 @@ def test_regexp_tagger_can_be_created_from_query_form(config_path):
             "name": "Compact architecture",
             "query_kind": "regexp",
             "content_scope": "papers",
-            "label_class": "Architecture",
-            "label_values": r"Compact = (?i)compact\s+agent",
-            "label_debug_text": "Updated compact agent sample.",
-            "paper_source_scope": "abstract",
-            "pdf_strategy": "auto",
+            "regexp_pattern": r"(?i)compact\s+agent",
+            "regexp_debug_text": "Updated compact agent sample.",
+            "paper_processing": "chunked",
         },
         follow_redirects=False,
     )
     assert updated.status_code == 303
     with Database(config.paths.database) as db:
-        assert db.get_saved_query(int(row["id"]))["label_debug_text"] == (
+        assert db.get_saved_query(int(row["id"]))["regexp_debug_text"] == (
             "Updated compact agent sample."
         )
 
@@ -1020,5 +937,5 @@ def test_automatic_regexp_tagger_runs_without_llm(app_config, paper_record):
         assert run["status"] == "success"
         assert run["provider"] == "local"
         tags = db.classification_results_for_content("paper", paper_id)
-        assert tags[0]["tag_name"].casefold() == "automatic compact tag: compact agent"
+        assert tags[0]["tag_name"].casefold() == "compact agent"
         assert stats.errors_count == 0

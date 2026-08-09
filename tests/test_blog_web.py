@@ -376,7 +376,7 @@ def test_blog_saved_prompt_routes_and_collection_runner(config_path):
     args, kwargs = controller.calls[-1]
     assert args[:3] == (
         query_id,
-        ("default",),
+        (),
         config.llm.context_window_tokens,
     )
     assert kwargs["content_type"] == "blogs"
@@ -419,7 +419,7 @@ def test_blog_saved_prompt_routes_and_collection_runner(config_path):
     args, kwargs = controller.calls[-1]
     assert args[:3] == (
         query_id,
-        ("default",),
+        (),
         config.llm.context_window_tokens,
     )
     selection = kwargs["selection"]

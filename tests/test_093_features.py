@@ -302,7 +302,7 @@ def test_shared_tags_direct_blog_import_rendering_and_fetch_history(
     ).status_code == 303
     with Database(config.paths.database) as db:
         assert db.list_content_tags() == []
-        assert SCHEMA_VERSION == 31
+        assert SCHEMA_VERSION == 32
 
 
 def test_regexp_and_tag_validation_edges(config_path):

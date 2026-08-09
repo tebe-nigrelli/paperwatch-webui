@@ -1718,3 +1718,97 @@ def test_arxiv_fallback_date_parses_both_formats_and_invalid_values():
     assert PaperWatch._arxiv_fallback_date(article("[v1] Fri, 8 Aug 2025")) == "2025-08-08"
     assert PaperWatch._arxiv_fallback_date(article("Submitted on 99 Aug 2026")) is None
     assert PaperWatch._arxiv_fallback_date(article("No date")) is None
+
+
+def test_refetch_after_delete_targets_every_recreated_blog_for_automatic_regexp(
+    app_config, author_candidate
+):
+    import hashlib
+
+    from paperwatch.blogs import BlogFetch, FeedItem
+
+    class NoopOpenAlex:
+        def close(self):
+            pass
+
+    class NoLLM:
+        provider = "none"
+        model = "none"
+
+        def close(self):
+            pass
+
+    items = tuple(
+        FeedItem(
+            external_id=f"post-{index}",
+            title=f"Post {index}",
+            url=f"https://example.test/blog/post-{index}",
+            published_at=f"2026-08-{index + 1:02d}",
+            text=f"Article body marker-{index}",
+            sha256=hashlib.sha256(f"Article body marker-{index}".encode()).hexdigest(),
+        )
+        for index in range(12)
+    )
+    fetched = BlogFetch(
+        method="rss",
+        title="Resettable feed",
+        status_code=200,
+        feed_url="https://example.test/blog/feed.xml",
+        feed_items=items,
+        source_mode="feed",
+    )
+    config = replace(
+        app_config,
+        fetch=replace(app_config.fetch, download_pdfs=False),
+        llm=replace(app_config.llm, provider="none", analyze_pdfs=False),
+    )
+
+    with Database(config.paths.database) as db:
+        db.add_author(author_candidate)
+        db.add_author_blog(author_candidate.openalex_id, "https://example.test/blog")
+        query_id = db.create_saved_query(
+            name="Reset regexp",
+            prompt="",
+            auto_run_blogs=True,
+            query_kind="regexp",
+            content_scope="blogs",
+            regexp_pattern=r"marker-\d+",
+        )
+        app = PaperWatch(
+            config,
+            db=db,
+            openalex=NoopOpenAlex(),
+            arxiv=None,
+            llm=NoLLM(),
+            pdf_client=httpx.Client(),
+        )
+
+        first = RunStats(run_id=db.start_run())
+        app._apply_blog_fetch(first, db.list_enabled_blogs()[0], fetched, None)
+        assert first.blog_updates_found == 0
+        assert len(first.new_blog_entry_ids) == len(items)
+
+        assert db.delete_all_blog_entries() == len(items)
+
+        second = RunStats(run_id=db.start_run())
+        app._apply_blog_fetch(second, db.list_enabled_blogs()[0], fetched, None)
+        assert second.blog_updates_found == 0
+        assert len(second.new_blog_entry_ids) == len(items)
+        assert set(second.new_blog_entry_ids) == {
+            int(row["id"]) for row in db.list_blog_entries()
+        }
+
+        app._run_automatic_queries(second)
+        runs = [
+            row for row in db.list_query_runs()
+            if int(row["query_id"]) == query_id
+        ]
+        assert len(runs) == len(items)
+        assert {int(row["blog_entry_id"]) for row in runs} == set(
+            second.new_blog_entry_ids
+        )
+        assert {row["status"] for row in runs} == {"success"}
+        for entry_id in second.new_blog_entry_ids:
+            tags = db.classification_results_for_content("blog", entry_id)
+            assert len(tags) == 1
+            assert tags[0]["tag_name"].startswith("marker-")

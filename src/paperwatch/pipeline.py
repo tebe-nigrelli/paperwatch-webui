@@ -721,6 +721,19 @@ class PaperWatch:
                 )
         return paper_id
 
+    @staticmethod
+    def _mark_new_blog_content(stats: RunStats, entry_id: int) -> None:
+        """Track blog content that should receive automatic saved queries.
+
+        ``blog_updates_found`` intentionally suppresses initial/baseline imports so
+        the fetch UI does not report an entire existing archive as fresh news.  An
+        automatic query configured for new blog content has a different contract:
+        every content row created or materially changed during this fetch must be
+        processed, including rows recreated after downloaded blog data is cleared.
+        """
+        if entry_id not in stats.new_blog_entry_ids:
+            stats.new_blog_entry_ids.append(entry_id)
+
     def _apply_blog_fetch(
         self,
         stats: RunStats,
@@ -872,10 +885,9 @@ class PaperWatch:
                             rendered_html=item_html,
                             linked_paper_id=linked_paper_id,
                         )
+                    self._mark_new_blog_content(stats, entry_id)
                     if kind != "baseline" and not initial_item:
                         stats.blog_updates_found += 1
-                        if entry_id not in stats.new_blog_entry_ids:
-                            stats.new_blog_entry_ids.append(entry_id)
                 feed_urls = {item.url for item in fetched.feed_items if item.url}
                 for article in fetched.article_items:
                     # A 304 feed response has no item payload, but known article pages
@@ -926,6 +938,7 @@ class PaperWatch:
                             rendered_html=combined_html,
                             linked_paper_id=linked_paper_id,
                         )
+                        self._mark_new_blog_content(stats, int(rss_entry["id"]))
                         # A later webpage-body change is a real update even though
                         # it is folded into the stable RSS entry instead of creating
                         # a duplicate snapshot row.
@@ -935,8 +948,6 @@ class PaperWatch:
                             and article_kind != "baseline"
                         ):
                             stats.blog_updates_found += 1
-                            if int(rss_entry["id"]) not in stats.new_blog_entry_ids:
-                                stats.new_blog_entry_ids.append(int(rss_entry["id"]))
                     else:
                         self.db.set_blog_entry_published_at(
                             int(rss_entry["id"]), article.published_at
@@ -992,6 +1003,7 @@ class PaperWatch:
                             rendered_html=combined_html,
                             published_at=article.published_at,
                         )
+                        self._mark_new_blog_content(stats, int(previous_article["id"]))
                         continue
                     if previous_article is None:
                         article_kind, article_diff = "changed", ""
@@ -1035,13 +1047,12 @@ class PaperWatch:
                             rendered_html=article.rendered_html,
                             published_at=article.published_at,
                         )
+                    self._mark_new_blog_content(stats, article_entry_id)
                     # The feed item itself is the new-content notification. The
                     # first HTML fetch is a usable website snapshot, not a
                     # second notification for the same post.
                     if article_kind != "baseline" and not first_page_fetch:
                         stats.blog_updates_found += 1
-                        if article_entry_id not in stats.new_blog_entry_ids:
-                            stats.new_blog_entry_ids.append(article_entry_id)
 
                 self.db.mark_blog_checked(
                     blog_id,
@@ -1136,9 +1147,9 @@ class PaperWatch:
                     published_at=article.published_at,
                     linked_paper_id=linked_paper_id,
                 )
+                self._mark_new_blog_content(stats, entry_id)
                 if not initial_article_sync and article.url not in existing_article_urls:
                     stats.blog_updates_found += 1
-                    stats.new_blog_entry_ids.append(entry_id)
 
             for article in fetched.article_items:
                 linked_paper_id = self._import_arxiv_feed_item(
@@ -1247,10 +1258,9 @@ class PaperWatch:
                         published_at=article.published_at,
                         linked_paper_id=linked_paper_id,
                     )
+                self._mark_new_blog_content(stats, article_entry_id)
                 if article_kind != "baseline" and not initial_article:
                     stats.blog_updates_found += 1
-                    if article_entry_id not in stats.new_blog_entry_ids:
-                        stats.new_blog_entry_ids.append(article_entry_id)
 
             if fetched.source_mode in {"article_index", "publications"}:
                 self.db.suppress_blog_source_page_entries(blog_id)
@@ -1322,9 +1332,9 @@ class PaperWatch:
                 rendered_html=fetched.snapshot_rendered_html,
                 published_at=fetched.snapshot_published_at,
             )
+            self._mark_new_blog_content(stats, entry_id)
             if kind != "baseline":
                 stats.blog_updates_found += 1
-                stats.new_blog_entry_ids.append(entry_id)
             self.db.mark_blog_checked(
                 blog_id,
                 status=fetched.status_code,
@@ -2105,6 +2115,17 @@ class PaperWatch:
             pdf_strategy = "auto" if content_type == "blogs" else str(
                 query["pdf_strategy"] or "chunked"
             )
+            # A saved query does not own a model anymore.  Its effective paper
+            # processing must therefore be compatible with the *current* default
+            # model.  Local/non-Codex models always use text chunk + merge, even
+            # if this row carries a legacy Codex-only direct/PDF setting.
+            if (
+                content_type == "papers"
+                and default_profile is not None
+                and default_profile.provider != "codex"
+            ):
+                source_scope = "auto"
+                pdf_strategy = "chunked"
             if content_type == "papers" and (
                 source_scope == "pdf" or pdf_strategy == "direct"
             ):

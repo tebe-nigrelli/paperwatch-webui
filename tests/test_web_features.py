@@ -130,7 +130,7 @@ def test_recent_feed_theme_and_direct_links(
     assert "author-picker" in js
     assert "localStorage" in js
     assert "PDF strategy only applies" not in js
-    assert "setLocked(strategy, lockedByDefaults || isClaude || !extractedPdf)" in js
+    assert "data-paper-processing" in js
     assert 'const wrapCycle = cycle && select.hasAttribute("data-wrap-cycle")' in js
     assert 'targetValue.value = targetValue.value === "selected" ? "results" : "selected"' in js
     assert 'control.setAttribute("aria-disabled", String(locked))' in js
@@ -191,13 +191,15 @@ def test_recent_papers_use_searchable_multi_select_author_tags_instead_of_kind(
     assert response.status_code == 200
     assert 'name="author_tag" value="theory"' in response.text
     assert 'name="author" form="content-column-filters" multiple' in response.text
+    assert 'aria-label="Filter authors" data-float-options' in response.text
+    assert 'aria-label="Filter topics" data-float-options' in response.text
     assert 'name="tag" form="content-column-filters" multiple' in response.text
-    assert 'aria-label="Filter authors"' in response.text
-    assert 'aria-label="Filter tags"' in response.text
+    assert 'aria-label="Filter tags" data-float-options' in response.text
     assert '<span>Kind</span>' not in response.text
     assert 'name="kind"' not in response.text
     assert "1 matching record" in response.text
     js = client.get("/static/app.js").text
+    assert 'select.hasAttribute("data-float-options")' in js
     assert 'details[data-persist-open]' in js
     assert 'storageSet(key, String(details.open))' in js
     assert '[data-author-tag-combobox]' in js
@@ -245,7 +247,7 @@ def test_paper_author_picker_and_chunked_multi_model_request(
 def test_saved_query_create_edit_run_output_and_delete(
     config_path, author_candidate, paper_record, analysis_result
 ):
-    config, _ = seed(config_path, author_candidate, paper_record, analysis_result)
+    config, paper_id = seed(config_path, author_candidate, paper_record, analysis_result)
     query = QueryStub()
     client = make_app(config_path, query=query)
     response = client.post(
@@ -268,6 +270,7 @@ def test_saved_query_create_edit_run_output_and_delete(
                 "query": "Minimal",
                 "date_from": "2026-01-01",
                 "date_to": "2026-12-31",
+                "resolved_paper_ids": [paper_id],
             },
         )[0]
         db.finish_query_run(
@@ -279,7 +282,7 @@ def test_saved_query_create_edit_run_output_and_delete(
                 "summary": "One paper matched.",
                 "items": [
                     {
-                        "paper_id": 1,
+                        "paper_id": paper_id,
                         "title": paper_record.title,
                         "output": "Evidence is limited to benchmarks.",
                     }
@@ -288,12 +291,14 @@ def test_saved_query_create_edit_run_output_and_delete(
         )
     page = client.get("/queries")
     assert "Compare evidence" in page.text
-    assert "Open result" in page.text
     assert "One paper matched" not in page.text
+    history = client.get("/queries?mode=history")
+    assert "Open result" in history.text
+    assert "One paper matched" not in history.text
     result = client.get(f"/queries/runs/{run_id}")
     assert "One paper matched" in result.text
-    assert "Search “Minimal”" in page.text
-    assert "From 2026-01-01" in page.text
+    assert "Search “Minimal”" in history.text
+    assert "From 2026-01-01" in history.text
     assert "Select papers and run" in page.text
     assert "Paper search" not in page.text
     recent = client.get("/")
@@ -310,7 +315,7 @@ def test_saved_query_create_edit_run_output_and_delete(
     assert 'name="return_to" value="/"' in recent.text
     assert 'type="button" data-run-target-toggle' in recent.text
     assert 'data-selected-count="0"' in recent.text
-    assert 'data-source-scope data-wrap-cycle' in recent.text
+    assert 'name="paper_processing"' in recent.text
     assert 'name="paper_ids"' not in recent.text
     response = client.post(
         "/queries/run-filtered",
@@ -325,13 +330,13 @@ def test_saved_query_create_edit_run_output_and_delete(
         follow_redirects=False,
     )
     assert response.status_code == 303
-    assert query.calls[0][:3] == (query_id, ("default",), 16384)
+    assert query.calls[0][:3] == (query_id, (), 16384)
     assert query.calls[0][3]["query"] == "Minimal"
     assert "paper_ids" not in query.calls[0][3]
     assert query.calls[0][4:] == ("auto", "chunked")
     query.calls.clear()
     with Database(config.paths.database) as db:
-        assert db.set_content_selected("paper", 1, True)
+        assert db.set_content_selected("paper", paper_id, True)
     selected_page = client.get("/")
     assert "Run saved prompt on all 1 search result" in selected_page.text
     assert 'data-selected-count="1"' in selected_page.text
@@ -346,12 +351,12 @@ def test_saved_query_create_edit_run_output_and_delete(
         follow_redirects=False,
     )
     assert response.status_code == 303
-    assert query.calls[0][3]["paper_ids"] == [1]
+    assert query.calls[0][3]["paper_ids"] == [paper_id]
     assert query.calls[0][3]["labels"] == ["Selected papers: 1"]
     assert "query" not in query.calls[0][3]
     query.calls.clear()
     with Database(config.paths.database) as db:
-        assert db.set_content_selected("paper", 1, False)
+        assert db.set_content_selected("paper", paper_id, False)
         assert db.add_author_tag("A123", "theory")
         assert db.add_author_tag("A123", "ML")
     response = client.post(
@@ -360,8 +365,7 @@ def test_saved_query_create_edit_run_output_and_delete(
             "query_id": str(query_id),
             "override_query_defaults": "1",
             "model": "default",
-            "source_scope": "fulltext",
-            "pdf_strategy": "chunked",
+            "paper_processing": "chunked",
             "context_window_tokens": "4096",
             "paper_ids": "1",
             "q": "Minimal",
@@ -383,7 +387,7 @@ def test_saved_query_create_edit_run_output_and_delete(
     assert query.calls[0][:3] == (query_id, ("default",), 4096)
     selection = query.calls[0][3]
     assert "paper_ids" not in selection
-    assert query.calls[0][4:] == ("fulltext", "chunked")
+    assert query.calls[0][4:] == ("auto", "chunked")
     assert selection["query"] == "Minimal"
     assert selection["author_id"] == "A123"
     assert selection["author_tags"] == ["theory", "ML"]
@@ -707,11 +711,12 @@ def test_recent_outputs_can_stop_running_query(
         )[0]
         db.start_query_run(run_id)
 
-    page = client.get("/queries")
+    page = client.get("/queries?mode=history")
     assert f'action="/queries/runs/{run_id}/cancel"' in page.text
     response = client.post(f"/queries/runs/{run_id}/cancel", follow_redirects=False)
     assert response.status_code == 303
     assert query.cancelled is True
+    assert response.headers["location"].startswith("/queries?mode=history&")
     assert "Stopping+Stop+me" in response.headers["location"]
 
 
@@ -770,6 +775,57 @@ def test_regexp_print_results_highlight_exact_matches(
     assert f'href="/queries/{query_id}/edit"' in content_detail.text
     assert "Edit query" in content_detail.text
     assert '<mark class="regexp-match">Military</mark>' in content_detail.text
+
+
+def test_regexp_print_generated_tag_is_visible_in_content_row_and_tag_picker(
+    config_path, author_candidate, paper_record, analysis_result
+):
+    config, paper_id = seed(config_path, author_candidate, paper_record, analysis_result)
+    with Database(config.paths.database) as db:
+        query_id = db.create_saved_query(
+            name="Compute and hardware requirements",
+            prompt="Print matches.",
+            regexp_pattern=r"H100",
+            regexp_radius=3,
+            regexp_mode="print",
+            content_scope="papers",
+        )
+        run_id = db.create_query_runs(
+            batch_id="regexp-picker-backfill",
+            query_id=query_id,
+            profiles=[("regexp", "local", "regexp")],
+            context_window_tokens=2048,
+            selection={"resolved_paper_ids": [paper_id]},
+        )[0]
+        db.finish_query_run(
+            run_id,
+            matched_count=1,
+            input_chars=30,
+            output={
+                "title": "Regexp matches: H100",
+                "summary": "1 match(es) across 1 record(s).",
+                "items": [
+                    {
+                        "paper_id": paper_id,
+                        "content_type": "paper",
+                        "title": paper_record.title,
+                        "output": "inference reaches 30 tokens/s on a single H100.",
+                    }
+                ],
+            },
+        )
+
+    page = make_app(config_path).get("/")
+    assert page.status_code == 200
+    tag = "H100"
+    assert tag in page.text
+    assert f'<option value="{tag}"' in page.text
+    assert 'name="tag" form="content-column-filters" multiple' in page.text
+    assert 'aria-label="Filter tags" data-float-options' in page.text
+
+    filtered = make_app(config_path).get("/", params={"tag": tag})
+    assert filtered.status_code == 200
+    assert paper_record.title in filtered.text
 
 
 def test_paper_saved_query_results_are_localized_to_current_record(
@@ -1009,7 +1065,7 @@ def test_paper_saved_query_run_remains_visible_when_model_omits_current_item(
     page = make_app(config_path).get(f"/papers/{paper_id}")
     assert page.status_code == 200
     assert "Missing item summary" in page.text
-    assert "did not return a per-record result for this paper" in page.text
+    assert "did not return a per-record result" not in page.text
     assert "SIBLING MUST STAY HIDDEN" not in page.text
     assert "COLLECTION SUMMARY HIDDEN" not in page.text
 
@@ -1089,3 +1145,111 @@ def test_blog_saved_query_results_fall_back_to_exact_title_when_model_omits_id(
     assert "2 matched records" not in page.text
     assert f'href="/queries/{query_id}/edit"' in page.text
     assert "Edit query" in page.text
+
+
+def test_query_page_tables_filter_each_column_and_runner_uses_query_chips(
+    config_path, paper_record
+):
+    config = load_config(config_path)
+    with Database(config.paths.database) as db:
+        db.upsert_paper(paper_record)
+        query_id = db.create_saved_query(name="Filterable query", prompt="Summarize")
+        run_id = db.create_query_runs(
+            batch_id="filterable-history",
+            query_id=query_id,
+            profiles=[("default", "ollama", "test-model")],
+            context_window_tokens=2048,
+            selection={"paper_ids": [1]},
+        )[0]
+        db.finish_query_run(
+            run_id,
+            matched_count=1,
+            input_chars=10,
+            output={
+                "title": "Done",
+                "summary": "Done",
+                "items": [{"paper_id": 1, "title": paper_record.title, "output": "Done"}],
+            },
+        )
+
+    client = make_app(config_path)
+    page = client.get("/queries")
+    assert page.status_code == 200
+    assert 'class="discover-mode-switch query-mode-switch"' in page.text
+    assert 'class="discover-mode-option active" href="/queries?mode=saved"' in page.text
+    assert "<h2>Saved queries</h2>" in page.text
+    assert "<h2>Query history</h2>" not in page.text
+    assert page.text.count("data-query-filter-table") == 1
+    for key in (
+        "name", "type", "supports", "model", "processing", "new-papers",
+        "new-blogs", "runs", "latest",
+    ):
+        assert f'data-table-filter="{key}"' in page.text
+
+    history = client.get("/queries?mode=history")
+    assert history.status_code == 200
+    assert 'class="discover-mode-option active" href="/queries?mode=history"' in history.text
+    assert "<h2>Saved queries</h2>" not in history.text
+    assert "<h2>Query history</h2>" in history.text
+    assert history.text.count("data-query-filter-table") == 1
+    for key in ("query", "model", "status", "records", "created", "output"):
+        assert f'data-table-filter="{key}"' in history.text
+    assert f'/queries?mode=saved#query-{query_id}' in history.text
+
+    content = client.get("/")
+    runner = content.text.split('id="collection-runner-form"', 1)[1].split("</form>", 1)[0]
+    assert 'name="query_id" multiple' in runner
+    assert 'data-search-placeholder="Search saved queries"' in runner
+    assert "selected queries appear as chips below" in runner.lower()
+    script = client.get("/static/app.js").text
+    assert "search-select-chips" in script
+    assert "start_many_on_results" not in script
+
+
+def test_query_views_are_limited_to_100_rows(config_path):
+    config = load_config(config_path)
+    with Database(config.paths.database) as db:
+        query_id = db.create_saved_query(name="History limit query", prompt="Summarize")
+        for index in range(105):
+            db.create_saved_query(name=f"Saved limit {index:03d}", prompt="Summarize")
+            db.create_query_runs(
+                batch_id=f"history-limit-{index:03d}",
+                query_id=query_id,
+                profiles=[("default", "ollama", "test-model")],
+                context_window_tokens=2048,
+            )
+
+    client = make_app(config_path)
+    saved = client.get("/queries?mode=saved")
+    history = client.get("/queries?mode=history")
+    assert saved.text.count("data-query-filter-row") == 100
+    assert history.text.count("data-query-filter-row") == 100
+
+
+def test_content_runner_submits_multiple_saved_queries(config_path, paper_record):
+    class MultiQueryStub(QueryStub):
+        def start_many_on_results(self, *args, **kwargs):
+            self.calls.append(("many", args, kwargs))
+            return ("batch-one", "batch-two")
+
+    config = load_config(config_path)
+    with Database(config.paths.database) as db:
+        db.upsert_paper(paper_record)
+        first = db.create_saved_query(name="First multi query", prompt="First")
+        second = db.create_saved_query(name="Second multi query", prompt="Second")
+
+    query = MultiQueryStub()
+    client = make_app(config_path, query=query)
+    response = client.post(
+        "/queries/run-filtered",
+        data={"query_id": [str(first), str(second)], "q": "Minimal"},
+        follow_redirects=False,
+    )
+    assert response.status_code == 303
+    assert "Started+2+saved+queries" in response.headers["location"]
+    kind, args, kwargs = query.calls[-1]
+    assert kind == "many"
+    assert args[0] == (first, second)
+    assert args[1] == ()
+    assert kwargs["targets"][0][0] == "papers"
+    assert kwargs["override_defaults"] is False

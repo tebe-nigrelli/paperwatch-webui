@@ -69,6 +69,8 @@ def test_content_extent_stub_button_and_colored_collapsed_diff(
         db.add_author(author_candidate)
         paper_id, _ = db.upsert_paper(paper_record)
         db.set_local_pdf(paper_id, str(pdf))
+        # Keep this rendering test independent of pypdf's handling of blank pages.
+        db.set_paper_pdf_page_count(paper_id, 3)
         blog_id = db.add_author_blog(
             author_candidate.openalex_id,
             "https://example.test/words",

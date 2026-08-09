@@ -11,11 +11,10 @@
 </section>
 {% if entries and saved_queries %}
 <section class="panel model-runner">
-  <div class="panel-heading"><div><h2>Run saved prompt</h2><p>Regexp-only queries run locally; other queries use the selected model.</p></div>{% if query_state.running and query_state.content_type == 'blogs' %}<span class="status status-running">running</span>{% endif %}</div>
+  <div class="panel-heading"><div><h2>Run saved prompt</h2><p>Regexp-only queries run locally; other queries use the default model from <code>config.toml</code>.</p></div>{% if query_state.running and query_state.content_type == 'blogs' %}<span class="status status-running">running</span>{% endif %}</div>
   <form method="post" action="/queries/run-blogs" class="saved-prompt-runner">
-    <label class="grow"><span>Saved query</span><select name="query_id" required>{% for query in saved_queries %}<option value="{{ query.id }}" {% if selected_query_id == query.id %}selected{% endif %}>{{ query.name }}{% if query.local_regexp %} · local regexp{% endif %}</option>{% endfor %}</select></label>
-    {% if model_profiles %}<label><span>Model</span><select name="model" required data-model-picker data-search-placeholder="Search model profiles">{% for profile in model_profiles %}<option value="{{ profile.profile }}" {% if loop.first %}selected{% endif %}>{{ profile.profile }} · {{ profile.provider }} · {{ profile.model }}</option>{% endfor %}</select></label>{% endif %}
-    <div class="model-run-actions"><small>Uses globally selected blog entries. Context size comes from the selected model profile.</small><button class="button button-primary" type="submit" {% if query_state.running %}disabled{% endif %}>Run on selected</button></div>
+    <label class="grow"><span>Saved query</span><select name="query_id" multiple size="6" required data-search-placeholder="Search saved queries">{% for query in saved_queries %}<option value="{{ query.id }}" {% if selected_query_id == query.id or (selected_query_id is none and loop.first) %}selected{% endif %}>{{ query.name }}{% if query.local_regexp %} · local regexp{% endif %}</option>{% endfor %}</select><small>Select one or more queries; selected queries appear as chips below.</small></label>
+    <div class="model-run-actions"><small>Uses globally selected blog entries. Model and context size come from the default LLM configuration.</small><button class="button button-primary" type="submit" {% if query_state.running %}disabled{% endif %}>Run on selected</button></div>
   </form>
 </section>
 {% endif %}

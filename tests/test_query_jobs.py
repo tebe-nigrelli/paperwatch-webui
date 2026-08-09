@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import sqlite3
 import threading
 from dataclasses import replace
 from pathlib import Path
@@ -469,15 +470,10 @@ def test_native_pdf_query_single_multi_and_provider_validation(monkeypatch):
     assert "large text" not in llm.pdf_calls[0][0]
     assert llm.pdf_calls[0][1] == Path("/tmp/1.pdf")
 
-    merged = BatchQueryResult(title="Merged", summary="Merged summary", items=[])
     monkeypatch.setattr(
         query_jobs,
         "run_query_for_model",
-        lambda *args, **kwargs: (
-            merged,
-            {"input_tokens": 7, "merge_provider": "ollama"},
-            11,
-        ),
+        lambda *args, **kwargs: pytest.fail("native PDFs must stay per-content"),
     )
     llm = FakeNativePDFLLM()
     result, usage, chars = run_query_for_native_pdfs(
@@ -489,14 +485,10 @@ def test_native_pdf_query_single_multi_and_provider_validation(monkeypatch):
         context_window_tokens=4096,
         max_input_chars=10_000,
     )
-    assert result == merged
-    assert usage == {
-        "input_tokens": 12,
-        "provider": "codex",
-        "cached": True,
-        "merge_provider": "ollama",
-    }
-    assert chars > 11
+    assert [item.paper_id for item in result.items] == [1, 2]
+    assert [item.output for item in result.items] == ["Output 1", "Output 2"]
+    assert usage["provider"] == "codex"
+    assert chars > 0
 
     with pytest.raises(LLMError, match="cannot read PDFs directly"):
         run_query_for_native_pdfs(
@@ -604,7 +596,7 @@ def test_native_pdf_batch_and_controller_preserve_codex_source(
     )
     assert batch_id
     controller.wait()
-    assert runner_calls[0][3] == 400000
+    assert runner_calls[0][3] == 2048
     with Database(config.paths.database) as db:
         row = db.query_runs_for_batch(batch_id)[0]
         selection = __import__("json").loads(row["selection_json"])
@@ -655,7 +647,7 @@ def test_query_batch_persisted_selection_and_edge_cases(
 ):
     config = load_config(config_path)
     with Database(config.paths.database) as db:
-        db.upsert_paper(paper_record)
+        paper_id, _ = db.upsert_paper(paper_record)
         query_id = db.create_saved_query(
             name="Filtered", source_type="papers", search_query="Minimal", prompt="Compare"
         )
@@ -664,7 +656,7 @@ def test_query_batch_persisted_selection_and_edge_cases(
             query_id=query_id,
             profiles=[("default", "ollama", "test-model")],
             context_window_tokens=2048,
-            selection={"query": "does-not-match", "labels": ["No matches"]},
+            selection={"paper_ids": [paper_id], "labels": ["Selected paper"]},
         )[0]
 
     client = FakeQueryLLM()
@@ -672,11 +664,11 @@ def test_query_batch_persisted_selection_and_edge_cases(
     assert run_query_batch(
         config_path, "filtered", query_id, ("default",), 2048
     ) == {"completed": 1, "failed": 0}
-    assert client.calls == []
+    assert client.calls
     with Database(config.paths.database) as db:
         row = db._conn.execute("SELECT * FROM query_runs WHERE id=?", (run_id,)).fetchone()
-        assert row["matched_count"] == 0
-        assert "No matching papers" in row["output_json"]
+        assert row["matched_count"] == 1
+        assert row["paper_id"] == paper_id
 
         malformed_id = db.create_query_runs(
             batch_id="malformed",
@@ -742,8 +734,9 @@ def test_query_controller_validation_busy_and_failure(config_path, paper_record)
     controller = QueryController(config_path, runner=runner)
     with pytest.raises(ValueError, match="512"):
         controller.start(query_id, ("default",), 100)
-    with pytest.raises(ValueError, match="Select"):
-        controller.start(query_id, (), 1024)
+    batch = controller.start(query_id, (), 1024, selection={"paper_ids": [paper_id]})
+    assert batch
+    controller.wait()
     with pytest.raises(ValueError, match="Unknown"):
         controller.start(query_id, ("missing",), 1024)
     with pytest.raises(ValueError, match="abstract or fulltext"):
@@ -759,7 +752,9 @@ def test_query_controller_validation_busy_and_failure(config_path, paper_record)
             source_scope="fulltext",
         )
     with Database(config.paths.database) as db:
-        assert db.list_query_runs(query_id) == []
+        # The earlier successful per-content run remains persisted; the warning
+        # above must not add another run.
+        assert len(db.list_query_runs(query_id)) == 1
     selection = {"query": "Minimal", "has_pdf": True}
     batch = controller.start(
         query_id, ("default", "default"), 1024, selection=selection
@@ -770,8 +765,9 @@ def test_query_controller_validation_busy_and_failure(config_path, paper_record)
         stored_selection = __import__("json").loads(stored["selection_json"])
         assert stored_selection == {
             **selection,
-            "source_scope": "abstract",
-            "pdf_strategy": "auto",
+            "source_scope": "auto",
+            "pdf_strategy": "chunked",
+            "paper_ids": [paper_id],
             "resolved_paper_ids": [paper_id],
         }
     assert controller.start(query_id, ("default",), 1024) is None
@@ -862,11 +858,13 @@ def test_pdf_query_strategies_and_oversized_document_splitting():
         )
 
     huge = [{"paper_id": 1, "title": "Huge", "fulltext": "x" * 20000}]
-    with pytest.raises(LLMError, match="exceed the context window"):
-        run_query_for_model(
-            llm, user_prompt="x", documents=huge,
-            context_window_tokens=512, max_input_chars=2000, pdf_strategy="direct",
-        )
+    before = len(llm.calls)
+    oversized, _usage, _chars = run_query_for_model(
+        llm, user_prompt="x", documents=huge,
+        context_window_tokens=512, max_input_chars=2000, pdf_strategy="direct",
+    )
+    assert oversized.items
+    assert len(llm.calls) > before + 1
 
     chunks = _split_oversized_document(huge[0], 700)
     assert len(chunks) > 1
@@ -1539,14 +1537,11 @@ def test_regexp_tag_query_runs_locally_and_applies_tag(config_path, paper_record
             prompt="",
             query_kind="regexp",
             content_scope="papers",
-            label_class="Architecture",
-            label_values=[
-                {"value": "Compact", "pattern": r"(?i)compact\s+agent"},
-            ],
+            regexp_pattern=r"(?i)compact\s+agent",
             paper_source_scope="abstract",
         )
         query = db.get_saved_query(query_id)
-        assert query["model_profile"] == ""
+        assert "model_profile" not in query.keys()
 
     controller = QueryController(config_path)
     batch_id = controller.start(
@@ -1566,8 +1561,119 @@ def test_regexp_tag_query_runs_locally_and_applies_tag(config_path, paper_record
         assert run["profile"] == "regexp"
         tags = db.classification_results_for_content("paper", paper_id)
         assert len(tags) == 1
-        assert tags[0]["tag_name"] == "Architecture: Compact"
+        assert tags[0]["tag_name"].casefold() == "compact agent"
         assert "compact agent" in tags[0]["raw_output"].lower()
+
+
+def test_regexp_print_query_immediately_persists_exact_match_as_tag(
+    config_path, paper_record
+):
+    config = load_config(config_path)
+    record = replace(
+        paper_record,
+        abstract="Inference runs on an H100 GPU and a CPU fallback.",
+        pdf_url=None,
+    )
+    with Database(config.paths.database) as db:
+        paper_id, _ = db.upsert_paper(record)
+        query_id = db.create_saved_query(
+            name="Compute and hardware requirements",
+            prompt="Print matching hardware references.",
+            regexp_pattern=r"H100",
+            regexp_radius=5,
+            regexp_mode="print",
+            content_scope="papers",
+            paper_source_scope="abstract",
+        )
+        run_id = db.create_query_runs(
+            batch_id="regexp-print-tag",
+            query_id=query_id,
+            profiles=[("regexp", "local", "regexp")],
+            context_window_tokens=2048,
+            selection={
+                "paper_ids": [paper_id],
+                "source_scope": "abstract",
+                "pdf_strategy": "chunked",
+            },
+        )[0]
+
+    assert run_query_batch(
+        config_path, "regexp-print-tag", query_id, ("regexp",), 2048
+    ) == {"completed": 1, "failed": 0}
+
+    # Use sqlite directly so opening Database cannot make this assertion pass
+    # via the historical backfill path. New runs must persist the tag now.
+    conn = sqlite3.connect(config.paths.database)
+    try:
+        row = conn.execute(
+            """
+            SELECT value, tag_name, query_run_id
+            FROM query_classification_results
+            WHERE query_id=? AND paper_id=?
+            """,
+            (query_id, paper_id),
+        ).fetchone()
+    finally:
+        conn.close()
+    assert row == ("H100", "H100", run_id)
+
+
+def test_database_open_backfills_tags_for_existing_regexp_print_runs(
+    config_path, paper_record
+):
+    config = load_config(config_path)
+    with Database(config.paths.database) as db:
+        paper_id, _ = db.upsert_paper(replace(paper_record, pdf_url=None))
+        query_id = db.create_saved_query(
+            name="Historical hardware regexp",
+            prompt="Print matches.",
+            regexp_pattern=r"H100",
+            regexp_radius=4,
+            regexp_mode="print",
+            content_scope="papers",
+            paper_source_scope="abstract",
+        )
+        run_id = db.create_query_runs(
+            batch_id="historical-regexp-print",
+            query_id=query_id,
+            profiles=[("regexp", "local", "regexp")],
+            context_window_tokens=2048,
+            selection={"resolved_paper_ids": [paper_id], "source_scope": "abstract"},
+        )[0]
+        db.finish_query_run(
+            run_id,
+            matched_count=1,
+            input_chars=40,
+            output={
+                "title": "Regexp matches: H100",
+                "summary": "1 match(es) across 1 record(s).",
+                "items": [
+                    {
+                        "paper_id": paper_id,
+                        "content_type": "paper",
+                        "title": paper_record.title,
+                        "output": "fast inference on an H100 GPU",
+                    }
+                ],
+            },
+        )
+        assert db.classification_results_for_content("paper", paper_id) == []
+
+    with Database(config.paths.database) as db:
+        tags = db.classification_results_for_content("paper", paper_id)
+        assert len(tags) == 1
+        assert tags[0]["value"] == "H100"
+        assert tags[0]["tag_name"] == "H100"
+        assert tags[0]["freeform"] is True
+        db._conn.execute(
+            "UPDATE query_classification_results SET tag_name=? WHERE query_id=? AND paper_id=?",
+            ("Historical hardware regexp: H100", query_id, paper_id),
+        )
+        db._conn.commit()
+
+    with Database(config.paths.database) as db:
+        tags = db.classification_results_for_content("paper", paper_id)
+        assert tags[0]["tag_name"] == "H100"
 
 
 def test_query_controller_runs_one_query_on_all_matching_result_types(
@@ -1663,8 +1769,11 @@ def test_query_controller_start_validation_edges(config_path, paper_record):
         controller.start(query_id, ("default",), 2048, pdf_strategy="bad")
     with pytest.raises(ValueError, match="Saved query not found"):
         controller.start(999999, ("default",), 2048)
-    with pytest.raises(ValueError, match="Select at least one"):
-        controller.start(query_id, (), 2048)
+    default_batch = controller.start(
+        query_id, (), 2048, selection={"paper_ids": [paper_id]}
+    )
+    assert default_batch
+    controller.wait()
     with pytest.raises(ValueError, match="Whole-PDF upload requires exactly one Codex"):
         controller.start(
             query_id,
@@ -1746,13 +1855,14 @@ def test_query_controller_start_on_results_validation_and_empty_matches(
         )
     with pytest.raises(ValueError, match="Saved query not found"):
         controller.start_on_results(999999, ("default",), 2048, targets=(("papers", {}),))
-    with pytest.raises(ValueError, match="Select at least one"):
-        controller.start_on_results(
-            papers_only,
-            (),
-            2048,
-            targets=(("papers", {"paper_ids": [paper_id]}),),
-        )
+    default_batches = controller.start_on_results(
+        papers_only,
+        (),
+        2048,
+        targets=(("papers", {"paper_ids": [paper_id]}),),
+    )
+    assert default_batches
+    controller.wait()
     with pytest.raises(ValueError, match="No records match"):
         controller.start_on_results(
             papers_only,
@@ -1873,5 +1983,62 @@ def test_query_controller_pdf_validation_and_codex_context_edges(config_path, pa
     assert batch_ids and len(batch_ids) == 1
     with Database(config.paths.database) as db:
         run = db.query_runs_for_batch(batch_ids[0])[0]
-        assert run["context_window_tokens"] == 400000
+        assert run["context_window_tokens"] == 2048
     controller.wait()
+
+
+def test_query_controller_runs_multiple_queries_across_result_types(
+    config_path, author_candidate, paper_record
+):
+    config = load_config(config_path)
+    with Database(config.paths.database) as db:
+        db.add_author(author_candidate)
+        paper_id, _ = db.upsert_paper(paper_record)
+        blog_id = db.add_author_blog(
+            author_candidate.openalex_id,
+            "https://example.test/multi-result-query",
+            label="Multi result query",
+        )
+        entry_id = db.save_blog_entry(
+            blog_id=blog_id,
+            title="Multi-result blog entry",
+            content_sha256="multi-result-entry",
+            normalized_text="A blog entry about efficient inference.",
+            diff_text="+A blog entry about efficient inference.",
+            change_kind="changed",
+            previous_entry_id=None,
+            source_url="https://example.test/multi-result-query/post",
+        )
+        both = db.create_saved_query(
+            name="Both content query", prompt="Summarize", content_scope="both"
+        )
+        paper_only = db.create_saved_query(
+            name="Paper only query", prompt="Summarize", content_scope="papers"
+        )
+
+    calls = []
+
+    def runner(path, batch, query, profiles, context):
+        calls.append((batch, query, profiles, context))
+        return {"completed": 1, "failed": 0}
+
+    controller = QueryController(config_path, runner=runner)
+    batch_ids = controller.start_many_on_results(
+        (both, paper_only, both),
+        (),
+        config.llm.context_window_tokens,
+        targets=(
+            ("papers", {"paper_ids": [paper_id]}),
+            ("blogs", {"blog_entry_ids": [entry_id]}),
+        ),
+    )
+    assert batch_ids is not None and len(batch_ids) == 3
+    controller.wait()
+    assert [call[1] for call in calls] == [both, both, paper_only]
+    with Database(config.paths.database) as db:
+        rows = [db.query_runs_for_batch(batch_id)[0] for batch_id in batch_ids]
+        assert [(row["query_id"], row["paper_id"], row["blog_entry_id"]) for row in rows] == [
+            (both, paper_id, None),
+            (both, None, entry_id),
+            (paper_only, paper_id, None),
+        ]

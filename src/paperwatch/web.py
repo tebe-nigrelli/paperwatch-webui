@@ -48,7 +48,7 @@ from .blogs import (
 )
 from .config import AppConfig, load_config
 from .db import DEFAULT_SUMMARY_QUERY_NAME, Database
-from .default_queries import add_default_queries
+from .default_queries import add_default_queries, refresh_default_regexp_patterns
 from .job_runtime import ProgressCallback
 from .locking import AnalysisAlreadyInProgress, analysis_lock
 from .models import (
@@ -906,8 +906,11 @@ def _query_execution_form(
 
     query_kind = str(form.get("query_kind", "summary"))
     regexp_pattern = str(
-        form.get("regexp_tag_pattern", "") if query_kind == "regexp"
-        else form.get("regexp_pattern", "")
+        (
+            form.get("regexp_tag_pattern", form.get("regexp_pattern", ""))
+            if query_kind == "regexp"
+            else form.get("regexp_pattern", "")
+        )
     )
     regexp_radius = _int_or_none(form.get("regexp_radius")) or 0
     regexp_mode = str(form.get("regexp_mode", "query"))
@@ -928,8 +931,9 @@ def _query_execution_form(
         "regexp_pattern": regexp_pattern,
         "regexp_radius": regexp_radius,
         "regexp_debug_text": (
-            str(form.get("regexp_tag_debug_text", ""))
-            if query_kind == "regexp" and "regexp_tag_debug_text" in form
+            str(form.get("regexp_tag_debug_text", form.get("regexp_debug_text", "")))
+            if query_kind == "regexp"
+            and ("regexp_tag_debug_text" in form or "regexp_debug_text" in form)
             else saved_text("regexp_debug_text")
         ),
         "regexp_mode": regexp_mode,
@@ -1144,11 +1148,17 @@ def _render_regexp_excerpt(value: str, pattern: str) -> str:
         if match.start() == match.end():
             continue
         pieces.append(html.escape(text[cursor:match.start()]))
-        pieces.append(
-            '<mark class="regexp-match">'
-            + html.escape(match.group(0))
-            + "</mark>"
-        )
+        matched = match.group(0)
+        scheme = re.match(r"(?i)^https?://", matched)
+        if scheme is not None:
+            pieces.append(html.escape(scheme.group(0)))
+            matched = matched[scheme.end():]
+        if matched:
+            pieces.append(
+                '<mark class="regexp-match">'
+                + html.escape(matched)
+                + "</mark>"
+            )
         cursor = match.end()
     pieces.append(html.escape(text[cursor:]))
     return "".join(pieces).replace("\n", "<br>")
@@ -2162,6 +2172,7 @@ def create_app(
                         config.available_llms[0].profile if config.available_llms else ""
                     )
                     add_default_queries(recovery_db, model_profile)
+                refresh_default_regexp_patterns(recovery_db)
                 recovery_db.fail_incomplete_query_runs(
                     "Interrupted because the web application restarted"
                 )
@@ -4668,15 +4679,25 @@ def create_app(
 
     @app.get("/queries", response_class=HTMLResponse)
     def queries(request: Request) -> HTMLResponse:
+        query_mode = "history" if request.query_params.get("mode") == "history" else "saved"
         with Database(config.paths.database) as db:
-            saved = [_query_view(row, config) for row in db.list_saved_queries()]
-            runs = [_query_output(row) for row in db.list_query_runs(limit=100)]
+            saved = (
+                [_query_view(row, config) for row in db.list_saved_queries()[:100]]
+                if query_mode == "saved"
+                else []
+            )
+            runs = (
+                [_query_output(row) for row in db.list_query_runs(limit=100)]
+                if query_mode == "history"
+                else []
+            )
         runs_by_query: dict[int, list[dict[str, Any]]] = {}
         for row in runs:
             runs_by_query.setdefault(int(row["query_id"]), []).append(row)
         return render(
             request,
             "queries.html",
+            query_mode=query_mode,
             queries=saved,
             runs=runs,
             runs_by_query=runs_by_query,
@@ -4973,11 +4994,16 @@ def create_app(
     async def run_filtered_query(request: Request) -> RedirectResponse:
         form = await request.form()
         return_to = _clean_local_return_path(form.get("return_to"), _request_return_path(request))
-        query_id = _int_or_none(form.get("query_id"))
-        if query_id is None:
+        query_ids = tuple(dict.fromkeys(
+            query_id
+            for raw in form.getlist("query_id")
+            if (query_id := _int_or_none(raw)) is not None
+        ))
+        if not query_ids:
             return RedirectResponse(
                 _notice_url(return_to, "Select a saved query.", level="error"), status_code=303
             )
+        query_id = query_ids[0]
         override_defaults = str(form.get("override_query_defaults", "")) in {
             "1", "true", "on"
         }
@@ -5027,12 +5053,13 @@ def create_app(
             "stub": filters.stub,
         }
         with Database(config.paths.database) as db:
-            stored_query = db.get_saved_query(query_id)
-            if stored_query is None:
+            stored_queries = [db.get_saved_query(value) for value in query_ids]
+            if any(row is None for row in stored_queries):
                 return RedirectResponse(
                     _notice_url(return_to, "Saved query not found.", level="error"), status_code=303
                 )
-            query = _query_view(stored_query, config)
+            queries = [_query_view(row, config) for row in stored_queries if row is not None]
+            query = queries[0]
             authors_for_labels = db.list_authors_with_tags(tracked_only=True)
             topics_for_labels = db.list_topics()
             paper_match_count = 0
@@ -5076,16 +5103,18 @@ def create_app(
             requested_context = _int_or_none(form.get("context_window_tokens"))
 
         local_regexp = bool(query["local_regexp"])
-        if local_regexp:
+        all_local_regexp = all(bool(item["local_regexp"]) for item in queries)
+        any_model_query = any(not bool(item["local_regexp"]) for item in queries)
+        if all_local_regexp:
             profiles = ()
         available_profiles = {item.profile for item in config.available_llms}
-        if not local_regexp and override_defaults and (
+        if any_model_query and override_defaults and (
             not profiles or any(name not in available_profiles for name in profiles)
         ):
             return RedirectResponse(
                 _notice_url(return_to, "Select a configured model.", level="error"), status_code=303
             )
-        if not local_regexp and not override_defaults and config.llm.provider == "none":
+        if any_model_query and not override_defaults and config.llm.provider == "none":
             return RedirectResponse(
                 _notice_url(return_to, "Configure a default LLM in config.toml.", level="error"), status_code=303
             )
@@ -5101,7 +5130,7 @@ def create_app(
 
         targets: list[tuple[str, dict[str, Any]]] = []
         if run_selected:
-            if selected_paper_ids and _query_supports(query, "papers"):
+            if selected_paper_ids and (len(queries) > 1 or _query_supports(query, "papers")):
                 targets.append(
                     (
                         "papers",
@@ -5111,7 +5140,7 @@ def create_app(
                         },
                     )
                 )
-            if selected_blog_ids and _query_supports(query, "blogs"):
+            if selected_blog_ids and (len(queries) > 1 or _query_supports(query, "blogs")):
                 targets.append(
                     (
                         "blogs",
@@ -5127,9 +5156,9 @@ def create_app(
             base_selection = _selection_with_labels(
                 filters, authors=authors_for_labels, topics=topics_for_labels
             )
-            if paper_match_count and _query_supports(query, "papers"):
+            if paper_match_count and (len(queries) > 1 or _query_supports(query, "papers")):
                 targets.append(("papers", dict(base_selection)))
-            if blog_match_count and _query_supports(query, "blogs"):
+            if blog_match_count and (len(queries) > 1 or _query_supports(query, "blogs")):
                 targets.append(("blogs", dict(base_selection)))
         if not targets:
             unsupported_target = "selected content" if run_selected else "current search results"
@@ -5143,7 +5172,17 @@ def create_app(
             )
 
         try:
-            if len(targets) == 1:
+            if len(query_ids) > 1:
+                batch_result = collection_controller.start_many_on_results(
+                    query_ids,
+                    profiles,
+                    context,
+                    targets=tuple(targets),
+                    source_scope=source_scope,
+                    pdf_strategy=pdf_strategy,
+                    override_defaults=override_defaults,
+                )
+            elif len(targets) == 1:
                 content_type, selection = targets[0]
                 kwargs: dict[str, Any] = {
                     "selection": selection,
@@ -5175,11 +5214,18 @@ def create_app(
                 _notice_url(return_to, "Another collection query is already running.", level="warning"),
                 status_code=303,
             )
-        message = (
-            "Started saved query on selected content."
-            if run_selected
-            else "Started saved query on all matching search results."
-        )
+        if len(query_ids) == 1:
+            message = (
+                "Started saved query on selected content."
+                if run_selected
+                else "Started saved query on all matching search results."
+            )
+        else:
+            message = (
+                f"Started {len(query_ids)} saved queries on selected content."
+                if run_selected
+                else f"Started {len(query_ids)} saved queries on all matching search results."
+            )
         warning = str(collection_controller.snapshot().warning or "").strip()
         if warning:
             message = f"{message} {warning}"
@@ -5287,18 +5333,15 @@ def create_app(
                 if (query_id := _int_or_none(raw)) is not None
             )
         )
-        profile = str(form.get("model", "")).strip()
         if not query_ids:
             return RedirectResponse(
                 _notice_url("/blogs", "Select a saved query.", level="error"),
                 status_code=303,
             )
-        configured_profile = config.llm_profile(profile)
-        if configured_profile is None:
-            return RedirectResponse(
-                _notice_url("/", "Select a configured model.", level="error"),
-                status_code=303,
-            )
+        # Saved queries never own a model.  Leave the profile empty so the
+        # query controller resolves the current default from config.toml; local
+        # regexp queries will select their built-in local executor instead.
+        profile = ""
         with Database(config.paths.database) as db:
             selected_ids = [
                 int(row["id"])
@@ -5311,7 +5354,7 @@ def create_app(
                 _notice_url("/", "Select at least one blog entry.", level="error"),
                 status_code=303,
             )
-        context = configured_profile.context_window_tokens
+        context = config.llm.context_window_tokens
         selection = {
             "content_type": "blogs",
             "blog_entry_ids": selected_ids,
@@ -5367,16 +5410,16 @@ def create_app(
             raise HTTPException(404, "Query output not found")
         if str(row["status"]) not in {"queued", "running"}:
             return RedirectResponse(
-                _notice_url("/queries", "That query is no longer running.", level="warning"),
+                _notice_url("/queries?mode=history", "That query is no longer running.", level="warning"),
                 status_code=303,
             )
         if not collection_controller.cancel():
             return RedirectResponse(
-                _notice_url("/queries", "No saved prompt is currently running.", level="warning"),
+                _notice_url("/queries?mode=history", "No saved prompt is currently running.", level="warning"),
                 status_code=303,
             )
         return RedirectResponse(
-            _notice_url("/queries", f"Stopping {row['query_name']}…", level="warning"),
+            _notice_url("/queries?mode=history", f"Stopping {row['query_name']}…", level="warning"),
             status_code=303,
         )
 
