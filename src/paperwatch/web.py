@@ -95,6 +95,63 @@ def _desktop_opener(platform: str | None = None) -> str | None:
     return shutil.which(command)
 
 
+def _desktop_directory_picker(platform: str | None = None) -> list[str] | None:
+    """Return a native folder-picker command, preferring KDE on Linux."""
+    current = platform or sys.platform
+    if current == "darwin":
+        osascript = shutil.which("osascript")
+        if osascript:
+            return [
+                osascript,
+                "-e",
+                'POSIX path of (choose folder with prompt "Choose export destination")',
+            ]
+        return None
+    if current.startswith("linux"):
+        home = str(Path.home())
+        kdialog = shutil.which("kdialog")
+        if kdialog:
+            return [
+                kdialog,
+                "--getexistingdirectory",
+                home,
+                "--title",
+                "Choose export destination",
+            ]
+        zenity = shutil.which("zenity")
+        if zenity:
+            return [
+                zenity,
+                "--file-selection",
+                "--directory",
+                "--title=Choose export destination",
+                f"--filename={home}/",
+            ]
+    return None
+
+
+def _choose_export_directory() -> Path | None:
+    """Open the system folder picker and return the selected existing folder."""
+    command = _desktop_directory_picker()
+    if command is None:
+        raise OSError("No system folder picker is available (install kdialog or zenity).")
+    completed = subprocess.run(
+        command,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        check=False,
+    )
+    selected = completed.stdout.strip()
+    if completed.returncode != 0 or not selected:
+        return None
+    path = Path(selected).expanduser().resolve()
+    if not path.is_dir():
+        raise OSError("The selected export destination is not a folder.")
+    return path
+
+
 @dataclass(frozen=True, slots=True)
 class PaperFilters:
     query: str = ""
@@ -2170,10 +2227,15 @@ def _csv_bytes(fields: list[str], rows: Iterable[dict[str, Any]]) -> bytes:
     return output.getvalue().encode("utf-8-sig")
 
 
+def _export_json(value: Any) -> str:
+    return json.dumps(value, ensure_ascii=False, default=str)
+
+
 def _selected_content_export(
-    db: Database, *, simplified: bool, include_authors: bool
+    db: Database, *, simplified: bool, include_authors: bool,
+    include_content_csv: bool = True,
 ) -> list[tuple[str, bytes | Path]]:
-    """Build the portable files for the current persistent content selection."""
+    """Build portable source files and optional metadata for the current selection."""
     papers, _ = db.search_papers(selected=True, limit=None, offset=0, include_dead=True)
     blogs = db.list_blog_entries(
         selected=True, show_stubs=True, limit=None, query_view=False
@@ -2203,10 +2265,50 @@ def _selected_content_export(
             source_name = f"papers/{_export_filename(title, paper_id, 'pdf')}"
             source = local_path
         files.append((source_name, source))
-        content_rows.append({
-            "content_type": "paper", "content_id": paper_id, "title": title,
-            "source_file": source_name, "source_url": paper["publication_url"] or paper["pdf_url"] or "",
-        })
+
+        paper_data = _paper_export(db, paper) if include_content_csv else {}
+        paper_authors = list(paper_data.get("authors", [])) if include_content_csv else []
+        analyses = list(paper_data.get("analyses", [])) if include_content_csv else []
+        query_outputs = (
+            [
+                _query_output_for_content(run, "paper", paper_id, title)
+                for run in db.query_runs_for_paper(
+                    paper_id, successful_only=False, limit=10000
+                )
+            ]
+            if include_content_csv else []
+        )
+        if include_content_csv:
+            summary = next(
+                (
+                    str(item.get("one_sentence_summary") or item.get("abstract_summary") or "")
+                    for item in analyses
+                    if item.get("one_sentence_summary") or item.get("abstract_summary")
+                ),
+                "",
+            )
+            content_rows.append({
+                "content_type": "paper",
+                "content_id": paper_id,
+                "title": title,
+                "source_file": source_name,
+                "source_url": paper["publication_url"] or paper["pdf_url"] or "",
+                "authors": "; ".join(str(item.get("name") or "") for item in paper_authors),
+                "topics": "; ".join(
+                    str(item.get("display_name") or "") for item in paper_data.get("topics", [])
+                ),
+                "tags": "; ".join(str(item["name"]) for item in db.paper_tags(paper_id)),
+                "starred": "yes" if paper["starred"] else "no",
+                "read_at": paper["read_at"] or "",
+                "notes": paper["notes"] or "",
+                "publication_date": paper["publication_date"] or "",
+                "fetched_at": paper["fetched_at"] or "",
+                "stored_text": paper["abstract"] or "",
+                "summary": summary,
+                "summaries_json": _export_json(analyses),
+                "query_results_json": _export_json(query_outputs),
+                "details_json": _export_json(paper_data),
+            })
         if include_authors:
             for author in db.paper_authors(paper_id):
                 author_rows.append({
@@ -2239,10 +2341,61 @@ def _selected_content_export(
             )
             source = document.encode("utf-8")
         files.append((source_name, source))
-        content_rows.append({
-            "content_type": "blog", "content_id": entry_id, "title": title,
-            "source_file": source_name, "source_url": source_url,
-        })
+
+        blog_authors = list(db.blog_authors(int(blog["blog_id"]))) if include_content_csv else []
+        query_outputs = (
+            [
+                _query_output_for_content(run, "blog", entry_id, title)
+                for run in db.query_runs_for_blog_entry(
+                    entry_id, successful_only=False, limit=10000
+                )
+            ]
+            if include_content_csv else []
+        )
+        if include_content_csv:
+            summary = ""
+            for output in query_outputs:
+                localized = output.get("output")
+                if not isinstance(localized, dict):
+                    continue
+                items = localized.get("items")
+                if isinstance(items, list):
+                    for item in items:
+                        if not isinstance(item, dict):
+                            continue
+                        summary = str(
+                            item.get("summary")
+                            or item.get("one_sentence_summary")
+                            or item.get("output")
+                            or ""
+                        ).strip()
+                        if summary:
+                            break
+                if not summary:
+                    summary = str(localized.get("summary") or "").strip()
+                if summary:
+                    break
+            blog_data = _row_dict(blog)
+            content_rows.append({
+                "content_type": "blog",
+                "content_id": entry_id,
+                "title": title,
+                "source_file": source_name,
+                "source_url": source_url,
+                "authors": "; ".join(str(item["name"] or "") for item in blog_authors),
+                "topics": "",
+                "tags": "; ".join(str(item["name"]) for item in db.blog_entry_tags(entry_id)),
+                "starred": "yes" if blog["starred"] else "no",
+                "read_at": blog["read_at"] or "",
+                "notes": blog["notes"] or "",
+                "publication_date": blog["published_at"] or "",
+                "fetched_at": blog["fetched_at"] or "",
+                "stored_text": blog["normalized_text"] or "",
+                "summary": summary,
+                "summaries_json": "[]",
+                "query_results_json": _export_json(query_outputs),
+                "details_json": _export_json(blog_data),
+            })
         if include_authors:
             for order, author in enumerate(db.blog_authors(int(blog["blog_id"])), start=1):
                 author_rows.append({
@@ -2251,9 +2404,16 @@ def _selected_content_export(
                     "author_order": order,
                 })
 
-    files.append(("content.csv", _csv_bytes(
-        ["content_type", "content_id", "title", "source_file", "source_url"], content_rows
-    )))
+    if include_content_csv:
+        files.append(("content.csv", _csv_bytes(
+            [
+                "content_type", "content_id", "title", "source_file", "source_url",
+                "authors", "topics", "tags", "starred", "read_at", "notes",
+                "publication_date", "fetched_at", "stored_text", "summary",
+                "summaries_json", "query_results_json", "details_json",
+            ],
+            content_rows,
+        )))
     if include_authors:
         files.append(("authors.csv", _csv_bytes(
             ["content_type", "content_id", "content_title", "author_name", "author_id", "author_order"],
@@ -2813,6 +2973,16 @@ def create_app(
             return JSONResponse({"ok": True, "selected": selected, "changed": changed})
         return RedirectResponse(_request_return_path(request), status_code=303)
 
+    @app.post("/content/selected/export/folder-picker")
+    def pick_selected_content_export_folder() -> JSONResponse:
+        try:
+            destination = _choose_export_directory()
+        except OSError as exc:
+            return JSONResponse({"ok": False, "message": str(exc)}, status_code=503)
+        if destination is None:
+            return JSONResponse({"ok": False, "cancelled": True})
+        return JSONResponse({"ok": True, "folder": str(destination)})
+
     @app.post("/content/selected/export")
     async def export_selected_content(request: Request) -> Response:
         form = await request.form()
@@ -2825,10 +2995,16 @@ def create_app(
         bundled = str(form.get("packaging", "zip")) == "zip"
         simplified = str(form.get("sources", "original")) == "simplified"
         include_authors = str(form.get("include_authors", "")) in {"1", "true", "on"}
+        include_content_csv = (
+            str(form.get("include_content_csv", "")) in {"1", "true", "on"}
+            if "content_csv_option_present" in form
+            else True
+        )
         try:
             with Database(config.paths.database) as db:
                 files = _selected_content_export(
-                    db, simplified=simplified, include_authors=include_authors
+                    db, simplified=simplified, include_authors=include_authors,
+                    include_content_csv=include_content_csv,
                 )
             output = _write_selected_content_export(
                 files, Path(raw_destination), bundled=bundled

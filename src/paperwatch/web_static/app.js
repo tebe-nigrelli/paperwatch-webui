@@ -1274,6 +1274,48 @@
     }
   });
 
+  document.addEventListener("submit", async (event) => {
+    const selectedExportForm = event.target.closest?.("[data-selected-export-form]");
+    if (!selectedExportForm) return;
+    const folderInput = selectedExportForm.querySelector("[data-export-folder]");
+    const folderStatus = selectedExportForm.querySelector("[data-export-folder-status]");
+    if (!folderInput || folderInput.value.trim() || selectedExportForm.dataset.choosingFolder === "true") return;
+    event.preventDefault();
+    selectedExportForm.dataset.choosingFolder = "true";
+    const setFolderStatus = (message, failed = false) => {
+      if (!folderStatus) return;
+      folderStatus.textContent = message;
+      folderStatus.classList.toggle("task-error", failed);
+      folderStatus.classList.toggle("muted", !failed);
+    };
+    const submitter = event.submitter || selectedExportForm.querySelector('button[type="submit"]');
+    if (submitter) submitter.disabled = true;
+    setFolderStatus("Opening system folder picker…");
+    try {
+      const response = await fetch("/content/selected/export/folder-picker", {
+        method: "POST",
+        headers: { "Accept": "application/json" },
+      });
+      const payload = await response.json();
+      if (!response.ok || (!payload.ok && !payload.cancelled)) {
+        throw new Error(payload.message || "Could not open the system folder picker.");
+      }
+      if (payload.cancelled) {
+        setFolderStatus("Folder selection cancelled.");
+        return;
+      }
+      folderInput.value = payload.folder || "";
+      if (!folderInput.value.trim()) throw new Error("No export folder was selected.");
+      setFolderStatus(`Destination: ${folderInput.value}`);
+      selectedExportForm.requestSubmit(submitter || undefined);
+    } catch (error) {
+      setFolderStatus(error.message || "Could not choose an export folder.", true);
+    } finally {
+      selectedExportForm.dataset.choosingFolder = "false";
+      if (submitter) submitter.disabled = false;
+    }
+  });
+
   document.querySelectorAll("[data-auto-read]").forEach((element) => {
     const contentType = element.dataset.contentType;
     const contentId = element.dataset.contentId;

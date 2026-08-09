@@ -762,3 +762,22 @@ label.control-disabled{opacity:.68}
   font-size:inherit;
   line-height:1.35;
 }
+
+/* Compact selected-content dock and keep Export immediately beside Undo. */
+.selected-content-dock{padding:14px 16px;margin-bottom:14px}
+.selected-content-header{grid-template-columns:minmax(220px,1fr) auto;gap:12px;align-items:center;margin-bottom:10px}
+.selected-content-title h2{margin:0 0 2px;font-size:1.08rem}
+.selected-content-title p{max-width:620px;font-size:.8rem;line-height:1.35}
+.selected-content-tools{display:grid;grid-template-columns:190px 190px auto 34px;gap:6px;align-items:center;justify-content:end;width:auto;margin:0}
+.selected-content-tools input{min-height:32px;padding:5px 8px;font-size:.8rem}
+.selected-content-tools .button{min-height:32px;padding:4px 8px}
+.selected-export-button{width:34px;min-width:34px;height:34px}
+.selected-export-button svg{width:18px;height:18px;fill:none;stroke:currentColor;stroke-width:1.9;stroke-linecap:round;stroke-linejoin:round}
+#selected-export-dialog{width:min(600px,calc(100% - 32px));padding:18px}
+.export-options-form{gap:13px}
+.export-options-form fieldset{padding:10px 12px}
+.export-content-option,.export-authors-option{display:flex;flex-direction:row;align-items:flex-start;gap:7px;font-weight:700}
+.export-content-option input,.export-authors-option input{margin-top:3px}
+@media(max-width:1050px){.selected-content-header{grid-template-columns:1fr}.selected-content-tools{justify-content:start}}
+@media(max-width:720px){.selected-content-tools{grid-template-columns:minmax(150px,1fr) minmax(150px,1fr) auto 34px;width:100%}}
+@media(max-width:560px){.selected-content-tools{grid-template-columns:1fr auto}.selected-content-tools>form:nth-child(1),.selected-content-tools>form:nth-child(2){grid-column:1/-1}.selected-content-tools>form:nth-child(3){grid-column:1}.selected-export-button{grid-column:2}.selected-content-tools .button{width:100%}}

@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import csv
 import io
+import subprocess
 import json
 import threading
 import zipfile
@@ -19,6 +21,8 @@ from paperwatch.sources.arxiv import ArxivEntry
 from paperwatch.web import (
     RunController,
     RunSnapshot,
+    _choose_export_directory,
+    _desktop_directory_picker,
     _manual_author_names,
     _manual_paper_record,
     _manual_publication_date,
@@ -499,6 +503,10 @@ def test_selected_content_export_overlay_and_zip_defaults(
     assert 'name="packaging" value="zip" checked' in page.text
     assert 'name="sources" value="original" checked' in page.text
     assert 'name="include_authors" value="1" checked' in page.text
+    assert 'name="include_content_csv" value="1" checked' in page.text
+    assert 'data-export-folder-status' in page.text
+    assert 'class="icon-button selected-export-button"' in page.text
+    assert ">Export…</button>" not in page.text
 
     with Database(config.paths.database) as db:
         db.set_content_selected("paper", paper_id, True)
@@ -519,6 +527,12 @@ def test_selected_content_export_overlay_and_zip_defaults(
         names = archive.namelist()
         assert any(name.startswith("papers/") and name.endswith(".pdf") for name in names)
         assert {"content.csv", "authors.csv"}.issubset(names)
+        content = next(csv.DictReader(io.StringIO(archive.read("content.csv").decode("utf-8-sig"))))
+        assert content["title"] == "Minimal Agents for Reliable Machine Learning"
+        assert "compact agent architecture" in content["summary"]
+        assert content["stored_text"] == "We introduce a compact agent architecture."
+        assert json.loads(content["summaries_json"])[0]["one_sentence_summary"]
+        assert json.loads(content["details_json"])["doi"] == "10.1000/example"
         authors = archive.read("authors.csv").decode("utf-8-sig")
         assert "Ada Lovelace" in authors
         assert "Alan Turing" in authors
@@ -538,6 +552,83 @@ def test_selected_content_export_overlay_and_zip_defaults(
     simplified = next(simplified_destination.glob("paperwatch-export-*"))
     assert "Page text" in next((simplified / "papers").glob("*.txt")).read_text()
     assert not (simplified / "authors.csv").exists()
+
+    no_csv_destination = tmp_path / "no-csv"
+    response = client.post(
+        "/content/selected/export",
+        data={
+            "folder": str(no_csv_destination),
+            "packaging": "files",
+            "sources": "original",
+            "content_csv_option_present": "1",
+        },
+        follow_redirects=False,
+    )
+    assert response.status_code == 303
+    no_csv = next(path for path in no_csv_destination.glob("paperwatch-export-*") if path.is_dir())
+    assert not (no_csv / "content.csv").exists()
+
+
+def test_selected_export_native_folder_picker(config_path, tmp_path, monkeypatch):
+    client, _ = make_client(config_path)
+    monkeypatch.setattr("paperwatch.web._choose_export_directory", lambda: tmp_path)
+    response = client.post("/content/selected/export/folder-picker")
+    assert response.status_code == 200
+    assert response.json() == {"ok": True, "folder": str(tmp_path.resolve())}
+
+    monkeypatch.setattr("paperwatch.web._choose_export_directory", lambda: None)
+    response = client.post("/content/selected/export/folder-picker")
+    assert response.status_code == 200
+    assert response.json() == {"ok": False, "cancelled": True}
+
+    def failed_picker():
+        raise OSError("No picker")
+
+    monkeypatch.setattr("paperwatch.web._choose_export_directory", failed_picker)
+    response = client.post("/content/selected/export/folder-picker")
+    assert response.status_code == 503
+    assert response.json()["message"] == "No picker"
+
+
+def test_desktop_directory_picker_and_selection(tmp_path, monkeypatch):
+    monkeypatch.setattr(
+        "paperwatch.web.shutil.which",
+        lambda command: f"/usr/bin/{command}" if command in {"kdialog", "zenity"} else None,
+    )
+    command = _desktop_directory_picker("linux")
+    assert command is not None
+    assert command[0] == "/usr/bin/kdialog"
+    assert command[1] == "--getexistingdirectory"
+
+    monkeypatch.setattr(
+        "paperwatch.web.shutil.which",
+        lambda command: "/usr/bin/zenity" if command == "zenity" else None,
+    )
+    assert _desktop_directory_picker("linux")[0] == "/usr/bin/zenity"
+
+    monkeypatch.setattr(
+        "paperwatch.web.shutil.which",
+        lambda command: "/usr/bin/osascript" if command == "osascript" else None,
+    )
+    assert _desktop_directory_picker("darwin")[0] == "/usr/bin/osascript"
+    assert _desktop_directory_picker("win32") is None
+
+    monkeypatch.setattr("paperwatch.web._desktop_directory_picker", lambda: ["picker"])
+    monkeypatch.setattr(
+        "paperwatch.web.subprocess.run",
+        lambda *_args, **_kwargs: subprocess.CompletedProcess(
+            ["picker"], 0, stdout=f"{tmp_path}\n", stderr=""
+        ),
+    )
+    assert _choose_export_directory() == tmp_path.resolve()
+
+    monkeypatch.setattr(
+        "paperwatch.web.subprocess.run",
+        lambda *_args, **_kwargs: subprocess.CompletedProcess(
+            ["picker"], 1, stdout="", stderr="cancelled"
+        ),
+    )
+    assert _choose_export_directory() is None
 
 
 def test_selected_content_simplified_blog_files_without_authors(
