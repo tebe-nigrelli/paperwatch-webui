@@ -65,6 +65,7 @@ from .models import (
 from .pdfs import (
     PDFError,
     download_pdf,
+    extract_pdf_text,
     pdf_page_count,
     pdf_sha256,
     safe_pdf_name,
@@ -2154,6 +2155,154 @@ def _csv_response(records: Iterable[dict[str, Any]]) -> Response:
     )
 
 
+def _export_filename(title: Any, record_id: int, extension: str) -> str:
+    """Return a stable, portable name for a selected-content source file."""
+    stem = re.sub(r"[^A-Za-z0-9._-]+", "-", str(title or "content")).strip(".-_")
+    stem = stem[:100] or "content"
+    return f"{stem}-{int(record_id)}.{extension.lstrip('.')}"
+
+
+def _csv_bytes(fields: list[str], rows: Iterable[dict[str, Any]]) -> bytes:
+    output = io.StringIO(newline="")
+    writer = csv.DictWriter(output, fieldnames=fields, extrasaction="ignore")
+    writer.writeheader()
+    writer.writerows(rows)
+    return output.getvalue().encode("utf-8-sig")
+
+
+def _selected_content_export(
+    db: Database, *, simplified: bool, include_authors: bool
+) -> list[tuple[str, bytes | Path]]:
+    """Build the portable files for the current persistent content selection."""
+    papers, _ = db.search_papers(selected=True, limit=None, offset=0, include_dead=True)
+    blogs = db.list_blog_entries(
+        selected=True, show_stubs=True, limit=None, query_view=False
+    )
+    if not papers and not blogs:
+        raise ValueError("Select at least one paper or blog entry before exporting.")
+
+    files: list[tuple[str, bytes | Path]] = []
+    content_rows: list[dict[str, Any]] = []
+    author_rows: list[dict[str, Any]] = []
+
+    for paper in papers:
+        paper_id = int(paper["id"])
+        title = str(paper["title"] or f"Paper {paper_id}")
+        local_value = str(paper["local_pdf_path"] or "").strip()
+        local_path = Path(local_value).expanduser() if local_value else None
+        if local_path is None or not local_path.is_file():
+            raise ValueError(f'Cannot export “{title}”: its local PDF is missing.')
+        if simplified:
+            try:
+                text = extract_pdf_text(local_path, max_chars=sys.maxsize)
+            except PDFError as exc:
+                raise ValueError(f'Cannot simplify “{title}”: {exc}') from exc
+            source_name = f"papers/{_export_filename(title, paper_id, 'txt')}"
+            source: bytes | Path = (title + "\n" + "=" * len(title) + "\n\n" + text + "\n").encode("utf-8")
+        else:
+            source_name = f"papers/{_export_filename(title, paper_id, 'pdf')}"
+            source = local_path
+        files.append((source_name, source))
+        content_rows.append({
+            "content_type": "paper", "content_id": paper_id, "title": title,
+            "source_file": source_name, "source_url": paper["publication_url"] or paper["pdf_url"] or "",
+        })
+        if include_authors:
+            for author in db.paper_authors(paper_id):
+                author_rows.append({
+                    "content_type": "paper", "content_id": paper_id, "content_title": title,
+                    "author_name": author["name"], "author_id": author["openalex_author_id"] or "",
+                    "author_order": int(author["author_order"]) + 1,
+                })
+
+    for blog in blogs:
+        entry_id = int(blog["id"])
+        title = str(blog["title"] or f"Blog entry {entry_id}")
+        source_url = str(blog["source_url"] or blog["url"] or "")
+        if simplified:
+            source_name = f"blogs/{_export_filename(title, entry_id, 'md')}"
+            heading = f"# {title}\n\n"
+            link = f"Source: <{source_url}>\n\n" if source_url else ""
+            source = (heading + link + str(blog["normalized_text"] or "").strip() + "\n").encode("utf-8")
+        else:
+            source_name = f"blogs/{_export_filename(title, entry_id, 'html')}"
+            body = str(blog["rendered_html"] or "").strip()
+            if not body:
+                body = "<pre>" + html.escape(str(blog["normalized_text"] or "")) + "</pre>"
+            canonical = (
+                f'<link rel="canonical" href="{html.escape(source_url, quote=True)}">'
+                if source_url else ""
+            )
+            document = (
+                "<!doctype html><html><head><meta charset=\"utf-8\">" + canonical
+                + f"<title>{html.escape(title)}</title></head><body>{body}</body></html>\n"
+            )
+            source = document.encode("utf-8")
+        files.append((source_name, source))
+        content_rows.append({
+            "content_type": "blog", "content_id": entry_id, "title": title,
+            "source_file": source_name, "source_url": source_url,
+        })
+        if include_authors:
+            for order, author in enumerate(db.blog_authors(int(blog["blog_id"])), start=1):
+                author_rows.append({
+                    "content_type": "blog", "content_id": entry_id, "content_title": title,
+                    "author_name": author["name"], "author_id": author["openalex_id"] or "",
+                    "author_order": order,
+                })
+
+    files.append(("content.csv", _csv_bytes(
+        ["content_type", "content_id", "title", "source_file", "source_url"], content_rows
+    )))
+    if include_authors:
+        files.append(("authors.csv", _csv_bytes(
+            ["content_type", "content_id", "content_title", "author_name", "author_id", "author_order"],
+            author_rows,
+        )))
+    return files
+
+
+def _write_selected_content_export(
+    files: list[tuple[str, bytes | Path]], destination: Path, *, bundled: bool
+) -> Path:
+    destination = destination.expanduser().resolve()
+    destination.mkdir(parents=True, exist_ok=True)
+    if not destination.is_dir():
+        raise ValueError("The export destination must be a folder.")
+    stamp = datetime.now().strftime("%Y%m%d-%H%M%S-%f")
+    if bundled:
+        output = destination / f"paperwatch-export-{stamp}.zip"
+        temporary = destination / f".{output.name}.part"
+        try:
+            with zipfile.ZipFile(temporary, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+                for relative, source in files:
+                    if isinstance(source, Path):
+                        archive.write(source, relative)
+                    else:
+                        archive.writestr(relative, source)
+            temporary.replace(output)
+        finally:
+            temporary.unlink(missing_ok=True)
+        return output
+
+    output = destination / f"paperwatch-export-{stamp}"
+    temporary = destination / f".{output.name}.part"
+    try:
+        temporary.mkdir()
+        for relative, source in files:
+            target = temporary / relative
+            target.parent.mkdir(parents=True, exist_ok=True)
+            if isinstance(source, Path):
+                shutil.copy2(source, target)
+            else:
+                target.write_bytes(source)
+        temporary.replace(output)
+    except Exception:
+        shutil.rmtree(temporary, ignore_errors=True)
+        raise
+    return output
+
+
 def create_app(
     config_path: str | Path = "config.toml",
     *,
@@ -2663,6 +2812,36 @@ def create_app(
         if _async_request(request):
             return JSONResponse({"ok": True, "selected": selected, "changed": changed})
         return RedirectResponse(_request_return_path(request), status_code=303)
+
+    @app.post("/content/selected/export")
+    async def export_selected_content(request: Request) -> Response:
+        form = await request.form()
+        raw_destination = str(form.get("folder", "")).strip()
+        if not raw_destination:
+            return RedirectResponse(
+                _notice_url(_request_return_path(request), "Choose an export folder.", level="error"),
+                status_code=303,
+            )
+        bundled = str(form.get("packaging", "zip")) == "zip"
+        simplified = str(form.get("sources", "original")) == "simplified"
+        include_authors = str(form.get("include_authors", "")) in {"1", "true", "on"}
+        try:
+            with Database(config.paths.database) as db:
+                files = _selected_content_export(
+                    db, simplified=simplified, include_authors=include_authors
+                )
+            output = _write_selected_content_export(
+                files, Path(raw_destination), bundled=bundled
+            )
+        except (OSError, ValueError, zipfile.BadZipFile) as exc:
+            return RedirectResponse(
+                _notice_url(_request_return_path(request), str(exc), level="error"),
+                status_code=303,
+            )
+        return RedirectResponse(
+            _notice_url(_request_return_path(request), f"Exported selected content to {output}."),
+            status_code=303,
+        )
 
     @app.post("/content/selected/{action}")
     def update_selected_content(request: Request, action: str) -> Response:

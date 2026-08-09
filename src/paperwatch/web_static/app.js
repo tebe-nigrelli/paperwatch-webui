@@ -1255,19 +1255,23 @@
     updateQueryKindSettings();
   }
 
-  document.querySelectorAll("[data-dialog-open]").forEach((button) => {
-    button.addEventListener("click", () => {
-      const dialog = document.getElementById(button.dataset.dialogOpen || "");
+  document.addEventListener("click", (event) => {
+    const opener = event.target.closest("[data-dialog-open]");
+    if (opener) {
+      const dialog = document.getElementById(opener.dataset.dialogOpen || "");
       if (dialog?.showModal) dialog.showModal();
-    });
-  });
-  document.querySelectorAll("dialog [data-dialog-close]").forEach((button) => {
-    button.addEventListener("click", () => button.closest("dialog")?.close());
-  });
-  document.querySelectorAll("dialog").forEach((dialog) => {
-    dialog.addEventListener("click", (event) => {
-      if (event.target === dialog) dialog.close();
-    });
+      return;
+    }
+    const closer = event.target.closest("dialog [data-dialog-close]");
+    if (closer) {
+      closer.closest("dialog")?.close();
+      document.body.classList.remove("dialog-open");
+      return;
+    }
+    if (event.target.matches("dialog")) {
+      event.target.close();
+      document.body.classList.remove("dialog-open");
+    }
   });
 
   document.querySelectorAll("[data-auto-read]").forEach((element) => {

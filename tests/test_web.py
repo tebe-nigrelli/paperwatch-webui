@@ -3,6 +3,7 @@ from __future__ import annotations
 import io
 import json
 import threading
+import zipfile
 from dataclasses import asdict, replace
 from pathlib import Path
 
@@ -485,6 +486,110 @@ def test_bulk_exports_preserve_structured_data(config_path, seeded_web):
     assert "Minimal Agents" in response.text
     assert "A Mathematical Note" in response.text
     assert client.get("/exports/papers.xml").status_code == 404
+
+
+def test_selected_content_export_overlay_and_zip_defaults(
+    config_path, seeded_web, tmp_path, monkeypatch
+):
+    config, paper_id, *_ = seeded_web
+    client, _ = make_client(config_path)
+
+    page = client.get("/")
+    assert 'data-dialog-open="selected-export-dialog"' in page.text
+    assert 'name="packaging" value="zip" checked' in page.text
+    assert 'name="sources" value="original" checked' in page.text
+    assert 'name="include_authors" value="1" checked' in page.text
+
+    with Database(config.paths.database) as db:
+        db.set_content_selected("paper", paper_id, True)
+
+    response = client.post(
+        "/content/selected/export",
+        data={
+            "folder": str(tmp_path),
+            "packaging": "zip",
+            "sources": "original",
+            "include_authors": "1",
+        },
+        follow_redirects=False,
+    )
+    assert response.status_code == 303
+    archive_path = next(tmp_path.glob("paperwatch-export-*.zip"))
+    with zipfile.ZipFile(archive_path) as archive:
+        names = archive.namelist()
+        assert any(name.startswith("papers/") and name.endswith(".pdf") for name in names)
+        assert {"content.csv", "authors.csv"}.issubset(names)
+        authors = archive.read("authors.csv").decode("utf-8-sig")
+        assert "Ada Lovelace" in authors
+        assert "Alan Turing" in authors
+
+    monkeypatch.setattr("paperwatch.web.extract_pdf_text", lambda _path, max_chars: "Page text")
+    simplified_destination = tmp_path / "simplified"
+    response = client.post(
+        "/content/selected/export",
+        data={
+            "folder": str(simplified_destination),
+            "packaging": "files",
+            "sources": "simplified",
+        },
+        follow_redirects=False,
+    )
+    assert response.status_code == 303
+    simplified = next(simplified_destination.glob("paperwatch-export-*"))
+    assert "Page text" in next((simplified / "papers").glob("*.txt")).read_text()
+    assert not (simplified / "authors.csv").exists()
+
+
+def test_selected_content_simplified_blog_files_without_authors(
+    config_path, seeded_web, tmp_path
+):
+    config, paper_id, *_ = seeded_web
+    with Database(config.paths.database) as db:
+        db.set_content_selected("paper", paper_id, False)
+        blog_id = db.add_author_blog("A123", "https://example.test/ada", label="Ada's blog")
+        entry_id = db.save_blog_entry(
+            blog_id=blog_id,
+            title="A useful post",
+            content_sha256="post",
+            normalized_text="A [linked idea](https://example.test/idea).",
+            rendered_html="<p>A linked idea.</p>",
+            diff_text="new",
+            change_kind="changed",
+            previous_entry_id=None,
+            source_url="https://example.test/ada/post",
+        )
+        db.set_content_selected("blog", entry_id, True)
+    client, _ = make_client(config_path)
+
+    response = client.post(
+        "/content/selected/export",
+        data={"folder": str(tmp_path), "packaging": "files", "sources": "simplified"},
+        follow_redirects=False,
+    )
+    assert response.status_code == 303
+    output = next(path for path in tmp_path.glob("paperwatch-export-*") if path.is_dir())
+    markdown = next((output / "blogs").glob("*.md")).read_text()
+    assert "# A useful post" in markdown
+    assert "[linked idea](https://example.test/idea)" in markdown
+    assert (output / "content.csv").is_file()
+    assert not (output / "authors.csv").exists()
+
+    original_destination = tmp_path / "original"
+    response = client.post(
+        "/content/selected/export",
+        data={
+            "folder": str(original_destination),
+            "packaging": "zip",
+            "sources": "original",
+            "include_authors": "1",
+        },
+        follow_redirects=False,
+    )
+    assert response.status_code == 303
+    with zipfile.ZipFile(next(original_destination.glob("*.zip"))) as archive:
+        html_name = next(name for name in archive.namelist() if name.endswith(".html"))
+        assert "<p>A linked idea.</p>" in archive.read(html_name).decode()
+        assert "Ada Lovelace" in archive.read("authors.csv").decode("utf-8-sig")
 
 
 def test_run_pages_action_and_status_api(config_path, seeded_web):
