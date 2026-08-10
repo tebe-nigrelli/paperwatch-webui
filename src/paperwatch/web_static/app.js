@@ -1362,7 +1362,6 @@
       openalex.hidden = !hasOpenAlex;
       const trackUrl = option.dataset.track || "";
       trackForm.action = trackUrl;
-      trackForm.hidden = !trackUrl;
       track.disabled = !trackUrl;
       status.textContent = option.dataset.status || "";
       status.className = `status ${option.dataset.status === "tracked" ? "status-success" : "status-disabled"}`;
