@@ -25,7 +25,7 @@
   </dl>
   <div class="content-detail-source-links content-detail-toolbar-source-links" aria-label="Source links"><a href="{{ entry.source_url or entry.url }}" target="_blank" rel="noreferrer noopener">Source ↗</a></div>
   <div class="content-detail-utility-actions">
-    {% if entry.linked_paper_id %}<a class="button button-small" href="/papers/{{ entry.linked_paper_id }}">View paper</a>{% endif %}
+    {% if entry.linked_paper_id %}<a class="button button-small" href="/papers/{{ entry.linked_paper_id }}">Open paper in Paperwatch</a>{% endif %}{% if prompt_runs %}<a class="button button-small" href="#summary">Jump to summary</a>{% endif %}
     <span class="status status-disabled">{{ 'Stub' if entry.is_stub else 'Full' }} · {{ 'auto' if entry.stub_state == 'auto' else 'manual' }}</span>
     <button class="button button-small" type="button" data-copy-source="blog-copy-source" data-copy-icon aria-label="Copy text" title="Copy text">Copy text</button>
     <form method="post" action="/content/blog/{{ entry.id }}/stub" data-async-action data-refresh-selector=".blog-reference-panel"><input type="hidden" name="stub_state" value="{{ next_stub_state }}"><button class="button button-small stub-detail-button{% if entry.is_stub %} is-stub{% endif %}{% if entry.stub_state != 'auto' %} is-manual{% endif %}" type="submit">{{ 'Mark as stub' if next_stub_state == 'stub' else ('Mark as full' if next_stub_state == 'full' else 'Use auto status') }}</button></form>
@@ -38,7 +38,7 @@
 
 {{ author_panel(authors, default_author_index) }}
 
-<section class="panel blog-content-panel content-detail-body-panel"><div class="panel-heading"><h2>Content</h2></div><article class="blog-content content-detail-reading-width">{{ entry.display_html|safe }}</article></section>
+<section class="panel blog-content-panel"><div class="panel-heading"><h2>Source content</h2></div><article class="blog-content content-detail-reading-width">{{ entry.display_html|safe }}</article></section>
 {% if entry.diff_text %}<details class="panel blog-diff-panel"><summary>Changes from previous version</summary><pre class="blog-diff">{% for line in entry.diff_lines %}<span class="blog-diff-line blog-diff-{{ line.kind }}">{{ line.text }}</span>{% endfor %}</pre></details>{% endif %}
 
 <section class="panel object-notes-panel inline-notes-panel content-detail-notes" data-inline-notes><div class="panel-heading"><h2>Notes</h2><button class="button button-small" type="button" data-notes-edit>{{ 'Edit notes' if entry.notes else 'Add notes' }}</button></div><div data-notes-display>{% if entry.notes %}<article class="prose notes-rendered">{{ entry.notes|markdown|safe }}</article>{% else %}<p class="muted">No notes.</p>{% endif %}</div><form method="post" action="/notes/blog/{{ entry.id }}" data-async-action data-refresh-selector=".object-notes-panel" data-notes-form hidden><textarea name="notes" rows="8" maxlength="200000" placeholder="Markdown notes">{{ entry.notes or '' }}</textarea><div class="button-group"><button class="button button-primary" type="submit">Save notes</button><button class="button" type="button" data-notes-cancel>Cancel</button></div></form></section>

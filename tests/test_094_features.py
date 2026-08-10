@@ -248,6 +248,8 @@ def test_unified_download_page_blog_tags_detail_toolbar_and_remote_image_csp(
     )
     assert json.loads(paper_file.read_text())["title"] == paper_record.title
     assert client.post("/content/blog/999999/export").status_code == 404
+    assert client.post("/content/paper/999999/export").status_code == 404
+    assert client.post("/content/unknown/1/export").status_code == 400
 
     paper_detail = client.get(f"/papers/{paper_id}")
     assert paper_detail.status_code == 200 and "shared" in paper_detail.text

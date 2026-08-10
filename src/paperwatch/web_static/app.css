@@ -873,9 +873,9 @@ label.control-disabled{opacity:.68}
 .content-detail-source-links a{font-weight:700;text-decoration:none;white-space:nowrap}
 .content-detail-source-links a:hover{text-decoration:underline}
 
-.content-detail-root .content-detail-classifications,.content-detail-root .content-detail-body-panel,.content-detail-root .content-detail-notes,.content-detail-root .blog-diff-panel,.content-detail-root #paper-results>.panel{margin-bottom:10px;padding:14px 16px;border-radius:9px;box-shadow:none}
-.content-detail-root .content-detail-classifications .panel-heading,.content-detail-root .content-detail-body-panel .panel-heading,.content-detail-root .content-detail-notes .panel-heading{align-items:center;margin-bottom:8px}
-.content-detail-root .content-detail-classifications .panel-heading h2,.content-detail-root .content-detail-body-panel .panel-heading h2,.content-detail-root .content-detail-notes .panel-heading h2{margin:0;font-size:1rem;letter-spacing:-.01em}
+.content-detail-root .content-detail-classifications,.content-detail-root .content-detail-body-panel,.content-detail-root .blog-content-panel,.content-detail-root .content-detail-notes,.content-detail-root .blog-diff-panel,.content-detail-root #paper-results>.panel{margin-bottom:10px;padding:14px 16px;border-radius:9px;box-shadow:none}
+.content-detail-root .content-detail-classifications .panel-heading,.content-detail-root .content-detail-body-panel .panel-heading,.content-detail-root .blog-content-panel .panel-heading,.content-detail-root .content-detail-notes .panel-heading{align-items:center;margin-bottom:8px}
+.content-detail-root .content-detail-classifications .panel-heading h2,.content-detail-root .content-detail-body-panel .panel-heading h2,.content-detail-root .blog-content-panel .panel-heading h2,.content-detail-root .content-detail-notes .panel-heading h2{margin:0;font-size:1rem;letter-spacing:-.01em}
 .content-detail-reading-width{max-width:82ch}
 .content-detail-root p.content-detail-reading-width{margin-bottom:0;line-height:1.56}
 .content-detail-root .blog-content.content-detail-reading-width{font-size:.94rem;line-height:1.58}
