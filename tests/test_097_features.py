@@ -505,6 +505,7 @@ def test_dropdown_and_delete_layout_assets(config_path):
     web = web_client(config_path)
     script = web.get("/static/app.js").text
     assert "enabledOptions.length <= 5" in script
+    assert '!select.hasAttribute("data-search-always")' in script
     assert "form.requestSubmit()" in script
     assert "refresh(true);\n            autoApply();" in script
     assert 'stub: "Stub filter"' in script

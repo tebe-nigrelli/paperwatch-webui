@@ -1077,6 +1077,17 @@ def _analysis_view(row: Any) -> dict[str, Any]:
     return data
 
 
+def _blog_export(db: Database, row: Any) -> dict[str, Any]:
+    entry = _row_dict(row)
+    entry["authors"] = [
+        _row_dict(author) for author in db.blog_authors(int(entry["blog_id"]))
+    ]
+    entry["tags"] = [
+        _row_dict(tag) for tag in db.blog_entry_tags(int(entry["id"]))
+    ]
+    return entry
+
+
 def _paper_export(db: Database, row: Any) -> dict[str, Any]:
     paper = _row_dict(row)
     paper["metadata"] = _json_value(paper.pop("metadata_json", "{}"), {})
@@ -2422,6 +2433,25 @@ def _selected_content_export(
     return files
 
 
+def _write_detail_json_export(
+    payload: dict[str, Any], destination: Path, filename: str
+) -> Path:
+    destination = destination.expanduser().resolve()
+    if not destination.is_dir():
+        raise ValueError("The export destination must be a folder.")
+    output = destination / filename
+    temporary = destination / f".{filename}.{uuid.uuid4().hex}.part"
+    try:
+        temporary.write_text(
+            json.dumps(payload, ensure_ascii=False, indent=2, default=str) + "\n",
+            encoding="utf-8",
+        )
+        temporary.replace(output)
+    finally:
+        temporary.unlink(missing_ok=True)
+    return output
+
+
 def _write_selected_content_export(
     files: list[tuple[str, bytes | Path]], destination: Path, *, bundled: bool
 ) -> Path:
@@ -2920,6 +2950,46 @@ def create_app(
         if request.headers.get("X-Paperwatch-Async") == "1":
             return JSONResponse({"ok": True, "selected": selected})
         return RedirectResponse(_request_return_path(request), status_code=303)
+
+    @app.post("/content/{content_type}/{record_id}/export")
+    def export_content_detail(
+        request: Request, content_type: str, record_id: int
+    ) -> Response:
+        normalized = content_type.strip().lower()
+        with Database(config.paths.database) as db:
+            if normalized in {"paper", "papers"}:
+                row = db.get_paper(record_id, include_dead=True)
+                if row is None:
+                    raise HTTPException(404, "Paper not found")
+                payload = _paper_export(db, row)
+                title = row["title"]
+            elif normalized in {"blog", "blogs", "blog_entry"}:
+                row = db.get_blog_entry(record_id)
+                if row is None:
+                    raise HTTPException(404, "Blog update not found")
+                payload = _blog_export(db, row)
+                title = row["title"]
+            else:
+                raise HTTPException(400, "Content type must be paper or blog")
+
+        try:
+            destination = _choose_export_directory()
+            if destination is None:
+                return RedirectResponse(_request_return_path(request), status_code=303)
+            output = _write_detail_json_export(
+                payload,
+                destination,
+                _export_filename(title, record_id, "json"),
+            )
+        except (OSError, ValueError) as exc:
+            return RedirectResponse(
+                _notice_url(_request_return_path(request), str(exc), level="error"),
+                status_code=303,
+            )
+        return RedirectResponse(
+            _notice_url(_request_return_path(request), f"Exported to {output}."),
+            status_code=303,
+        )
 
     @app.post("/content/select-results")
     async def select_content_results(request: Request) -> Response:
@@ -4774,7 +4844,6 @@ def create_app(
             analysis_tasks=analysis_tasks,
             analyses=analyses,
             prompt_runs=prompt_runs,
-            metadata=_json_value(paper["metadata_json"], {}),
             paper_tags=paper_tags,
             content_tags=content_tags,
             classifications=classifications,

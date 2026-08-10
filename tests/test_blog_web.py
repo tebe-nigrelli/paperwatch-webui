@@ -269,7 +269,7 @@ def test_blog_csv_import_and_feed_ui(config_path):
     assert str(changed) in feed.text
     detail = client.get(f"/blogs/{changed}")
     assert detail.status_code == 200
-    assert "Version difference" in detail.text
+    assert "Changes from previous version" in detail.text
     assert "+new" in detail.text
     assert f'action="/content/blog/{changed}/star"' in detail.text
     starred = client.post(

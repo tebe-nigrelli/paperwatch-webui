@@ -2,56 +2,44 @@
 {% from "_author_panel.html" import author_panel %}
 {% block title %}{{ paper.title }} · paperwatch{% endblock %}
 {% block content %}
-<div class="paper-detail-root" data-pdf-drop-target data-paper-id="{{ paper.id }}">
-<section class="page-heading paper-heading"{% if not paper.read_at %} data-auto-read data-content-type="paper" data-content-id="{{ paper.id }}"{% endif %}>
-  <div class="blog-heading-meta-row"><div class="paper-meta"><span>{{ paper.publication_date or 'Unknown date' }}</span><span>{{ paper.venue or 'Venue unavailable' }}</span><span>Fetched {{ paper.fetched_at }}</span></div><div class="content-tag-row blog-heading-tags" data-detail-tags>{% for tag in paper_tags %}{% if tag.generated %}<span class="tag generated-tag" title="Managed by a classifier query">{{ tag.name }}</span>{% else %}<form method="post" action="/papers/{{ paper.id }}/tags/remove" data-async-action data-refresh-selector=".paper-detail-root"><input type="hidden" name="tag" value="{{ tag.name }}"><button class="tag removable-tag" type="submit" title="Remove tag">{{ tag.name }} ×</button></form>{% endif %}{% else %}<span class="muted">No tags</span>{% endfor %}</div></div>
+<div class="paper-detail-root content-detail-root" data-pdf-drop-target data-paper-id="{{ paper.id }}">
+<header class="page-heading content-detail-header"{% if not paper.read_at %} data-auto-read data-content-type="paper" data-content-id="{{ paper.id }}"{% endif %}>
+  <div class="content-detail-meta"><span class="content-detail-kind">Paper</span><span>{{ paper.publication_date or 'Date unknown' }}</span>{% if paper.venue %}<span>{{ paper.venue }}</span>{% endif %}</div>
   <h1{% if paper.notes or paper.pdf_modified %} class="object-name-noted"{% endif %}>{{ paper.title }}</h1>
+  <div class="content-detail-tag-line">
+    <div class="content-tag-row" data-detail-tags>{% for tag in paper_tags %}{% if tag.generated %}<span class="tag generated-tag" title="Managed by a classifier query">{{ tag.name }}</span>{% else %}<form method="post" action="/papers/{{ paper.id }}/tags/remove" data-async-action data-refresh-selector=".paper-detail-root"><input type="hidden" name="tag" value="{{ tag.name }}"><button class="tag removable-tag" type="submit" title="Remove tag">{{ tag.name }} ×</button></form>{% endif %}{% endfor %}</div>
+    <form method="post" action="/papers/{{ paper.id }}/tags/add" class="content-detail-tag-form" data-async-action data-refresh-selector=".paper-detail-root" data-enter-submit><input name="tag" list="content-tag-options" maxlength="40" required aria-label="Add tag" placeholder="+ tag"></form>
+  </div>
   {% if topics %}<div class="topic-tags paper-topic-tags" aria-label="OpenAlex topics">{% for topic in topics %}<a class="tag topic-tag{% if topic.is_primary %} active{% endif %}" href="/?topic={{ topic.openalex_id }}" title="{% if topic.score is not none %}OpenAlex relevance {{ '%.3f'|format(topic.score) }}{% endif %}{% if topic.subfield_name %} · {{ topic.subfield_name }}{% endif %}">{{ topic.display_name }}</a>{% endfor %}</div>{% endif %}
-</section>
+</header>
 
-{% if classifications %}<section class="panel classification-panel"><div class="panel-heading"><div><h2>Query tags</h2><p>Tags can be changed per content item. Manual changes remain fixed on later runs.</p></div></div><div class="classification-grid">{% for item in classifications %}<form method="post" action="/content/paper/{{ paper.id }}/classifications/{{ item.query_id }}" class="classification-row" data-async-action data-refresh-selector=".classification-panel"><label><a href="/queries#query-{{ item.query_id }}">{{ item.label_class }}</a>{% if item.freeform %}<input name="value" value="{{ item.value }}" maxlength="80" required>{% else %}<select name="value">{% for choice in item.choices %}<option value="{{ choice }}" {% if choice == item.value %}selected{% endif %}>{{ choice }}</option>{% endfor %}</select>{% endif %}</label><button class="button button-small" type="submit">Set</button></form>{% endfor %}</div></section>{% endif %}
+<nav class="content-detail-toolbar paper-reference-panel" aria-label="Paper actions">
+  <div class="content-detail-primary-actions">
+    <form method="post" action="/content/paper/{{ paper.id }}/star" data-content-state><input type="hidden" name="starred" value="{{ 0 if paper.starred else 1 }}"><button class="button icon-button star-button{% if paper.starred %} is-starred{% endif %}" type="submit" data-starred-label="Remove star" data-unstarred-label="Star paper" title="{{ 'Remove star' if paper.starred else 'Star paper' }}" aria-label="{{ 'Remove star' if paper.starred else 'Star paper' }}">{{ '★' if paper.starred else '☆' }}</button></form>
+    {% if paper.local_pdf_path %}<a class="button button-primary" href="/papers/{{ paper.id }}/pdf/open">Read PDF</a>{% elif paper.pdf_url %}<a class="button button-primary" href="{{ paper.pdf_url }}" target="_blank" rel="noreferrer">View PDF ↗</a>{% elif paper.publication_url %}<a class="button button-primary" href="{{ paper.publication_url }}" target="_blank" rel="noreferrer">View publication ↗</a>{% elif paper.arxiv_url %}<a class="button button-primary" href="{{ paper.arxiv_url }}" target="_blank" rel="noreferrer">View arXiv ↗</a>{% endif %}
+  </div>
+  <dl class="content-detail-toolbar-facts" aria-label="Paper details">
+      <div><dt>DOI</dt><dd>{{ paper.doi or '—' }}</dd></div>
+      <div><dt>arXiv</dt><dd>{{ paper.arxiv_id or '—' }}</dd></div>
+      <div><dt>Fetched</dt><dd>{{ paper.fetched_at[:16]|replace('T', ' ') }}</dd></div>
+  </dl>
+  <div class="content-detail-source-links content-detail-toolbar-source-links" aria-label="Source links">{% if paper.arxiv_url %}<a href="{{ paper.arxiv_url }}" target="_blank" rel="noreferrer">arXiv ↗</a>{% endif %}<a href="{{ paper.google_scholar_url }}" target="_blank" rel="noreferrer">Scholar ↗</a>{% if paper.openalex_url %}<a href="{{ paper.openalex_url }}" target="_blank" rel="noreferrer">OpenAlex ↗</a>{% endif %}{% if paper.publication_url %}<a href="{{ paper.publication_url }}" target="_blank" rel="noreferrer">Publication ↗</a>{% endif %}{% if paper.local_pdf_path and paper.pdf_url %}<a href="{{ paper.pdf_url }}" target="_blank" rel="noreferrer">PDF source ↗</a>{% endif %}</div>
+  <div class="content-detail-utility-actions">
+    <form method="post" action="/papers/{{ paper.id }}/pdf/upload" enctype="multipart/form-data" class="inline-upload-form" data-pdf-upload-form><label class="button button-small paper-upload-button"><span>{{ 'Replace PDF' if paper.local_pdf_path else 'Add PDF' }}</span><input type="file" name="pdf" accept="application/pdf,.pdf" required data-auto-upload></label></form>
+    {% if paper.pdf_modified %}<span class="status status-warning">{{ 'PDF missing' if paper.pdf_missing_on_disk else 'PDF modified' }}</span>{% endif %}
+    <form method="post" action="/content/paper/{{ paper.id }}/export"><button class="button button-small" type="submit">Export</button></form>
+    {% if paper.pdf_modified and paper.pdf_url %}<form method="post" action="/papers/{{ paper.id }}/pdf/restore" data-confirm="Replace the local PDF with a fresh download from the stored source?"><button class="button button-small button-warning" type="submit">Restore PDF</button></form>{% endif %}
+    <form class="content-detail-danger" method="post" action="/papers/{{ paper.id }}/delete" data-confirm="Mark this paper and all stored identifiers/source links as dead? It will not be fetched again."><button class="button button-small button-danger" type="submit">Delete paper</button></form>
+  </div>
+</nav>
+<datalist id="content-tag-options">{% for tag in content_tags %}<option value="{{ tag.name }}">{% endfor %}</datalist>
 
 {{ author_panel(authors, default_author_index, "/papers/" ~ paper.id ~ "/authors") }}
-<section class="panel paper-reference-panel">
-  <div class="paper-reference-layout">
-    <div class="metadata-grid paper-reference-metadata">
-      <div><span>DOI</span><strong>{{ paper.doi or '—' }}</strong></div>
-      <div><span>arXiv</span><strong>{{ paper.arxiv_id or '—' }}</strong></div>
-      <div><span>OpenAlex</span><strong>{{ paper.openalex_id or '—' }}</strong></div>
-      <div><span>Abstract source</span><strong>{{ paper.abstract_source or '—' }}</strong></div>
-      <div><span>PDF source</span><strong>{{ paper.pdf_source or '—' }}</strong></div>
-    </div>
-    <div class="paper-link-groups">
-      <div class="paper-link-group">
-        <span>External links</span>
-        <div class="button-group">
-          {% if paper.arxiv_url %}<a class="button button-primary" href="{{ paper.arxiv_url }}" target="_blank" rel="noreferrer">arXiv</a>{% endif %}
-          <a class="button" href="{{ paper.google_scholar_url }}" target="_blank" rel="noreferrer">Google Scholar</a>
-          {% if paper.openalex_url %}<a class="button" href="{{ paper.openalex_url }}" target="_blank" rel="noreferrer">OpenAlex</a>{% endif %}
-          {% if paper.publication_url %}<a class="button" href="{{ paper.publication_url }}" target="_blank" rel="noreferrer">Publication</a>{% endif %}
-        </div>
-      </div>
-      <div class="paper-link-group paper-link-group-actions">
-        <span>Paper actions</span>
-        <div class="button-group">
-          <form method="post" action="/content/paper/{{ paper.id }}/star" data-content-state><input type="hidden" name="starred" value="{{ 0 if paper.starred else 1 }}"><button class="button icon-button star-button{% if paper.starred %} is-starred{% endif %}" type="submit" data-starred-label="Remove star" data-unstarred-label="Star paper" title="{{ 'Remove star' if paper.starred else 'Star paper' }}" aria-label="{{ 'Remove star' if paper.starred else 'Star paper' }}">{{ '★' if paper.starred else '☆' }}</button></form>
-          {% if paper.local_pdf_path %}<a class="button button-primary" href="/papers/{{ paper.id }}/pdf/open">Open PDF</a>{% endif %}
-          {% if paper.pdf_url %}<a class="button" href="{{ paper.pdf_url }}" target="_blank" rel="noreferrer">Source PDF</a>{% endif %}
-          {% if paper.pdf_modified and paper.pdf_url %}<form method="post" action="/papers/{{ paper.id }}/pdf/restore" data-confirm="Replace the local PDF with a fresh download from the stored source?"><button class="button button-warning" type="submit">Restore PDF</button></form>{% endif %}
-          <a class="button" href="/papers/{{ paper.id }}/export.json">Export JSON</a>
-          <button class="button icon-button" type="button" data-copy-source="paper-source-metadata-copy" data-copy-icon aria-label="Copy source metadata" title="Copy source metadata"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M8 7V5a2 2 0 0 1 2-2h8a2 2 0 0 1 2 2v10a2 2 0 0 1-2 2h-2M6 7h8a2 2 0 0 1 2 2v10a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V9a2 2 0 0 1 2-2Z" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg></button>
-          <div class="paper-action-tail"><form method="post" action="/papers/{{ paper.id }}/delete" data-confirm="Mark this paper and all stored identifiers/source links as dead? It will not be fetched again."><button class="button button-danger" type="submit">Delete</button></form><form method="post" action="/papers/{{ paper.id }}/tags/add" class="inline-tag-form compact-action-form paper-action-tag-form" data-async-action data-refresh-selector=".paper-detail-root" data-enter-submit><input name="tag" list="content-tag-options" maxlength="40" required aria-label="Add tag" placeholder="Add tag"></form><form method="post" action="/papers/{{ paper.id }}/pdf/upload" enctype="multipart/form-data" class="inline-upload-form compact-action-form paper-action-upload-form" data-pdf-upload-form><label class="button paper-upload-button"><span>{{ 'Replace local PDF' if paper.local_pdf_path else 'Import PDF' }}</span><input type="file" name="pdf" accept="application/pdf,.pdf" required data-auto-upload></label></form></div>
-        </div>
-        {% if paper.pdf_modified %}<span class="status status-warning">{{ 'Missing on disk' if paper.pdf_missing_on_disk else 'Modified on disk' }}</span>{% endif %}
-        <small class="muted">Drop a PDF anywhere on this page to replace the local file.</small>
-      </div>
-    </div>
-  </div>
-  <datalist id="content-tag-options">{% for tag in content_tags %}<option value="{{ tag.name }}">{% endfor %}</datalist>
-  <pre id="paper-source-metadata-copy" hidden>{{ metadata|prettyjson }}</pre>
-</section>
-{% if paper.abstract %}<section class="panel prose"><div class="panel-heading"><h2>Source abstract</h2></div><p>{{ paper.abstract|inline_text }}</p></section>{% endif %}
-<section class="panel object-notes-panel inline-notes-panel" data-inline-notes><div class="panel-heading">{% if not paper.notes %}<div><h2>Notes</h2><p>Private Markdown notes for this paper.</p></div>{% else %}<span></span>{% endif %}<button class="button button-small" type="button" data-notes-edit>{{ 'Edit' if paper.notes else 'Add notes' }}</button></div><div data-notes-display>{% if paper.notes %}<article class="prose notes-rendered">{{ paper.notes|markdown|safe }}</article>{% else %}<p class="muted">No notes.</p>{% endif %}</div><form method="post" action="/notes/paper/{{ paper.id }}" data-async-action data-refresh-selector=".object-notes-panel" data-notes-form hidden><textarea name="notes" rows="8" maxlength="200000" placeholder="Markdown notes">{{ paper.notes or '' }}</textarea><div class="button-group"><button class="button button-primary" type="submit">Save notes</button><button class="button" type="button" data-notes-cancel>Cancel</button></div></form></section>
+
+{% if classifications %}<section class="panel classification-panel content-detail-classifications"><div class="panel-heading"><h2>Query tags</h2></div><div class="classification-grid">{% for item in classifications %}<form method="post" action="/content/paper/{{ paper.id }}/classifications/{{ item.query_id }}" class="classification-row" data-async-action data-refresh-selector=".classification-panel"><label><a href="/queries#query-{{ item.query_id }}">{{ item.label_class }}</a>{% if item.freeform %}<input name="value" value="{{ item.value }}" maxlength="80" required>{% else %}<select name="value">{% for choice in item.choices %}<option value="{{ choice }}" {% if choice == item.value %}selected{% endif %}>{{ choice }}</option>{% endfor %}</select>{% endif %}</label><button class="button button-small" type="submit">Save</button></form>{% endfor %}</div></section>{% endif %}
+
+{% if paper.abstract %}<section class="panel prose content-detail-body-panel"><div class="panel-heading"><h2>Abstract</h2></div><p class="content-detail-reading-width">{{ paper.abstract|inline_text }}</p></section>{% endif %}
+<section class="panel object-notes-panel inline-notes-panel content-detail-notes" data-inline-notes><div class="panel-heading"><h2>Notes</h2><button class="button button-small" type="button" data-notes-edit>{{ 'Edit notes' if paper.notes else 'Add notes' }}</button></div><div data-notes-display>{% if paper.notes %}<article class="prose notes-rendered">{{ paper.notes|markdown|safe }}</article>{% else %}<p class="muted">No notes.</p>{% endif %}</div><form method="post" action="/notes/paper/{{ paper.id }}" data-async-action data-refresh-selector=".object-notes-panel" data-notes-form hidden><textarea name="notes" rows="8" maxlength="200000" placeholder="Markdown notes">{{ paper.notes or '' }}</textarea><div class="button-group"><button class="button button-primary" type="submit">Save notes</button><button class="button" type="button" data-notes-cancel>Cancel</button></div></form></section>
 
 <div id="paper-results">
 <section class="panel model-task-history">

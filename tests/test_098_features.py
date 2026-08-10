@@ -234,8 +234,8 @@ def test_web_star_selection_reading_classifier_and_author_csv_ui(
     assert "Query tags" in paper.text
     blog = web.get(f"/blogs/{entry_id}")
     assert 'data-auto-read data-content-type="blog"' in blog.text
-    assert "Local papers" in blog.text
-    assert "Local blogs" in blog.text
+    assert ">Papers<" in blog.text
+    assert ">Blogs<" in blog.text
 
     query_edit = web.get(f"/queries/{query_id}/edit")
     assert 'name="query_kind"' in query_edit.text

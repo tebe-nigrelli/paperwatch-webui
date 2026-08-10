@@ -891,7 +891,7 @@
     const multiple = select.multiple;
     const enabledOptions = Array.from(select.options).filter((option) => !option.disabled);
     const currentEnabledOptions = () => Array.from(select.options).filter((option) => !option.disabled);
-    const cycle = !multiple && enabledOptions.length > 0 && enabledOptions.length <= 5;
+    const cycle = !select.hasAttribute("data-search-always") && !multiple && enabledOptions.length > 0 && enabledOptions.length <= 5;
     const wrapCycle = cycle && select.hasAttribute("data-wrap-cycle");
     const form = select.form || select.closest("form");
     const autoApply = () => {

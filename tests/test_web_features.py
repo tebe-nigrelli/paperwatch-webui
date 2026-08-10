@@ -216,6 +216,7 @@ def test_paper_author_picker_and_chunked_multi_model_request(
     client = make_app(config_path, analysis=analysis)
     page = client.get(f"/papers/{paper_id}")
     assert 'id="author-picker"' in page.text
+    assert 'data-search-always' in page.text
     assert 'id="author-local-papers"' in page.text
     assert 'id="author-local-blogs"' in page.text
     assert 'id="author-track-form"' in page.text

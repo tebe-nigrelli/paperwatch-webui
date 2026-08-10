@@ -396,9 +396,9 @@ def test_paper_detail_and_exports(config_path, seeded_web):
     assert "Recent tasks" in response.text
     assert f'href="/analyses/{analysis_id}"' in response.text
     assert "Source metadata" not in response.text
-    assert 'data-copy-source="paper-source-metadata-copy"' in response.text
-    assert 'id="paper-source-metadata-copy" hidden' in response.text
-    assert response.text.index("Paper actions") < response.text.index("Recent tasks")
+    assert "Copy metadata" not in response.text
+    assert 'data-copy-source="paper-source-metadata-copy"' not in response.text
+    assert response.text.index("content-detail-toolbar") < response.text.index("Recent tasks")
     assert "Run saved prompt" not in response.text
     assert "Override Defaults" not in response.text
     assert 'data-query-defaults-form' not in response.text
@@ -409,18 +409,32 @@ def test_paper_detail_and_exports(config_path, seeded_web):
     assert 'value="whole_text"' in results_page.text
     assert 'value="pdf"' in results_page.text
     assert "Run additional models" not in response.text
-    assert "Google Scholar" in response.text
-    assert "OpenAlex" in response.text
-    assert "arXiv" in response.text
-    assert "External links" in response.text
-    assert "Paper actions" in response.text
-    assert 'class="paper-reference-layout"' in response.text
-    assert 'class="metadata-grid paper-reference-metadata"' in response.text
+    assert "Scholar ↗" in response.text
+    assert "OpenAlex ↗" in response.text
+    assert "arXiv ↗" in response.text
+    assert ">Export</button>" in response.text
+    assert f'action="/content/paper/{paper_id}/export"' in response.text
+    assert 'class="content-detail-toolbar paper-reference-panel"' in response.text
+    assert 'class="content-detail-toolbar-facts" aria-label="Paper details"' in response.text
+    assert "<dt>Abstract</dt>" not in response.text
+    assert "<dt>PDF</dt>" not in response.text
     assert "Author actions" not in response.text
     assert "Pick an author once" not in response.text
-    assert response.text.index("DOI") < response.text.index("External links")
-    assert response.text.index("External links") < response.text.index("Paper actions")
-    assert "Track author" in response.text
+    assert response.text.index("content-detail-toolbar") < response.text.index("author-picker-panel")
+    toolbar = response.text.split('class="content-detail-toolbar paper-reference-panel"', 1)[1].split("</nav>", 1)[0]
+    assert toolbar.index("Read PDF") < toolbar.index("<dt>DOI</dt>")
+    assert toolbar.index("<dt>DOI</dt>") < toolbar.index("<dt>arXiv</dt>")
+    assert toolbar.index("<dt>arXiv</dt>") < toolbar.index("<dt>Fetched</dt>")
+    source_links = toolbar.index('class="content-detail-source-links content-detail-toolbar-source-links"')
+    assert toolbar.index("<dt>Fetched</dt>") < source_links < toolbar.index("Replace PDF")
+    fetched = toolbar.split("<dt>Fetched</dt><dd>", 1)[1].split("</dd>", 1)[0]
+    assert len(fetched) == 16 and fetched[10] == " " and fetched[13] == ":"
+    assert "T" not in fetched
+    author_row = response.text.split('class="panel author-picker-panel"', 1)[1].split("</section>", 1)[0]
+    assert author_row.index('id="author-status"') < author_row.index('id="author-page"')
+    assert author_row.index('id="author-page"') < author_row.index('id="author-scholar"')
+    assert 'class="content-detail-author-sources"' not in author_row
+    assert "Track" in response.text
     assert "/?content=papers&amp;author=A123" in response.text
     assert "/?content=blogs&amp;author=A123" in response.text
     assert "https://openalex.org/authors/a123" in response.text
@@ -1082,7 +1096,7 @@ def test_manual_pdf_import_behaves_like_fetched_paper(config_path, seeded_web):
     detail = client.get(f"/papers/{paper_id}")
     assert detail.status_code == 200
     assert "A Manually Imported Paper" in detail.text
-    assert "Open PDF" in detail.text
+    assert "Read PDF" in detail.text
     assert "Run selected models" not in detail.text
     assert "Run saved prompt" not in detail.text
     assert "Override Defaults" not in detail.text

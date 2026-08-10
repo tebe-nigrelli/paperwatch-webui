@@ -180,7 +180,7 @@ def test_blank_regexp_is_exact_noop_and_dropdown_script_supports_typing_enter(mo
 
 
 def test_unified_download_page_blog_tags_detail_toolbar_and_remote_image_csp(
-    config_path, author_candidate, paper_record
+    config_path, author_candidate, paper_record, tmp_path, monkeypatch
 ):
     paper_id, _blog_id, entry_id, _pdf = _seed_content(
         config_path, author_candidate, paper_record
@@ -210,16 +210,44 @@ def test_unified_download_page_blog_tags_detail_toolbar_and_remote_image_csp(
 
     detail = client.get(f"/blogs/{entry_id}")
     assert detail.status_code == 200
-    back = detail.text.index("Back to updates")
-    original = detail.text.index("Open original")
-    copy = detail.text.index('aria-label="Copy text"')
-    assert original < back < copy
-    assert 'class="panel paper-reference-panel blog-reference-panel"' in detail.text
-    assert 'class="paper-link-group paper-link-group-actions"' in detail.text
-    assert '<svg viewBox="0 0 24 24"' in detail.text
+    source = detail.text.index("View source")
+    copy = detail.text.index("Copy text")
+    delete = detail.text.index("Delete post")
+    assert source < copy < delete
+    assert 'class="content-detail-toolbar blog-reference-panel"' in detail.text
+    assert 'class="content-detail-toolbar-facts" aria-label="Blog details"' in detail.text
+    assert f'action="/content/blog/{entry_id}/export"' in detail.text
+    assert 'content-detail-toolbar-source-links' in detail.text
+    assert 'class="content-detail-author-sources"' not in detail.text
+    assert "Source ↗" in detail.text
     assert 'src="https://cdn.example.test/diagram.gif"' in detail.text
     assert 'referrerpolicy="no-referrer"' in detail.text
     assert "shared" in detail.text
+
+    monkeypatch.setattr("paperwatch.web._choose_export_directory", lambda: tmp_path)
+    blog_export = client.post(
+        f"/content/blog/{entry_id}/export",
+        headers={"referer": f"http://testserver/blogs/{entry_id}"},
+        follow_redirects=False,
+    )
+    assert blog_export.status_code == 303
+    blog_file = next(tmp_path.glob(f"*-{entry_id}.json"))
+    blog_payload = json.loads(blog_file.read_text())
+    assert blog_payload["title"] == "A fetched website article"
+    assert blog_payload["authors"]
+    assert any(tag["name"] == "shared" for tag in blog_payload["tags"])
+
+    paper_export = client.post(
+        f"/content/paper/{paper_id}/export",
+        headers={"referer": f"http://testserver/papers/{paper_id}"},
+        follow_redirects=False,
+    )
+    assert paper_export.status_code == 303
+    paper_file = next(
+        path for path in tmp_path.glob(f"*-{paper_id}.json") if path != blog_file
+    )
+    assert json.loads(paper_file.read_text())["title"] == paper_record.title
+    assert client.post("/content/blog/999999/export").status_code == 404
 
     paper_detail = client.get(f"/papers/{paper_id}")
     assert paper_detail.status_code == 200 and "shared" in paper_detail.text

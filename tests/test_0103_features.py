@@ -193,7 +193,7 @@ def test_stub_state_is_auto_assigned_filterable_and_manually_editable(
     assert "Metadata stub" not in client.get("/?content=blogs&stub=yes").text
 
     detail = client.get(f"/blogs/{auto_stub_id}")
-    assert "Stub: Full" in detail.text
+    assert "Full · manual" in detail.text
     reset = client.post(
         f"/content/blog/{auto_stub_id}/stub",
         data={"stub_state": "auto"},

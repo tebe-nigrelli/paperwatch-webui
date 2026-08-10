@@ -154,15 +154,24 @@ def test_content_detail_data_and_query_layouts(
     assert "data-pdf-upload-form" in paper.text
     assert "data-auto-upload" in paper.text
     assert "inline-notes-panel" in paper.text
-    assert "Type and press Enter" in paper.text
+    assert 'placeholder="+ tag"' in paper.text
 
     blog = web.get(f"/blogs/{entry_id}")
     assert "content-tags-panel" not in blog.text
     assert "inline-notes-panel" in blog.text
     assert "blog-reference-panel" in blog.text
-    assert "paper-reference-layout" in blog.text
-    assert blog.text.index("author-picker-panel") < blog.text.index("blog-reference-panel")
-    assert blog.text.index("blog-reference-panel") < blog.text.index("blog-content-panel")
+    assert 'class="content-detail-toolbar-facts" aria-label="Blog details"' in blog.text
+    assert ">Export</button>" in blog.text
+    assert blog.text.index("blog-reference-panel") < blog.text.index("author-picker-panel")
+    blog_toolbar = blog.text.split('class="content-detail-toolbar blog-reference-panel"', 1)[1].split("</nav>", 1)[0]
+    blog_source_links = blog_toolbar.index('class="content-detail-source-links content-detail-toolbar-source-links"')
+    assert blog_toolbar.index("<dt>Fetched</dt>") < blog_source_links < blog_toolbar.index("Copy text")
+    fetched = blog_toolbar.split("<dt>Fetched</dt><dd>", 1)[1].split("</dd>", 1)[0]
+    assert len(fetched) == 16 and fetched[10] == " " and fetched[13] == ":"
+    blog_author_row = blog.text.split('class="panel author-picker-panel"', 1)[1].split("</section>", 1)[0]
+    assert blog_author_row.index('id="author-status"') < blog_author_row.index('id="author-page"')
+    assert blog_author_row.index('id="author-page"') < blog_author_row.index('id="author-scholar"')
+    assert blog.text.index("author-picker-panel") < blog.text.index("blog-content-panel")
     assert blog.text.index("blog-content-panel") < blog.text.index("inline-notes-panel")
 
     query = web.get("/queries/new")
