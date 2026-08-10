@@ -286,6 +286,8 @@ def test_shared_author_panel_has_local_papers_and_blogs(
         assert 'class="panel author-picker-panel"' in response.text
         assert 'id="author-local-papers"' in response.text
         assert 'id="author-local-blogs"' in response.text
+        assert 'id="author-page"' in response.text
+        assert '/authors?q=Ada%20Lovelace' in response.text
         assert "/?content=papers&amp;author=A123" in response.text
         assert "/?content=blogs&amp;author=A123" in response.text
 

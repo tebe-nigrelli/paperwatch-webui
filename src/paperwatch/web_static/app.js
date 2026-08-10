@@ -1343,6 +1343,7 @@
   if (picker) {
     const localPapers = document.getElementById("author-local-papers");
     const localBlogs = document.getElementById("author-local-blogs");
+    const authorPage = document.getElementById("author-page");
     const scholar = document.getElementById("author-scholar");
     const arxiv = document.getElementById("author-arxiv");
     const openalex = document.getElementById("author-openalex");
@@ -1353,6 +1354,7 @@
       const option = picker.options[picker.selectedIndex];
       localPapers.href = option.dataset.papers || "#";
       localBlogs.href = option.dataset.blogs || "#";
+      authorPage.href = `/authors?q=${encodeURIComponent(option.dataset.authorName || "")}`;
       scholar.href = option.dataset.scholar || "#";
       arxiv.href = option.dataset.arxiv || "#";
       const hasOpenAlex = Boolean(option.dataset.openalex);
