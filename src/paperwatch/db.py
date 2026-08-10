@@ -691,6 +691,8 @@ class Database:
         self._conn.execute("PRAGMA foreign_keys = ON")
         self._conn.execute("PRAGMA busy_timeout = 10000")
         database_key = self.path.resolve()
+        self._database_key = database_key
+        self._changes_after_maintenance = self._conn.total_changes
         with _DATABASE_INITIALIZATION_LOCK:
             version = int(self._conn.execute("PRAGMA user_version").fetchone()[0])
             identity = self._database_identity()
@@ -748,6 +750,7 @@ class Database:
             # those rows idempotently so upgrading fixes existing content too.
             self._backfill_local_regexp_query_tags()
             _INITIALIZED_DATABASES[database_key] = self._database_identity()
+            self._changes_after_maintenance = self._conn.total_changes
 
     def _database_identity(self) -> tuple[int, int, int]:
         stat = self.path.stat()
@@ -813,7 +816,7 @@ class Database:
             items = payload.get("items") if isinstance(payload, dict) else None
             if not isinstance(items, list):
                 continue
-            exact_match: str | None = None
+            classification_items: list[dict[str, Any]] = []
             for item in items:
                 if not isinstance(item, dict):
                     continue
@@ -823,24 +826,26 @@ class Database:
                 else:
                     match = expression.search(output)
                     exact_match = match.group(0) if match is not None else None
-                if exact_match:
-                    break
-            if not exact_match:
-                continue
-            item: dict[str, Any] = {"output": exact_match}
-            if row["paper_id"] is not None:
-                item["paper_id"] = int(row["paper_id"])
-                item["content_type"] = "paper"
-            elif row["blog_entry_id"] is not None:
-                item["blog_entry_id"] = int(row["blog_entry_id"])
-                item["content_type"] = "blog"
-            else:
-                # Pre-v32 aggregate runs have no authoritative per-content id;
-                # do not guess which item belongs to which content record.
-                continue
-            self.apply_query_classifications(
-                int(row["query_id"]), int(row["run_id"]), {"items": [item]}
-            )
+                if not exact_match:
+                    continue
+                classification_item: dict[str, Any] = {"output": exact_match}
+                paper_id = item.get("paper_id", row["paper_id"])
+                blog_entry_id = item.get("blog_entry_id", row["blog_entry_id"])
+                if paper_id is not None:
+                    classification_item["paper_id"] = int(paper_id)
+                    classification_item["content_type"] = "paper"
+                elif blog_entry_id is not None:
+                    classification_item["blog_entry_id"] = int(blog_entry_id)
+                    classification_item["content_type"] = "blog"
+                else:
+                    continue
+                classification_items.append(classification_item)
+            if classification_items:
+                self.apply_query_classifications(
+                    int(row["query_id"]),
+                    int(row["run_id"]),
+                    {"items": classification_items},
+                )
         with self.transaction() as conn:
             conn.execute(
                 """
@@ -1783,6 +1788,8 @@ class Database:
         self._conn.executescript(ANALYSES_SCHEMA)
 
     def close(self) -> None:
+        if self._conn.total_changes != self._changes_after_maintenance:
+            _INITIALIZED_DATABASES.pop(self._database_key, None)
         self._conn.close()
 
     def __enter__(self) -> Database:
