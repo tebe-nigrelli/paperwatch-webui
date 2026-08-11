@@ -23,7 +23,7 @@ from .models import (
 )
 
 
-SCHEMA_VERSION = 32
+SCHEMA_VERSION = 33
 
 # Schema creation and migrations are process-level work, while normal database
 # access is connection-level work.  Keep the expensive initialization result
@@ -738,8 +738,8 @@ class Database:
                 self._migrate_feed_article_tracking()
             if version < 21:
                 self._migrate_arxiv_blog_links()
-            if version < 31:
-                self._migrate_blog_title_duplicates_v31()
+            if version < 33:
+                self._migrate_blog_title_duplicates_v33()
             self._ensure_run_blog_columns()
             if version < 6:
                 self._backfill_paper_topics()
@@ -1132,34 +1132,51 @@ class Database:
             """
         )
 
-    def _migrate_blog_title_duplicates_v31(self) -> None:
-        """Collapse historical same-title entries within one blog source.
+    def _migrate_blog_title_duplicates_v33(self) -> None:
+        """Collapse historical entries with the same title and website.
 
         The oldest row remains the stable content identity so notes, stars, read
         state, selections, and saved-query history attached to it remain valid.
         Its fetched content is refreshed from the newest duplicate; later rows
         are retained as hidden baselines so foreign keys and old run payloads stay
-        valid.
+        valid. Author links are deliberately not part of blog-entry identity.
         """
         groups = self._conn.execute(
             """
-            SELECT blog_id, paperwatch_title_key(title) AS title_key
-            FROM blog_entries
-            WHERE change_kind != 'baseline'
-              AND paperwatch_title_key(title) != ''
-            GROUP BY blog_id, paperwatch_title_key(title)
+            SELECT paperwatch_title_key(be.title) AS title_key,
+                   COALESCE(
+                       NULLIF(paperwatch_host_key(be.source_url), ''),
+                       paperwatch_host_key(b.url)
+                   ) AS website_key
+            FROM blog_entries be
+            JOIN blogs b ON b.id=be.blog_id
+            WHERE be.change_kind != 'baseline'
+              AND b.dead=0
+              AND paperwatch_title_key(be.title) != ''
+              AND COALESCE(
+                    NULLIF(paperwatch_host_key(be.source_url), ''),
+                    paperwatch_host_key(b.url)
+                  ) != ''
+            GROUP BY paperwatch_title_key(be.title), website_key
             HAVING count(*) > 1
             """
         ).fetchall()
         for group in groups:
             rows = self._conn.execute(
                 """
-                SELECT * FROM blog_entries
-                WHERE blog_id=? AND change_kind != 'baseline'
-                  AND paperwatch_title_key(title)=?
-                ORDER BY id ASC
+                SELECT be.*
+                FROM blog_entries be
+                JOIN blogs b ON b.id=be.blog_id
+                WHERE be.change_kind != 'baseline'
+                  AND b.dead=0
+                  AND paperwatch_title_key(be.title)=?
+                  AND COALESCE(
+                        NULLIF(paperwatch_host_key(be.source_url), ''),
+                        paperwatch_host_key(b.url)
+                      )=?
+                ORDER BY be.id ASC
                 """,
-                (int(group["blog_id"]), str(group["title_key"])),
+                (str(group["title_key"]), str(group["website_key"])),
             ).fetchall()
             if len(rows) < 2:
                 continue
@@ -1179,7 +1196,8 @@ class Database:
                 SET title=?, content_sha256=?, normalized_text=?,
                     content_word_count=paperwatch_blog_word_count(?, ?, previous_entry_id),
                     rendered_html=?, linked_paper_id=COALESCE(?, linked_paper_id), diff_text=?,
-                    change_kind=?, source_url=COALESCE(?, source_url),
+                    change_kind=?, entry_kind=?, external_id=COALESCE(?, external_id),
+                    source_url=COALESCE(?, source_url),
                     published_at=COALESCE(?, published_at), fetched_at=?
                 WHERE id=?
                 """,
@@ -1188,7 +1206,8 @@ class Database:
                     latest["normalized_text"], latest["normalized_text"],
                     latest["diff_text"], latest["rendered_html"],
                     latest["linked_paper_id"], latest["diff_text"],
-                    latest["change_kind"], latest["source_url"],
+                    latest["change_kind"], latest["entry_kind"], latest["external_id"],
+                    latest["source_url"],
                     latest["published_at"], latest["fetched_at"], canonical_id,
                 ),
             )
@@ -2797,11 +2816,11 @@ class Database:
         title: str,
         source_url: str | None = None,
     ) -> sqlite3.Row | None:
-        """Find the stable entry for the same title, author, and website.
+        """Find the stable entry for the same title and website.
 
         Different paths on the same host are intentionally treated as the same
-        website. A source linked to the same tracked author may therefore reuse
-        an entry from another blog row on that host.
+        website. Author associations are deliberately ignored, so re-adding a
+        site under another author still refreshes the existing logical entry.
         """
         title_key = _title_key(title)
         if not title_key:
@@ -2820,20 +2839,9 @@ class Database:
             WHERE be.change_kind != 'baseline'
               AND b.dead=0
               AND paperwatch_title_key(be.title)=?
-              AND (
-                    be.blog_id=?
-                    OR EXISTS (
-                        SELECT 1
-                        FROM author_blogs current_ab
-                        JOIN author_blogs candidate_ab
-                          ON candidate_ab.author_id=current_ab.author_id
-                        WHERE current_ab.blog_id=?
-                          AND candidate_ab.blog_id=be.blog_id
-                    )
-              )
-            ORDER BY CASE WHEN be.blog_id=? THEN 0 ELSE 1 END, be.id ASC
+              ORDER BY be.id ASC
             """,
-            (title_key, int(blog_id), int(blog_id), int(blog_id)),
+            (title_key,),
         ).fetchall()
         for row in rows:
             candidate_host = _website_host_key(row["source_url"]) or _website_host_key(
@@ -3152,14 +3160,11 @@ class Database:
                 "FROM blog_entries be_d JOIN blogs b_d ON b_d.id=be_d.blog_id "
                 "WHERE be_d.change_kind != 'baseline' AND b_d.dead=0 "
                 "AND paperwatch_title_key(be_d.title)=paperwatch_title_key(be.title) "
-                "AND paperwatch_host_key(COALESCE(be_d.source_url, b_d.url))="
-                "paperwatch_host_key(COALESCE(be.source_url, b.url)) "
-                "AND (be_d.blog_id=be.blog_id OR EXISTS ("
-                "SELECT 1 FROM author_blogs dedupe_current "
-                "JOIN author_blogs dedupe_candidate "
-                "ON dedupe_candidate.author_id=dedupe_current.author_id "
-                "WHERE dedupe_current.blog_id=be.blog_id "
-                "AND dedupe_candidate.blog_id=be_d.blog_id)))"
+                "AND COALESCE(NULLIF(paperwatch_host_key(be_d.source_url), ''), "
+                "paperwatch_host_key(b_d.url))="
+                "COALESCE(NULLIF(paperwatch_host_key(be.source_url), ''), "
+                "paperwatch_host_key(b.url)) "
+                ")"
             )
         params: list[Any] = []
         stub_sql = _blog_stub_sql()

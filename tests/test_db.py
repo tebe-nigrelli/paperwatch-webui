@@ -302,7 +302,7 @@ def test_v31_query_runs_migrate_before_content_indexes(tmp_path):
         assert {"paper_id", "blog_entry_id"}.issubset(columns)
         assert "idx_query_runs_paper" in indexes
         assert "idx_query_runs_blog" in indexes
-        assert db._conn.execute("PRAGMA user_version").fetchone()[0] == 32
+        assert db._conn.execute("PRAGMA user_version").fetchone()[0] == 33
 
 
 def test_analysis_fields_are_named_columns_and_round_trip(tmp_path, paper_record, analysis_result):

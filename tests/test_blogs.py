@@ -807,10 +807,13 @@ def test_same_title_new_path_reuses_entry_and_preserves_user_history(
     old_text = "Title: Stable post\nURL: https://example.com/posts/old\nOld body"
     new_text = "Title: Stable post\nURL: https://example.com/writing/new-path\nNew body"
     with Database(app_config.paths.database) as db:
+        other = AuthorCandidate(openalex_id="A456", name="Other Author")
         db.add_author(author_candidate)
-        blog_id = db.add_author_blog("A123", "https://example.com/blog")
+        db.add_author(other)
+        old_blog_id = db.add_author_blog("A123", "https://example.com/blog")
+        new_blog_id = db.add_author_blog("A456", "https://example.com/writing")
         entry_id = db.save_blog_entry(
-            blog_id=blog_id,
+            blog_id=old_blog_id,
             title="Stable post",
             content_sha256=hashlib.sha256(old_text.encode()).hexdigest(),
             normalized_text=old_text,
@@ -822,6 +825,7 @@ def test_same_title_new_path_reuses_entry_and_preserves_user_history(
             source_url="https://example.com/posts/old",
         )
         db.set_object_notes("blog", entry_id, "Keep this note")
+        db.add_blog_entry_tag(entry_id, "keep-this-tag")
         query_id = db.create_saved_query(name="Existing summary", prompt="Summarize")
         run_id = db.create_query_runs(
             batch_id="existing-summary",
@@ -849,7 +853,11 @@ def test_same_title_new_path_reuses_entry_and_preserves_user_history(
         app = PaperWatch(
             app_config, db=db, openalex=NoPapers(), arxiv=None, llm=NoLLM()
         )
-        row = app._prepare_blog_fetch_rows(db.list_enabled_blogs())[0]
+        row = next(
+            row
+            for row in app._prepare_blog_fetch_rows(db.list_enabled_blogs())
+            if int(row["id"]) == new_blog_id
+        )
         fetched = blogs.BlogFetch(
             method="rss",
             title="Feed",
@@ -877,13 +885,19 @@ def test_same_title_new_path_reuses_entry_and_preserves_user_history(
         assert current["source_url"] == "https://example.com/writing/new-path"
         assert current["external_id"] == "new-guid"
         assert current["normalized_text"] == new_text
+        assert current["published_at"] == "2026-08-08"
         assert current["notes"] == "Keep this note"
+        assert {row["name"] for row in db.blog_entry_tags(entry_id)} == {
+            "keep-this-tag"
+        }
         assert db.query_runs_for_blog_entry(entry_id)[0]["id"] == run_id
         assert run_stats.new_blog_entry_ids == [entry_id]
         app.close()
 
 
-def test_same_title_requires_same_author_and_site(tmp_path, author_candidate):
+def test_same_title_and_site_deduplicates_regardless_of_author(
+    tmp_path, author_candidate
+):
     other = AuthorCandidate(openalex_id="A456", name="Other Author")
     with Database(tmp_path / "blog-title-identity.sqlite") as db:
         db.add_author(author_candidate)
@@ -900,12 +914,6 @@ def test_same_title_requires_same_author_and_site(tmp_path, author_candidate):
             previous_entry_id=None,
             source_url="https://example.com/old/path",
         )
-        assert db.matching_blog_entry_by_title(
-            second_blog,
-            title="Shared title",
-            source_url="https://example.com/new/path",
-        ) is None
-        db.add_author_blog("A123", "https://example.com/other")
         matched = db.matching_blog_entry_by_title(
             second_blog,
             title="Shared title",
@@ -924,14 +932,24 @@ def test_same_title_requires_same_author_and_site(tmp_path, author_candidate):
         )
         assert db.count_blog_entries(dedupe_titles=True) == 1
 
+        third_blog = db.add_author_blog("A456", "https://different.example/blog")
+        assert db.matching_blog_entry_by_title(
+            third_blog,
+            title="Shared title",
+            source_url="https://different.example/new/path",
+        ) is None
 
-def test_schema_31_migration_collapses_existing_same_title_rows(tmp_path, author_candidate):
+
+def test_schema_33_migration_collapses_existing_same_title_rows(tmp_path, author_candidate):
     path = tmp_path / "title-dedupe-migration.sqlite"
     with Database(path) as db:
+        other = AuthorCandidate(openalex_id="A456", name="Other Author")
         db.add_author(author_candidate)
-        blog_id = db.add_author_blog("A123", "https://example.com/blog")
+        db.add_author(other)
+        old_blog_id = db.add_author_blog("A123", "https://example.com/blog")
+        new_blog_id = db.add_author_blog("A456", "https://example.com/writing")
         old_id = db.save_blog_entry(
-            blog_id=blog_id,
+            blog_id=old_blog_id,
             title="Same title",
             content_sha256="old",
             normalized_text="Old content",
@@ -944,8 +962,9 @@ def test_schema_31_migration_collapses_existing_same_title_rows(tmp_path, author
             published_at="2026-01-01",
         )
         db.set_object_notes("blog", old_id, "Persistent note")
+        db.add_blog_entry_tag(old_id, "old-tag")
         new_id = db.save_blog_entry(
-            blog_id=blog_id,
+            blog_id=new_blog_id,
             title="Same title",
             content_sha256="new",
             normalized_text="Newest content",
@@ -967,10 +986,14 @@ def test_schema_31_migration_collapses_existing_same_title_rows(tmp_path, author
         assert int(visible[0]["id"]) == old_id
         assert visible[0]["normalized_text"] == "Newest content"
         assert visible[0]["source_url"] == "https://example.com/new-path"
+        assert visible[0]["published_at"] == "2026-08-08"
         assert visible[0]["notes"] == "Persistent note"
-        assert "migrated-tag" in {row["name"] for row in db.blog_entry_tags(old_id)}
+        assert {row["name"] for row in db.blog_entry_tags(old_id)} == {
+            "migrated-tag",
+            "old-tag",
+        }
         hidden = db._conn.execute(
             "SELECT change_kind FROM blog_entries WHERE id=?", (new_id,)
         ).fetchone()
         assert hidden["change_kind"] == "baseline"
-        assert db._conn.execute("PRAGMA user_version").fetchone()[0] == 32
+        assert db._conn.execute("PRAGMA user_version").fetchone()[0] == 33
