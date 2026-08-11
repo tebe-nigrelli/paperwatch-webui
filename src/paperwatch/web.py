@@ -2780,10 +2780,23 @@ def create_app(
                 "blog",
                 [int(item["id"]) for item in (*blog_views, *selected_blog_views)],
             )
+            blog_source_tag_items = db.blog_source_tag_items(
+                [int(item["blog_id"]) for item in (*blog_views, *selected_blog_views)]
+            )
             for item in (*paper_views, *selected_paper_views):
                 item["content_tag_items"] = paper_tag_items.get(int(item["id"]), [])
             for item in (*blog_views, *selected_blog_views):
-                item["content_tag_items"] = blog_tag_items.get(int(item["id"]), [])
+                entry_tags = blog_tag_items.get(int(item["id"]), [])
+                website_tags = blog_source_tag_items.get(int(item["blog_id"]), [])
+                seen_names = {str(tag["name"]).casefold() for tag in entry_tags}
+                item["content_tag_items"] = [
+                    *entry_tags,
+                    *(
+                        tag
+                        for tag in website_tags
+                        if str(tag["name"]).casefold() not in seen_names
+                    ),
+                ]
             summary_paper_runs = db.latest_query_runs_for_content(
                 DEFAULT_SUMMARY_QUERY_NAME,
                 "paper",

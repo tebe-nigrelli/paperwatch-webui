@@ -191,6 +191,28 @@ def test_content_table_colors_tags_by_provenance(
     assert 'class="tag content-tag-source-automated" data-tag-source="automated" title="Automated classification tag"' in home.text
 
 
+def test_content_table_displays_blog_website_tags_without_copying_them(
+    config_path, author_candidate, paper_record
+):
+    _paper_id, entry_id = seed(config_path, author_candidate, paper_record)
+    config = load_config(config_path)
+    with Database(config.paths.database) as db:
+        entry = db.get_blog_entry(entry_id)
+        assert db.add_blog_source_tag(int(entry["blog_id"]), "Source topic")
+        assert db.blog_entry_tags(entry_id) == []
+
+    home = client(config_path).get("/?content=blogs")
+    assert home.status_code == 200
+    assert (
+        'class="tag content-tag-source-website" data-tag-source="website" '
+        'title="Website tag"' in home.text
+    )
+    assert "Source topic" in home.text
+
+    with Database(config.paths.database) as db:
+        assert db.blog_entry_tags(entry_id) == []
+
+
 def test_web_star_selection_reading_classifier_and_author_csv_ui(
     config_path, author_candidate, paper_record
 ):

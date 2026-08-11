@@ -5118,6 +5118,31 @@ class Database:
             ).fetchall()
         )
 
+    def blog_source_tag_items(
+        self, blog_ids: Iterable[int]
+    ) -> dict[int, list[dict[str, str]]]:
+        """Return source tags for transient display alongside blog-entry tags."""
+        ids = tuple(dict.fromkeys(int(blog_id) for blog_id in blog_ids))
+        if not ids:
+            return {}
+        placeholders = ",".join("?" for _ in ids)
+        rows = self._conn.execute(
+            f"""
+            SELECT bstl.blog_id, ct.name
+            FROM blog_source_tag_links bstl
+            JOIN content_tags ct ON ct.id=bstl.tag_id
+            WHERE bstl.blog_id IN ({placeholders})
+            ORDER BY bstl.blog_id, ct.name COLLATE NOCASE
+            """,
+            ids,
+        ).fetchall()
+        result: dict[int, list[dict[str, str]]] = {blog_id: [] for blog_id in ids}
+        for row in rows:
+            result[int(row["blog_id"])].append(
+                {"name": str(row["name"]), "source": "website"}
+            )
+        return result
+
     def _add_content_tag(
         self,
         table: str,
