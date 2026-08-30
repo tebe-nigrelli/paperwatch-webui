@@ -23,7 +23,7 @@ from .models import (
 )
 
 
-SCHEMA_VERSION = 33
+SCHEMA_VERSION = 34
 
 # Schema creation and migrations are process-level work, while normal database
 # access is connection-level work.  Keep the expensive initialization result
@@ -541,7 +541,7 @@ CREATE TABLE IF NOT EXISTS saved_queries (
     regexp_mode TEXT NOT NULL DEFAULT 'query'
         CHECK (regexp_mode IN ('query', 'print')),
     content_scope TEXT NOT NULL DEFAULT 'both'
-        CHECK (content_scope IN ('both', 'papers', 'blogs')),
+        CHECK (content_scope IN ('both', 'papers', 'blogs', 'rss_blogs', 'web_blogs')),
     query_kind TEXT NOT NULL DEFAULT 'summary'
         CHECK (query_kind IN ('summary', 'classification', 'regexp')),
     label_class TEXT NOT NULL DEFAULT '',
@@ -723,6 +723,8 @@ class Database:
             self._conn.executescript(EXTRA_SCHEMA)
             self._migrate_saved_queries_v25()
             self._migrate_saved_queries_v32()
+            if version < 34:
+                self._migrate_saved_query_content_scopes_v34()
             self._ensure_query_columns()
             self._migrate_query_runs_v32()
             self._conn.executescript(QUERY_RUN_CONTENT_INDEXES)
@@ -1338,7 +1340,7 @@ class Database:
             if regexp_mode not in {"query", "print"}:
                 regexp_mode = "query"
             content_scope = text(row, "content_scope", "both")
-            if content_scope not in {"both", "papers", "blogs"}:
+            if content_scope not in {"both", "papers", "blogs", "rss_blogs", "web_blogs"}:
                 content_scope = "both"
             query_kind = text(row, "query_kind", "summary")
             if query_kind not in {"summary", "classification", "regexp"}:
@@ -1398,7 +1400,7 @@ class Database:
                     regexp_mode TEXT NOT NULL DEFAULT 'query'
                         CHECK (regexp_mode IN ('query', 'print')),
                     content_scope TEXT NOT NULL DEFAULT 'both'
-                        CHECK (content_scope IN ('both', 'papers', 'blogs')),
+                        CHECK (content_scope IN ('both', 'papers', 'blogs', 'rss_blogs', 'web_blogs')),
                     query_kind TEXT NOT NULL DEFAULT 'summary'
                         CHECK (query_kind IN ('summary', 'classification', 'regexp')),
                     label_class TEXT NOT NULL DEFAULT '',
@@ -1506,7 +1508,7 @@ class Database:
                     regexp_mode TEXT NOT NULL DEFAULT 'query'
                         CHECK (regexp_mode IN ('query', 'print')),
                     content_scope TEXT NOT NULL DEFAULT 'both'
-                        CHECK (content_scope IN ('both', 'papers', 'blogs')),
+                        CHECK (content_scope IN ('both', 'papers', 'blogs', 'rss_blogs', 'web_blogs')),
                     query_kind TEXT NOT NULL DEFAULT 'summary'
                         CHECK (query_kind IN ('summary', 'classification', 'regexp')),
                     label_class TEXT NOT NULL DEFAULT '',
@@ -1538,6 +1540,84 @@ class Database:
             raise
         finally:
             self._conn.execute("PRAGMA foreign_keys = ON")
+
+    def _migrate_saved_query_content_scopes_v34(self) -> None:
+        """Allow saved queries to target RSS-only or website-diff blog entries."""
+        table_sql_row = self._conn.execute(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name='saved_queries'"
+        ).fetchone()
+        table_sql = str(table_sql_row["sql"] or "") if table_sql_row is not None else ""
+        if "'rss_blogs'" in table_sql and "'web_blogs'" in table_sql:
+            return
+
+        self._conn.commit()
+        self._conn.execute("PRAGMA foreign_keys = OFF")
+        try:
+            self._conn.execute("BEGIN IMMEDIATE")
+            self._conn.execute("DROP TABLE IF EXISTS saved_queries_v34")
+            self._conn.execute(
+                """
+                CREATE TABLE saved_queries_v34 (
+                    id INTEGER PRIMARY KEY,
+                    name TEXT NOT NULL,
+                    source_type TEXT NOT NULL CHECK (source_type IN ('papers', 'summaries')),
+                    search_query TEXT NOT NULL DEFAULT '',
+                    prompt TEXT NOT NULL,
+                    is_builtin INTEGER NOT NULL DEFAULT 0,
+                    auto_run_papers INTEGER NOT NULL DEFAULT 0,
+                    auto_run_blogs INTEGER NOT NULL DEFAULT 0,
+                    paper_source_scope TEXT NOT NULL DEFAULT 'auto'
+                        CHECK (paper_source_scope IN ('auto', 'abstract', 'fulltext', 'pdf')),
+                    pdf_strategy TEXT NOT NULL DEFAULT 'chunked'
+                        CHECK (pdf_strategy IN ('auto', 'direct', 'chunked')),
+                    regexp_pattern TEXT NOT NULL DEFAULT '',
+                    regexp_radius INTEGER NOT NULL DEFAULT 0,
+                    regexp_debug_text TEXT NOT NULL DEFAULT '',
+                    regexp_mode TEXT NOT NULL DEFAULT 'query'
+                        CHECK (regexp_mode IN ('query', 'print')),
+                    content_scope TEXT NOT NULL DEFAULT 'both'
+                        CHECK (content_scope IN ('both', 'papers', 'blogs', 'rss_blogs', 'web_blogs')),
+                    query_kind TEXT NOT NULL DEFAULT 'summary'
+                        CHECK (query_kind IN ('summary', 'classification', 'regexp')),
+                    label_class TEXT NOT NULL DEFAULT '',
+                    label_values_json TEXT NOT NULL DEFAULT '[]',
+                    label_debug_text TEXT NOT NULL DEFAULT '',
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    last_run_at TEXT
+                )
+                """
+            )
+            self._conn.execute(
+                """
+                INSERT INTO saved_queries_v34(
+                    id, name, source_type, search_query, prompt, is_builtin,
+                    auto_run_papers, auto_run_blogs, paper_source_scope, pdf_strategy,
+                    regexp_pattern, regexp_radius, regexp_debug_text, regexp_mode,
+                    content_scope, query_kind, label_class, label_values_json,
+                    label_debug_text, created_at, updated_at, last_run_at
+                )
+                SELECT
+                    id, name, source_type, search_query, prompt, is_builtin,
+                    auto_run_papers, auto_run_blogs, paper_source_scope, pdf_strategy,
+                    regexp_pattern, regexp_radius, regexp_debug_text, regexp_mode,
+                    content_scope, query_kind, label_class, label_values_json,
+                    label_debug_text, created_at, updated_at, last_run_at
+                FROM saved_queries
+                """
+            )
+            self._conn.execute("DROP TABLE saved_queries")
+            self._conn.execute("ALTER TABLE saved_queries_v34 RENAME TO saved_queries")
+            self._conn.commit()
+        except Exception:
+            self._conn.rollback()
+            raise
+        finally:
+            self._conn.execute("PRAGMA foreign_keys = ON")
+
+        violations = self._conn.execute("PRAGMA foreign_key_check").fetchall()
+        if violations:
+            raise DatabaseError("Saved-query v34 migration produced foreign-key violations")
 
     def _migrate_query_runs_v32(self) -> None:
         """Persist one query run per content record and remove batch/profile uniqueness."""
@@ -3151,15 +3231,22 @@ class Database:
         analyzed: bool | None = None,
         show_stubs: bool = True,
         stub: bool | None = None,
+        entry_kind: str = "",
         dedupe_titles: bool = False,
     ) -> tuple[str, list[Any]]:
         where = ["be.change_kind != 'baseline'", "b.dead=0"]
+        normalized_entry_kind = str(entry_kind or "").strip().lower()
+        if normalized_entry_kind:
+            if normalized_entry_kind not in {"rss", "snapshot"}:
+                raise ValueError("Blog entry kind must be rss or snapshot")
+            where.append("be.entry_kind=?")
         if dedupe_titles:
             where.append(
                 "be.id=(SELECT max(be_d.id) "
                 "FROM blog_entries be_d JOIN blogs b_d ON b_d.id=be_d.blog_id "
                 "WHERE be_d.change_kind != 'baseline' AND b_d.dead=0 "
-                "AND paperwatch_title_key(be_d.title)=paperwatch_title_key(be.title) "
+                + ("AND be_d.entry_kind=be.entry_kind " if normalized_entry_kind else "")
+                + "AND paperwatch_title_key(be_d.title)=paperwatch_title_key(be.title) "
                 "AND COALESCE(NULLIF(paperwatch_host_key(be_d.source_url), ''), "
                 "paperwatch_host_key(b_d.url))="
                 "COALESCE(NULLIF(paperwatch_host_key(be.source_url), ''), "
@@ -3167,6 +3254,8 @@ class Database:
                 ")"
             )
         params: list[Any] = []
+        if normalized_entry_kind:
+            params.append(normalized_entry_kind)
         stub_sql = _blog_stub_sql()
         if stub is not None:
             where.append(f"({stub_sql})=?")
@@ -3331,6 +3420,7 @@ class Database:
         analyzed: bool | None = None,
         show_stubs: bool = True,
         stub: bool | None = None,
+        entry_kind: str = "",
         offset: int = 0,
         ids_only: bool = False,
         table_view: bool = False,
@@ -3353,6 +3443,7 @@ class Database:
             analyzed=analyzed,
             show_stubs=show_stubs,
             stub=stub,
+            entry_kind=entry_kind,
             dedupe_titles=dedupe_titles,
         )
         has_summary_sql = (
@@ -5816,11 +5907,13 @@ class Database:
             regexp_action = "query"
         if kind in {"classification", "regexp"} and regexp_action == "print":
             raise ValueError("Tagging queries cannot print regexp excerpts")
-        if content_scope not in {"both", "papers", "blogs"}:
-            raise ValueError("Query content scope must be both, papers, or blogs")
+        if content_scope not in {"both", "papers", "blogs", "rss_blogs", "web_blogs"}:
+            raise ValueError(
+                "Query content scope must be both, papers, blogs, rss_blogs, or web_blogs"
+            )
         if content_scope == "papers":
             auto_run_blogs = False
-        elif content_scope == "blogs":
+        elif content_scope in {"blogs", "rss_blogs", "web_blogs"}:
             auto_run_papers = False
         if not name and not prompt and regexp_action != "print" and kind != "regexp":
             raise ValueError("Query name and prompt are required")
@@ -5924,8 +6017,10 @@ class Database:
             regexp_action = "query"
         if kind in {"classification", "regexp"} and regexp_action == "print":
             raise ValueError("Tagging queries cannot print regexp excerpts")
-        if content_scope not in {"both", "papers", "blogs"}:
-            raise ValueError("Query content scope must be both, papers, or blogs")
+        if content_scope not in {"both", "papers", "blogs", "rss_blogs", "web_blogs"}:
+            raise ValueError(
+                "Query content scope must be both, papers, blogs, rss_blogs, or web_blogs"
+            )
         if not name and not prompt and regexp_action != "print" and kind != "regexp":
             raise ValueError("Query name and prompt are required")
         if not name:
@@ -5977,7 +6072,7 @@ class Database:
                 conn.execute(
                     "UPDATE saved_queries SET auto_run_blogs=0 WHERE id=?", (query_id,)
                 )
-            elif content_scope == "blogs":
+            elif content_scope in {"blogs", "rss_blogs", "web_blogs"}:
                 conn.execute(
                     "UPDATE saved_queries SET auto_run_papers=0 WHERE id=?", (query_id,)
                 )
@@ -5999,7 +6094,7 @@ class Database:
                 conn.execute(
                     """
                     UPDATE saved_queries
-                    SET auto_run_papers=CASE WHEN content_scope='blogs' THEN 0 ELSE ? END,
+                    SET auto_run_papers=CASE WHEN content_scope IN ('blogs','rss_blogs','web_blogs') THEN 0 ELSE ? END,
                         auto_run_blogs=CASE WHEN content_scope='papers' THEN 0 ELSE ? END,
                         updated_at=?
                     WHERE id=?
@@ -6303,11 +6398,15 @@ class Database:
         if content_type not in {"papers", "blogs"}:
             raise ValueError("Content type must be papers or blogs")
         column = "auto_run_papers" if content_type == "papers" else "auto_run_blogs"
+        scopes = ("both", "papers") if content_type == "papers" else (
+            "both", "blogs", "rss_blogs", "web_blogs"
+        )
+        placeholders = ",".join("?" for _ in scopes)
         return list(
             self._conn.execute(
                 f"SELECT * FROM saved_queries WHERE {column}=1 "
-                "AND content_scope IN ('both', ?) ORDER BY id",
-                (content_type,),
+                f"AND content_scope IN ({placeholders}) ORDER BY id",
+                scopes,
             ).fetchall()
         )
 

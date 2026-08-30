@@ -13,7 +13,9 @@ from paperwatch.blogs import ArticleItem, BlogFetch
 from paperwatch.config import load_config
 from paperwatch.db import Database, SCHEMA_VERSION
 from paperwatch.pipeline import PaperWatch, RunStats
-from paperwatch.query_jobs import QueryBatchSnapshot
+from paperwatch.query_jobs import (
+    QueryBatchSnapshot, _apply_blog_query_scope, _selected_blog_entries,
+)
 from paperwatch.web import RunSnapshot, _render_stored_markdown, create_app
 
 
@@ -138,7 +140,7 @@ def seed_content(config_path, author_candidate, paper_record):
 def test_query_content_scope_cleanup_and_schema(config_path):
     config = load_config(config_path)
     with Database(config.paths.database) as db:
-        assert SCHEMA_VERSION == 33
+        assert SCHEMA_VERSION == 34
         paper_query = db.create_saved_query(
             name="Paper only",
             prompt="Paper prompt",
@@ -209,6 +211,90 @@ def test_query_content_scope_cleanup_and_schema(config_path):
         remaining = db.list_saved_queries()
         assert len(remaining) == 1 and remaining[0]["is_builtin"] == 1
 
+
+
+def test_rss_and_web_blog_content_filters_and_prompt_scopes(
+    config_path, author_candidate
+):
+    config = load_config(config_path)
+    with Database(config.paths.database) as db:
+        db.add_author(author_candidate)
+        blog_id = db.add_author_blog(
+            author_candidate.openalex_id,
+            "https://example.test/mixed-blog/",
+            label="Mixed blog",
+        )
+        rss_id = db.save_blog_entry(
+            blog_id=blog_id,
+            title="RSS-only entry",
+            content_sha256="rss-scope-096",
+            normalized_text="RSS body",
+            diff_text="",
+            change_kind="changed",
+            previous_entry_id=None,
+            entry_kind="rss",
+            external_id="rss-scope-096",
+            source_url="https://example.test/mixed-blog/rss",
+        )
+        web_id = db.save_blog_entry(
+            blog_id=blog_id,
+            title="Web-only entry",
+            content_sha256="web-scope-096",
+            normalized_text="Web body",
+            diff_text="changed words",
+            change_kind="changed",
+            previous_entry_id=None,
+            entry_kind="snapshot",
+            external_id="web-scope-096",
+            source_url="https://example.test/mixed-blog/web",
+        )
+        all_blogs_query = db.create_saved_query(
+            name="All blogs scope", prompt="Summarize", content_scope="blogs",
+            auto_run_papers=True, auto_run_blogs=True,
+        )
+        rss_query = db.create_saved_query(
+            name="RSS scope", prompt="Summarize", content_scope="rss_blogs",
+            auto_run_papers=True, auto_run_blogs=True,
+        )
+        web_query = db.create_saved_query(
+            name="Web scope", prompt="Summarize", content_scope="web_blogs",
+            auto_run_papers=True, auto_run_blogs=True,
+        )
+        assert db.count_blog_entries(entry_kind="rss") == 1
+        assert db.count_blog_entries(entry_kind="snapshot") == 1
+        assert [row["id"] for row in db.list_blog_entries(entry_kind="rss")] == [rss_id]
+        assert [row["id"] for row in db.list_blog_entries(entry_kind="snapshot")] == [web_id]
+        automatic_blog_ids = [int(row["id"]) for row in db.list_automatic_queries("blogs")]
+        assert automatic_blog_ids[-3:] == [all_blogs_query, rss_query, web_query]
+        assert db.get_saved_query(rss_query)["auto_run_papers"] == 0
+        assert db.get_saved_query(web_query)["auto_run_papers"] == 0
+
+        rss_selection = {"content_type": "blogs"}
+        _apply_blog_query_scope(rss_selection, "rss_blogs")
+        assert [int(row["id"]) for row in _selected_blog_entries(db, rss_selection)] == [rss_id]
+        conflicting_selection = {"content_type": "blogs", "entry_kind": "rss"}
+        _apply_blog_query_scope(conflicting_selection, "web_blogs")
+        assert _selected_blog_entries(db, conflicting_selection) == []
+
+    web = client(config_path)
+    all_blogs = web.get("/?content=blogs")
+    assert "RSS-only entry" in all_blogs.text and "Web-only entry" in all_blogs.text
+    assert 'data-filter-values="all|papers|blogs|rss_blogs|web_blogs"' in all_blogs.text
+    assert 'data-filter-labels="Both|Papers|All blogs|RSS blogs|Web blogs"' in all_blogs.text
+
+    rss_page = web.get("/?content=rss_blogs")
+    assert "RSS-only entry" in rss_page.text and "Web-only entry" not in rss_page.text
+    assert 'name="content" value="rss_blogs"' in rss_page.text
+    web_page = web.get("/?content=web_blogs")
+    assert "Web-only entry" in web_page.text and "RSS-only entry" not in web_page.text
+    assert 'name="content" value="web_blogs"' in web_page.text
+
+    editor = web.get(f"/queries/{rss_query}/edit")
+    assert '{"value":"blogs","label":"All blogs"}' in editor.text
+    assert '{"value":"rss_blogs","label":"RSS blogs"}' in editor.text
+    assert '{"value":"web_blogs","label":"Web blogs"}' in editor.text
+    queries = web.get("/queries")
+    assert "All blogs" in queries.text and "RSS blogs" in queries.text and "Web blogs" in queries.text
 
 def test_content_author_links_page_jump_query_result_and_controls(
     config_path, author_candidate, paper_record

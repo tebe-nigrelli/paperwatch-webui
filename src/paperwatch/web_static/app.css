@@ -278,7 +278,7 @@
 .content-kind-icon{display:inline-grid;place-items:center;width:34px;height:34px;border:1px solid var(--line);border-radius:8px;background:var(--surface-2);color:var(--muted)}
 .content-kind-icon svg{width:19px;height:19px;fill:none;stroke:currentColor;stroke-width:1.8;stroke-linecap:round;stroke-linejoin:round}
 .content-kind-paper{color:var(--accent);background:var(--accent-soft)}
-.content-kind-blog{color:var(--good);background:var(--good-soft)}
+.content-kind-blog,.content-kind-blog-diff{color:var(--good);background:var(--good-soft)}
 .content-row[data-read="true"]{background:color-mix(in srgb,var(--surface-2) 82%,#505967 18%)}
 :root[data-theme="dark"] .content-row[data-read="true"]{background:color-mix(in srgb,var(--surface-2) 70%,#000 30%)}
 .content-row-selected[data-read="true"]{background:color-mix(in srgb,var(--warn-soft) 66%,var(--surface-2))!important}
@@ -466,7 +466,9 @@ label.control-disabled{opacity:.68}
 .filter-cycle-button[data-filter-state="yes"] [data-filter-state-value="yes"],
 .filter-cycle-button[data-filter-state="no"] [data-filter-state-value="no"],
 .filter-cycle-button[data-filter-state="papers"] [data-filter-state-value="papers"],
-.filter-cycle-button[data-filter-state="blogs"] [data-filter-state-value="blogs"]{display:inline-grid}
+.filter-cycle-button[data-filter-state="blogs"] [data-filter-state-value="blogs"],
+.filter-cycle-button[data-filter-state="rss_blogs"] [data-filter-state-value="rss_blogs"],
+.filter-cycle-button[data-filter-state="web_blogs"] [data-filter-state-value="web_blogs"]{display:inline-grid}
 .compact-header-filters{display:flex;align-items:center;justify-content:center;gap:5px}
 .filter-cycle-button{margin:0}
 .filter-cycle-button[data-filter-state="yes"]{color:var(--good);border-color:var(--good)}
@@ -479,7 +481,7 @@ label.control-disabled{opacity:.68}
 .filter-svg-icon{place-items:center;width:20px;height:20px}
 .filter-svg-icon svg{width:19px;height:19px;fill:none;stroke:currentColor;stroke-width:1.8;stroke-linecap:round;stroke-linejoin:round}
 .content-type-filter-button[data-filter-state="papers"]{color:var(--accent);background:var(--accent-soft)}
-.content-type-filter-button[data-filter-state="blogs"]{color:var(--good);background:var(--good-soft)}
+.content-type-filter-button[data-filter-state="blogs"],.content-type-filter-button[data-filter-state="rss_blogs"],.content-type-filter-button[data-filter-state="web_blogs"]{color:var(--good);background:var(--good-soft)}
 .author-header-title{display:flex;align-items:center;justify-content:space-between;gap:8px}
 .author-table thead th{vertical-align:top}
 .author-table .author-star-column,.author-table .author-state-column{text-align:center}

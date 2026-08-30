@@ -2079,7 +2079,30 @@ class PaperWatch:
             ids = list(dict.fromkeys(raw_ids))
             if not ids:
                 continue
+            blog_entry_kinds: dict[int, str] = {}
+            if content_type == "blogs":
+                blog_entry_kinds = {
+                    int(row["id"]): str(row["entry_kind"] or "")
+                    for row in self.db.blog_entries_by_ids(
+                        ids, query_view=True, include_baseline=True
+                    )
+                }
             for query in self.db.list_automatic_queries(content_type):
+                query_ids = ids
+                if content_type == "blogs":
+                    scope = str(query["content_scope"] or "both")
+                    required_kind = {
+                        "rss_blogs": "rss",
+                        "web_blogs": "snapshot",
+                    }.get(scope, "")
+                    if required_kind:
+                        query_ids = [
+                            entry_id
+                            for entry_id in ids
+                            if blog_entry_kinds.get(entry_id) == required_kind
+                        ]
+                        if not query_ids:
+                            continue
                 query_kind = str(query["query_kind"] or "summary")
                 regexp_pattern = str(query["regexp_pattern"] or "").strip()
                 local = query_kind == "regexp" or (
@@ -2098,7 +2121,7 @@ class PaperWatch:
                         ),
                     )
                     continue
-                jobs.append((content_type, ids, str(query["name"]), query, profiles))
+                jobs.append((content_type, query_ids, str(query["name"]), query, profiles))
 
         if not jobs:
             return

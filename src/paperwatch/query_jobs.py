@@ -375,6 +375,29 @@ def _selection_stub_filter(selection: dict[str, Any] | None) -> bool | None:
     return None if bool(selection.get("display_stubs")) else False
 
 
+def _blog_entry_kind_for_query_scope(scope: str) -> str:
+    return {"rss_blogs": "rss", "web_blogs": "snapshot"}.get(str(scope), "")
+
+
+def _query_scope_supports_content(scope: str, content_type: str) -> bool:
+    scope = str(scope or "both")
+    if content_type == "blogs":
+        return scope in {"both", "blogs", "rss_blogs", "web_blogs"}
+    return scope in {"both", content_type}
+
+
+def _apply_blog_query_scope(selection: dict[str, Any], scope: str) -> None:
+    required_kind = _blog_entry_kind_for_query_scope(scope)
+    if not required_kind:
+        return
+    existing_kind = str(selection.get("entry_kind") or "").strip().lower()
+    if existing_kind and existing_kind != required_kind:
+        selection.pop("resolved_blog_entry_ids", None)
+        selection["blog_entry_ids"] = []
+        return
+    selection["entry_kind"] = required_kind
+
+
 def _selected_blog_entries(db: Database, selection: dict[str, Any] | None) -> list[Any]:
     selected_ids: list[int] = []
     raw_ids = (
@@ -382,6 +405,7 @@ def _selected_blog_entries(db: Database, selection: dict[str, Any] | None) -> li
         if selection and isinstance(selection.get("resolved_blog_entry_ids"), list)
         else selection.get("blog_entry_ids") if selection else None
     )
+    entry_kind = str((selection or {}).get("entry_kind") or "").strip().lower()
     if isinstance(raw_ids, list):
         for value in raw_ids:
             try:
@@ -391,13 +415,14 @@ def _selected_blog_entries(db: Database, selection: dict[str, Any] | None) -> li
         # Explicit query selections include baseline rows. Freshly initialized
         # blog sources deliberately enqueue those rows for automatic saved
         # queries, even though ordinary blog listings hide baselines.
-        return (
+        rows = (
             db.blog_entries_by_ids(
                 selected_ids, query_view=True, include_baseline=True
             )
             if selected_ids
             else []
         )
+        return [row for row in rows if not entry_kind or row["entry_kind"] == entry_kind]
     args = _selection_search_args(selection)
     return db.list_blog_entries(
         limit=None,
@@ -419,6 +444,7 @@ def _selected_blog_entries(db: Database, selection: dict[str, Any] | None) -> li
         analyzed=args["analyzed"] if isinstance(args["analyzed"], bool) else None,
         notes=args["notes"] if isinstance(args["notes"], bool) else None,
         stub=_selection_stub_filter(selection),
+        entry_kind=entry_kind,
         query_view=True,
     )
 
@@ -1350,9 +1376,11 @@ class QueryController:
                 if query is None:
                     raise ValueError("Saved query not found")
                 supported = str(query["content_scope"] or "both")
-                if supported not in {"both", content_type}:
+                if not _query_scope_supports_content(supported, content_type):
                     label = "papers" if supported == "papers" else "blogs"
                     raise ValueError(f"This query is configured for {label} only")
+                if content_type == "blogs":
+                    _apply_blog_query_scope(selection, supported)
                 local_print = (
                     str(query["regexp_mode"] or "query") == "print"
                     and bool(str(query["regexp_pattern"] or "").strip())
@@ -1515,11 +1543,12 @@ class QueryController:
                     context_window_tokens = configured_profiles[0].context_window_tokens
 
                 for content_type, raw_selection in ordered_targets:
-                    if supported not in {"both", content_type}:
+                    if not _query_scope_supports_content(supported, content_type):
                         continue
                     selection = dict(raw_selection)
                     if content_type == "blogs":
                         selection["content_type"] = "blogs"
+                        _apply_blog_query_scope(selection, supported)
                         target_source = "blog"
                         target_pdf_strategy = "auto"
                         if not _selected_blog_entries(db, selection):
@@ -1629,14 +1658,25 @@ class QueryController:
                     source_scope="blog",
                     pdf_strategy="auto",
                 )
-                warning = _selection_warning_text(selection)
                 for query_id in ordered_ids:
                     query = db.get_saved_query(query_id)
                     if query is None:
                         raise ValueError(f"Saved query {query_id} was not found")
                     supported = str(query["content_scope"] or "both")
-                    if supported not in {"both", "blogs"}:
+                    if not _query_scope_supports_content(supported, "blogs"):
                         raise ValueError(f"{query['name']} is configured for papers only")
+                    query_selection = dict(selection)
+                    _apply_blog_query_scope(query_selection, supported)
+                    try:
+                        validate_query_sources(
+                            db,
+                            selection=query_selection,
+                            source_scope="blog",
+                            pdf_strategy="auto",
+                        )
+                    except ValueError:
+                        continue
+                    warning = _selection_warning_text(query_selection)
                     local_print = (
                         str(query["regexp_mode"] or "query") == "print"
                         and bool(str(query["regexp_pattern"] or "").strip())
@@ -1655,9 +1695,11 @@ class QueryController:
                             else (profile, available[profile].provider, available[profile].model)
                         ],
                         context_window_tokens=context_window_tokens,
-                        selection=selection,
+                        selection=query_selection,
                     )
                     jobs.append((batch_id, query_id, selected))
+            if not jobs:
+                raise ValueError("No selected blog entries match the selected query scopes")
             self._cancel_event = threading.Event()
             self._active_llm = None
             self._snapshot = QueryBatchSnapshot(
@@ -1778,11 +1820,12 @@ class QueryController:
                             query_source, query_pdf_strategy = "auto", "chunked"
 
                     for content_type, raw_selection in ordered_targets:
-                        if supported not in {"both", content_type}:
+                        if not _query_scope_supports_content(supported, content_type):
                             continue
                         selection = dict(raw_selection)
                         if content_type == "blogs":
                             selection["content_type"] = "blogs"
+                            _apply_blog_query_scope(selection, supported)
                             target_source = "blog"
                             target_pdf_strategy = "auto"
                             if not _selected_blog_entries(db, selection):

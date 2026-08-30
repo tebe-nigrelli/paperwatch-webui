@@ -101,7 +101,7 @@ def test_schema_25_pdf_fingerprint_persists_modified_state(
     with Database(config.paths.database) as db:
         db.set_local_pdf(paper_id, str(pdf), expected)
         row = dict(db.get_paper(paper_id))
-        assert SCHEMA_VERSION == 33
+        assert SCHEMA_VERSION == 34
         assert "pdf_modified_on_disk" in row
         assert _paper_pdf_state(db, row)["pdf_modified"] is False
 
@@ -344,7 +344,7 @@ def test_compact_content_and_author_header_filters(
     assert "Any reading state" not in content.text
     assert "Any notes state" not in content.text
     assert 'data-filter-name="starred" data-filter-values="any|yes|no"' in content.text
-    assert 'data-filter-name="content" data-filter-values="all|papers|blogs"' in content.text
+    assert 'data-filter-name="content" data-filter-values="all|papers|blogs|rss_blogs|web_blogs"' in content.text
     assert 'data-filter-name="read" data-filter-values="any|yes|no"' in content.text
     assert 'data-filter-name="notes" data-filter-values="any|yes|no"' in content.text
 

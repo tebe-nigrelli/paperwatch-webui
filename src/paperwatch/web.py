@@ -1015,7 +1015,13 @@ def _query_execution_form(
 
 
 def _query_supports(query: Any, content_type: str) -> bool:
-    scope = str(query.get("content_scope", "both") if isinstance(query, dict) else query["content_scope"] or "both")
+    scope = str(
+        query.get("content_scope", "both")
+        if isinstance(query, dict)
+        else query["content_scope"] or "both"
+    )
+    if content_type == "blogs":
+        return scope in {"both", "blogs", "rss_blogs", "web_blogs"}
     return scope == "both" or scope == content_type
 
 
@@ -1165,9 +1171,20 @@ def _all_filtered(
     return rows
 
 
+BLOG_CONTENT_FILTERS = {"blogs", "rss_blogs", "web_blogs"}
+
+
 def _content_kind(value: str | None, default: str = "all") -> str:
     normalized = str(value or default).strip().lower()
-    return normalized if normalized in {"all", "papers", "blogs"} else default
+    return (
+        normalized
+        if normalized in {"all", "papers", *BLOG_CONTENT_FILTERS}
+        else default
+    )
+
+
+def _blog_entry_kind_for_scope(value: str) -> str:
+    return {"rss_blogs": "rss", "web_blogs": "snapshot"}.get(str(value), "")
 
 
 def _website_view(value: str) -> tuple[str, str]:
@@ -2663,6 +2680,7 @@ def create_app(
             "notes": filters.notes,
             "analyzed": filters.analyzed,
             "stub": filters.stub,
+            "entry_kind": _blog_entry_kind_for_scope(content_filter),
             "dedupe_titles": True,
         }
         blog_compatible_filters = not (
@@ -2681,7 +2699,7 @@ def create_app(
             selected_matching_papers = 0
             selected_matching_blogs = 0
             has_blog_entries = db.has_visible_blog_entries()
-            if content_filter != "blogs" and filters.stub is not True:
+            if content_filter not in BLOG_CONTENT_FILTERS and filters.stub is not True:
                 paper_rows, paper_total = db.search_papers(
                     **paper_filters,
                     selected=False,
@@ -2707,8 +2725,8 @@ def create_app(
                     blog_rows = db.list_blog_entries(
                         **blog_filters,
                         selected=False,
-                        limit=(filters.page_size if content_filter == "blogs" else prefetch),
-                        offset=(offset if content_filter == "blogs" else 0),
+                        limit=(filters.page_size if content_filter in BLOG_CONTENT_FILTERS else prefetch),
+                        offset=(offset if content_filter in BLOG_CONTENT_FILTERS else 0),
                         table_view=True,
                     )
 
@@ -3046,6 +3064,7 @@ def create_app(
             "selected": target_state,
             "analyzed": filters.analyzed,
             "stub": filters.stub,
+            "entry_kind": _blog_entry_kind_for_scope(content_filter),
         }
         blog_compatible = not (
             filters.topic_id
@@ -3059,7 +3078,7 @@ def create_app(
                 selected=selected,
                 paper_filters=(
                     paper_filters
-                    if content_filter != "blogs" and filters.stub is not True
+                    if content_filter not in BLOG_CONTENT_FILTERS and filters.stub is not True
                     else None
                 ),
                 blog_filters=(
@@ -5645,6 +5664,7 @@ def create_app(
             "notes": filters.notes,
             "analyzed": filters.analyzed,
             "stub": filters.stub,
+            "entry_kind": _blog_entry_kind_for_scope(content_filter),
         }
         with Database(config.paths.database) as db:
             stored_queries = [db.get_saved_query(value) for value in query_ids]
@@ -5670,7 +5690,7 @@ def create_app(
                 )
                 selected_blog_ids = [int(row["id"]) for row in selected_blogs]
             else:
-                if content_filter != "blogs" and filters.stub is not True:
+                if content_filter not in BLOG_CONTENT_FILTERS and filters.stub is not True:
                     _, paper_match_count = db.search_papers(
                         **paper_filter_args, limit=0, offset=0
                     )
@@ -5753,7 +5773,11 @@ def create_app(
             if paper_match_count and (len(queries) > 1 or _query_supports(query, "papers")):
                 targets.append(("papers", dict(base_selection)))
             if blog_match_count and (len(queries) > 1 or _query_supports(query, "blogs")):
-                targets.append(("blogs", dict(base_selection)))
+                blog_selection = dict(base_selection)
+                blog_entry_kind = _blog_entry_kind_for_scope(content_filter)
+                if blog_entry_kind:
+                    blog_selection["entry_kind"] = blog_entry_kind
+                targets.append(("blogs", blog_selection))
         if not targets:
             unsupported_target = "selected content" if run_selected else "current search results"
             return RedirectResponse(
