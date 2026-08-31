@@ -306,7 +306,7 @@ def _run(args: argparse.Namespace, services: Services) -> int:
         f"pdfs={stats.pdfs_downloaded} blogs={getattr(stats, 'blogs_checked', 0)} "
         f"blog_updates={getattr(stats, 'blog_updates_found', 0)} errors={stats.errors_count}"
     )
-    return 0 if stats.status == "success" else 1
+    return 0 if stats.status in {"success", "partial"} else 1
 
 
 def _backfill(args: argparse.Namespace, services: Services) -> int:
@@ -363,7 +363,7 @@ def _backfill(args: argparse.Namespace, services: Services) -> int:
         f"pdfs={stats.pdfs_downloaded} analyses={stats.papers_analyzed} "
         f"errors={stats.errors_count}"
     )
-    return 0 if stats.status == "success" else 1
+    return 0 if stats.status in {"success", "partial"} else 1
 
 
 def _list_papers(args: argparse.Namespace, services: Services) -> int:
