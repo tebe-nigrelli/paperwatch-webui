@@ -101,6 +101,12 @@ def test_schema_content_state_author_star_and_bulk_selection(
         assert db.search_papers(selected=True)[1] == 0
         assert db.list_blog_entries(selected=True) == []
 
+        db.set_content_selected("paper", paper_id, True)
+        db.set_content_selected("blog", entry_id, True)
+        assert db.delete_selected_content() == (2, ())
+        assert db.get_paper(paper_id) is None
+        assert db.get_blog_entry(entry_id) is None
+
 
 def test_classifier_query_assigns_shared_tags_and_allows_controlled_edits(
     config_path, author_candidate, paper_record

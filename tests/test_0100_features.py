@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import re
+from dataclasses import replace
 from pathlib import Path
 
 from fastapi.testclient import TestClient
@@ -121,6 +122,76 @@ def test_schema_25_pdf_fingerprint_persists_modified_state(
         assert db.get_paper(paper_id)["pdf_modified_on_disk"] == 0
 
 
+def test_selected_delete_preserves_modified_pdfs_and_manages_trash(
+    monkeypatch, config_path, author_candidate, paper_record
+):
+    paper_id, _, entry_id = seed(config_path, author_candidate, paper_record)
+    config = load_config(config_path)
+    second_record = replace(
+        paper_record,
+        openalex_id="W457",
+        doi="10.1000/unmodified",
+        arxiv_id=None,
+        title="Unmodified downloaded paper",
+    )
+    modified_pdf = config.paths.pdf_dir / "modified.pdf"
+    unmodified_pdf = config.paths.pdf_dir / "unmodified.pdf"
+    original = b"%PDF-1.4\noriginal\n%%EOF\n"
+    changed = b"%PDF-1.4\nmanually changed\n%%EOF\n"
+    modified_pdf.write_bytes(original)
+    unmodified_pdf.write_bytes(original)
+    trash = config.paths.pdf_dir.parent / "trash"
+    trash.mkdir()
+    (trash / modified_pdf.name).write_bytes(b"previously preserved")
+
+    with Database(config.paths.database) as db:
+        second_id, _ = db.upsert_paper(second_record)
+        digest = hashlib.sha256(original).hexdigest()
+        db.set_local_pdf(paper_id, str(modified_pdf), digest)
+        db.set_local_pdf(second_id, str(unmodified_pdf), digest)
+        db.set_content_selected("paper", paper_id, True)
+        db.set_content_selected("paper", second_id, True)
+        db.set_content_selected("blog", entry_id, True)
+    modified_pdf.write_bytes(changed)
+
+    web = client(config_path)
+    response = web.post(
+        "/content/selected/delete",
+        headers={"X-Paperwatch-Async": "1"},
+    )
+    assert response.status_code == 200
+    assert response.json() == {"ok": True, "changed": 3, "removed": 1, "preserved": 1}
+    assert not modified_pdf.exists()
+    assert not unmodified_pdf.exists()
+    assert sorted(path.read_bytes() for path in trash.glob("modified*.pdf")) == [
+        b"%PDF-1.4\nmanually changed\n%%EOF\n",
+        b"previously preserved",
+    ]
+    with Database(config.paths.database) as db:
+        assert db.get_paper(paper_id) is None
+        assert db.get_paper(second_id) is None
+        assert db.get_blog_entry(entry_id) is None
+
+    nested = trash / "nested"
+    nested.mkdir()
+    (nested / "file.txt").write_text("trash", encoding="utf-8")
+    emptied = web.post("/data/delete/trash", follow_redirects=False)
+    assert emptied.status_code == 303
+    assert trash.is_dir() and list(trash.iterdir()) == []
+
+    launched = []
+    monkeypatch.setattr("paperwatch.web.shutil.which", lambda _command: "/usr/bin/xdg-open")
+    monkeypatch.setattr(
+        "paperwatch.web.subprocess.Popen",
+        lambda args, **kwargs: launched.append((args, kwargs)),
+    )
+    assert web.get("/data/folders/content/open").status_code == 204
+    assert web.get("/data/folders/trash/open").status_code == 204
+    assert [Path(args[1]) for args, _ in launched] == [config.paths.pdf_dir, trash]
+    assert all(kwargs["start_new_session"] for _, kwargs in launched)
+    assert web.get("/data/folders/unknown/open").status_code == 404
+
+
 def test_content_detail_data_and_query_layouts(
     config_path, author_candidate, paper_record
 ):
@@ -143,6 +214,13 @@ def test_content_detail_data_and_query_layouts(
     assert "Import blog links" in data.text
     assert "Delete stored records" in data.text
     assert "Author CSV schema" in data.text and "Blogs CSV schema" in data.text
+    assert 'href="/data/folders/content/open"' in data.text
+    assert 'href="/data/folders/trash/open"' in data.text
+    assert 'action="/data/delete/trash"' in data.text
+    assert "Open Content Folder" in data.text
+    assert "Open Trash Folder" in data.text
+    assert "Empty Trash Folder" in data.text
+    assert data.text.index("Delete fetch history") < data.text.index("Empty Trash Folder")
     authors_page = web.get("/authors").text
     assert "Add author manually" not in authors_page
     assert "Import blog links" not in authors_page
@@ -271,8 +349,13 @@ def test_blog_results_runner_accepts_multiple_queries_and_one_model(
     assert "Remove all tags" in headers[7]
     assert "Undo tag action" not in headers[6]
     selected_tools = content.text.split('class="selected-content-tools"', 1)[1].split("</div>", 1)[0]
+    assert selected_tools.index('action="/content/selected/delete"') < selected_tools.index("Add tag and press Enter")
     assert selected_tools.index("Add tag and press Enter") < selected_tools.index("Remove tag and press Enter")
     assert selected_tools.index("Remove tag and press Enter") < selected_tools.index("Undo tag action")
+    assert 'action="/content/selected/delete"' in selected_tools
+    assert 'aria-label="Delete selected content"' in selected_tools
+    script = web.get("/static/app.js").text
+    assert 'if (!form || event.defaultPrevented) return;' in script
 
     with Database(config.paths.database) as db:
         db.set_content_starred("blog", entry_id, True)
@@ -396,7 +479,7 @@ def test_static_assets_use_partial_updates_and_requested_layout():
     assert '[data-filter-cycle]' in script
     assert 'button.dataset.filterState = nextState' in script
     assert '.filter-word-button[data-filter-state="yes"]' in css
-    assert ".selected-content-tools{display:grid;grid-template-columns:220px 220px auto" in css
+    assert ".selected-content-tools{display:grid;grid-template-columns:34px 190px 190px auto 34px" in css
     assert ".regexp-editor-grid" in css
     assert ".object-list article>.markdown-block{display:block" in css
     assert ".query-run-status-column,.query-run-status-cell{width:18rem;max-width:18rem}" in css

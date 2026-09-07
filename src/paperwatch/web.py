@@ -152,6 +152,25 @@ def _choose_export_directory() -> Path | None:
     return path
 
 
+def _trash_directory(pdf_dir: Path) -> Path:
+    return pdf_dir.parent / "trash"
+
+
+def _open_desktop_directory(path: Path) -> None:
+    path.mkdir(parents=True, exist_ok=True)
+    opener = _desktop_opener()
+    if opener is None:
+        command = "open" if sys.platform == "darwin" else "xdg-open"
+        raise OSError(f"Desktop opener {command!r} is not available")
+    subprocess.Popen(
+        [opener, str(path.resolve())],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        start_new_session=True,
+    )
+
+
 @dataclass(frozen=True, slots=True)
 class PaperFilters:
     query: str = ""
@@ -3137,6 +3156,57 @@ def create_app(
             status_code=303,
         )
 
+    @app.post("/content/selected/delete")
+    def delete_selected_content(request: Request) -> Response:
+        with Database(config.paths.database) as db:
+            paper_rows, _ = db.search_papers(
+                selected=True, limit=None, include_dead=True
+            )
+            file_states: dict[str, bool] = {}
+            for row in paper_rows:
+                value = str(row["local_pdf_path"] or "").strip()
+                if not value:
+                    continue
+                path = Path(value).expanduser().resolve()
+                stored_hash = str(row["pdf_sha256"] or "").strip()
+                modified = bool(row["pdf_modified_on_disk"]) or not stored_hash
+                if not modified:
+                    try:
+                        modified = pdf_sha256(path) != stored_hash
+                    except PDFError:
+                        modified = True
+                file_states[str(path)] = file_states.get(str(path), False) or modified
+            changed, paths = db.delete_selected_content()
+        root = config.paths.pdf_dir.resolve()
+        trash = _trash_directory(config.paths.pdf_dir)
+        removed = 0
+        preserved = 0
+        for value in paths:
+            path = Path(value).expanduser().resolve()
+            if path.is_file() and root in path.parents:
+                if file_states.get(str(path), False):
+                    trash.mkdir(parents=True, exist_ok=True)
+                    destination = trash / path.name
+                    if destination.exists():
+                        destination = trash / (
+                            f"{path.stem}-{uuid.uuid4().hex[:8]}{path.suffix}"
+                        )
+                    shutil.move(str(path), str(destination))
+                    preserved += 1
+                    continue
+                path.unlink(missing_ok=True)
+                removed += 1
+        if _async_request(request):
+            return JSONResponse(
+                {
+                    "ok": True,
+                    "changed": changed,
+                    "removed": removed,
+                    "preserved": preserved,
+                }
+            )
+        return RedirectResponse(_request_return_path(request), status_code=303)
+
     @app.post("/content/selected/{action}")
     def update_selected_content(request: Request, action: str) -> Response:
         try:
@@ -3347,6 +3417,20 @@ def create_app(
             download_pdfs=download_pdfs,
             app_uptime_seconds=int(time.monotonic() - app_started_at),
         )
+
+    @app.get("/data/folders/{folder}/open")
+    def open_data_folder(folder: str) -> Response:
+        path = {
+            "content": config.paths.pdf_dir,
+            "trash": _trash_directory(config.paths.pdf_dir),
+        }.get(folder)
+        if path is None:
+            raise HTTPException(404, "Data folder not found")
+        try:
+            _open_desktop_directory(path)
+        except OSError as exc:
+            raise HTTPException(503, str(exc)) from exc
+        return Response(status_code=204)
 
     @app.post("/data/settings/download-pdfs")
     async def set_download_pdfs_setting(request: Request) -> RedirectResponse:
@@ -6153,6 +6237,25 @@ def create_app(
             _notice_url(
                 "/data",
                 f"Deleted {count} fetch-history record{'s' if count != 1 else ''}.",
+            ),
+            status_code=303,
+        )
+
+    @app.post("/data/delete/trash")
+    def empty_trash_folder() -> RedirectResponse:
+        trash = _trash_directory(config.paths.pdf_dir)
+        trash.mkdir(parents=True, exist_ok=True)
+        removed = 0
+        for path in trash.iterdir():
+            if path.is_dir() and not path.is_symlink():
+                shutil.rmtree(path)
+            else:
+                path.unlink()
+            removed += 1
+        return RedirectResponse(
+            _notice_url(
+                "/data",
+                f"Emptied the trash folder; removed {removed} item{'s' if removed != 1 else ''}.",
             ),
             status_code=303,
         )

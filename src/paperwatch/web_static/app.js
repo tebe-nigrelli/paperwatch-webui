@@ -1687,7 +1687,7 @@
 
   document.addEventListener("submit", async (event) => {
     const form = event.target.closest("form");
-    if (!form) return;
+    if (!form || event.defaultPrevented) return;
     if (form.matches("[data-content-filter]")) {
       event.preventDefault();
       const url = new URL(form.action || window.location.href, window.location.href);

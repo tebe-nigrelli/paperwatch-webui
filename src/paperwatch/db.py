@@ -3864,6 +3864,21 @@ class Database:
             ).rowcount
         return int(papers + blogs)
 
+    def delete_selected_content(self) -> tuple[int, tuple[str, ...]]:
+        """Delete selected content and return local PDF paths for filesystem cleanup."""
+        paths = tuple(
+            str(row["local_pdf_path"])
+            for row in self._conn.execute(
+                "SELECT local_pdf_path FROM papers "
+                "WHERE selected=1 AND local_pdf_path IS NOT NULL"
+            ).fetchall()
+            if str(row["local_pdf_path"] or "").strip()
+        )
+        with self.transaction() as conn:
+            papers = conn.execute("DELETE FROM papers WHERE selected=1").rowcount
+            blogs = conn.execute("DELETE FROM blog_entries WHERE selected=1").rowcount
+        return int(papers + blogs), paths
+
     def _find_existing_paper(self, paper: PaperRecord) -> sqlite3.Row | None:
         row = self._conn.execute(
             "SELECT * FROM papers WHERE identity_key = ?", (paper.identity_key,)
