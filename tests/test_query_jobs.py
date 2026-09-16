@@ -516,7 +516,8 @@ def test_native_pdf_batch_and_controller_preserve_codex_source(
         paper_id, _ = db.upsert_paper(paper_record)
         db.set_local_pdf(paper_id, str(pdf))
         query_id = db.create_saved_query(
-            name="Native critique", source_type="papers", search_query="", prompt="Critique"
+            name="Native critique", source_type="papers", search_query="", prompt="Critique",
+            regexp_pattern="paper",
         )
         db.create_query_runs(
             batch_id="native-batch",
@@ -542,6 +543,9 @@ def test_native_pdf_batch_and_controller_preserve_codex_source(
     active: list[object | None] = []
     seen: dict[str, object] = {}
     monkeypatch.setattr(query_jobs, "create_llm", lambda profile: client)
+    monkeypatch.setattr(
+        query_jobs, "_paper_text", lambda *args, **kwargs: (paper_record, "complete paper")
+    )
 
     def fake_native(llm, **kwargs):
         seen.update(kwargs)
@@ -1965,14 +1969,16 @@ def test_query_controller_pdf_validation_and_codex_context_edges(config_path, pa
     selection = {"paper_ids": [paper_id]}
     with pytest.raises(ValueError, match="Unknown configured model"):
         controller.start(plain_query, ("missing",), 2048, selection=selection)
-    with pytest.raises(ValueError, match="Regexp preprocessing"):
-        controller.start(
-            regexp_query,
-            ("codex-review",),
-            2048,
-            selection=selection,
-            source_scope="pdf",
-        )
+    regexp_batch = controller.start(
+        regexp_query,
+        ("codex-review",),
+        2048,
+        selection=selection,
+        source_scope="pdf",
+        pdf_strategy="auto",
+    )
+    assert regexp_batch
+    controller.wait()
     with pytest.raises(ValueError, match="Unknown configured model"):
         controller.start_on_results(
             plain_query,
@@ -1980,14 +1986,16 @@ def test_query_controller_pdf_validation_and_codex_context_edges(config_path, pa
             2048,
             targets=(("papers", selection),),
         )
-    with pytest.raises(ValueError, match="Regexp preprocessing"):
-        controller.start_on_results(
-            regexp_query,
-            ("codex-review",),
-            2048,
-            targets=(("papers", selection),),
-            source_scope="pdf",
-        )
+    regexp_batches = controller.start_on_results(
+        regexp_query,
+        ("codex-review",),
+        2048,
+        targets=(("papers", selection),),
+        source_scope="pdf",
+        pdf_strategy="auto",
+    )
+    assert regexp_batches and len(regexp_batches) == 1
+    controller.wait()
 
     batch_ids = controller.start_on_results(
         plain_query,

@@ -1171,7 +1171,6 @@ def run_query_batch(
                         and profile.provider == "codex"
                         and content_type == "papers"
                         and source_scope == "pdf"
-                        and not regexp_pattern
                     )
                     native_papers: list[Any] = []
                     if native_pdf:
@@ -1180,6 +1179,19 @@ def run_query_batch(
                             raise ValueError("No paper matches this query run")
                         document = _paper_document(db, native_papers[0])
                         documents = [document]
+                        if regexp_pattern and not local_regexp_tags:
+                            with httpx.Client(
+                                timeout=60, follow_redirects=True,
+                                headers={"User-Agent": USER_AGENT},
+                            ) as pdf_client:
+                                _paper, fulltext = _paper_text(
+                                    config, db, int(native_papers[0]["id"]),
+                                    "fulltext", pdf_client,
+                                )
+                            regexp_document = dict(document)
+                            regexp_document["source"] = "fulltext"
+                            regexp_document["fulltext"] = fulltext
+                            documents = [regexp_document]
                     else:
                         documents = collect_query_documents(
                             db, source_scope, selection=selection, config=config
@@ -1413,8 +1425,6 @@ class QueryController:
                         raise ValueError("Local regexp queries cannot upload a whole PDF")
                     if len(configured_profiles) != 1 or configured_profiles[0].provider != "codex":
                         raise ValueError("Whole-PDF upload requires exactly one Codex model")
-                    if str(query["regexp_pattern"] or "").strip():
-                        raise ValueError("Regexp preprocessing is unavailable for whole-PDF upload")
                     context_window_tokens = configured_profiles[0].context_window_tokens
                 validate_query_sources(
                     db,
@@ -1538,8 +1548,6 @@ class QueryController:
                         raise ValueError("Local regexp queries cannot upload a whole PDF")
                     if len(configured_profiles) != 1 or configured_profiles[0].provider != "codex":
                         raise ValueError("Whole-PDF upload requires exactly one Codex model")
-                    if str(query["regexp_pattern"] or "").strip():
-                        raise ValueError("Regexp preprocessing is unavailable for whole-PDF upload")
                     context_window_tokens = configured_profiles[0].context_window_tokens
 
                 for content_type, raw_selection in ordered_targets:

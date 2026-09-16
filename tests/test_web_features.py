@@ -108,7 +108,9 @@ def test_recent_feed_theme_and_direct_links(
     client = make_app(config_path)
     response = client.get("/")
     assert response.status_code == 200
-    assert "Recent papers" in response.text
+    assert "Unified downloads" not in response.text
+    assert "Recent papers and blog updates" not in response.text
+    assert "Papers and blogs share search" not in response.text
     assert "Research feed" not in response.text
     assert "Tracked author(s)" in response.text
     assert "OpenAlex topics" in response.text
@@ -223,7 +225,7 @@ def test_paper_author_picker_and_chunked_multi_model_request(
     assert "Run saved prompt" not in page.text
     assert 'id="saved-prompt-form"' not in page.text
     results_page = client.get("/")
-    assert "Run saved prompt on all 1 search result" in results_page.text
+    assert "Run prompt" in results_page.text
     assert "Override Defaults" in results_page.text
     runner = results_page.text.split('id="collection-runner-form"', 1)[1].split("</form>", 1)[0]
     assert runner.index("Saved query") < runner.index("Override Defaults")
@@ -303,7 +305,7 @@ def test_saved_query_create_edit_run_output_and_delete(
     assert "Select papers and run" in page.text
     assert "Paper search" not in page.text
     recent = client.get("/")
-    assert "Run saved prompt on all 1 search result" in recent.text
+    assert "Run prompt" in recent.text
     assert "Saved query" in recent.text
     assert 'name="override_query_defaults"' in recent.text
     assert "data-query-defaults-form" in recent.text
@@ -339,8 +341,9 @@ def test_saved_query_create_edit_run_output_and_delete(
     with Database(config.paths.database) as db:
         assert db.set_content_selected("paper", paper_id, True)
     selected_page = client.get("/")
-    assert "Run saved prompt on all 1 search result" in selected_page.text
+    assert "Run prompt" in selected_page.text
     assert 'data-selected-count="1"' in selected_page.text
+    assert 'name="selection_mode" value="selected" data-run-target-value' in selected_page.text
     assert 'name="paper_ids"' not in selected_page.text
     response = client.post(
         "/queries/run-filtered",

@@ -426,11 +426,7 @@
       : `Search results (${resultCount})`;
     const running = runButton.dataset.runRunning === "true";
     runButton.disabled = running || activeCount === 0;
-    if (summary) {
-      summary.textContent = useSelected
-        ? `Run saved prompt on ${selectedCount} selected record${selectedCount === 1 ? "" : "s"}`
-        : `Run saved prompt on all ${resultCount} search result${resultCount === 1 ? "" : "s"}`;
-    }
+    if (summary) summary.textContent = "Run prompt";
   };
   contentResultsRunnerForm?.querySelector("[data-run-target-toggle]")?.addEventListener(
     "click", () => {
@@ -456,8 +452,14 @@
     const targetToggle = contentResultsRunnerForm.querySelector("[data-run-target-toggle]");
     const incomingToggle = incomingForm.querySelector("[data-run-target-toggle]");
     if (targetToggle && incomingToggle) {
+      const previousSelectedCount = Number(targetToggle.dataset.selectedCount || 0);
+      const nextSelectedCount = Number(incomingToggle.dataset.selectedCount || 0);
       targetToggle.dataset.resultCount = incomingToggle.dataset.resultCount || "0";
-      targetToggle.dataset.selectedCount = incomingToggle.dataset.selectedCount || "0";
+      targetToggle.dataset.selectedCount = String(nextSelectedCount);
+      const targetValue = contentResultsRunnerForm.querySelector("[data-run-target-value]");
+      if (targetValue && previousSelectedCount === 0 && nextSelectedCount > 0) {
+        targetValue.value = "selected";
+      }
     }
     const runButton = contentResultsRunnerForm.querySelector(".collection-run-button");
     const incomingButton = incomingForm.querySelector(".collection-run-button");

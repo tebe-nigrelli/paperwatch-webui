@@ -307,7 +307,7 @@ def test_blog_results_runner_accepts_multiple_queries_and_one_model(
     capture = QueryCapture()
     web = client(config_path, capture)
     content = web.get("/")
-    assert "Run saved prompt on all 2 search results" in content.text
+    assert "Run prompt" in content.text
     runner = content.text.split('id="collection-runner-form"', 1)[1].split(
         "</form>", 1
     )[0]
