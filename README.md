@@ -493,6 +493,16 @@ systemctl --user daemon-reload
 systemctl --user enable --now paperwatch.timer paperwatch-web.service
 ```
 
+`paperwatch-web.service` is attached to `graphical-session.target` so desktop
+launches such as **Open PDF** inherit the Plasma/GNOME Wayland/X11 and D-Bus
+environment. If upgrading from a version that used `default.target`, refresh the
+enablement symlink once:
+
+```bash
+systemctl --user reenable paperwatch-web.service
+systemctl --user restart paperwatch-web.service
+```
+
 The timer runs daily, catches missed executions, and randomizes startup by up to 30 minutes.
 
 ## Verification

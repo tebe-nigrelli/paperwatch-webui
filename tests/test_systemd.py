@@ -17,3 +17,9 @@ def test_web_service_is_local_and_restarts():
     assert " web --host 127.0.0.1 --port 8765" in service
     assert "Restart=on-failure" in service
     assert "EnvironmentFile=" in service
+    # The web service launches desktop applications via xdg-open. Starting it
+    # from default.target can happen before Plasma imports DISPLAY/Wayland/DBus
+    # variables into the systemd user manager, leaving it permanently headless.
+    assert "PartOf=graphical-session.target" in service
+    assert "WantedBy=graphical-session.target" in service
+    assert "WantedBy=default.target" not in service

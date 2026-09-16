@@ -2,6 +2,7 @@
 Description=Paperwatch local web interface
 After=network-online.target
 Wants=network-online.target
+PartOf=graphical-session.target
 
 [Service]
 Type=simple
@@ -12,4 +13,4 @@ Restart=on-failure
 RestartSec=5s
 
 [Install]
-WantedBy=default.target
+WantedBy=graphical-session.target
