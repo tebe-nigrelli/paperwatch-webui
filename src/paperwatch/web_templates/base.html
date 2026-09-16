@@ -24,8 +24,28 @@
       <button class="button {{ 'button-danger' if run_state.running else 'button-primary' }} button-small" type="submit" title="{{ 'Request cancellation after the current fetch or model step.' if run_state.running else 'Fetch new papers, download PDFs when enabled under Data, retry recent missing PDFs when enabled, and check linked RSS/Atom feeds and blog snapshots. Models run only for queries checked under New papers or New blog entries. Click again while running to stop.' }}" aria-label="{{ 'Stop fetch: request cancellation after the current step' if run_state.running else 'Fetch now: papers, PDFs, and blogs; run only selected automatic queries' }}">{{ 'Stop fetch' if run_state.running else 'Fetch now' }}</button>
     </form>
     <button id="theme-toggle" class="theme-toggle" type="button" data-default-theme="system" aria-label="Theme: follow system" title="Theme: follow system">◐</button>
+    <button id="about-toggle" class="theme-toggle info-toggle" type="button" aria-label="About paperwatch" title="About paperwatch" aria-haspopup="dialog" aria-controls="about-dialog">
+      <svg class="info-icon" viewBox="0 0 24 24" aria-hidden="true" focusable="false"><circle cx="12" cy="12" r="9"></circle><path d="M12 11v6"></path><path d="M12 7h.01"></path></svg>
+    </button>
   </div>
 </header>
+<dialog id="about-dialog" class="about-dialog" aria-labelledby="about-dialog-title">
+  <div class="about-dialog-card">
+    <div class="about-dialog-heading">
+      <div>
+        <div class="eyebrow">About</div>
+        <h2 id="about-dialog-title">paperwatch</h2>
+      </div>
+      <button class="theme-toggle" type="button" data-about-close aria-label="Close about panel" title="Close">×</button>
+    </div>
+    <dl class="about-meta">
+      <div><dt>Author</dt><dd><a class="github-profile-chip" href="https://github.com/tebe-nigrelli" target="_blank" rel="noopener noreferrer" aria-label="Tebe Nigrelli on GitHub"><img src="https://github.com/tebe-nigrelli.png?size=64" alt="" width="24" height="24"><span>Tebe Nigrelli</span></a></dd></div>
+      <div><dt>Project</dt><dd><a class="about-project-link" href="https://github.com/tebe-nigrelli/paperwatch-webui" target="_blank" rel="noopener noreferrer">tebe-nigrelli/paperwatch-webui</a></dd></div>
+      <div><dt>Last commit</dt><dd><time datetime="2026-09-16">16 September 2026</time></dd></div>
+    </dl>
+    <p>If Paperwatch has been useful, consider dropping the repository a star on GitHub.</p>
+  </div>
+</dialog>
 <main class="shell">
   {% if notice %}<div class="notice notice-{{ notice_level }}" role="status">{{ notice }}</div>{% endif %}
   {% if run_state.error %}<div class="notice notice-error">Fetch failed: {{ run_state.error }}</div>{% endif %}

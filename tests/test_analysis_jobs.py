@@ -385,6 +385,7 @@ def test_direct_analysis_rejects_context_that_cannot_hold_prompt(
 def test_codex_fulltext_batch_uploads_original_pdf_without_extracting_text(
     config_path, paper_record, analysis_result, monkeypatch
 ):
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
     with config_path.open("a", encoding="utf-8") as handle:
         handle.write(
             """
@@ -393,7 +394,6 @@ def test_codex_fulltext_batch_uploads_original_pdf_without_extracting_text(
 name = "codex-review"
 provider = "codex"
 model = "gpt-5.3-codex"
-api_key = "secret"
 reasoning_effort = "high"
 timeout_seconds = 1
 max_input_chars = 5000

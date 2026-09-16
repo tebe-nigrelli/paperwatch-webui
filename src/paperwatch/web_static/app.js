@@ -48,6 +48,16 @@
     updateThemeButton();
   }
 
+  const aboutToggle = document.getElementById("about-toggle");
+  const aboutDialog = document.getElementById("about-dialog");
+  if (aboutToggle && aboutDialog) {
+    aboutToggle.addEventListener("click", () => aboutDialog.showModal());
+    aboutDialog.querySelector("[data-about-close]")?.addEventListener("click", () => aboutDialog.close());
+    aboutDialog.addEventListener("click", (event) => {
+      if (event.target === aboutDialog) aboutDialog.close();
+    });
+  }
+
   document.querySelectorAll("details[data-persist-open]").forEach((details) => {
     const key = details.dataset.persistOpen;
     const saved = storageGet(key);

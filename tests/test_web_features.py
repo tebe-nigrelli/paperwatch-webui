@@ -117,6 +117,18 @@ def test_recent_feed_theme_and_direct_links(
     assert "File present" in response.text
     assert 'id="theme-toggle"' in response.text
     assert 'data-default-theme="system"' in response.text
+    assert 'id="about-toggle"' in response.text
+    assert 'class="info-icon"' in response.text
+    assert '<path d="M12 11v6"></path>' in response.text
+    assert 'id="about-dialog"' in response.text
+    assert "Tebe Nigrelli" in response.text
+    assert 'class="github-profile-chip"' in response.text
+    assert 'href="https://github.com/tebe-nigrelli"' in response.text
+    assert 'src="https://github.com/tebe-nigrelli.png?size=64"' in response.text
+    assert 'href="https://github.com/tebe-nigrelli/paperwatch-webui"' in response.text
+    assert "tebe-nigrelli/paperwatch-webui" in response.text
+    assert 'datetime="2026-09-16"' in response.text
+    assert "dropping the repository a star on GitHub" in response.text
     assert "Queries" in response.text
     assert f'/papers/{paper_id}' in response.text
     assert "https://arxiv.org/abs/2607.12345" in response.text
@@ -129,6 +141,8 @@ def test_recent_feed_theme_and_direct_links(
     assert 'light: "☀"' in js
     assert 'dark: "☾"' in js
     assert 'storageRemove(themeKey)' in js
+    assert 'document.getElementById("about-toggle")' in js
+    assert "aboutDialog.showModal()" in js
     assert "author-picker" in js
     assert "localStorage" in js
     assert "PDF strategy only applies" not in js
