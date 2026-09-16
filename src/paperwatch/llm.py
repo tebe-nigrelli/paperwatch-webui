@@ -3,6 +3,7 @@ from __future__ import annotations
 import copy
 from dataclasses import dataclass
 import json
+import os
 from pathlib import Path
 import re
 import shutil
@@ -762,6 +763,12 @@ class OpenAIClient:
 
 
 
+def _subprocess_command(command: str) -> str:
+    if os.name == "nt":
+        return shutil.which(command) or command
+    return command
+
+
 class CodexClient:
     """Codex CLI headless mode using the user's existing local authentication."""
 
@@ -829,7 +836,7 @@ class CodexClient:
         include_model: bool = True,
     ) -> list[str]:
         command = [
-            self.command,
+            _subprocess_command(self.command),
             "exec",
             "--skip-git-repo-check",
             "--ephemeral",
@@ -1169,7 +1176,7 @@ class ClaudeCodeClient:
             "user's source and output schema exactly."
         )
         command = [
-            self.command,
+            _subprocess_command(self.command),
             "-p",
             "Analyze the research-paper request supplied on stdin and return only the requested structured output.",
             "--output-format",

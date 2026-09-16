@@ -91,13 +91,55 @@ SELECTED_CONTENT_PREVIEW_LIMIT = 25
 
 def _desktop_opener(platform: str | None = None) -> str | None:
     """Return the native desktop opener for supported Unix platforms."""
-    command = "open" if (platform or sys.platform) == "darwin" else "xdg-open"
+    current = platform or sys.platform
+    if current == "win32":
+        return None
+    command = "open" if current == "darwin" else "xdg-open"
     return shutil.which(command)
+
+
+def _open_desktop_path(path: Path) -> None:
+    resolved = path.resolve()
+    if sys.platform == "win32":
+        startfile = getattr(os, "startfile", None)
+        if startfile is None:
+            raise OSError("Windows desktop opener is not available")
+        startfile(str(resolved))
+        return
+    opener = _desktop_opener()
+    if opener is None:
+        command = "open" if sys.platform == "darwin" else "xdg-open"
+        raise OSError(f"Desktop opener {command!r} is not available")
+    subprocess.Popen(
+        [opener, str(resolved)],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        start_new_session=True,
+    )
 
 
 def _desktop_directory_picker(platform: str | None = None) -> list[str] | None:
     """Return a native folder-picker command, preferring KDE on Linux."""
     current = platform or sys.platform
+    if current == "win32":
+        powershell = (
+            shutil.which("powershell.exe")
+            or shutil.which("powershell")
+            or shutil.which("pwsh.exe")
+            or shutil.which("pwsh")
+        )
+        if powershell:
+            script = (
+                "Add-Type -AssemblyName System.Windows.Forms; "
+                "$dialog = New-Object System.Windows.Forms.FolderBrowserDialog; "
+                "$dialog.Description = 'Choose export destination'; "
+                "if ($dialog.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) "
+                "{ [Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false); "
+                "Write-Output $dialog.SelectedPath }"
+            )
+            return [powershell, "-NoProfile", "-STA", "-Command", script]
+        return None
     if current == "darwin":
         osascript = shutil.which("osascript")
         if osascript:
@@ -134,7 +176,12 @@ def _choose_export_directory() -> Path | None:
     """Open the system folder picker and return the selected existing folder."""
     command = _desktop_directory_picker()
     if command is None:
+        if sys.platform == "win32":
+            raise OSError("No system folder picker is available (PowerShell is required on Windows).")
         raise OSError("No system folder picker is available (install kdialog or zenity).")
+    run_kwargs: dict[str, Any] = {}
+    if sys.platform == "win32":
+        run_kwargs["encoding"] = "utf-8"
     completed = subprocess.run(
         command,
         stdin=subprocess.DEVNULL,
@@ -142,6 +189,7 @@ def _choose_export_directory() -> Path | None:
         stderr=subprocess.PIPE,
         text=True,
         check=False,
+        **run_kwargs,
     )
     selected = completed.stdout.strip()
     if completed.returncode != 0 or not selected:
@@ -158,17 +206,7 @@ def _trash_directory(pdf_dir: Path) -> Path:
 
 def _open_desktop_directory(path: Path) -> None:
     path.mkdir(parents=True, exist_ok=True)
-    opener = _desktop_opener()
-    if opener is None:
-        command = "open" if sys.platform == "darwin" else "xdg-open"
-        raise OSError(f"Desktop opener {command!r} is not available")
-    subprocess.Popen(
-        [opener, str(path.resolve())],
-        stdin=subprocess.DEVNULL,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-        start_new_session=True,
-    )
+    _open_desktop_path(path)
 
 
 @dataclass(frozen=True, slots=True)
@@ -5182,19 +5220,11 @@ def create_app(
     @app.get("/papers/{paper_id}/pdf/open")
     def open_local_pdf(paper_id: int) -> Response:
         path = local_pdf_path(paper_id)
-        opener = _desktop_opener()
-        if opener is None:
-            command = "open" if sys.platform == "darwin" else "xdg-open"
-            raise HTTPException(503, f"Desktop opener {command!r} is not available")
         try:
-            subprocess.Popen(
-                [opener, str(path)],
-                stdin=subprocess.DEVNULL,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                start_new_session=True,
-            )
+            _open_desktop_path(path)
         except OSError as exc:
+            if _desktop_opener() is None and sys.platform != "win32":
+                raise HTTPException(503, str(exc)) from exc
             raise HTTPException(500, f"Could not open PDF: {exc}") from exc
         return Response(status_code=204)
 

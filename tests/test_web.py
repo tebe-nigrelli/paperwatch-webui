@@ -629,7 +629,17 @@ def test_desktop_directory_picker_and_selection(tmp_path, monkeypatch):
         lambda command: "/usr/bin/osascript" if command == "osascript" else None,
     )
     assert _desktop_directory_picker("darwin")[0] == "/usr/bin/osascript"
-    assert _desktop_directory_picker("win32") is None
+
+    monkeypatch.setattr(
+        "paperwatch.web.shutil.which",
+        lambda command: "C:/Windows/System32/WindowsPowerShell/v1.0/powershell.exe"
+        if command == "powershell.exe"
+        else None,
+    )
+    windows = _desktop_directory_picker("win32")
+    assert windows is not None
+    assert windows[0].endswith("powershell.exe")
+    assert windows[1:3] == ["-NoProfile", "-STA"]
 
     monkeypatch.setattr("paperwatch.web._desktop_directory_picker", lambda: ["picker"])
     monkeypatch.setattr(
@@ -1600,6 +1610,20 @@ def test_local_pdf_opens_with_system_application(config_path, seeded_web, monkey
     failed = client.get(f"/papers/{paper_id}/pdf/open")
     assert failed.status_code == 500
     assert "desktop launcher failed" in failed.text
+
+
+def test_windows_desktop_open_uses_startfile(tmp_path, monkeypatch):
+    from paperwatch.web import _open_desktop_path
+
+    opened = []
+    target = tmp_path / "paper.pdf"
+    target.write_bytes(b"%PDF-1.4\n%%EOF\n")
+    monkeypatch.setattr("paperwatch.web.sys.platform", "win32")
+    monkeypatch.setattr("paperwatch.web.os.startfile", lambda path: opened.append(path), raising=False)
+
+    _open_desktop_path(target)
+
+    assert opened == [str(target.resolve())]
 
 
 def test_macos_desktop_opener(monkeypatch):

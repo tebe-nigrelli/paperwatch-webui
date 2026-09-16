@@ -62,9 +62,19 @@ python3 -m venv .venv
 export OPENALEX_API_KEY='...'
 ```
 
-The application code supports Linux and macOS. The optional unit files in
-`systemd/` are Linux-only; on macOS, run the CLI manually or configure the same
-`paperwatch run` and `paperwatch web` commands as `launchd` jobs.
+On Windows (PowerShell):
+
+```powershell
+cd paperwatch
+py -3.11 -m venv .venv
+.\.venv\Scripts\python.exe -m pip install -e '.[dev]'
+.\.venv\Scripts\paperwatch.exe init config.toml
+$env:OPENALEX_API_KEY='...'
+```
+
+The application code supports Linux, macOS, and Windows. The optional unit files in
+`systemd/` are Linux-only; on macOS or Windows, run the CLI manually or configure the
+same `paperwatch run` and `paperwatch web` commands with the platform scheduler.
 
 For Ollama:
 
@@ -112,7 +122,7 @@ The home page is a newest-first unified table for papers and blog entries. Paper
 - shared paper/blog tags;
 - direct links to local PDFs or original blog pages.
 
-Tracked author names link directly to the same table filtered to that author. Every native select is enhanced with a text field: typing filters option labels and values, and Enter inserts the highlighted choice. Search, exact author, searchable multi-select author tags, shared content tags, topic, date, PDF, and analysis filters stay on this page. Checkboxes select exact paper or blog subsets for saved prompts. The table supports page sizes up to 1000 records. Local PDF links use the operating system's desktop opener (`xdg-open` on Linux and `open` on macOS), so they launch the configured PDF application.
+Tracked author names link directly to the same table filtered to that author. Every native select is enhanced with a text field: typing filters option labels and values, and Enter inserts the highlighted choice. Search, exact author, searchable multi-select author tags, shared content tags, topic, date, PDF, and analysis filters stay on this page. Checkboxes select exact paper or blog subsets for saved prompts. The table supports page sizes up to 1000 records. Local PDF links use the operating system's desktop opener (`xdg-open` on Linux, `open` on macOS, and the Windows shell on Windows), so they launch the configured PDF application.
 
 Blog detail pages preserve sanitized article structure and show remote HTTP(S) images or GIFs only while the page is open. Paperwatch stores their URLs in article text but never downloads the media into its data directory. Back, original-source, and icon-only copy controls stay on one line.
 

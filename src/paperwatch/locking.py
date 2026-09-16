@@ -1,7 +1,11 @@
 from __future__ import annotations
 
-import fcntl
 import os
+
+if os.name == "nt":
+    import msvcrt
+else:
+    import fcntl
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Iterator, TextIO
@@ -26,11 +30,20 @@ def _named_lock(
     path = Path(f"{Path(database_path)}.{suffix}.lock")
     path.parent.mkdir(parents=True, exist_ok=True)
     handle: TextIO = path.open("a+", encoding="utf-8")
+    locked = False
     try:
-        try:
-            fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BlockingIOError as exc:
-            raise error_type(message.format(database=Path(database_path))) from exc
+        if os.name == "nt":
+            handle.seek(0)
+            try:
+                msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+            except OSError as exc:
+                raise error_type(message.format(database=Path(database_path))) from exc
+        else:
+            try:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError as exc:
+                raise error_type(message.format(database=Path(database_path))) from exc
+        locked = True
         handle.seek(0)
         handle.truncate()
         handle.write(str(os.getpid()))
@@ -38,7 +51,12 @@ def _named_lock(
         yield
     finally:
         try:
-            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+            if locked:
+                if os.name == "nt":
+                    handle.seek(0)
+                    msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+                else:
+                    fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
         finally:
             handle.close()
 
