@@ -12,6 +12,12 @@ Everything is stored locally in SQLite and presented in a browser-based interfac
 - [Paperwatch](#paperwatch)
   - [Contents](#contents)
   - [Showcase](#showcase)
+    - [Content Page](#content-page)
+    - [Authors Page](#authors-page)
+    - [Queries Page](#queries-page)
+    - [Discover Page](#discover-page)
+    - [Run Page](#run-page)
+    - [Data](#data)
   - [Features](#features)
   - [Quickstart](#quickstart)
     - [Linux](#linux)
@@ -25,15 +31,53 @@ Everything is stored locally in SQLite and presented in a browser-based interfac
 
 ## Showcase
 
-The six top-level menus cover the complete workflow.
+### Content Page
 
-| Content | Authors |
-| --- | --- |
-| [![Content library with paper and blog filters](docs/images/content.png)](docs/images/content.png) | [![Tracked authors and their sources](docs/images/authors.png)](docs/images/authors.png) |
-| **Queries** | **Discover** |
-| [![Saved model and regexp queries](docs/images/queries.png)](docs/images/queries.png) | [![Paper, author, and blog discovery](docs/images/discover.png)](docs/images/discover.png) |
-| **Run** | **Data** |
-| [![Fetch and query run history](docs/images/run.png)](docs/images/run.png) | [![Import, export, backup, and data management](docs/images/data.png)](docs/images/data.png) |
+[![Content library with paper and blog filters](docs/images/content.png)](docs/images/content.png)
+
+The unified Content feed brings papers and blog updates into one searchable workspace. Filter by author, topic, tag, date, PDF availability, or analysis state; star and annotate useful records; select groups for saved prompts; and open downloaded PDFs or original sources directly from the table without changing pages or losing context.
+
+<br><br>
+
+### Authors Page
+
+[![Tracked authors and their sources](docs/images/authors.png)](docs/images/authors.png)
+
+Authors provides a compact overview of everyone Paperwatch follows. Search names, institutions, identifiers, and tags; pause or resume tracking; edit OpenAlex IDs; inspect paper and blog counts; open external profiles; and manage each researcher’s connected personal, laboratory, publication, or company sources from a single organized table with clear controls.
+
+<br><br>
+
+### Queries Page
+
+[![Saved model and regexp queries](docs/images/queries.png)](docs/images/queries.png)
+
+Queries turns repeatable research questions into reusable workflows. Create prompts or regexp classifiers, choose whether they process papers, blogs, or both, enable automatic runs for newly fetched material, inspect stored results and failures, and rerun a definition across existing content using the currently configured model profile whenever needed later on.
+
+<br><br>
+
+### Discover Page
+
+[![Paper, author, and blog discovery](docs/images/discover.png)](docs/images/discover.png)
+
+Discover gathers network-based import tools away from the local library. Search OpenAlex for papers or researchers, preview matches before importing them, inspect a blog URL for available entries, add individual sources, and launch a one-year PDF backfill when you want to build a broader historical collection from open research sources.
+
+<br><br>
+
+### Run Page
+
+[![Fetch and query run history](docs/images/run.png)](docs/images/run.png)
+
+Run shows what Paperwatch is doing now and what happened previously. Follow active fetches, summaries, and saved queries; review progress and model details; inspect paper and blog outcomes separately; and open recorded errors when one author, source, download, or model job needs attention without interrupting everything else in the pipeline.
+
+<br><br>
+
+### Data
+
+[![Import, export, backup, and data management](docs/images/data.png)](docs/images/data.png)
+
+Data collects administrative tools in one deliberate workspace. Add authors manually, import author or blog catalogs, export portable records, create or restore complete database and PDF backups, open storage folders, change download behavior, and remove selected categories of stored information through clearly separated, guarded controls when maintenance is required locally.
+
+<br><br>
 
 ## Features
 
